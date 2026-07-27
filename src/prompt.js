@@ -145,8 +145,10 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focu
     module, then judge whether anything in the upstream range breaks, deprecates, or changes the behavior of a
     symbol this repo actually uses — a removed export, a changed function signature, a changed default, a
     renamed field. If nothing this repo uses is affected, say so briefly in the ${toolNames.finishReview}
-    summary; if something is, record it with ${toolNames.requestChange} at 'blocking' severity, on the go.mod
-    version line, naming the exact upstream change and the call site it affects.\n`
+    summary; if something is, name the exact upstream change and the call site it affects at 'blocking'
+    severity — as ${toolNames.requestChange} on the go.mod version line if that line is shown above (a LINE N
+    anchor), or in the ${toolNames.finishReview} summary if go.mod's own diff was too large to show inline
+    (see the unshowable-files note above) — never silently drop the finding because the anchor isn't available.\n`
     : '';
 
   // [LAW:dataflow-not-control-flow] The set of files to read in full is a VALUE: a non-empty scopeFiles
