@@ -131,10 +131,19 @@ const MAX_COMMITS = 30;
 const MAX_FILES = 50;
 
 // [LAW:no-silent-failure] Every bump resolves to a value: `resolved: true` with the fetched
-// summary, or `resolved: false` naming why — an unresolvable module or a failed compare call never
-// silently vanishes from the review's context; renderDependencyDiffNote surfaces both.
+// summary, or `resolved: false` naming why — an unresolvable module, a network error resolving it,
+// or a failed compare call never silently vanish from the review's context (nor propagate as an
+// unhandled rejection that would crash the whole review) — renderDependencyDiffNote surfaces all
+// three. resolveModuleRepo's own network call (the vanity-import discovery fetch) is not exempt: a
+// DNS failure or timeout there is caught here exactly like a compareCommits failure below, so both
+// of this function's network calls share one no-throw contract, not two.
 async function fetchUpstreamChangeSummary(octokit, bump, fetchImpl = fetch) {
-  const repo = await resolveModuleRepo(bump.modulePath, fetchImpl);
+  let repo;
+  try {
+    repo = await resolveModuleRepo(bump.modulePath, fetchImpl);
+  } catch (e) {
+    return { ...bump, resolved: false, reason: `could not resolve a GitHub repository for this module path (${e.message})` };
+  }
   if (!repo) {
     return { ...bump, resolved: false, reason: 'could not resolve a GitHub repository for this module path' };
   }

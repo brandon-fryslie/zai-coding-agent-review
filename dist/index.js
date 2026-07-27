@@ -30827,10 +30827,19 @@ const MAX_COMMITS = 30;
 const MAX_FILES = 50;
 
 // [LAW:no-silent-failure] Every bump resolves to a value: `resolved: true` with the fetched
-// summary, or `resolved: false` naming why — an unresolvable module or a failed compare call never
-// silently vanishes from the review's context; renderDependencyDiffNote surfaces both.
+// summary, or `resolved: false` naming why — an unresolvable module, a network error resolving it,
+// or a failed compare call never silently vanish from the review's context (nor propagate as an
+// unhandled rejection that would crash the whole review) — renderDependencyDiffNote surfaces all
+// three. resolveModuleRepo's own network call (the vanity-import discovery fetch) is not exempt: a
+// DNS failure or timeout there is caught here exactly like a compareCommits failure below, so both
+// of this function's network calls share one no-throw contract, not two.
 async function fetchUpstreamChangeSummary(octokit, bump, fetchImpl = fetch) {
-  const repo = await resolveModuleRepo(bump.modulePath, fetchImpl);
+  let repo;
+  try {
+    repo = await resolveModuleRepo(bump.modulePath, fetchImpl);
+  } catch (e) {
+    return { ...bump, resolved: false, reason: `could not resolve a GitHub repository for this module path (${e.message})` };
+  }
   if (!repo) {
     return { ...bump, resolved: false, reason: 'could not resolve a GitHub repository for this module path' };
   }
@@ -34477,21 +34486,34 @@ function bindingLevers({ effortRoundCap, difficultyCeilingRoundCap, defaultRound
   };
 }
 
+// The per-bump caps in dependency-diff.js (MAX_COMMITS/MAX_FILES) bound one module's contribution
+// to the note; this bounds how many MODULES get fetched at all — a grouped Dependabot PR can bump
+// many requirements in one go.mod diff, and without this a five-module bump would still inject
+// several hundred lines into every worker's prompt. [LAW:no-mode-explosion] one fixed constant.
+const MAX_DEPENDENCY_BUMPS_FETCHED = 8;
+
 // [LAW:effects-at-boundaries] The dependency-diff boundary: parses go.mod's OWN diff for version
 // bumps and fetches each bumped module's upstream change via the trusted host's octokit client —
 // the reviewing engine never makes this call itself (src/dependency-diff.js). Off by default
 // (dependencyDiffOn=false) is byte-identical to before this feature: no go.mod scan, no fetch, ''
 // flows through buildPrMaterial unchanged. [LAW:no-silent-failure] a per-bump fetch failure (bad
 // ref, unresolvable module, rate limit) is carried as `resolved: false` and rendered into the note
-// rather than thrown — one unreachable upstream must never abort the whole review.
+// rather than thrown — one unreachable upstream must never abort the whole review. A bump beyond
+// MAX_DEPENDENCY_BUMPS_FETCHED is the same shape: not fetched, but reported as such, not dropped.
 async function resolveDependencyDiffNote(octokit, filteredFiles, dependencyDiffOn) {
   if (!dependencyDiffOn) return '';
   const goMod = filteredFiles.find(f => f.filename === 'go.mod' && f.patch);
   if (!goMod) return '';
   const bumps = parseGoModBumps(goMod.patch);
   if (bumps.length === 0) return '';
-  core.info(`Dependency diff: fetching upstream context for ${bumps.length} go.mod bump(s)...`);
-  const summaries = await Promise.all(bumps.map(b => fetchUpstreamChangeSummary(octokit, b)));
+  const toFetch = bumps.slice(0, MAX_DEPENDENCY_BUMPS_FETCHED);
+  const skipped = bumps.slice(MAX_DEPENDENCY_BUMPS_FETCHED).map(b => ({
+    ...b, resolved: false, reason: `upstream context not fetched — this PR bumps more than ${MAX_DEPENDENCY_BUMPS_FETCHED} modules`,
+  }));
+  core.info(`Dependency diff: fetching upstream context for ${toFetch.length} go.mod bump(s)`
+    + `${skipped.length > 0 ? ` (${skipped.length} more skipped — over the ${MAX_DEPENDENCY_BUMPS_FETCHED}-module cap)` : ''}...`);
+  const fetched = await Promise.all(toFetch.map(b => fetchUpstreamChangeSummary(octokit, b)));
+  const summaries = [...fetched, ...skipped];
   for (const s of summaries) {
     core.info(s.resolved
       ? `Dependency diff: ${s.modulePath} ${s.from} → ${s.to} — ${s.totalCommits} upstream commit(s) via github.com/${s.owner}/${s.repoName}.`
@@ -34848,7 +34870,7 @@ async function run() {
   }
 }
 
-module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers };
+module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencyDiffNote, MAX_DEPENDENCY_BUMPS_FETCHED };
 
 
 /***/ }),

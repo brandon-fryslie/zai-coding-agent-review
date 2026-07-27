@@ -187,6 +187,15 @@ describe('fetchUpstreamChangeSummary', () => {
     assert.match(summary.reason, /pressly\/goose/);
     assert.match(summary.reason, /Not Found/);
   });
+
+  test('a network error DURING module resolution (not just compareCommits) reports resolved:false and never throws', async () => {
+    const octokit = { rest: { repos: { compareCommits: async () => { throw new Error('must not be called — resolution failed first'); } } } };
+    const flakyFetch = async () => { throw new Error('ECONNRESET'); };
+    const summary = await fetchUpstreamChangeSummary(octokit, { modulePath: 'example.com/some/module', from: 'v1.0.0', to: 'v1.1.0' }, flakyFetch);
+    assert.equal(summary.resolved, false);
+    assert.match(summary.reason, /could not resolve/);
+    assert.match(summary.reason, /ECONNRESET/);
+  });
 });
 
 describe('renderDependencyDiffNote', () => {
