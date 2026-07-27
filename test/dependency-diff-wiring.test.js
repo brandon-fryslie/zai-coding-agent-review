@@ -69,4 +69,18 @@ describe('resolveDependencyDiffNote', () => {
     const lastSkipped = bumps[bumps.length - 1].modulePath;
     assert.ok(note.includes(lastSkipped), 'a skipped module is still named in the note, not dropped');
   });
+
+  test('a bump in a NESTED go.mod (monorepo submodule) is covered, not just the root file', async () => {
+    const rootBump = { modulePath: 'github.com/org/root-dep', from: 'v1.0.0', to: 'v1.1.0' };
+    const nestedBump = { modulePath: 'github.com/org/nested-dep', from: 'v2.0.0', to: 'v2.1.0' };
+    const files = [
+      { filename: 'go.mod', patch: goModPatchFor([rootBump]) },
+      { filename: 'tools/go.mod', patch: goModPatchFor([nestedBump]) },
+    ];
+    let calls = 0;
+    const note = await resolveDependencyDiffNote(stubOctokit(() => calls++), files, true);
+    assert.equal(calls, 2);
+    assert.ok(note.includes(rootBump.modulePath));
+    assert.ok(note.includes(nestedBump.modulePath));
+  });
 });

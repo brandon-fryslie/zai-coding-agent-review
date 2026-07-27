@@ -35,6 +35,7 @@ function parseGoModBumps(patch) {
     const marker = line[0];
     if (marker !== '+' && marker !== '-') continue;
     if (line.startsWith('+++') || line.startsWith('---')) continue; // the diff's file header, not a requirement line
+    if (line.includes('=>')) continue; // a `replace` directive's mapping, not a require bump — its LHS version is not the one in effect
     const m = GO_MOD_REQUIRE_LINE.exec(line);
     if (!m) continue;
     (marker === '-' ? removed : added).set(m[1], m[2]);
@@ -56,7 +57,7 @@ const GOLANG_X_MIRROR = /^golang\.org\/x\/([a-zA-Z0-9_-]+)$/;
 // is the allowlist a module path must clear before it is EVER used to build a request URL — the
 // module path comes from PR diff content (untrusted input), so a crafted "module path" is not
 // free to smuggle a scheme, credentials, or a different host into that request. [LAW:types-are-the-program]
-const SAFE_MODULE_PATH = /^[a-zA-Z0-9][a-zA-Z0-9.-]*(?:\/[a-zA-Z0-9._-]+)+$/;
+const SAFE_MODULE_PATH = /^[a-zA-Z0-9][a-zA-Z0-9._-]*(?:\/[a-zA-Z0-9._-]+)+$/;
 
 function directGithubRepo(modulePath) {
   const m = /^github\.com\/([^/]+)\/([^/]+)/.exec(modulePath);
@@ -164,9 +165,16 @@ async function resolveModuleRepo(modulePath, fetchImpl = fetch, lookupImpl = dns
 // is legal here.
 const PSEUDO_VERSION_COMMIT = /-(?:[0-9A-Za-z]*\.)?\d{14}-([0-9a-f]{12})$/;
 
+// A v2+ module that hasn't adopted Go-modules semantics carries a `+incompatible` build-metadata
+// suffix in its go.mod version string (e.g. v2.0.0+incompatible); the underlying git tag is the
+// version WITHOUT that suffix (v2.0.0). Stripped first, so it never interferes with pseudo-version
+// detection below (the two suffix forms are mutually exclusive on a real version string).
+const INCOMPATIBLE_SUFFIX = /\+incompatible$/;
+
 function refFor(version) {
-  const m = PSEUDO_VERSION_COMMIT.exec(version);
-  return m ? m[1] : version;
+  const stripped = version.replace(INCOMPATIBLE_SUFFIX, '');
+  const m = PSEUDO_VERSION_COMMIT.exec(stripped);
+  return m ? m[1] : stripped;
 }
 
 // Commits/files a summary carries into the prompt are capped so one upstream bump (which can

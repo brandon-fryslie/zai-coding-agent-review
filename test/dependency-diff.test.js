@@ -84,6 +84,22 @@ describe('parseGoModBumps', () => {
     assert.deepEqual(parseGoModBumps(patch), []);
   });
 
+  test('a replace directive is not mistaken for a require bump (its LHS is not the version in effect)', () => {
+    const patch = '@@ -1,1 +1,1 @@\n-\tgithub.com/foo/bar v1.2.0 => github.com/foo/bar v1.2.0\n+\tgithub.com/foo/bar v1.2.0 => github.com/foo/bar v1.3.0';
+    assert.deepEqual(parseGoModBumps(patch), []);
+  });
+
+  test('a genuine require bump on the same patch as a changed replace directive only yields the require bump', () => {
+    const patch = [
+      '@@ -1,4 +1,4 @@',
+      '-\tgolang.org/x/net v0.53.0',
+      '+\tgolang.org/x/net v0.55.0',
+      '-\tgithub.com/foo/bar v1.2.0 => github.com/foo/bar v1.2.0',
+      '+\tgithub.com/foo/bar v1.2.0 => github.com/foo/bar v1.3.0',
+    ].join('\n');
+    assert.deepEqual(parseGoModBumps(patch), [{ modulePath: 'golang.org/x/net', from: 'v0.53.0', to: 'v0.55.0' }]);
+  });
+
   test('file header lines (+++/---) are not mistaken for requirement lines', () => {
     const patch = '--- a/go.mod\n+++ b/go.mod\n@@ -1,1 +1,1 @@\n-\tgolang.org/x/mod v0.35.0\n+\tgolang.org/x/mod v0.37.0';
     assert.deepEqual(parseGoModBumps(patch), [{ modulePath: 'golang.org/x/mod', from: 'v0.35.0', to: 'v0.37.0' }]);
@@ -143,6 +159,14 @@ describe('resolveModuleRepo', () => {
       const repo = await resolveModuleRepo(bad, noNetwork, noDns);
       assert.equal(repo, null, bad);
     }
+  });
+
+  test('an underscore in the domain segment clears the shape check and reaches resolution (Go module paths allow it)', async () => {
+    let lookupCalls = 0;
+    const lookup = async (hostname) => { lookupCalls++; assert.equal(hostname, 'my_domain.example'); return [{ address: '93.184.216.34', family: 4 }]; };
+    const repo = await resolveModuleRepo('my_domain.example/some/pkg', async () => ({ ok: false }), lookup);
+    assert.equal(lookupCalls, 1, 'the shape check let this path through to DNS resolution, unlike a truly malformed path');
+    assert.equal(repo, null); // ok:false from the stub — resolution itself is not under test here
   });
 
   test('a host resolving to a private/loopback/link-local/metadata address is rejected before the discovery fetch is attempted', async () => {
@@ -219,9 +243,30 @@ describe('refFor', () => {
   test('a pseudo-version resolves to its embedded commit hash', () => {
     assert.equal(refFor('v0.2.1-0.20260314000741-0fe74e7ee31a'), '0fe74e7ee31a');
   });
+
+  test('a v2+ incompatible module strips the +incompatible suffix to the real git tag', () => {
+    assert.equal(refFor('v2.0.0+incompatible'), 'v2.0.0');
+    assert.equal(refFor('v3.1.4+incompatible'), 'v3.1.4');
+  });
+
+  test('an incompatible pseudo-version strips both the suffix and resolves to the commit hash', () => {
+    assert.equal(refFor('v2.0.0-20260101000000-abcdef012345+incompatible'), 'abcdef012345');
+  });
 });
 
 describe('fetchUpstreamChangeSummary', () => {
+  test('a +incompatible version bump resolves against the stripped git tag', async () => {
+    const octokit = {
+      rest: { repos: { compareCommits: async ({ base, head }) => {
+        assert.equal(base, 'v1.9.0');
+        assert.equal(head, 'v2.0.0');
+        return { data: { html_url: 'https://github.com/dolthub/driver/compare/v1.9.0...v2.0.0', commits: [], files: [] } };
+      } } },
+    };
+    const summary = await fetchUpstreamChangeSummary(octokit, { modulePath: 'github.com/dolthub/driver', from: 'v1.9.0+incompatible', to: 'v2.0.0+incompatible' }, noNetwork);
+    assert.equal(summary.resolved, true);
+  });
+
   test('a resolved module returns commits/files capped and counted', async () => {
     const commits = Array.from({ length: 35 }, (_, i) => ({ sha: `${i}`.padStart(40, '0'), commit: { message: `commit ${i}\n\nbody` } }));
     const files = Array.from({ length: 60 }, (_, i) => ({ filename: `file${i}.go` }));

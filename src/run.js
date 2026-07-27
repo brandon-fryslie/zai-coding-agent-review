@@ -237,9 +237,11 @@ const MAX_DEPENDENCY_BUMPS_FETCHED = 8;
 // MAX_DEPENDENCY_BUMPS_FETCHED is the same shape: not fetched, but reported as such, not dropped.
 async function resolveDependencyDiffNote(octokit, filteredFiles, dependencyDiffOn) {
   if (!dependencyDiffOn) return '';
-  const goMod = filteredFiles.find(f => f.filename === 'go.mod' && f.patch);
-  if (!goMod) return '';
-  const bumps = parseGoModBumps(goMod.patch);
+  // A monorepo can carry more than one go.mod (nested modules, e.g. tools/go.mod) — every one of
+  // them is in scope, not just the root file, so a bump in a nested module is never silently skipped.
+  const goMods = filteredFiles.filter(f => f.patch && (f.filename === 'go.mod' || f.filename.endsWith('/go.mod')));
+  if (goMods.length === 0) return '';
+  const bumps = goMods.flatMap(f => parseGoModBumps(f.patch));
   if (bumps.length === 0) return '';
   const toFetch = bumps.slice(0, MAX_DEPENDENCY_BUMPS_FETCHED);
   const skipped = bumps.slice(MAX_DEPENDENCY_BUMPS_FETCHED).map(b => ({
