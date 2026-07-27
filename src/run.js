@@ -15,6 +15,7 @@ const { parseDailyBudgetUsd, defaultBudgetCandidates, chooseProfile, effectiveRo
 const { assessDifficulty } = require('./difficulty');
 const { difficultyCandidates, parseDifficultyScaling } = require('./difficulty-policy');
 const { readSpentToday, appendCost } = require('./ledger');
+const { parseDependencyDiffFlag, parseGoModBumps, fetchUpstreamChangeSummary, renderDependencyDiffNote } = require('./dependency-diff');
 const { renderCostLine, costWarning, costMarker } = require('./usage');
 const { renderRepoReport } = require('./report');
 const registry = require('./engine/registry');
@@ -220,6 +221,48 @@ function bindingLevers({ effortRoundCap, difficultyCeilingRoundCap, defaultRound
   };
 }
 
+// The per-bump caps in dependency-diff.js (MAX_COMMITS/MAX_FILES) bound one module's contribution
+// to the note; this bounds how many MODULES get fetched at all — a grouped Dependabot PR can bump
+// many requirements in one go.mod diff, and without this a five-module bump would still inject
+// several hundred lines into every worker's prompt. [LAW:no-mode-explosion] one fixed constant.
+const MAX_DEPENDENCY_BUMPS_FETCHED = 8;
+
+// [LAW:effects-at-boundaries] The dependency-diff boundary: parses go.mod's OWN diff for version
+// bumps and fetches each bumped module's upstream change via the trusted host's octokit client —
+// the reviewing engine never makes this call itself (src/dependency-diff.js). Off by default
+// (dependencyDiffOn=false) is byte-identical to before this feature: no go.mod scan, no fetch, ''
+// flows through buildPrMaterial unchanged. [LAW:no-silent-failure] a per-bump fetch failure (bad
+// ref, unresolvable module, rate limit) is carried as `resolved: false` and rendered into the note
+// rather than thrown — one unreachable upstream must never abort the whole review. A bump beyond
+// MAX_DEPENDENCY_BUMPS_FETCHED is the same shape: not fetched, but reported as such, not dropped.
+async function resolveDependencyDiffNote(octokit, filteredFiles, dependencyDiffOn) {
+  if (!dependencyDiffOn) return '';
+  // A monorepo can carry more than one go.mod (nested modules, e.g. tools/go.mod) — every one of
+  // them is in scope, not just the root file, so a bump in a nested module is never silently skipped.
+  // A vendored go.mod (vendor/.../go.mod) is excluded: it describes the VENDORED dependency's own
+  // requirements, not this project's — matching it would fetch and inject irrelevant upstream context.
+  const goMods = filteredFiles.filter(f => f.patch
+    && (f.filename === 'go.mod' || f.filename.endsWith('/go.mod'))
+    && !f.filename.startsWith('vendor/'));
+  if (goMods.length === 0) return '';
+  const bumps = goMods.flatMap(f => parseGoModBumps(f.patch));
+  if (bumps.length === 0) return '';
+  const toFetch = bumps.slice(0, MAX_DEPENDENCY_BUMPS_FETCHED);
+  const skipped = bumps.slice(MAX_DEPENDENCY_BUMPS_FETCHED).map(b => ({
+    ...b, resolved: false, reason: `upstream context not fetched — this PR bumps more than ${MAX_DEPENDENCY_BUMPS_FETCHED} modules`,
+  }));
+  core.info(`Dependency diff: fetching upstream context for ${toFetch.length} go.mod bump(s)`
+    + `${skipped.length > 0 ? ` (${skipped.length} more skipped — over the ${MAX_DEPENDENCY_BUMPS_FETCHED}-module cap)` : ''}...`);
+  const fetched = await Promise.all(toFetch.map(b => fetchUpstreamChangeSummary(octokit, b)));
+  const summaries = [...fetched, ...skipped];
+  for (const s of summaries) {
+    core.info(s.resolved
+      ? `Dependency diff: ${s.modulePath} ${s.from} → ${s.to} — ${s.totalCommits} upstream commit(s) via github.com/${s.owner}/${s.repoName}.`
+      : `Dependency diff: ${s.modulePath} ${s.from} → ${s.to} — ${s.reason}.`);
+  }
+  return renderDependencyDiffNote(summaries);
+}
+
 // PR-diff review: fetch the PR, gate forks, build the diff material + anchors, run the engine
 // chain, and submit an inline GitHub review.
 async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
@@ -311,9 +354,11 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
   // [LAW:no-silent-failure] each input is parsed strictly and reds the run loud on a malformed value.
   let dailyBudget;
   let difficultyScaling;
+  let dependencyDiffOn;
   try {
     dailyBudget = parseDailyBudgetUsd(core.getInput('DAILY_BUDGET_USD'));
     difficultyScaling = parseDifficultyScaling(core.getInput('DIFFICULTY_SCALING'));
+    dependencyDiffOn = parseDependencyDiffFlag(core.getInput('DEPENDENCY_DIFF'));
   } catch (e) {
     core.setFailed(e.message);
     return;
@@ -437,7 +482,8 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
   // produceReview) owns retry timing; the whole scout→workers pass is one attempt per config.
   const anchorInput = buildReviewInput(filteredFiles, maxDiffChars, registry.get(chain[0].engine).toolNames, REVIEWED_REPO_ROOT);
   const anchors = buildReviewAnchors(anchorInput.files);
-  const material = buildPrMaterial({ files: filteredFiles, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT });
+  const dependencyDiffNote = await resolveDependencyDiffNote(octokit, filteredFiles, dependencyDiffOn);
+  const material = buildPrMaterial({ files: filteredFiles, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencyDiffNote });
 
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
@@ -565,4 +611,4 @@ async function run() {
   }
 }
 
-module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers };
+module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencyDiffNote, MAX_DEPENDENCY_BUMPS_FETCHED };
