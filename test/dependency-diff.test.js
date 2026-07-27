@@ -200,6 +200,15 @@ describe('isPublicAddress', () => {
     }
   });
 
+  test('rejects the RFC 6598 shared/CGNAT range (100.64.0.0/10), used by some clouds for internal infra', () => {
+    for (const addr of ['100.64.0.1', '100.100.100.1', '100.127.255.255']) {
+      assert.equal(isPublicAddress(addr, 4), false, addr);
+    }
+    // just outside the /10 on either side stays public
+    assert.equal(isPublicAddress('100.63.255.255', 4), true);
+    assert.equal(isPublicAddress('100.128.0.1', 4), true);
+  });
+
   test('accepts an ordinary public IPv4 address', () => {
     assert.equal(isPublicAddress('140.82.121.3', 4), true); // a real github.com address range
     assert.equal(isPublicAddress('172.15.0.1', 4), true);   // just below the 172.16/12 private range
@@ -334,6 +343,29 @@ describe('renderDependencyDiffNote', () => {
     assert.match(note, /abc123 fix thing/);
     assert.match(note, /http2\/transport\.go/);
     assert.match(note, /READ-ONLY reference material/);
+  });
+
+  test('a truncated summary (totalCommits/totalFiles exceeding what is shown) surfaces the truncation explicitly', () => {
+    const note = renderDependencyDiffNote([{
+      modulePath: 'golang.org/x/net', from: 'v0.53.0', to: 'v0.55.0',
+      resolved: true, owner: 'golang', repoName: 'net',
+      compareUrl: 'https://github.com/golang/net/compare/v0.53.0...v0.55.0',
+      totalCommits: 35, commits: Array.from({ length: 30 }, (_, i) => ({ sha: `${i}`, message: `commit ${i}` })),
+      totalFiles: 60, files: Array.from({ length: 50 }, (_, i) => `file${i}.go`),
+    }]);
+    assert.match(note, /35 total, most recent 30 shown/);
+    assert.match(note, /60 total, first 50 shown/);
+  });
+
+  test('a NON-truncated summary (counts match what is shown) omits the truncation note', () => {
+    const note = renderDependencyDiffNote([{
+      modulePath: 'golang.org/x/net', from: 'v0.53.0', to: 'v0.55.0',
+      resolved: true, owner: 'golang', repoName: 'net',
+      compareUrl: 'https://github.com/golang/net/compare/v0.53.0...v0.55.0',
+      totalCommits: 2, commits: [{ sha: 'abc123', message: 'fix thing' }, { sha: 'def456', message: 'another' }],
+      totalFiles: 1, files: ['http2/transport.go'],
+    }]);
+    assert.ok(!note.includes('shown'));
   });
 
   test('an unresolved summary still renders, naming the reason, without a compare block', () => {

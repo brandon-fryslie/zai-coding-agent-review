@@ -83,4 +83,18 @@ describe('resolveDependencyDiffNote', () => {
     assert.ok(note.includes(rootBump.modulePath));
     assert.ok(note.includes(nestedBump.modulePath));
   });
+
+  test('a vendored go.mod is excluded — it describes the vendored dependency, not this project', async () => {
+    const rootBump = { modulePath: 'github.com/org/root-dep', from: 'v1.0.0', to: 'v1.1.0' };
+    const vendoredBump = { modulePath: 'github.com/other/vendored-dep', from: 'v3.0.0', to: 'v3.1.0' };
+    const files = [
+      { filename: 'go.mod', patch: goModPatchFor([rootBump]) },
+      { filename: 'vendor/github.com/pressly/goose/go.mod', patch: goModPatchFor([vendoredBump]) },
+    ];
+    let calls = 0;
+    const note = await resolveDependencyDiffNote(stubOctokit(() => calls++), files, true);
+    assert.equal(calls, 1, 'only the root bump is fetched');
+    assert.ok(note.includes(rootBump.modulePath));
+    assert.ok(!note.includes(vendoredBump.modulePath));
+  });
 });

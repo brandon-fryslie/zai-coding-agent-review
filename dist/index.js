@@ -30788,6 +30788,7 @@ function isPublicAddress(address, family) {
   if (family === 4) {
     const [a, b] = address.split('.').map(Number);
     if (a === 0 || a === 10 || a === 127) return false;
+    if (a === 100 && b >= 64 && b <= 127) return false; // RFC 6598 shared/CGNAT space — some clouds use it for internal infra
     if (a === 169 && b === 254) return false; // link-local, incl. the cloud metadata endpoint
     if (a === 172 && b >= 16 && b <= 31) return false;
     if (a === 192 && b === 168) return false;
@@ -34563,7 +34564,11 @@ async function resolveDependencyDiffNote(octokit, filteredFiles, dependencyDiffO
   if (!dependencyDiffOn) return '';
   // A monorepo can carry more than one go.mod (nested modules, e.g. tools/go.mod) — every one of
   // them is in scope, not just the root file, so a bump in a nested module is never silently skipped.
-  const goMods = filteredFiles.filter(f => f.patch && (f.filename === 'go.mod' || f.filename.endsWith('/go.mod')));
+  // A vendored go.mod (vendor/.../go.mod) is excluded: it describes the VENDORED dependency's own
+  // requirements, not this project's — matching it would fetch and inject irrelevant upstream context.
+  const goMods = filteredFiles.filter(f => f.patch
+    && (f.filename === 'go.mod' || f.filename.endsWith('/go.mod'))
+    && !f.filename.startsWith('vendor/'));
   if (goMods.length === 0) return '';
   const bumps = goMods.flatMap(f => parseGoModBumps(f.patch));
   if (bumps.length === 0) return '';
