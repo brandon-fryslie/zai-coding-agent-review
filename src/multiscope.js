@@ -258,14 +258,17 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
 // (so every anchor stays valid) with its scope as the CONCENTRATE focus, but reads only its scope's
 // assigned files in full. files/maxDiffChars are the same values run.js uses to build the anchors, so
 // worker findings and anchors share one diff.
-function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot }) {
+// dependencyDiffNote is the (possibly empty) upstream-change context src/dependency-diff.js fetched
+// for any go.mod bump in this PR; '' is the common case (no bump, or the feature is off) and flows
+// through to buildReviewInput unchanged. [LAW:dataflow-not-control-flow]
+function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencyDiffNote = '' }) {
   const changedPaths = files.map(f => f.filename);
   return {
     // [LAW:types-are-the-program] The changed-file list is a first-class field of the material, not
     // recovered from the prompt: runMultiScopePass verifies the scout's plan covers it (planScopes).
     changedPaths,
     buildScoutPrompt: (toolNames) => buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot }).prompt,
-    buildWorkerPrompt: (focusText, toolNames, scopeFiles) => buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focusText, scopeFiles).prompt,
+    buildWorkerPrompt: (focusText, toolNames, scopeFiles) => buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focusText, scopeFiles, dependencyDiffNote).prompt,
   };
 }
 

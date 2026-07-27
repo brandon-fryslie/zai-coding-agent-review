@@ -88,6 +88,10 @@ inputs:
     description: "Scale review effort to change difficulty: an easy diff (tiny churn, few files, tests-only/docs-only) draws fewer review rounds; a substantial diff draws the full MAX_REVIEW_ROUNDS. Uses a free, pre-spend proxy of the diff — it only ever LOWERS effort below MAX_REVIEW_ROUNDS, never raises it. Composes with DAILY_BUDGET_USD (difficulty proposes, budget caps) and activates independently. 'false' (default) = off (today's default effort). PR mode only."
     required: false
     default: "false"
+  DEPENDENCY_DIFF:
+    description: "For a PR that bumps a go.mod requirement, fetch the bumped module's upstream commits and changed files (via GitHub's compare API, resolved from the module path) and give the reviewer that context, so it can judge whether the version bump breaks or changes behavior this repo relies on — not just that a version string moved. Runs in the host action, never grants the reviewing engine network access. 'false' (default) = off (no go.mod scan, no outbound fetch). PR mode only."
+    required: false
+    default: "false"
   GITHUB_TOKEN:
     description: "GitHub token for API access."
     required: false

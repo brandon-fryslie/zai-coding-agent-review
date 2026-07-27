@@ -98,6 +98,7 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | `DAILY_BUDGET_USD` | `0` (off) | Daily spend ceiling honored as a **gradient** — see [Daily budget](#daily-budget). `0`/unset = off (today's default effort, no ledger I/O). PR mode only; requires `LEDGER_ISSUE` and `issues: write`. |
 | `LEDGER_ISSUE` | — | Issue number of the append-only daily cost ledger the budget gradient reads and writes (typically `${{ vars.LEDGER_ISSUE }}`). Required when `DAILY_BUDGET_USD` is set. |
 | `DIFFICULTY_SCALING` | `false` (off) | Scale review effort to change difficulty — see [Difficulty scaling](#difficulty-scaling). An easy diff draws fewer review rounds; a complex diff reasons harder each round. PR mode only. |
+| `DEPENDENCY_DIFF` | `false` (off) | Fetch upstream commit/file context for a `go.mod` version bump — see [Dependency diff context](#dependency-diff-context). PR mode only. |
 | `GITHUB_TOKEN` | `${{ github.token }}` | Token for GitHub API access (fetching the diff, posting the review). Defaults to the workflow's automatic token, which needs `pull-requests: write`. |
 | `GITHUB_REVIEW_TOKEN` | — | Token used for all GitHub calls when set; required to submit a **formal approval** (see [Approvals](#approvals)). |
 | `PR_NUMBER` | from event | PR number. Auto-detected on `pull_request` events; pass explicitly on others (e.g. `workflow_run`). |
@@ -171,6 +172,26 @@ jobs:
         with:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DIFFICULTY_SCALING: "true"
+```
+
+## Dependency diff context
+
+Set `DEPENDENCY_DIFF: "true"` to give the reviewer more than a version string when a PR bumps a `go.mod` requirement (for example, a Dependabot PR). When the diff changes a `go.mod` requirement line, the action resolves the bumped module to its GitHub repository and fetches the upstream commits and changed files between the old and new version via GitHub's compare API — then hands that as read-only context to the reviewer, which is instructed to check whether anything this repo actually calls into changed, broke, or was deprecated upstream, not just that a version moved.
+
+This runs entirely in the **host action** — the reviewing engine is never granted `Bash`, `WebFetch`, or any other network-capable tool; only the trusted Node process fetches the upstream diff, exactly as it already fetches the PR's own diff.
+
+Module resolution covers direct `github.com/...` module paths, the `golang.org/x/*` modules (mirrored 1:1 to `github.com/golang/*`), and falls back to the standard Go vanity-import discovery protocol for anything else. A module that can't be resolved to a GitHub repo (or whose compare call fails) is reported as such in the review context rather than silently omitted — the review still runs on the manifest diff alone.
+
+Off by default: no `go.mod` scan, no outbound fetch. PR mode only.
+
+```yaml
+jobs:
+  review:
+    steps:
+      - uses: promptctl/copirate-code-review-agent@v1
+        with:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEPENDENCY_DIFF: "true"
 ```
 
 ## Whole-repo review

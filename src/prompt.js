@@ -83,7 +83,11 @@ function reviewCharter(toolNames) {
 // scopeFiles is this worker's assigned changed files: it reads THOSE in full, not the whole changed
 // set, so N workers cost ~1× the read of the changed set (split), not N× (duplicated). Empty scopeFiles
 // is the whole-set read (single-scope PR, or repo mode) — a value, not a branch. [LAW:decomposition]
-function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = []) {
+// dependencyDiffNote is a value, not a mode: '' (the common case — no dependency-manifest bump,
+// or the DEPENDENCY_DIFF input off) renders nothing; a non-empty note (src/dependency-diff.js)
+// appends the fetched upstream-change context after the diff, same placement as the unshowable-
+// files note below. [LAW:dataflow-not-control-flow]
+function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = [], dependencyDiffNote = '') {
   const patchableFiles = files.filter(f => f.patch);
   const includedDiffs = [];
   const includedFiles = [];
@@ -117,6 +121,10 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focu
     diffs += `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`). Read each in full at its absolute path, review its changes, and because its lines cannot be anchored inline, report any issues via the ${toolNames.finishReview} summary rather than ${toolNames.requestChange}:\n${unshowableFiles.map(f => `> - ${reviewedRepoRoot}/${f}`).join('\n')}`;
   }
 
+  if (dependencyDiffNote) {
+    diffs += `\n\n${dependencyDiffNote}`;
+  }
+
   // [LAW:dataflow-not-control-flow] focus renders as a value: '' yields no block, a scope yields a
   // concentration instruction. The worker sees the whole diff (anchors stay valid) and concentrates
   // its deepest reading on the named part, but records EVERY genuine issue it notices anywhere —
@@ -126,6 +134,19 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focu
   // silently withheld. [LAW:no-silent-failure]
   const focusBlock = focus
     ? `\n    CONCENTRATE THIS REVIEW on one part of the change: ${focus}\n    The whole diff is shown below both for context and because you must not stay silent about a real bug just because it falls outside this part. Read the named part most deeply, but if you notice a genuine issue ANYWHERE in the diff, still record it with ${toolNames.requestChange} (assigning severity as usual). Overlapping findings are de-duplicated downstream, so nothing is lost by reporting an issue another review may also catch.\n`
+    : '';
+
+  // [LAW:dataflow-not-control-flow] A value again: no upstream note means no instruction block.
+  // When present, tell the worker WHAT to do with the fetched upstream context — cross-check it
+  // against this repo's own usage rather than just reading it as trivia.
+  const dependencyInstructionBlock = dependencyDiffNote
+    ? `\n    This PR bumps a dependency version. Upstream commit/file context for that bump is included below (the
+    section starting "Dependency version bump"). Use \`Grep\` to find where this repo calls into the bumped
+    module, then judge whether anything in the upstream range breaks, deprecates, or changes the behavior of a
+    symbol this repo actually uses — a removed export, a changed function signature, a changed default, a
+    renamed field. If nothing this repo uses is affected, say so briefly in the ${toolNames.finishReview}
+    summary; if something is, record it with ${toolNames.requestChange} at 'blocking' severity, on the go.mod
+    version line, naming the exact upstream change and the call site it affects.\n`
     : '';
 
   // [LAW:dataflow-not-control-flow] The set of files to read in full is a VALUE: a non-empty scopeFiles
@@ -148,7 +169,7 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focu
     prompt: `
 Review this pull request. The repository under review is checked out at ${reviewedRepoRoot}.
     Your working directory is intentionally outside the repository; reach it by that absolute path with your Read tool.
-${focusBlock}
+${focusBlock}${dependencyInstructionBlock}
     BEFORE judging anything, ${readTargets} The diff shows only the changed hunks; most bugs are only
     visible in the full surrounding context of the function and module — a missing guard, a caller you'd
     break, a value that can't be what this line assumes. Do not form or report any judgment until you
