@@ -1,5 +1,7 @@
 'use strict';
 
+const dns = require('node:dns').promises;
+
 // Detect a Go module version bump in a PR's go.mod diff, resolve the module to its GitHub
 // repository, and fetch what actually changed upstream between the two versions — so a reviewer
 // sees the real upstream commits, not just a version string, for a dependency-bump PR.
@@ -80,11 +82,55 @@ function parseGoImportMeta(html, modulePath) {
   return null;
 }
 
+// SAFE_MODULE_PATH validates the SHAPE of a module path, never its DESTINATION: a syntactically
+// plausible module path can still name a host that resolves to an internal or cloud-metadata
+// address (e.g. 169.254.169.254). isPublicAddress is the second, independent guard — is THIS
+// resolved address one a diff-controlled request may ever reach — checked against the reserved
+// ranges a private network or a cloud metadata endpoint actually uses. [LAW:types-are-the-program]
+function isPublicAddress(address, family) {
+  if (family === 4) {
+    const [a, b] = address.split('.').map(Number);
+    if (a === 0 || a === 10 || a === 127) return false;
+    if (a === 169 && b === 254) return false; // link-local, incl. the cloud metadata endpoint
+    if (a === 172 && b >= 16 && b <= 31) return false;
+    if (a === 192 && b === 168) return false;
+    return true;
+  }
+  const lower = address.toLowerCase();
+  if (lower === '::' || lower === '::1') return false;
+  if (lower.startsWith('fe80:') || lower.startsWith('fc') || lower.startsWith('fd')) return false; // link-local + unique-local
+  return true;
+}
+
+// Resolve `hostname` and refuse to proceed if ANY resolved address is private/loopback/link-local,
+// or if it fails to resolve at all — a diff-controlled module path must clear this before the host
+// ever issues the discovery request. lookupImpl is injected (defaults to dns.lookup) so tests never
+// perform a real DNS resolution. [LAW:no-silent-failure] an unresolvable host is treated as unsafe,
+// not skipped silently — the caller's null return already carries "not fetched" honestly.
+//
+// Known residual gap: this checks the address BEFORE the request, not the address the runtime TCP
+// connection actually uses — a DNS answer that changes between this check and the fetch (rebinding)
+// could still reach a private address. Pinning the fetch to this checked address would require
+// disabling TLS certificate hostname verification (the cert is issued for the hostname, not the
+// resolved IP), which is strictly worse, so that gap is accepted and documented, not closed here.
+async function isSafeHost(hostname, lookupImpl = dns.lookup) {
+  let addresses;
+  try {
+    addresses = await lookupImpl(hostname, { all: true, verbatim: true });
+  } catch {
+    return false;
+  }
+  return addresses.length > 0 && addresses.every((a) => isPublicAddress(a.address, a.family));
+}
+
 // Effectful: reached only when the module is neither a direct github.com/... path nor a known
 // mirror — genuinely unresolved cases (GitLab, Bitbucket, self-hosted, Gerrit-only). fetchImpl is
-// injected (defaults to the global fetch) so tests never make a real network call.
+// injected (defaults to the global fetch) so tests never make a real network call. lookupImpl
+// (defaults to dns.lookup) backs the isSafeHost pre-flight check below — also injected for tests.
 // [LAW:effects-at-boundaries]
-async function discoverGithubRepo(modulePath, fetchImpl) {
+async function discoverGithubRepo(modulePath, fetchImpl, lookupImpl) {
+  const hostname = modulePath.split('/')[0];
+  if (!(await isSafeHost(hostname, lookupImpl))) return null;
   const res = await fetchImpl(`https://${modulePath}?go-get=1`, { signal: AbortSignal.timeout(10_000) });
   if (!res.ok) return null;
   const html = await res.text();
@@ -101,11 +147,11 @@ async function discoverGithubRepo(modulePath, fetchImpl) {
 // diff-controlled content can only ever drive a plausible bare module-path request, never an
 // arbitrary URL. [LAW:dataflow-not-control-flow] a null return is a value every caller must handle,
 // not a thrown error — an unresolved module is an ordinary, expected outcome.
-async function resolveModuleRepo(modulePath, fetchImpl = fetch) {
+async function resolveModuleRepo(modulePath, fetchImpl = fetch, lookupImpl = dns.lookup) {
   if (!SAFE_MODULE_PATH.test(modulePath)) return null;
   return directGithubRepo(modulePath)
     || knownMirrorRepo(modulePath)
-    || discoverGithubRepo(modulePath, fetchImpl);
+    || discoverGithubRepo(modulePath, fetchImpl, lookupImpl);
 }
 
 // A Go pseudo-version encodes an untagged commit as one of vX.0.0-yyyymmddhhmmss-abcdef012345
@@ -137,10 +183,10 @@ const MAX_FILES = 50;
 // three. resolveModuleRepo's own network call (the vanity-import discovery fetch) is not exempt: a
 // DNS failure or timeout there is caught here exactly like a compareCommits failure below, so both
 // of this function's network calls share one no-throw contract, not two.
-async function fetchUpstreamChangeSummary(octokit, bump, fetchImpl = fetch) {
+async function fetchUpstreamChangeSummary(octokit, bump, fetchImpl = fetch, lookupImpl = dns.lookup) {
   let repo;
   try {
-    repo = await resolveModuleRepo(bump.modulePath, fetchImpl);
+    repo = await resolveModuleRepo(bump.modulePath, fetchImpl, lookupImpl);
   } catch (e) {
     return { ...bump, resolved: false, reason: `could not resolve a GitHub repository for this module path (${e.message})` };
   }
@@ -200,4 +246,7 @@ module.exports = {
   fetchUpstreamChangeSummary,
   renderDependencyDiffNote,
   refFor,
+  // Exported for direct unit testing of the SSRF guard; not part of the feature's public surface.
+  isPublicAddress,
+  isSafeHost,
 };
