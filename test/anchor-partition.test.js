@@ -3,7 +3,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { partitionFindings, nearestAnchorableLine, parseFindingValue, severityTaggedBody } = require('../src/review');
-const { submitReview, gitHubTransport } = require('../src/transport');
+const { submitReview, gitHubTransport, giteaTransport } = require('../src/transport');
 const { buildReviewAnchors } = require('../src/diff');
 
 // [LAW:verifiable-goals] AC: a finding the model anchors outside the diff never aborts the
@@ -188,6 +188,40 @@ describe('submitReview — unanchored findings', () => {
     const arg = octokit.calls[0];
     assert.equal(arg.event, 'COMMENT'); // not approvable, no findings
     assert.doesNotMatch(arg.body, /Findings outside the reviewed diff/);
+  });
+});
+
+// [LAW:verifiable-goals] AC (home-copirate-review-9uj.12): Gitea's ReviewStateType enum spells
+// approval 'APPROVED' (past tense), not GitHub's imperative 'APPROVE'. Gitea's create-review
+// handler has no error branch for an unrecognized event string — it silently falls through to
+// ReviewTypePending — so sending GitHub's spelling produced a 200 response with the review stuck
+// at state=PENDING forever, with no error anywhere in the chain. Reproduced live against Gitea
+// v1.27.1: a raw API call with event='APPROVE' returned state=PENDING; the identical call with
+// event='APPROVED' returned state=APPROVED. Each transport must supply the event string its own
+// host actually recognizes.
+describe('submitReview — approve event spelling is host-specific (home-copirate-review-9uj.12)', () => {
+  test('gitHubTransport approves with GitHub\'s imperative spelling', async () => {
+    const octokit = fakeOctokit();
+    const review = { summary: 'Clean.', findings: [], unanchored: [] };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    assert.equal(octokit.calls[0].event, 'APPROVE');
+  });
+
+  test('giteaTransport approves with Gitea\'s ReviewStateType spelling, not GitHub\'s', async () => {
+    const octokit = fakeOctokit();
+    const review = { summary: 'Clean.', findings: [], unanchored: [] };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, giteaTransport([]));
+    assert.equal(octokit.calls[0].event, 'APPROVED');
+  });
+
+  test('REQUEST_CHANGES is spelled identically across transports (no host-specific mapping needed)', async () => {
+    const review = { summary: 'Bad.', findings: [{ path: 'a.js', line: 1, body: 'x', severity: 'blocking' }], unanchored: [] };
+    const gh = fakeOctokit();
+    await submitReview(gh, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    const gt = fakeOctokit();
+    await submitReview(gt, 'o', 'r', 1, 'sha', 'Reviewer', review, true, giteaTransport([]));
+    assert.equal(gh.calls[0].event, 'REQUEST_CHANGES');
+    assert.equal(gt.calls[0].event, 'REQUEST_CHANGES');
   });
 });
 
