@@ -27,15 +27,25 @@ async function listAllFiles(octokit, owner, repo, pullNumber) {
 }
 
 // [LAW:one-type-per-behavior] One transport; the host differs only in how the diff is
-// sourced and how a finding's new-file line becomes a review comment.
+// sourced, how a finding's new-file line becomes a review comment, and which literal
+// string its review-submission API expects for an approval event (approveEvent below).
 // [LAW:dataflow-not-control-flow] Capability — does listFiles carry per-file patch? —
 // selects the instance, not a hardcoded hostname (GitHub & Enterprise carry it; Gitea does not).
+//
+// [LAW:no-silent-failure] approveEvent exists because GitHub and Gitea disagree on this one
+// verb: GitHub's create-review `event` takes the imperative 'APPROVE', but Gitea's is typed as
+// `ReviewStateType`, whose approved value is the past-tense 'APPROVED' (REQUEST_CHANGES and
+// COMMENT happen to share GitHub's spelling). Gitea's handler has no else-error branch for an
+// unrecognized event string — it falls through to ReviewTypePending — so sending 'APPROVE' to
+// Gitea produced a 200 response with the review silently stuck at state=PENDING forever, with
+// no error anywhere in the chain (verified against Gitea v1.27.1 source and reproduced live:
+// home-copirate-review-9uj.12).
 function gitHubTransport(files) {
-  return { files, toComment: f => ({ path: f.path, line: f.line, side: 'RIGHT', body: f.body }) };
+  return { files, toComment: f => ({ path: f.path, line: f.line, side: 'RIGHT', body: f.body }), approveEvent: 'APPROVE' };
 }
 
 function giteaTransport(files) {
-  return { files, toComment: f => ({ path: f.path, new_position: f.line, body: f.body }) };
+  return { files, toComment: f => ({ path: f.path, new_position: f.line, body: f.body }), approveEvent: 'APPROVED' };
 }
 
 async function selectTransport(octokit, owner, repo, pullNumber) {
@@ -125,12 +135,16 @@ function parseMaxRounds(raw) {
 }
 
 // [LAW:dataflow-not-control-flow] A review is ALWAYS posted to the PR. The data
-// (findings present? token approval-capable?) selects only the GitHub event —
-// never whether the message is posted. canApprove gates APPROVE vs COMMENT
+// (findings present? token approval-capable?) selects only the event string —
+// never whether the message is posted. canApprove gates approval vs COMMENT
 // because the default GITHUB_TOKEN cannot submit a formal approval, but a
 // visible "✅ Approved" message must still land on the PR either way.
-function reviewEvent(requestsChanges, canApprove) {
-  return requestsChanges ? 'REQUEST_CHANGES' : (canApprove ? 'APPROVE' : 'COMMENT');
+// [LAW:one-source-of-truth] The approval verb's spelling is owned by the transport
+// (transport.approveEvent), not restated here — REQUEST_CHANGES and COMMENT are
+// spelled identically by every host this action targets, so only the approve
+// branch varies per transport.
+function reviewEvent(requestsChanges, canApprove, transport) {
+  return requestsChanges ? 'REQUEST_CHANGES' : (canApprove ? transport.approveEvent : 'COMMENT');
 }
 
 // [LAW:effects-at-boundaries] Pure: render the findings that could not be posted inline as a
@@ -155,7 +169,7 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   const unanchored = review.unanchored || [];
   const isBlocking = f => f.severity === 'blocking';
   const requestsChanges = review.findings.some(isBlocking) || unanchored.some(isBlocking);
-  const event = reviewEvent(requestsChanges, canApprove);
+  const event = reviewEvent(requestsChanges, canApprove, transport);
   const verdict = requestsChanges ? REQUEST_CHANGES_MESSAGE : APPROVED_MESSAGE;
   const footer = attributionFooter ? `\n\n${attributionFooter}` : '';
   const body = `## ${reviewerName}\n\n${review.summary}${renderUnanchoredSection(unanchored)}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;

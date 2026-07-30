@@ -16,6 +16,12 @@ describe('gitHubTransport.toComment', () => {
     const comment = transport.toComment({ path: 'a.js', line: 1, body: 'x' });
     assert.equal(comment.side, 'RIGHT');
   });
+
+  // [LAW:verifiable-goals] AC (home-copirate-review-9uj.12): GitHub's create-review `event`
+  // takes the imperative 'APPROVE'.
+  test('approveEvent is GitHub\'s imperative spelling', () => {
+    assert.equal(gitHubTransport([]).approveEvent, 'APPROVE');
+  });
 });
 
 describe('giteaTransport.toComment', () => {
@@ -36,6 +42,13 @@ describe('giteaTransport.toComment', () => {
     const comment = transport.toComment({ path: 'f.js', line: 5, body: 'x' });
     assert.equal('line' in comment, false);
     assert.equal(comment.new_position, 5);
+  });
+
+  // [LAW:verifiable-goals] AC (home-copirate-review-9uj.12): Gitea's ReviewStateType enum spells
+  // approval 'APPROVED' (past tense) — sending GitHub's 'APPROVE' silently falls through to
+  // Gitea's default ReviewTypePending branch with no error, verified live against Gitea v1.27.1.
+  test('approveEvent is Gitea\'s ReviewStateType spelling, not GitHub\'s', () => {
+    assert.equal(giteaTransport([]).approveEvent, 'APPROVED');
   });
 });
 
