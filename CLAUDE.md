@@ -63,7 +63,7 @@ Versioning is split into two parts, deliberately:
 
 ## Architecture
 
-The source is split into focused modules under `src/` (orchestrator `run.js`; the config-file path `config.js` / `provider.js` / `selection.js` / `failover.js`; engine adapters under `engine/`; `prompt.js`, `transport.js`, `diff.js`, `review.js`, `collector.js`, `usage.js`, `report.js`); `src/index.js` is the thin entry point that bundles to `dist/index.js`. It has **two entry points**, selected at the bottom (the `COLLECTOR_SERVER_ARG` check):
+The source is split into focused modules under `src/` (orchestrator `run.js`; the config-file path `config.js` / `provider.js` / `selection.js` / `failover.js`; engine adapters under `engine/`; `prompt.js`, `transport.js`, `diff.js`, `review.js`, `collector.js`, `usage.js`, `report.js`, `dependency-diff.js`); `src/index.js` is the thin entry point that bundles to `dist/index.js`. It has **two entry points**, selected at the bottom (the `COLLECTOR_SERVER_ARG` check):
 
 1. **Action orchestrator** (`run` in `src/run.js`) — the default mode the runner invokes.
 2. **MCP collector server** (`runReviewCollectorServer` in `src/collector-server.js`) — the *same bundled binary* re-spawned as a stdio MCP subprocess by the engine. The MCP config (`createReviewCollector`) wires `command: node, args: [__filename, '--review-collector-server']`, so the binary is self-referential.

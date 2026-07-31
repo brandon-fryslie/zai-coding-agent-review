@@ -297,6 +297,16 @@ function escapeHtml(str) {
   return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+// escapeHtml's markdown counterpart, for untrusted text rendered as markdown RUNNING TEXT (a <details>
+// body list item, the <summary> line) rather than raw HTML. HTML-escaping alone stops <details> break-out
+// but leaves markdown live — an upstream commit message like `[click](https://evil)` would render as a real
+// link, `**x**` as bold. This backslash-escapes the inline metacharacters that form links, images, emphasis,
+// code spans, and strikethrough, THEN HTML-escapes, so the value displays as the literal text it is. `<`, `>`,
+// `&` are left to escapeHtml (backslashing them would fight the entity-encode). [FRAMING:representation]
+function mdText(str) {
+  return escapeHtml(String(str).replace(/[\\`*_[\]()~]/g, m => `\\${m}`));
+}
+
 // [LAW:one-source-of-truth] The verdict enum owns its glyph, label, and action at THIS one site — exactly
 // as a finding's severity owns its tag (severityTaggedBody). Nothing else re-spells a verdict; every render
 // derives from here. The verdict is PRESENTATION — the merge gate is driven by blocking findings, not by
@@ -306,7 +316,12 @@ const VERDICT_PRESENTATION = {
   review: { glyph: '⚠️', label: 'Review', action: 'worth a human glance before merge.' },
   risky: { glyph: '🛑', label: 'Risky', action: 'breaking change affecting this repo — address before merge.' },
 };
+// [FRAMING:representation] Two distinct not-a-verdict states get two distinct glyphs, so the summary line
+// is self-describing without cross-referencing the tally: ⚪ = upstream could not be fetched (a host-side
+// fetch failure), ❔ = upstream WAS fetched but the model recorded no merge-risk assessment (a model-side
+// omission). Conflating them under one glyph would lose that difference at a glance.
 const UNRESOLVED_GLYPH = '⚪';
+const UNASSESSED_GLYPH = '❔';
 const MAX_COMMITS_SHOWN = 10;
 
 // [LAW:effects-at-boundaries] Pure: assemble the posted-review dependency section from the HOST-owned
@@ -326,18 +341,19 @@ function renderDependencyReviewSection(summaries, assessments = []) {
   if (!summaries || summaries.length === 0) return '';
   const byModule = new Map(assessments.map(a => [a.module, a]));
 
-  // Collapse internal whitespace AND entity-encode: values on a single <summary> line or in markdown
-  // running-text where a stray newline or a raw `<` would break the collapsible / inject structure.
+  // esc: HTML-only, for values inside <code> (markdown is not parsed there). mdLine: markdown+HTML, for a
+  // value on the single <summary> line or in a body list item (a markdown context) — also whitespace-
+  // collapsed so a stray newline can't close the collapsible early.
   const esc = escapeHtml;
-  const escLine = str => escapeHtml(str.replace(/\s+/g, ' ').trim());
+  const mdLine = str => mdText(str.replace(/\s+/g, ' ').trim());
 
   const tally = { safe: 0, review: 0, risky: 0, unresolved: 0, unassessed: 0 };
   const blocks = summaries.map((s) => {
     if (!s.resolved) {
       tally.unresolved++;
       // modulePath/from/to sit inside backtick code spans — GitHub escapes code-span content itself, so
-      // they render literally and safely without manual encoding. reason is running text → escape it.
-      return `- ${UNRESOLVED_GLYPH} \`${s.modulePath}\` \`${s.from} → ${s.to}\` — upstream not fetched (${esc(s.reason)}).`;
+      // they render literally and safely without manual encoding. reason is markdown running text → mdText it.
+      return `- ${UNRESOLVED_GLYPH} \`${s.modulePath}\` \`${s.from} → ${s.to}\` — upstream not fetched (${mdText(s.reason)}).`;
     }
     const magnitude = semverMagnitude(s.from, s.to);
     // URLs are built from host-owned, shape-constrained parts (owner/repoName from the resolved repo, sha
@@ -346,7 +362,7 @@ function renderDependencyReviewSection(summaries, assessments = []) {
     const commitUrl = sha => `https://github.com/${s.owner}/${s.repoName}/commit/${sha}`;
     const shown = s.commits.slice(0, MAX_COMMITS_SHOWN);
     const commitLines = shown.length > 0
-      ? shown.map(c => `  - [\`${c.sha}\`](${commitUrl(c.sha)}) ${esc(c.message)}`).join('\n')
+      ? shown.map(c => `  - [\`${c.sha}\`](${commitUrl(c.sha)}) ${mdText(c.message)}`).join('\n')
         + (s.totalCommits > shown.length ? `\n  - …and ${s.totalCommits - shown.length} more (see the full comparison).` : '')
       : '  - (no commits listed)';
     const tag = releaseTag(s.to);
@@ -362,7 +378,7 @@ function renderDependencyReviewSection(summaries, assessments = []) {
     const assessment = byModule.get(s.modulePath);
     if (!assessment) {
       tally.unassessed++;
-      return `<details>\n<summary>${UNRESOLVED_GLYPH} ${codeHead} · ${magnitude}</summary>\n\n`
+      return `<details>\n<summary>${UNASSESSED_GLYPH} ${codeHead} · ${magnitude}</summary>\n\n`
         + `${compareLine}\n`
         + `- **Notable commits:**\n${commitLines}${releaseLine}\n`
         + `- _No merge-risk assessment was recorded for this module._\n</details>`;
@@ -370,10 +386,12 @@ function renderDependencyReviewSection(summaries, assessments = []) {
 
     const v = VERDICT_PRESENTATION[assessment.verdict];
     tally[assessment.verdict]++;
+    // Escape only the untrusted callSite value; the '(call site not named)' fallback is a host literal and
+    // must not be backslash-mangled. [FRAMING:representation] escape the data, never our own constants.
     const repoImpact = assessment.affected
-      ? `Affected — ${escLine(assessment.callSite || '(call site not named)')}`
+      ? `Affected — ${assessment.callSite ? mdLine(assessment.callSite) : '(call site not named)'}`
       : 'Not affected.';
-    return `<details>\n<summary>${v.glyph} ${codeHead} · ${magnitude} · ${escLine(assessment.impact)}</summary>\n\n`
+    return `<details>\n<summary>${v.glyph} ${codeHead} · ${magnitude} · ${mdLine(assessment.impact)}</summary>\n\n`
       + `${compareLine}\n`
       + `- **Notable commits:**\n${commitLines}${releaseLine}\n`
       + `- **Impact on this repo:** ${repoImpact}\n`
@@ -387,7 +405,7 @@ function renderDependencyReviewSection(summaries, assessments = []) {
   if (tally.safe) parts.push(`${tally.safe} ${VERDICT_PRESENTATION.safe.glyph} safe`);
   if (tally.review) parts.push(`${tally.review} ${VERDICT_PRESENTATION.review.glyph} review`);
   if (tally.risky) parts.push(`${tally.risky} ${VERDICT_PRESENTATION.risky.glyph} risky`);
-  if (tally.unassessed) parts.push(`${tally.unassessed} unassessed`);
+  if (tally.unassessed) parts.push(`${tally.unassessed} ${UNASSESSED_GLYPH} unassessed`);
   if (tally.unresolved) parts.push(`${tally.unresolved} ${UNRESOLVED_GLYPH} unresolved`);
   const rollup = `**Dependency review** — ${summaries.length} module(s): ${parts.join(' · ')}`;
 

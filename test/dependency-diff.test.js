@@ -466,7 +466,9 @@ describe('renderDependencyReviewSection', () => {
     assert.match(out, /<details>/);
     assert.match(out, /No merge-risk assessment was recorded for this module/);
     assert.match(out, /\*\*Compare:\*\*/); // host facts still present
-    assert.match(out, /1 unassessed/); // reflected in the roll-up
+    assert.match(out, /1 ❔ unassessed/); // reflected in the roll-up, with its own glyph
+    // ❔ (fetched-but-unassessed) is distinct from ⚪ (not fetched) in the <summary>.
+    assert.match(out, /<summary>❔ /);
   });
 
   test('a pseudo-version target has no release page, so no release line is emitted', () => {
@@ -496,6 +498,17 @@ describe('renderDependencyReviewSection', () => {
     assert.match(out, /&lt;img src=x&gt;router\.go/);
     // Exactly one opening <summary> tag survives (ours) — the injected ones are encoded away.
     assert.equal((out.match(/<summary>/g) || []).length, 1);
+  });
+
+  test('markdown metacharacters in an upstream commit message render literally, not as a live link or emphasis', () => {
+    const out = renderDependencyReviewSection(
+      [resolvedSummary({ commits: [{ sha: 'abc123def456', message: 'see [click](https://evil.example) and **bold**' }] })],
+      [assessment()],
+    );
+    // The link/emphasis syntax is neutralized (backslash-escaped) — no live markdown link or bold survives.
+    assert.doesNotMatch(out, /\[click\]\(https:\/\/evil\.example\)/);
+    assert.match(out, /\\\[click\\\]\\\(https:\/\/evil\.example\\\)/);
+    assert.match(out, /\\\*\\\*bold\\\*\\\*/);
   });
 
   test('a crafted version string is HTML-escaped in the header and cannot become a release URL', () => {

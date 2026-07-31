@@ -603,6 +603,28 @@ describe('buildPrMaterial', () => {
     assert.match(prompt, /Read the complete content of every changed file/);
     assert.doesNotMatch(prompt, /Read the complete content of THESE files/);
   });
+
+  // dependencySummaries is the ONE source buildPrMaterial derives both the prompt note (renderDependencyDiffNote)
+  // and the resolved-only assess bumps from. [LAW:verifiable-goals]
+  test('dependencySummaries drives the worker prompt: the note is injected and the assess directive lists only RESOLVED modules', () => {
+    const goModFiles = [{ filename: 'go.mod', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+\tgithub.com/a/b v1.1.0' }];
+    const summaries = [
+      { modulePath: 'github.com/a/b', from: 'v1.0.0', to: 'v1.1.0', resolved: true, owner: 'a', repoName: 'b',
+        compareUrl: 'https://github.com/a/b/compare/v1.0.0...v1.1.0', totalCommits: 1, commits: [{ sha: 'x'.repeat(12), message: 'm' }], totalFiles: 0, files: [] },
+      { modulePath: 'gitlab.example/c/d', from: 'v2.0.0', to: 'v2.1.0', resolved: false, reason: 'no GitHub repo' },
+    ];
+    const depMaterial = buildPrMaterial({ files: goModFiles, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT, dependencySummaries: summaries });
+    const prompt = depMaterial.buildWorkerPrompt('dep — go.mod', TOOL_NAMES, ['go.mod']);
+    // The fetched-upstream note is injected (both resolved and unresolved modules appear as CONTEXT).
+    assert.match(prompt, /Dependency version bump/);
+    assert.match(prompt, /github\.com\/a\/b/);
+    assert.match(prompt, /gitlab\.example\/c\/d/); // the unresolved bump is still shown as context in the note
+    // The assess directive fires for the go.mod owner and lists ONLY the resolved module — the unresolved
+    // one carries no upstream context to judge, so it is excluded from the list (the ". Provide" delimiter
+    // proves nothing follows github.com/a/b in the VERBATIM enumeration).
+    assert.match(prompt, new RegExp(`call ${TOOL_NAMES.assessDependency}`));
+    assert.match(prompt, /VERBATIM: github\.com\/a\/b\. Provide/);
+  });
 });
 
 describe('buildRepoMaterial', () => {
