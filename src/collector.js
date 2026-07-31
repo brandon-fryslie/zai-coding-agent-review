@@ -3,7 +3,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const core = require('@actions/core');
-const { parseFindingValue, parseScopeValue, parseReviewValue } = require('./review');
+const { parseFindingValue, parseScopeValue, parseAssessmentValue, parseReviewValue } = require('./review');
 // [LAW:one-way-deps] ProtocolError's home is failover.js, beside TransientError — the retry seam owns
 // the vocabulary of errors a re-spawn can fix, and every thrower requires it from there (codex.js does
 // the same with TransientError). readCollectedReview runs in the ACTION process (never the collector
@@ -67,11 +67,18 @@ function readCollectedReview(recordsPath) {
   const scopes = records
     .filter(record => record.type === 'scope')
     .map((record, index) => parseScopeValue(record.scope, index));
+  // [LAW:dataflow-not-control-flow] A third record kind through the same one reader: a worker that reviewed
+  // a resolved go.mod bump records per-module dependency assessments; every other spawn produces none, so
+  // this is an empty list by construction, never a branch. Typed and schema-validated exactly like findings
+  // and scopes. [FRAMING:representation]
+  const assessments = records
+    .filter(record => record.type === 'assessment')
+    .map((record, index) => parseAssessmentValue(record.assessment, index));
   const review = parseReviewValue({
     summary: finish.summary,
     findings,
   }, 'Review collector output');
-  return { ...review, scopes };
+  return { ...review, scopes, assessments };
 }
 
 // [FRAMING:representation] The MCP config createReviewCollector writes self-references this file:

@@ -22,6 +22,7 @@ const TOOL_NAMES = {
   requestChange: 'mcp__review_collector__request_change',
   finishReview: 'mcp__review_collector__finish_review',
   addScope: 'mcp__review_collector__add_scope',
+  assessDependency: 'mcp__review_collector__assess_dependency',
 };
 const REPO_ROOT = '/home/runner/work/acme/acme';
 
@@ -270,6 +271,7 @@ describe('runMultiScopePass — spawn-level transient resilience', () => {
         return {
           summary: `sum-${scope.name}`,
           findings: [{ path: `${scope.name}.js`, line: 1, body: `bug in ${scope.name}` }],
+          assessments: [],
           usage: null,
         };
       },
@@ -287,6 +289,27 @@ describe('runMultiScopePass — spawn-level transient resilience', () => {
     assert.equal(calls.workers.a, 1);
     assert.equal(calls.workers.b, 2); // 1 blip + 1 successful retry
     assert.equal(calls.workers.c, 1);
+  });
+
+  test("a worker's dependency assessments reach the aggregated review (they are not dropped at the worker seam)", async () => {
+    // Regression: runScopeWorker once destructured only {summary,findings,usage}, silently dropping the
+    // assessments the adapter returned — every bump then rendered "unassessed". This asserts the CONTRACT
+    // (a worker's assessments survive aggregation), independent of how runScopeWorker forwards them.
+    const adapter = {
+      async produceReview({ buildPromptFor }) {
+        const prompt = buildPromptFor({});
+        if (prompt === 'SCOUT') return { summary: 'ctx', findings: [], scopes: SCOPES, assessments: [], usage: null };
+        const scope = SCOPES.find(s => prompt.includes(`${s.name} — ${s.focus}`));
+        // Only scope 'b' owns the go.mod bump and records an assessment; the others record none.
+        const assessments = scope.name === 'b'
+          ? [{ module: 'github.com/a/b', impact: 'adds retries', affected: false, callSite: null, verdict: 'safe' }]
+          : [];
+        return { summary: `sum-${scope.name}`, findings: [], assessments, usage: null };
+      },
+    };
+    const review = await runMultiScopePass(passArgs({ get: () => adapter }));
+    assert.equal(review.assessments.length, 1, 'the single worker assessment must survive to the aggregate');
+    assert.deepEqual(review.assessments[0], { module: 'github.com/a/b', impact: 'adds retries', affected: false, callSite: null, verdict: 'safe' });
   });
 
   test('a transient error that persists past spawn retries propagates loudly — no scope is silently dropped', async () => {
@@ -323,7 +346,7 @@ describe('runMultiScope — reasoningTier fold onto the chain', () => {
       async produceReview({ config, buildPromptFor }) {
         seen.push(config.reasoning);
         if (buildPromptFor({}) === 'SCOUT') return { summary: 'ctx', findings: [], scopes: SCOPES, usage: null };
-        return { summary: 'sum', findings: [], usage: null };
+        return { summary: 'sum', findings: [], assessments: [], usage: null };
       },
     };
     return { get: () => adapter };
@@ -372,7 +395,7 @@ describe('runMultiScope — reasoningTier fold onto the chain', () => {
         async produceReview({ config, buildPromptFor }) {
           seen.push(config.reasoning);
           if (buildPromptFor({}) === 'SCOUT') return { summary: 'ctx', findings: [], scopes: SCOPES, usage: null };
-          return { summary: 'sum', findings: [], usage: null };
+          return { summary: 'sum', findings: [], assessments: [], usage: null };
         },
       },
     };
@@ -492,7 +515,7 @@ describe('runMultiScopePass — scout coverage sweep', () => {
         const prompt = buildPromptFor({});
         if (prompt === 'SCOUT') return { summary: 'ctx', findings: [], scopes: scoutScopes, usage: null };
         seen.push(prompt);
-        return { summary: 'ok', findings: [], usage: null };
+        return { summary: 'ok', findings: [], assessments: [], usage: null };
       },
     };
     return { registry: { get: () => adapter }, seen };
@@ -579,6 +602,28 @@ describe('buildPrMaterial', () => {
     const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, []);
     assert.match(prompt, /Read the complete content of every changed file/);
     assert.doesNotMatch(prompt, /Read the complete content of THESE files/);
+  });
+
+  // dependencySummaries is the ONE source buildPrMaterial derives both the prompt note (renderDependencyDiffNote)
+  // and the resolved-only assess bumps from. [LAW:verifiable-goals]
+  test('dependencySummaries drives the worker prompt: the note is injected and the assess directive lists only RESOLVED modules', () => {
+    const goModFiles = [{ filename: 'go.mod', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+\tgithub.com/a/b v1.1.0' }];
+    const summaries = [
+      { modulePath: 'github.com/a/b', from: 'v1.0.0', to: 'v1.1.0', resolved: true, owner: 'a', repoName: 'b',
+        compareUrl: 'https://github.com/a/b/compare/v1.0.0...v1.1.0', totalCommits: 1, commits: [{ sha: 'x'.repeat(12), message: 'm' }], totalFiles: 0, files: [] },
+      { modulePath: 'gitlab.example/c/d', from: 'v2.0.0', to: 'v2.1.0', resolved: false, reason: 'no GitHub repo' },
+    ];
+    const depMaterial = buildPrMaterial({ files: goModFiles, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT, dependencySummaries: summaries });
+    const prompt = depMaterial.buildWorkerPrompt('dep — go.mod', TOOL_NAMES, ['go.mod']);
+    // The fetched-upstream note is injected (both resolved and unresolved modules appear as CONTEXT).
+    assert.match(prompt, /Dependency version bump/);
+    assert.match(prompt, /github\.com\/a\/b/);
+    assert.match(prompt, /gitlab\.example\/c\/d/); // the unresolved bump is still shown as context in the note
+    // The assess directive fires for the go.mod owner and lists ONLY the resolved module — the unresolved
+    // one carries no upstream context to judge, so it is excluded from the list (the ". Provide" delimiter
+    // proves nothing follows github.com/a/b in the VERBATIM enumeration).
+    assert.match(prompt, new RegExp(`call ${TOOL_NAMES.assessDependency}`));
+    assert.match(prompt, /VERBATIM: github\.com\/a\/b\. Provide/);
   });
 });
 
@@ -676,6 +721,46 @@ describe('buildReviewInput focus', () => {
     // The old suppression sentence must be gone — it is what taught the model to self-censor.
     assert.doesNotMatch(prompt, /only flag issues that belong to that part/);
     assert.doesNotMatch(prompt, /Other parts are reviewed separately/);
+  });
+});
+
+// ── buildReviewInput dependency assess directive — gated on owning the bumped go.mod ──────────────
+// [LAW:dataflow-not-control-flow] The assess directive is a VALUE rendered from scopeFiles + the bump
+// list: only the ONE worker whose assigned files include the bumped go.mod is asked to assess, so a
+// single author records each module's judgment. Every other worker — and every non-dependency PR —
+// renders nothing.
+describe('buildReviewInput dependency assess directive', () => {
+  const FILES = [{ filename: 'go.mod', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+require github.com/a/b v1.1.0' }];
+  const BUMPS = [{ modulePath: 'github.com/a/b', from: 'v1.0.0', to: 'v1.1.0', resolved: true }];
+
+  test('the go.mod-owning worker is told to call assess_dependency, naming the exact module', () => {
+    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, '', ['go.mod'], 'the note', BUMPS);
+    assert.match(prompt, new RegExp(`call ${TOOL_NAMES.assessDependency}`));
+    assert.match(prompt, /copying the module path VERBATIM: github\.com\/a\/b/);
+  });
+
+  test('a worker that does NOT own the go.mod gets no assess directive, even with bumps present', () => {
+    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, '', ['src/other.js'], 'the note', BUMPS);
+    assert.doesNotMatch(prompt, new RegExp(`call ${TOOL_NAMES.assessDependency}`));
+  });
+
+  test('a nested go.mod (tools/go.mod) still triggers the directive for its owner', () => {
+    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, '', ['tools/go.mod'], 'the note', BUMPS);
+    assert.match(prompt, new RegExp(`call ${TOOL_NAMES.assessDependency}`));
+  });
+
+  test('no bumps means no directive even for a go.mod owner (a non-dependency PR touching go.mod)', () => {
+    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, '', ['go.mod'], '', []);
+    assert.doesNotMatch(prompt, new RegExp(`call ${TOOL_NAMES.assessDependency}`));
+  });
+
+  test('the same module bumped in two go.mod files is listed once (distinct modules), not repeated', () => {
+    const dupBumps = [
+      { modulePath: 'github.com/a/b', from: 'v1.0.0', to: 'v1.1.0', resolved: true },
+      { modulePath: 'github.com/a/b', from: 'v1.0.0', to: 'v1.2.0', resolved: true },
+    ];
+    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, '', ['go.mod'], 'the note', dupBumps);
+    assert.match(prompt, /VERBATIM: github\.com\/a\/b\./); // exactly one occurrence in the list, no ", github.com/a/b" repeat
   });
 });
 

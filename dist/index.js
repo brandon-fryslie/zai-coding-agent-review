@@ -30173,7 +30173,7 @@ module.exports = {
 "use strict";
 
 const fs = __nccwpck_require__(9896);
-const { parseFindingValue, parseScopeValue } = __nccwpck_require__(1565);
+const { parseFindingValue, parseScopeValue, parseAssessmentValue } = __nccwpck_require__(1565);
 
 function writeJsonRpcResponse(id, result) {
   process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, result })}\n`);
@@ -30223,6 +30223,22 @@ function collectorTools() {
       },
     },
     {
+      name: 'assess_dependency',
+      description: "Record your merge-risk judgment of ONE resolved dependency-version bump (a go.mod requirement whose upstream change context was fetched for you). Call once per bumped module you were asked to assess. The host already owns the module name, version jump, and the compare/commit/release links — provide ONLY your judgment: 'impact' is one line synthesizing what materially changed upstream (not a commit dump); 'affected' is whether THIS repo's own usage breaks or changes; 'callSite' names the file (or file:line) when affected; 'verdict' is 'safe' (routine, merge freely), 'review' (worth a human glance), or 'risky' (breaking change that touches this repo — do not merge without addressing).",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          module: { type: 'string' },
+          impact: { type: 'string' },
+          affected: { type: 'boolean' },
+          callSite: { type: 'string' },
+          verdict: { type: 'string', enum: ['safe', 'review', 'risky'] },
+        },
+        required: ['module', 'impact', 'affected', 'verdict'],
+        additionalProperties: false,
+      },
+    },
+    {
       name: 'finish_review',
       description: 'Finish the review after all required changes have been requested.',
       inputSchema: {
@@ -30247,6 +30263,11 @@ function callCollectorTool(name, args) {
     const scope = parseScopeValue(args, 0);
     appendCollectorRecord({ type: 'scope', scope });
     return { content: [{ type: 'text', text: 'Review scope recorded.' }] };
+  }
+  if (name === 'assess_dependency') {
+    const assessment = parseAssessmentValue(args, 0);
+    appendCollectorRecord({ type: 'assessment', assessment });
+    return { content: [{ type: 'text', text: 'Dependency assessment recorded.' }] };
   }
   if (name === 'finish_review') {
     if (!args || typeof args.summary !== 'string' || args.summary.trim().length === 0) {
@@ -30324,7 +30345,7 @@ const fs = __nccwpck_require__(9896);
 const os = __nccwpck_require__(857);
 const path = __nccwpck_require__(6928);
 const core = __nccwpck_require__(7484);
-const { parseFindingValue, parseScopeValue, parseReviewValue } = __nccwpck_require__(1565);
+const { parseFindingValue, parseScopeValue, parseAssessmentValue, parseReviewValue } = __nccwpck_require__(1565);
 // [LAW:one-way-deps] ProtocolError's home is failover.js, beside TransientError — the retry seam owns
 // the vocabulary of errors a re-spawn can fix, and every thrower requires it from there (codex.js does
 // the same with TransientError). readCollectedReview runs in the ACTION process (never the collector
@@ -30388,11 +30409,18 @@ function readCollectedReview(recordsPath) {
   const scopes = records
     .filter(record => record.type === 'scope')
     .map((record, index) => parseScopeValue(record.scope, index));
+  // [LAW:dataflow-not-control-flow] A third record kind through the same one reader: a worker that reviewed
+  // a resolved go.mod bump records per-module dependency assessments; every other spawn produces none, so
+  // this is an empty list by construction, never a branch. Typed and schema-validated exactly like findings
+  // and scopes. [FRAMING:representation]
+  const assessments = records
+    .filter(record => record.type === 'assessment')
+    .map((record, index) => parseAssessmentValue(record.assessment, index));
   const review = parseReviewValue({
     summary: finish.summary,
     findings,
   }, 'Review collector output');
-  return { ...review, scopes };
+  return { ...review, scopes, assessments };
 }
 
 // [FRAMING:representation] The MCP config createReviewCollector writes self-references this file:
@@ -30944,12 +30972,178 @@ function renderDependencyDiffNote(summaries) {
     + `${blocks.join('\n\n')}`;
 }
 
+// [LAW:effects-at-boundaries] Pure: the semver magnitude of a from→to jump, derived from the versions
+// themselves — the HOST owns this fact, the model never states it. Only the leading vX.Y.Z core is
+// compared (the +incompatible suffix and any pseudo/pre-release tail are irrelevant to the magnitude of
+// the release step). A version that is not a plain semver (a pseudo-version, or two that share a core but
+// differ only in an untagged-commit tail) is 'unknown' rather than a forced label — an honest gap, not a
+// guess. [LAW:no-silent-failure]
+function parseSemverCore(version) {
+  const stripped = version.replace(/^v/, '').replace(INCOMPATIBLE_SUFFIX, '');
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(stripped);
+  return m ? { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]) } : null;
+}
+
+function semverMagnitude(from, to) {
+  const a = parseSemverCore(from);
+  const b = parseSemverCore(to);
+  if (!a || !b) return 'unknown';
+  if (a.major !== b.major) return 'major';
+  if (a.minor !== b.minor) return 'minor';
+  if (a.patch !== b.patch) return 'patch';
+  return 'unknown';
+}
+
+// A real release tag is a strict semver ref: `vX.Y.Z` with an optional pre-release tail of the limited
+// tag alphabet. This is a TYPE constraint, not a display filter — the tag flows into a constructed release
+// URL, and `from`/`to` come from the go.mod diff (untrusted: GO_MOD_REQUIRE_LINE's `v\d\S*` admits `<`,
+// `>`, `)`), so a crafted version must be UNABLE to smuggle markup or a link-breaking `)` into that URL.
+// [LAW:types-are-the-program] the guard is the shape, applied once here, not an escape bolted on downstream.
+const SAFE_RELEASE_TAG = /^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+
+// [LAW:one-source-of-truth] A release tag exists only for a real tagged version — a pseudo-version encodes
+// an untagged commit, so it has no release page; a version that is not a strict tag has none either. The
+// +incompatible suffix is build metadata, not part of the git tag. Returns the tag to link, or null.
+function releaseTag(version) {
+  const stripped = version.replace(INCOMPATIBLE_SUFFIX, '');
+  if (PSEUDO_VERSION_COMMIT.test(stripped)) return null;
+  return SAFE_RELEASE_TAG.test(stripped) ? stripped : null;
+}
+
+// [LAW:single-enforcer] The ONE escape at the review-body boundary. The dependency section renders into a
+// GitHub review comment as inline HTML (<details>/<summary>) — which GitHub's sanitizer permits structurally
+// — so every dynamic value carried into that HTML or into markdown running-text (not a code span, which
+// GitHub already escapes) MUST be entity-encoded, or untrusted content (an upstream commit message, a
+// crafted go.mod version) could close the collapsible early and inject structure. [FRAMING:representation]
+// the escape matches the rendering context; renderDependencyDiffNote does NOT use this — its output is
+// prompt text wrapped as data, never displayed HTML.
+function escapeHtml(str) {
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// escapeHtml's markdown counterpart, for untrusted text rendered as markdown RUNNING TEXT (a <details>
+// body list item, the <summary> line) rather than raw HTML. HTML-escaping alone stops <details> break-out
+// but leaves markdown live — an upstream commit message like `[click](https://evil)` would render as a real
+// link, `**x**` as bold. This backslash-escapes the inline metacharacters that form links, images, emphasis,
+// code spans, and strikethrough, THEN HTML-escapes, so the value displays as the literal text it is. `<`, `>`,
+// `&` are left to escapeHtml (backslashing them would fight the entity-encode). [FRAMING:representation]
+function mdText(str) {
+  return escapeHtml(String(str).replace(/[\\`*_[\]()~]/g, m => `\\${m}`));
+}
+
+// [LAW:one-source-of-truth] The verdict enum owns its glyph, label, and action at THIS one site — exactly
+// as a finding's severity owns its tag (severityTaggedBody). Nothing else re-spells a verdict; every render
+// derives from here. The verdict is PRESENTATION — the merge gate is driven by blocking findings, not by
+// this glyph — so a lenient verdict can never silently downgrade a real blocker. [LAW:single-enforcer]
+const VERDICT_PRESENTATION = {
+  safe: { glyph: '✅', label: 'Safe', action: 'routine bump; safe to merge.' },
+  review: { glyph: '⚠️', label: 'Review', action: 'worth a human glance before merge.' },
+  risky: { glyph: '🛑', label: 'Risky', action: 'breaking change affecting this repo — address before merge.' },
+};
+// [FRAMING:representation] Two distinct not-a-verdict states get two distinct glyphs, so the summary line
+// is self-describing without cross-referencing the tally: ⚪ = upstream could not be fetched (a host-side
+// fetch failure), ❔ = upstream WAS fetched but the model recorded no merge-risk assessment (a model-side
+// omission). Conflating them under one glyph would lose that difference at a glance.
+const UNRESOLVED_GLYPH = '⚪';
+const UNASSESSED_GLYPH = '❔';
+const MAX_COMMITS_SHOWN = 10;
+
+// [LAW:effects-at-boundaries] Pure: assemble the posted-review dependency section from the HOST-owned
+// structural summaries (module, from→to, links, commits) ENRICHED by the model-owned per-module
+// assessments (impact, repo impact, verdict). One source (summaries) rendered for the sink here, exactly as
+// renderDependencyDiffNote renders the SAME summaries for the prompt. [LAW:one-source-of-truth]
+//
+// Every summary renders as a VALUE, never a branch that drops one [LAW:dataflow-not-control-flow]:
+//   - unresolved → a plain, non-collapsed line stating upstream wasn't fetched and why (nothing to expand).
+//   - resolved + assessed → a collapsible <details>: the <summary> is the scannable one-liner (verdict glyph
+//     · module · from→to · magnitude · impact); the body carries the compare/commit/release links, the
+//     explicit repo impact, and the verdict with its action.
+//   - resolved but NOT assessed → the same <details> with host facts and an explicit "no assessment recorded"
+//     note, so a model that skipped the assess call degrades loudly, never silently drops the module.
+// '' when there are no bumps at all, so a non-dependency PR's posted summary is byte-identical to before.
+function renderDependencyReviewSection(summaries, assessments = []) {
+  if (!summaries || summaries.length === 0) return '';
+  const byModule = new Map(assessments.map(a => [a.module, a]));
+
+  // esc: HTML-only, for values inside <code> (markdown is not parsed there). mdLine: markdown+HTML, for a
+  // value on the single <summary> line or in a body list item (a markdown context) — also whitespace-
+  // collapsed so a stray newline can't close the collapsible early.
+  const esc = escapeHtml;
+  const mdLine = str => mdText(str.replace(/\s+/g, ' ').trim());
+
+  const tally = { safe: 0, review: 0, risky: 0, unresolved: 0, unassessed: 0 };
+  const blocks = summaries.map((s) => {
+    if (!s.resolved) {
+      tally.unresolved++;
+      // modulePath/from/to sit inside backtick code spans — GitHub escapes code-span content itself, so
+      // they render literally and safely without manual encoding. reason is markdown running text → mdText it.
+      return `- ${UNRESOLVED_GLYPH} \`${s.modulePath}\` \`${s.from} → ${s.to}\` — upstream not fetched (${mdText(s.reason)}).`;
+    }
+    const magnitude = semverMagnitude(s.from, s.to);
+    // URLs are built from host-owned, shape-constrained parts (owner/repoName from the resolved repo, sha
+    // hex, releaseTag strictly validated, compareUrl from GitHub's API) — a URL context, not HTML text, so
+    // it is not entity-encoded (that would corrupt the link). Only the link TEXT and running text are escaped.
+    const commitUrl = sha => `https://github.com/${s.owner}/${s.repoName}/commit/${sha}`;
+    const shown = s.commits.slice(0, MAX_COMMITS_SHOWN);
+    const commitLines = shown.length > 0
+      ? shown.map(c => `  - [\`${c.sha}\`](${commitUrl(c.sha)}) ${mdText(c.message)}`).join('\n')
+        + (s.totalCommits > shown.length ? `\n  - …and ${s.totalCommits - shown.length} more (see the full comparison).` : '')
+      : '  - (no commits listed)';
+    const tag = releaseTag(s.to);
+    const releaseLine = tag
+      ? `\n- **Release notes:** [${esc(tag)}](https://github.com/${s.owner}/${s.repoName}/releases/tag/${tag})`
+      : '';
+    // Static link TEXT: the from→to versions are already shown (escaped) in the <summary> header, so the
+    // compare link needs no dynamic text — keeping untrusted from/to out of markdown link-text closes the
+    // markdown-metacharacter (`]`, `(`) injection vector that HTML-escaping alone does not cover. [LAW:types-are-the-program]
+    const compareLine = `- **Compare:** [full comparison](${s.compareUrl})`;
+    const codeHead = `<code>${esc(s.modulePath)}</code> <code>${esc(s.from)} → ${esc(s.to)}</code>`;
+
+    const assessment = byModule.get(s.modulePath);
+    if (!assessment) {
+      tally.unassessed++;
+      return `<details>\n<summary>${UNASSESSED_GLYPH} ${codeHead} · ${magnitude}</summary>\n\n`
+        + `${compareLine}\n`
+        + `- **Notable commits:**\n${commitLines}${releaseLine}\n`
+        + `- _No merge-risk assessment was recorded for this module._\n</details>`;
+    }
+
+    const v = VERDICT_PRESENTATION[assessment.verdict];
+    tally[assessment.verdict]++;
+    // Escape only the untrusted callSite value; the '(call site not named)' fallback is a host literal and
+    // must not be backslash-mangled. [FRAMING:representation] escape the data, never our own constants.
+    const repoImpact = assessment.affected
+      ? `Affected — ${assessment.callSite ? mdLine(assessment.callSite) : '(call site not named)'}`
+      : 'Not affected.';
+    return `<details>\n<summary>${v.glyph} ${codeHead} · ${magnitude} · ${mdLine(assessment.impact)}</summary>\n\n`
+      + `${compareLine}\n`
+      + `- **Notable commits:**\n${commitLines}${releaseLine}\n`
+      + `- **Impact on this repo:** ${repoImpact}\n`
+      + `- **Verdict:** ${v.glyph} ${v.label} — ${v.action}\n</details>`;
+  });
+
+  // [LAW:dataflow-not-control-flow] The roll-up is the non-zero tally buckets joined — a value assembled
+  // from counts, never a fixed set of branches. verdict buckets first (the headline), then the two
+  // not-fully-judged buckets.
+  const parts = [];
+  if (tally.safe) parts.push(`${tally.safe} ${VERDICT_PRESENTATION.safe.glyph} safe`);
+  if (tally.review) parts.push(`${tally.review} ${VERDICT_PRESENTATION.review.glyph} review`);
+  if (tally.risky) parts.push(`${tally.risky} ${VERDICT_PRESENTATION.risky.glyph} risky`);
+  if (tally.unassessed) parts.push(`${tally.unassessed} ${UNASSESSED_GLYPH} unassessed`);
+  if (tally.unresolved) parts.push(`${tally.unresolved} ${UNRESOLVED_GLYPH} unresolved`);
+  const rollup = `**Dependency review** — ${summaries.length} module(s): ${parts.join(' · ')}`;
+
+  return `${rollup}\n\n${blocks.join('\n\n')}`;
+}
+
 module.exports = {
   parseDependencyDiffFlag,
   parseGoModBumps,
   resolveModuleRepo,
   fetchUpstreamChangeSummary,
   renderDependencyDiffNote,
+  renderDependencyReviewSection,
+  semverMagnitude,
   refFor,
   // Exported for direct unit testing of the SSRF guard; not part of the feature's public surface.
   isPublicAddress,
@@ -31645,6 +31839,7 @@ const TOOL_NAMES = {
   requestChange: 'mcp__review_collector__request_change',
   finishReview: 'mcp__review_collector__finish_review',
   addScope: 'mcp__review_collector__add_scope',
+  assessDependency: 'mcp__review_collector__assess_dependency',
 };
 
 // [LAW:single-enforcer] Every collector tool the model is told to call is also allowed here — the
@@ -31895,11 +32090,16 @@ const { runEngine } = __nccwpck_require__(8861);
 // implementation; each engine module supplies its spec.
 //
 // [FRAMING:parts-and-seams] The adapter contract is lifted to the judgment-vs-transport seam:
-// produceReview({config, buildPromptFor, instructionsPath}) -> {summary, findings, usage}. The whole
-// MCP-collector dance (createReviewCollector -> materializeHome -> spawn -> readCollectedReview) is a
-// PRIVATE detail in here — the registry/run.js contract is produceReview, never the subprocess
-// mechanics. A direct-API engine implements produceReview with one HTTPS call and never touches this
-// factory. [LAW:carrying-cost]
+// produceReview({config, buildPromptFor, instructionsPath}) -> {summary, findings, scopes, assessments, usage}.
+// The three record-kind fields are ALWAYS present arrays (empty when the spawn produced none), mirroring
+// readCollectedReview's shape — a scout run fills `scopes`, a worker run fills `findings` and (for the
+// go.mod-owning worker) `assessments`. This is a REQUIRED part of the contract, not optional: the
+// multi-scope aggregator accesses `r.findings`/`r.assessments` with no fallback, so an adapter that omits a
+// field fails loud rather than silently degrading (e.g. every bump rendering "unassessed"). A new engine —
+// including a direct-API one that never touches this factory — must return all five. [LAW:composability]
+// The whole MCP-collector dance (createReviewCollector -> materializeHome -> spawn -> readCollectedReview)
+// is a PRIVATE detail in here — the registry/run.js contract is produceReview, never the subprocess
+// mechanics. [LAW:carrying-cost]
 //
 // [LAW:single-enforcer] Instruction-injection guard: the engine spawns with its working directory
 // set to a fresh ISOLATED temp dir that is NOT an ancestor of the reviewed repo. Every engine
@@ -31939,9 +32139,10 @@ function makeCliAdapter(spec) {
             const output = await runEngine(spec, config, prompt, home, collector, cwd);
             const usage = spec.extractUsage(output, config);
             const review = readCollectedReview(collector.recordsPath);
-            // [LAW:dataflow-not-control-flow] scopes (a scout run) and findings (a worker run) are
-            // both carried through as values; the caller uses whichever its pass produced.
-            return { summary: review.summary, findings: review.findings, scopes: review.scopes, usage };
+            // [LAW:dataflow-not-control-flow] scopes (a scout run), findings (a worker run), and
+            // dependency assessments (a worker that reviewed a go.mod bump) are all carried through as
+            // values; the caller uses whichever its pass produced, an empty list otherwise.
+            return { summary: review.summary, findings: review.findings, scopes: review.scopes, assessments: review.assessments, usage };
           } finally {
             fs.rmSync(home, { recursive: true });
           }
@@ -32004,6 +32205,7 @@ const TOOL_NAMES = {
   requestChange: 'mcp__review_collector__request_change',
   finishReview: 'mcp__review_collector__finish_review',
   addScope: 'mcp__review_collector__add_scope',
+  assessDependency: 'mcp__review_collector__assess_dependency',
 };
 
 // [LAW:effects-at-boundaries] Pure: produces TOML text from values, touches no filesystem.
@@ -32251,6 +32453,7 @@ const TOOL_NAMES = {
   requestChange: `${MCP_SERVER_NAME}_request_change`,
   finishReview: `${MCP_SERVER_NAME}_finish_review`,
   addScope: `${MCP_SERVER_NAME}_add_scope`,
+  assessDependency: `${MCP_SERVER_NAME}_assess_dependency`,
 };
 
 // [LAW:effects-at-boundaries] Pure: builds the opencode.json object from values, touches no
@@ -33122,7 +33325,8 @@ module.exports = {
 
 const { produceReview, retryTransientSpawn, sleep } = __nccwpck_require__(2887);
 const { defaultEffortProfile, maxTier } = __nccwpck_require__(4652);
-const { dedupeFindings } = __nccwpck_require__(1565);
+const { dedupeFindings, dedupeAssessments } = __nccwpck_require__(1565);
+const { renderDependencyDiffNote } = __nccwpck_require__(9838);
 const {
   buildReviewInput,
   buildRepoReviewInput,
@@ -33237,9 +33441,13 @@ async function runScopeWorker({ scope, context, material, spawn, log }) {
   // the material threads scope.files into the read instruction. Repo material ignores it (no diff).
   const buildPromptFor = (toolNames) => material.buildWorkerPrompt(focusText, toolNames, scope.files);
   log(`scope '${scope.name}' starting…`);
-  const { summary, findings, usage } = await spawn(buildPromptFor, `scope '${scope.name}'`);
+  // [LAW:dataflow-not-control-flow] Every record kind the spawn produced flows through this seam
+  // unbroken — findings AND dependency assessments (the go.mod-owning worker's per-module judgments).
+  // Dropping assessments here would silently strip the whole feature: the aggregation's `|| []` fallback
+  // would fire on every worker and every bump would render "unassessed". [LAW:no-silent-failure]
+  const { summary, findings, assessments, usage } = await spawn(buildPromptFor, `scope '${scope.name}'`);
   log(`scope '${scope.name}' done — ${findings.length} finding(s)`);
-  return { name: scope.name, summary, findings, usage };
+  return { name: scope.name, summary, findings, assessments, usage };
 }
 
 // [LAW:effects-at-boundaries] Pure: given the scout's planned scopes and the changed paths the plan was
@@ -33342,6 +33550,14 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   return {
     summary: composeSummary(scopes, workerResults),
     findings: dedupeFindings(workerResults.flatMap(r => r.findings)),
+    // [LAW:dataflow-not-control-flow] Dependency assessments aggregate exactly like findings — a flatMap
+    // over the workers plus one dedup — and with the SAME shape: no `|| []` fallback, because every worker
+    // result carries an `assessments` array (readCollectedReview always returns one), exactly as it carries
+    // `findings`. [LAW:one-type-per-behavior] guarding only this record kind would let an out-of-contract
+    // adapter that omits the field degrade the whole section to "unassessed" silently; the bare access makes
+    // that surface as a loud crash instead. [LAW:no-silent-failure] Only the go.mod-owning worker records
+    // any; dedupeAssessments (keyed by module) collapses the multi-go.mod case. Non-dependency PR → [].
+    assessments: dedupeAssessments(workerResults.flatMap(r => r.assessments)),
     usage: sumUsage([scoutResult.usage, ...workerResults.map(r => r.usage)]),
   };
 }
@@ -33379,17 +33595,24 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
 // (so every anchor stays valid) with its scope as the CONCENTRATE focus, but reads only its scope's
 // assigned files in full. files/maxDiffChars are the same values run.js uses to build the anchors, so
 // worker findings and anchors share one diff.
-// dependencyDiffNote is the (possibly empty) upstream-change context src/dependency-diff.js fetched
-// for any go.mod bump in this PR; '' is the common case (no bump, or the feature is off) and flows
-// through to buildReviewInput unchanged. [LAW:dataflow-not-control-flow]
-function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencyDiffNote = '' }) {
+// dependencySummaries is the (possibly empty) structured upstream-change context src/dependency-diff.js
+// fetched for any go.mod bump in this PR — the ONE source both the worker prompt (this material) and the
+// posted-review section (run.js) render from. [LAW:one-source-of-truth] The material derives the prompt
+// NOTE from it here (renderDependencyDiffNote) and threads the RESOLVED bumps to the worker so the assess
+// directive can name the exact modules. [] is the common case (no bump, or the feature is off): the note
+// is '' and the bump list empty, flowing through unchanged. [LAW:dataflow-not-control-flow]
+function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySummaries = [] }) {
   const changedPaths = files.map(f => f.filename);
+  const dependencyDiffNote = renderDependencyDiffNote(dependencySummaries);
+  // Only a resolved bump has upstream context to judge; an unresolved one renders as a plain line in the
+  // sink and carries no model assessment, so it is excluded from the assess directive. [LAW:no-silent-failure]
+  const dependencyBumps = dependencySummaries.filter(s => s.resolved);
   return {
     // [LAW:types-are-the-program] The changed-file list is a first-class field of the material, not
     // recovered from the prompt: runMultiScopePass verifies the scout's plan covers it (planScopes).
     changedPaths,
     buildScoutPrompt: (toolNames) => buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot }).prompt,
-    buildWorkerPrompt: (focusText, toolNames, scopeFiles) => buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focusText, scopeFiles, dependencyDiffNote).prompt,
+    buildWorkerPrompt: (focusText, toolNames, scopeFiles) => buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focusText, scopeFiles, dependencyDiffNote, dependencyBumps).prompt,
   };
 }
 
@@ -33636,7 +33859,7 @@ function reviewCharter(toolNames) {
 // or the DEPENDENCY_DIFF input off) renders nothing; a non-empty note (src/dependency-diff.js)
 // appends the fetched upstream-change context after the diff, same placement as the unshowable-
 // files note below. [LAW:dataflow-not-control-flow]
-function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = [], dependencyDiffNote = '') {
+function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = [], dependencyDiffNote = '', dependencyBumps = []) {
   const patchableFiles = files.filter(f => f.patch);
   const includedDiffs = [];
   const includedFiles = [];
@@ -33700,6 +33923,30 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focu
     (see the unshowable-files note above) — never silently drop the finding because the anchor isn't available.\n`
     : '';
 
+  // [LAW:dataflow-not-control-flow] The assess directive is rendered by a VALUE, not a mode: it fires only
+  // for the worker whose assigned files include the bumped go.mod, so exactly ONE worker authors the
+  // per-module assessments (dedupeAssessments collapses the multi-go.mod case downstream). Any other
+  // worker — and every non-dependency PR (dependencyBumps === []) — renders nothing. The assessment is the
+  // SUMMARY-level judgment the host folds into the review's dependency section; it does NOT replace the
+  // blocking finding a real break still requires (that is what drives the merge verdict). [LAW:no-silent-failure]
+  const ownsBumpedGoMod = dependencyBumps.length > 0
+    && scopeFiles.some(f => f === 'go.mod' || f.endsWith('/go.mod'));
+  // [FRAMING:representation] List DISTINCT module paths: when two go.mod files bump the same module the raw
+  // map repeats it, and "EACH ... exactly ONCE" turns ambiguous. dedupeAssessments would still collapse a
+  // double call, but the directive should name each module once.
+  const bumpedModules = [...new Set(dependencyBumps.map(b => b.modulePath))];
+  const dependencyAssessBlock = ownsBumpedGoMod
+    ? `\n    You own this PR's go.mod bump. For EACH of these bumped modules, call ${toolNames.assessDependency} exactly
+    ONCE, copying the module path VERBATIM: ${bumpedModules.join(', ')}. Provide your
+    merge-risk judgment as fields: 'impact' (ONE line synthesizing what materially changed upstream from the
+    commit context above — not a list of commits), 'affected' (true/false — does THIS repo's own usage break or
+    change?), 'callSite' (the file or file:line where, when affected — omit when not), and 'verdict' ('safe' =
+    routine, merge freely; 'review' = worth a human glance; 'risky' = a breaking change that touches this repo).
+    The host renders this into the review's dependency summary. It does NOT replace a finding: if the bump breaks
+    a symbol this repo uses, still record that as a 'blocking' ${toolNames.requestChange} (or in the ${toolNames.finishReview}
+    summary if unanchorable), because the assessment's verdict is presentation — findings drive the merge decision.\n`
+    : '';
+
   // [LAW:dataflow-not-control-flow] The set of files to read in full is a VALUE: a non-empty scopeFiles
   // narrows the full read to this worker's assigned files (another worker reads the rest — the read cost
   // is split, not duplicated N times); an empty scopeFiles reads the whole changed set (single-scope PR
@@ -33720,7 +33967,7 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focu
     prompt: `
 Review this pull request. The repository under review is checked out at ${reviewedRepoRoot}.
     Your working directory is intentionally outside the repository; reach it by that absolute path with your Read tool.
-${focusBlock}${dependencyInstructionBlock}
+${focusBlock}${dependencyInstructionBlock}${dependencyAssessBlock}
     BEFORE judging anything, ${readTargets} The diff shows only the changed hunks; most bugs are only
     visible in the full surrounding context of the function and module — a missing guard, a caller you'd
     break, a value that can't be what this line assumes. Do not form or report any judgment until you
@@ -34191,6 +34438,74 @@ function parseScopeValue(scope, index) {
   return { name: name.trim(), focus: focus.trim(), files };
 }
 
+// [LAW:types-are-the-program] A dependency assessment is the same kind of typed, schema-validated
+// record as a finding or a scope: the model's per-module judgment about a resolved go.mod bump, recorded
+// through the assess_dependency collector tool (never parsed from prose). The HOST owns every structural
+// fact — module, from→to, magnitude, and the compare/commit/release links — so this record carries ONLY
+// what the host cannot derive: the model's judgment. [LAW:one-source-of-truth]
+//   - module: which bump this judges (matched back to a host-owned summary by exact module path).
+//   - impact: the one-line synthesis of what materially changed upstream — the headline, not a commit dump.
+//   - affected: does THIS repo's own usage break/change? A required boolean, so "we didn't check" can never
+//     masquerade as "not affected" — the model must commit to a call. [LAW:no-silent-failure]
+//   - callSite: where, when affected. Optional string: a genuine domain optional (there is no call site to
+//     name when affected is false), so its absence is a value the renderer handles, not a guard. When
+//     affected is true it SHOULD be named; a missing one degrades to an explicit "(call site not named)"
+//     rather than failing the whole review. [LAW:no-defensive-null-guards]
+//   - verdict: the merge-risk call, a closed enum — it owns its glyph and action string at the one render
+//     site, exactly as a finding's severity owns its tag (severityTaggedBody). The verdict is PRESENTATION;
+//     the actual merge gate stays driven by blocking findings, so a lenient verdict can never silently
+//     downgrade a real blocker. [LAW:single-enforcer]
+const ASSESSMENT_VERDICTS = ['safe', 'review', 'risky'];
+
+function parseAssessmentValue(assessment, index) {
+  if (!assessment || typeof assessment !== 'object' || Array.isArray(assessment)) {
+    throw new Error(`Review collector assessment ${index + 1} is not an object.`);
+  }
+  const module = assessment.module;
+  if (typeof module !== 'string' || module.trim().length === 0) {
+    throw new Error(`Review collector assessment ${index + 1} has an invalid module.`);
+  }
+  const impact = assessment.impact;
+  if (typeof impact !== 'string' || impact.trim().length === 0) {
+    throw new Error(`Review collector assessment ${index + 1} ('${module.trim()}') has an invalid impact.`);
+  }
+  if (typeof assessment.affected !== 'boolean') {
+    throw new Error(`Review collector assessment ${index + 1} ('${module.trim()}') has an invalid affected (expected boolean).`);
+  }
+  const verdict = assessment.verdict;
+  if (!ASSESSMENT_VERDICTS.includes(verdict)) {
+    throw new Error(`Review collector assessment ${index + 1} ('${module.trim()}') has an invalid verdict (expected ${ASSESSMENT_VERDICTS.map(v => `'${v}'`).join(', ')}).`);
+  }
+  // callSite is a genuine optional: absent/blank collapses to null (no call site to name), a value the
+  // renderer handles — never a guard skipping work. [LAW:no-defensive-null-guards]
+  const callSite = typeof assessment.callSite === 'string' && assessment.callSite.trim().length > 0
+    ? assessment.callSite.trim()
+    : null;
+  return { module: module.trim(), impact: impact.trim(), affected: assessment.affected, callSite, verdict };
+}
+
+// [LAW:one-source-of-truth] "The same assessed module": keyed on the module path alone — a module is
+// assessed once. The dependency note reaches every worker, but the assess directive is gated to the ONE
+// worker that owns the bumped go.mod (buildReviewInput), so single authorship is the common case; this is
+// the safety net for the multi-go.mod PR (several workers each own a go.mod) and any model over-eagerness.
+//
+// [LAW:one-type-per-behavior] Conflict resolution mirrors dedupeFindings' severity merge, which is the same
+// behavior on the other record kind: two workers assessing one module with different verdicts must not let
+// arrival order (nondeterministic under concurrency — [LAW:no-ambient-temporal-coupling]) pick the winner.
+// The MORE CAUTIOUS verdict wins — a masked 'safe' over a real 'risky' would mislead the reader even though
+// the merge gate is findings-driven. ASSESSMENT_VERDICTS is ordered by ascending caution, so its index IS
+// the caution rank — no second table to drift. [LAW:one-source-of-truth] First-seen position is preserved
+// (a Map keeps a key's original slot when its value is replaced), matching dedupeFindings.
+function dedupeAssessments(assessments) {
+  const caution = a => ASSESSMENT_VERDICTS.indexOf(a.verdict);
+  const byModule = new Map();
+  for (const a of assessments) {
+    const existing = byModule.get(a.module);
+    if (!existing || caution(a) > caution(existing)) byModule.set(a.module, a);
+  }
+  return [...byModule.values()];
+}
+
 // [LAW:one-source-of-truth] The single definition of "the same recorded finding, up to wording": a
 // body normalized by collapsing whitespace and lowercasing. Both dedup sites — the pre-anchor merge of
 // worker findings (dedupeFindings) and the post-anchor collapse of findings that snapped to one line
@@ -34314,7 +34629,7 @@ function severityTaggedBody(finding) {
     : finding.body;
 }
 
-module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTaggedBody };
+module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTaggedBody };
 
 
 /***/ }),
@@ -34340,7 +34655,7 @@ const { parseDailyBudgetUsd, defaultBudgetCandidates, chooseProfile, effectiveRo
 const { assessDifficulty } = __nccwpck_require__(4260);
 const { difficultyCandidates, parseDifficultyScaling } = __nccwpck_require__(9935);
 const { readSpentToday, appendCost } = __nccwpck_require__(8192);
-const { parseDependencyDiffFlag, parseGoModBumps, fetchUpstreamChangeSummary, renderDependencyDiffNote } = __nccwpck_require__(9838);
+const { parseDependencyDiffFlag, parseGoModBumps, fetchUpstreamChangeSummary, renderDependencyReviewSection } = __nccwpck_require__(9838);
 const { renderCostLine, costWarning, costMarker } = __nccwpck_require__(9614);
 const { renderRepoReport } = __nccwpck_require__(8959);
 const registry = __nccwpck_require__(25);
@@ -34554,14 +34869,16 @@ const MAX_DEPENDENCY_BUMPS_FETCHED = 8;
 
 // [LAW:effects-at-boundaries] The dependency-diff boundary: parses go.mod's OWN diff for version
 // bumps and fetches each bumped module's upstream change via the trusted host's octokit client —
-// the reviewing engine never makes this call itself (src/dependency-diff.js). Off by default
-// (dependencyDiffOn=false) is byte-identical to before this feature: no go.mod scan, no fetch, ''
-// flows through buildPrMaterial unchanged. [LAW:no-silent-failure] a per-bump fetch failure (bad
-// ref, unresolvable module, rate limit) is carried as `resolved: false` and rendered into the note
-// rather than thrown — one unreachable upstream must never abort the whole review. A bump beyond
-// MAX_DEPENDENCY_BUMPS_FETCHED is the same shape: not fetched, but reported as such, not dropped.
-async function resolveDependencyDiffNote(octokit, filteredFiles, dependencyDiffOn) {
-  if (!dependencyDiffOn) return '';
+// the reviewing engine never makes this call itself (src/dependency-diff.js). Returns the STRUCTURED
+// summaries (the one source both renderings derive from — the prompt note via renderDependencyDiffNote,
+// the posted-review section via renderDependencyReviewSection). [LAW:one-source-of-truth] Off by default
+// (dependencyDiffOn=false) is byte-identical to before this feature: no go.mod scan, no fetch, [] flows
+// through unchanged. [LAW:no-silent-failure] a per-bump fetch failure (bad ref, unresolvable module,
+// rate limit) is carried as `resolved: false` rather than thrown — one unreachable upstream must never
+// abort the whole review. A bump beyond MAX_DEPENDENCY_BUMPS_FETCHED is the same shape: not fetched, but
+// reported as such, not dropped.
+async function resolveDependencySummaries(octokit, filteredFiles, dependencyDiffOn) {
+  if (!dependencyDiffOn) return [];
   // A monorepo can carry more than one go.mod (nested modules, e.g. tools/go.mod) — every one of
   // them is in scope, not just the root file, so a bump in a nested module is never silently skipped.
   // A vendored go.mod (vendor/.../go.mod) is excluded: it describes the VENDORED dependency's own
@@ -34569,9 +34886,9 @@ async function resolveDependencyDiffNote(octokit, filteredFiles, dependencyDiffO
   const goMods = filteredFiles.filter(f => f.patch
     && (f.filename === 'go.mod' || f.filename.endsWith('/go.mod'))
     && !f.filename.startsWith('vendor/'));
-  if (goMods.length === 0) return '';
+  if (goMods.length === 0) return [];
   const bumps = goMods.flatMap(f => parseGoModBumps(f.patch));
-  if (bumps.length === 0) return '';
+  if (bumps.length === 0) return [];
   const toFetch = bumps.slice(0, MAX_DEPENDENCY_BUMPS_FETCHED);
   const skipped = bumps.slice(MAX_DEPENDENCY_BUMPS_FETCHED).map(b => ({
     ...b, resolved: false, reason: `upstream context not fetched — this PR bumps more than ${MAX_DEPENDENCY_BUMPS_FETCHED} modules`,
@@ -34585,7 +34902,7 @@ async function resolveDependencyDiffNote(octokit, filteredFiles, dependencyDiffO
       ? `Dependency diff: ${s.modulePath} ${s.from} → ${s.to} — ${s.totalCommits} upstream commit(s) via github.com/${s.owner}/${s.repoName}.`
       : `Dependency diff: ${s.modulePath} ${s.from} → ${s.to} — ${s.reason}.`);
   }
-  return renderDependencyDiffNote(summaries);
+  return summaries;
 }
 
 // PR-diff review: fetch the PR, gate forks, build the diff material + anchors, run the engine
@@ -34807,8 +35124,8 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
   // produceReview) owns retry timing; the whole scout→workers pass is one attempt per config.
   const anchorInput = buildReviewInput(filteredFiles, maxDiffChars, registry.get(chain[0].engine).toolNames, REVIEWED_REPO_ROOT);
   const anchors = buildReviewAnchors(anchorInput.files);
-  const dependencyDiffNote = await resolveDependencyDiffNote(octokit, filteredFiles, dependencyDiffOn);
-  const material = buildPrMaterial({ files: filteredFiles, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencyDiffNote });
+  const dependencySummaries = await resolveDependencySummaries(octokit, filteredFiles, dependencyDiffOn);
+  const material = buildPrMaterial({ files: filteredFiles, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencySummaries });
 
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
@@ -34826,10 +35143,14 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
     core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
   }
 
+  // [LAW:one-source-of-truth] The dependency section is assembled once here, at the sink, from the SAME
+  // structured summaries the prompt note derived from — now enriched by the workers' per-module
+  // assessments. '' for a non-dependency PR, so the posted body is byte-identical to before. [LAW:dataflow-not-control-flow]
+  const dependencySection = renderDependencyReviewSection(dependencySummaries, review.assessments);
   const footer = buildReviewFooter(review.usage, configUsed, prior.cost);
   await submitReview(
     reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
-    { summary: review.summary, findings: anchored, unanchored },
+    { summary: review.summary, findings: anchored, unanchored, dependencySection },
     Boolean(reviewToken), transport, footer,
   );
 
@@ -34936,7 +35257,7 @@ async function run() {
   }
 }
 
-module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencyDiffNote, MAX_DEPENDENCY_BUMPS_FETCHED };
+module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, MAX_DEPENDENCY_BUMPS_FETCHED };
 
 
 /***/ }),
@@ -35186,7 +35507,12 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   const event = reviewEvent(requestsChanges, canApprove, transport);
   const verdict = requestsChanges ? REQUEST_CHANGES_MESSAGE : APPROVED_MESSAGE;
   const footer = attributionFooter ? `\n\n${attributionFooter}` : '';
-  const body = `## ${reviewerName}\n\n${review.summary}${renderUnanchoredSection(unanchored)}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
+  // [LAW:dataflow-not-control-flow] The dependency section is a VALUE prepended to the summary: a
+  // dependency-bump PR leads with its scannable roll-up + per-module breakdown; every other PR carries
+  // '' and the body is byte-identical to before. The section is assembled host-side in run.js (from the
+  // structured summaries + the model's assessments); this sink only places it. [LAW:single-enforcer]
+  const dependencySection = review.dependencySection ? `${review.dependencySection}\n\n` : '';
+  const body = `## ${reviewerName}\n\n${dependencySection}${review.summary}${renderUnanchoredSection(unanchored)}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
   const comments = review.findings.map(finding => transport.toComment({ ...finding, body: severityTaggedBody(finding) }));
 
   // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.

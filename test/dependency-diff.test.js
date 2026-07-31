@@ -8,6 +8,8 @@ const {
   resolveModuleRepo,
   fetchUpstreamChangeSummary,
   renderDependencyDiffNote,
+  renderDependencyReviewSection,
+  semverMagnitude,
   refFor,
   isPublicAddress,
   isSafeHost,
@@ -375,5 +377,165 @@ describe('renderDependencyDiffNote', () => {
     }]);
     assert.match(note, /gitlab\.example\/foo\/bar: v1\.0\.0 → v1\.1\.0/);
     assert.match(note, /Upstream change not fetched/);
+  });
+});
+
+describe('semverMagnitude', () => {
+  test('classifies patch / minor / major by which core component moved', () => {
+    assert.equal(semverMagnitude('v1.2.3', 'v1.2.4'), 'patch');
+    assert.equal(semverMagnitude('v1.2.3', 'v1.3.0'), 'minor');
+    assert.equal(semverMagnitude('v1.2.3', 'v2.0.0'), 'major');
+  });
+
+  test('a +incompatible suffix is ignored — only the vX.Y.Z core decides the magnitude', () => {
+    assert.equal(semverMagnitude('v2.0.0+incompatible', 'v3.0.0+incompatible'), 'major');
+    assert.equal(semverMagnitude('v2.0.0+incompatible', 'v2.1.0+incompatible'), 'minor');
+  });
+
+  test('a pseudo-version (untagged commit move) with no semver step is unknown, not a forced label', () => {
+    assert.equal(semverMagnitude('v0.0.0-20240101000000-abcdef012345', 'v0.0.0-20240202000000-fedcba543210'), 'unknown');
+  });
+
+  test('a non-semver string is unknown rather than a guess', () => {
+    assert.equal(semverMagnitude('latest', 'v1.0.0'), 'unknown');
+  });
+});
+
+// A resolved, assessed summary factory — the common case — so each test varies only what it asserts.
+function resolvedSummary(over = {}) {
+  return {
+    modulePath: 'github.com/gorilla/mux', from: 'v1.7.0', to: 'v1.8.0',
+    resolved: true, owner: 'gorilla', repoName: 'mux',
+    compareUrl: 'https://github.com/gorilla/mux/compare/v1.7.0...v1.8.0',
+    totalCommits: 2, commits: [{ sha: 'abc123def456', message: 'add context support' }],
+    totalFiles: 1, files: ['mux.go'],
+    ...over,
+  };
+}
+function assessment(over = {}) {
+  return { module: 'github.com/gorilla/mux', impact: 'adds request context helpers', affected: false, callSite: null, verdict: 'safe', ...over };
+}
+
+describe('renderDependencyReviewSection', () => {
+  test('no summaries renders nothing (a non-dependency PR is unchanged)', () => {
+    assert.equal(renderDependencyReviewSection([]), '');
+    assert.equal(renderDependencyReviewSection(undefined), '');
+  });
+
+  test('a resolved+assessed module renders a <details> whose summary carries glyph, module, jump, magnitude, and impact', () => {
+    const out = renderDependencyReviewSection([resolvedSummary()], [assessment()]);
+    assert.match(out, /<details>/);
+    assert.match(out, /<summary>✅ <code>github\.com\/gorilla\/mux<\/code> <code>v1\.7\.0 → v1\.8\.0<\/code> · minor · adds request context helpers<\/summary>/);
+  });
+
+  test("the expanded body links compare, commits, and release, and states repo impact + verdict", () => {
+    const out = renderDependencyReviewSection([resolvedSummary()], [assessment()]);
+    assert.match(out, /\*\*Compare:\*\* \[full comparison\]\(https:\/\/github\.com\/gorilla\/mux\/compare\/v1\.7\.0\.\.\.v1\.8\.0\)/);
+    assert.match(out, /\[`abc123def456`\]\(https:\/\/github\.com\/gorilla\/mux\/commit\/abc123def456\) add context support/);
+    assert.match(out, /\*\*Release notes:\*\* \[v1\.8\.0\]\(https:\/\/github\.com\/gorilla\/mux\/releases\/tag\/v1\.8\.0\)/);
+    assert.match(out, /\*\*Impact on this repo:\*\* Not affected\./);
+    assert.match(out, /\*\*Verdict:\*\* ✅ Safe — routine bump; safe to merge\./);
+  });
+
+  test('an AFFECTED assessment names the call site in the repo-impact line', () => {
+    const out = renderDependencyReviewSection(
+      [resolvedSummary()],
+      [assessment({ affected: true, callSite: 'internal/router.go:42', verdict: 'risky' })],
+    );
+    assert.match(out, /🛑 <code>github\.com\/gorilla\/mux<\/code>/);
+    assert.match(out, /\*\*Impact on this repo:\*\* Affected — internal\/router\.go:42/);
+    assert.match(out, /\*\*Verdict:\*\* 🛑 Risky/);
+  });
+
+  test('an affected assessment that failed to name a call site degrades explicitly, never silently', () => {
+    const out = renderDependencyReviewSection([resolvedSummary()], [assessment({ affected: true, callSite: null, verdict: 'review' })]);
+    assert.match(out, /Affected — \(call site not named\)/);
+  });
+
+  test('an unresolved module renders a plain line (no <details> to expand), naming why', () => {
+    const out = renderDependencyReviewSection([{
+      modulePath: 'gitlab.example/foo/bar', from: 'v1.0.0', to: 'v1.1.0',
+      resolved: false, reason: 'could not resolve a GitHub repository for this module path',
+    }], []);
+    assert.doesNotMatch(out, /<details>/);
+    assert.match(out, /⚪ `gitlab\.example\/foo\/bar` `v1\.0\.0 → v1\.1\.0` — upstream not fetched \(could not resolve/);
+  });
+
+  test('a resolved module with NO matching assessment still renders host facts, flagged as unassessed', () => {
+    const out = renderDependencyReviewSection([resolvedSummary()], []); // no assessments at all
+    assert.match(out, /<details>/);
+    assert.match(out, /No merge-risk assessment was recorded for this module/);
+    assert.match(out, /\*\*Compare:\*\*/); // host facts still present
+    assert.match(out, /1 ❔ unassessed/); // reflected in the roll-up, with its own glyph
+    // ❔ (fetched-but-unassessed) is distinct from ⚪ (not fetched) in the <summary>.
+    assert.match(out, /<summary>❔ /);
+  });
+
+  test('a pseudo-version target has no release page, so no release line is emitted', () => {
+    const out = renderDependencyReviewSection(
+      [resolvedSummary({ to: 'v0.0.0-20240202000000-fedcba543210' })],
+      [assessment({ verdict: 'review' })],
+    );
+    assert.doesNotMatch(out, /Release notes:/);
+  });
+
+  test('commit lists are capped in the display, with the remainder pointed at the comparison', () => {
+    const commits = Array.from({ length: 25 }, (_, i) => ({ sha: `sha${i}`.padEnd(12, '0'), message: `commit ${i}` }));
+    const out = renderDependencyReviewSection([resolvedSummary({ totalCommits: 25, commits })], [assessment()]);
+    assert.match(out, /…and 15 more \(see the full comparison\)\./); // 25 total, 10 shown
+  });
+
+  test('untrusted content rendered into the HTML body is entity-encoded, not injected (impact + commit message)', () => {
+    const out = renderDependencyReviewSection(
+      [resolvedSummary({ commits: [{ sha: 'abc123def456', message: '</summary><details open><summary>gotcha' }] })],
+      [assessment({ impact: 'breaks </summary></details> the layout', affected: true, callSite: '<img src=x>router.go' })],
+    );
+    // The raw structural sequences must NOT appear; their encoded forms must.
+    assert.doesNotMatch(out, /<summary>gotcha/);
+    assert.doesNotMatch(out, /breaks <\/summary>/);
+    assert.match(out, /breaks &lt;\/summary&gt;&lt;\/details&gt; the layout/);
+    assert.match(out, /&lt;\/summary&gt;&lt;details open&gt;&lt;summary&gt;gotcha/);
+    assert.match(out, /&lt;img src=x&gt;router\.go/);
+    // Exactly one opening <summary> tag survives (ours) — the injected ones are encoded away.
+    assert.equal((out.match(/<summary>/g) || []).length, 1);
+  });
+
+  test('markdown metacharacters in an upstream commit message render literally, not as a live link or emphasis', () => {
+    const out = renderDependencyReviewSection(
+      [resolvedSummary({ commits: [{ sha: 'abc123def456', message: 'see [click](https://evil.example) and **bold**' }] })],
+      [assessment()],
+    );
+    // The link/emphasis syntax is neutralized (backslash-escaped) — no live markdown link or bold survives.
+    assert.doesNotMatch(out, /\[click\]\(https:\/\/evil\.example\)/);
+    assert.match(out, /\\\[click\\\]\\\(https:\/\/evil\.example\\\)/);
+    assert.match(out, /\\\*\\\*bold\\\*\\\*/);
+  });
+
+  test('a crafted version string is HTML-escaped in the header and cannot become a release URL', () => {
+    const out = renderDependencyReviewSection(
+      [resolvedSummary({ to: 'v1.8.0<script>' })],
+      [assessment({ verdict: 'review' })],
+    );
+    assert.doesNotMatch(out, /Release notes:/);       // not a strict tag → no release URL built from it
+    assert.doesNotMatch(out, /v1\.8\.0<script>/);     // raw markup never reaches the body
+    assert.match(out, /v1\.8\.0&lt;script&gt;/);      // escaped inside the <code> header
+    // The compare link text is static, so a `]`/`(` in a version can't break the markdown link either.
+    assert.match(out, /\[full comparison\]/);
+  });
+
+  test('the roll-up tallies every non-zero bucket across mixed modules', () => {
+    const summaries = [
+      resolvedSummary({ modulePath: 'github.com/a/one' }),
+      resolvedSummary({ modulePath: 'github.com/a/two' }),
+      resolvedSummary({ modulePath: 'github.com/a/three' }),
+      { modulePath: 'gitlab.example/x/y', from: 'v1.0.0', to: 'v2.0.0', resolved: false, reason: 'no GitHub repo' },
+    ];
+    const assessments = [
+      assessment({ module: 'github.com/a/one', verdict: 'safe' }),
+      assessment({ module: 'github.com/a/two', verdict: 'review' }),
+      assessment({ module: 'github.com/a/three', verdict: 'risky' }),
+    ];
+    const out = renderDependencyReviewSection(summaries, assessments);
+    assert.match(out, /\*\*Dependency review\*\* — 4 module\(s\): 1 ✅ safe · 1 ⚠️ review · 1 🛑 risky · 1 ⚪ unresolved/);
   });
 });

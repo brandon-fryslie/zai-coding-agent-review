@@ -33,6 +33,7 @@ const TOOL_NAMES = {
   requestChange: 'mcp__review_collector__request_change',
   finishReview: 'mcp__review_collector__finish_review',
   addScope: 'mcp__review_collector__add_scope',
+  assessDependency: 'mcp__review_collector__assess_dependency',
 };
 
 // [LAW:single-enforcer] Every collector tool the model is told to call is also allowed here — the

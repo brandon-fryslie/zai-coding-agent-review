@@ -1,6 +1,6 @@
 'use strict';
 const fs = require('fs');
-const { parseFindingValue, parseScopeValue } = require('./review');
+const { parseFindingValue, parseScopeValue, parseAssessmentValue } = require('./review');
 
 function writeJsonRpcResponse(id, result) {
   process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, result })}\n`);
@@ -50,6 +50,22 @@ function collectorTools() {
       },
     },
     {
+      name: 'assess_dependency',
+      description: "Record your merge-risk judgment of ONE resolved dependency-version bump (a go.mod requirement whose upstream change context was fetched for you). Call once per bumped module you were asked to assess. The host already owns the module name, version jump, and the compare/commit/release links — provide ONLY your judgment: 'impact' is one line synthesizing what materially changed upstream (not a commit dump); 'affected' is whether THIS repo's own usage breaks or changes; 'callSite' names the file (or file:line) when affected; 'verdict' is 'safe' (routine, merge freely), 'review' (worth a human glance), or 'risky' (breaking change that touches this repo — do not merge without addressing).",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          module: { type: 'string' },
+          impact: { type: 'string' },
+          affected: { type: 'boolean' },
+          callSite: { type: 'string' },
+          verdict: { type: 'string', enum: ['safe', 'review', 'risky'] },
+        },
+        required: ['module', 'impact', 'affected', 'verdict'],
+        additionalProperties: false,
+      },
+    },
+    {
       name: 'finish_review',
       description: 'Finish the review after all required changes have been requested.',
       inputSchema: {
@@ -74,6 +90,11 @@ function callCollectorTool(name, args) {
     const scope = parseScopeValue(args, 0);
     appendCollectorRecord({ type: 'scope', scope });
     return { content: [{ type: 'text', text: 'Review scope recorded.' }] };
+  }
+  if (name === 'assess_dependency') {
+    const assessment = parseAssessmentValue(args, 0);
+    appendCollectorRecord({ type: 'assessment', assessment });
+    return { content: [{ type: 'text', text: 'Dependency assessment recorded.' }] };
   }
   if (name === 'finish_review') {
     if (!args || typeof args.summary !== 'string' || args.summary.trim().length === 0) {
