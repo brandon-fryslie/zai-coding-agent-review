@@ -159,9 +159,13 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focu
   // blocking finding a real break still requires (that is what drives the merge verdict). [LAW:no-silent-failure]
   const ownsBumpedGoMod = dependencyBumps.length > 0
     && scopeFiles.some(f => f === 'go.mod' || f.endsWith('/go.mod'));
+  // [FRAMING:representation] List DISTINCT module paths: when two go.mod files bump the same module the raw
+  // map repeats it, and "EACH ... exactly ONCE" turns ambiguous. dedupeAssessments would still collapse a
+  // double call, but the directive should name each module once.
+  const bumpedModules = [...new Set(dependencyBumps.map(b => b.modulePath))];
   const dependencyAssessBlock = ownsBumpedGoMod
     ? `\n    You own this PR's go.mod bump. For EACH of these bumped modules, call ${toolNames.assessDependency} exactly
-    ONCE, copying the module path VERBATIM: ${dependencyBumps.map(b => b.modulePath).join(', ')}. Provide your
+    ONCE, copying the module path VERBATIM: ${bumpedModules.join(', ')}. Provide your
     merge-risk judgment as fields: 'impact' (ONE line synthesizing what materially changed upstream from the
     commit context above — not a list of commits), 'affected' (true/false — does THIS repo's own usage break or
     change?), 'callSite' (the file or file:line where, when affected — omit when not), and 'verdict' ('safe' =

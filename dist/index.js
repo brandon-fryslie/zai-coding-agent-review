@@ -33528,10 +33528,13 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     summary: composeSummary(scopes, workerResults),
     findings: dedupeFindings(workerResults.flatMap(r => r.findings)),
     // [LAW:dataflow-not-control-flow] Dependency assessments aggregate exactly like findings — a flatMap
-    // over the workers plus one dedup. Only the worker that owns the bumped go.mod is asked to assess, so
-    // this is usually one author's list; dedupeAssessments (keyed by module) collapses the multi-go.mod
-    // case. A non-dependency PR yields [] by construction — an empty value, never a branch. [LAW:no-silent-failure]
-    assessments: dedupeAssessments(workerResults.flatMap(r => r.assessments || [])),
+    // over the workers plus one dedup — and with the SAME shape: no `|| []` fallback, because every worker
+    // result carries an `assessments` array (readCollectedReview always returns one), exactly as it carries
+    // `findings`. [LAW:one-type-per-behavior] guarding only this record kind would let an out-of-contract
+    // adapter that omits the field degrade the whole section to "unassessed" silently; the bare access makes
+    // that surface as a loud crash instead. [LAW:no-silent-failure] Only the go.mod-owning worker records
+    // any; dedupeAssessments (keyed by module) collapses the multi-go.mod case. Non-dependency PR → [].
+    assessments: dedupeAssessments(workerResults.flatMap(r => r.assessments)),
     usage: sumUsage([scoutResult.usage, ...workerResults.map(r => r.usage)]),
   };
 }
@@ -33905,9 +33908,13 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focu
   // blocking finding a real break still requires (that is what drives the merge verdict). [LAW:no-silent-failure]
   const ownsBumpedGoMod = dependencyBumps.length > 0
     && scopeFiles.some(f => f === 'go.mod' || f.endsWith('/go.mod'));
+  // [FRAMING:representation] List DISTINCT module paths: when two go.mod files bump the same module the raw
+  // map repeats it, and "EACH ... exactly ONCE" turns ambiguous. dedupeAssessments would still collapse a
+  // double call, but the directive should name each module once.
+  const bumpedModules = [...new Set(dependencyBumps.map(b => b.modulePath))];
   const dependencyAssessBlock = ownsBumpedGoMod
     ? `\n    You own this PR's go.mod bump. For EACH of these bumped modules, call ${toolNames.assessDependency} exactly
-    ONCE, copying the module path VERBATIM: ${dependencyBumps.map(b => b.modulePath).join(', ')}. Provide your
+    ONCE, copying the module path VERBATIM: ${bumpedModules.join(', ')}. Provide your
     merge-risk judgment as fields: 'impact' (ONE line synthesizing what materially changed upstream from the
     commit context above — not a list of commits), 'affected' (true/false — does THIS repo's own usage break or
     change?), 'callSite' (the file or file:line where, when affected — omit when not), and 'verdict' ('safe' =
@@ -34458,12 +34465,20 @@ function parseAssessmentValue(assessment, index) {
 // assessed once. The dependency note reaches every worker, but the assess directive is gated to the ONE
 // worker that owns the bumped go.mod (buildReviewInput), so single authorship is the common case; this is
 // the safety net for the multi-go.mod PR (several workers each own a go.mod) and any model over-eagerness.
-// First-seen wins (a Map keeps a key's original position), so the aggregate order is stable, matching
-// dedupeFindings' discipline. [LAW:single-enforcer] one dedup rule, expressed once.
+//
+// [LAW:one-type-per-behavior] Conflict resolution mirrors dedupeFindings' severity merge, which is the same
+// behavior on the other record kind: two workers assessing one module with different verdicts must not let
+// arrival order (nondeterministic under concurrency — [LAW:no-ambient-temporal-coupling]) pick the winner.
+// The MORE CAUTIOUS verdict wins — a masked 'safe' over a real 'risky' would mislead the reader even though
+// the merge gate is findings-driven. ASSESSMENT_VERDICTS is ordered by ascending caution, so its index IS
+// the caution rank — no second table to drift. [LAW:one-source-of-truth] First-seen position is preserved
+// (a Map keeps a key's original slot when its value is replaced), matching dedupeFindings.
 function dedupeAssessments(assessments) {
+  const caution = a => ASSESSMENT_VERDICTS.indexOf(a.verdict);
   const byModule = new Map();
   for (const a of assessments) {
-    if (!byModule.has(a.module)) byModule.set(a.module, a);
+    const existing = byModule.get(a.module);
+    if (!existing || caution(a) > caution(existing)) byModule.set(a.module, a);
   }
   return [...byModule.values()];
 }

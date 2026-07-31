@@ -271,6 +271,7 @@ describe('runMultiScopePass — spawn-level transient resilience', () => {
         return {
           summary: `sum-${scope.name}`,
           findings: [{ path: `${scope.name}.js`, line: 1, body: `bug in ${scope.name}` }],
+          assessments: [],
           usage: null,
         };
       },
@@ -345,7 +346,7 @@ describe('runMultiScope — reasoningTier fold onto the chain', () => {
       async produceReview({ config, buildPromptFor }) {
         seen.push(config.reasoning);
         if (buildPromptFor({}) === 'SCOUT') return { summary: 'ctx', findings: [], scopes: SCOPES, usage: null };
-        return { summary: 'sum', findings: [], usage: null };
+        return { summary: 'sum', findings: [], assessments: [], usage: null };
       },
     };
     return { get: () => adapter };
@@ -394,7 +395,7 @@ describe('runMultiScope — reasoningTier fold onto the chain', () => {
         async produceReview({ config, buildPromptFor }) {
           seen.push(config.reasoning);
           if (buildPromptFor({}) === 'SCOUT') return { summary: 'ctx', findings: [], scopes: SCOPES, usage: null };
-          return { summary: 'sum', findings: [], usage: null };
+          return { summary: 'sum', findings: [], assessments: [], usage: null };
         },
       },
     };
@@ -514,7 +515,7 @@ describe('runMultiScopePass — scout coverage sweep', () => {
         const prompt = buildPromptFor({});
         if (prompt === 'SCOUT') return { summary: 'ctx', findings: [], scopes: scoutScopes, usage: null };
         seen.push(prompt);
-        return { summary: 'ok', findings: [], usage: null };
+        return { summary: 'ok', findings: [], assessments: [], usage: null };
       },
     };
     return { registry: { get: () => adapter }, seen };
@@ -729,6 +730,15 @@ describe('buildReviewInput dependency assess directive', () => {
   test('no bumps means no directive even for a go.mod owner (a non-dependency PR touching go.mod)', () => {
     const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, '', ['go.mod'], '', []);
     assert.doesNotMatch(prompt, new RegExp(`call ${TOOL_NAMES.assessDependency}`));
+  });
+
+  test('the same module bumped in two go.mod files is listed once (distinct modules), not repeated', () => {
+    const dupBumps = [
+      { modulePath: 'github.com/a/b', from: 'v1.0.0', to: 'v1.1.0', resolved: true },
+      { modulePath: 'github.com/a/b', from: 'v1.0.0', to: 'v1.2.0', resolved: true },
+    ];
+    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, '', ['go.mod'], 'the note', dupBumps);
+    assert.match(prompt, /VERBATIM: github\.com\/a\/b\./); // exactly one occurrence in the list, no ", github.com/a/b" repeat
   });
 });
 

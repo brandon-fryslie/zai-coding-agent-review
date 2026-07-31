@@ -227,10 +227,13 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     summary: composeSummary(scopes, workerResults),
     findings: dedupeFindings(workerResults.flatMap(r => r.findings)),
     // [LAW:dataflow-not-control-flow] Dependency assessments aggregate exactly like findings — a flatMap
-    // over the workers plus one dedup. Only the worker that owns the bumped go.mod is asked to assess, so
-    // this is usually one author's list; dedupeAssessments (keyed by module) collapses the multi-go.mod
-    // case. A non-dependency PR yields [] by construction — an empty value, never a branch. [LAW:no-silent-failure]
-    assessments: dedupeAssessments(workerResults.flatMap(r => r.assessments || [])),
+    // over the workers plus one dedup — and with the SAME shape: no `|| []` fallback, because every worker
+    // result carries an `assessments` array (readCollectedReview always returns one), exactly as it carries
+    // `findings`. [LAW:one-type-per-behavior] guarding only this record kind would let an out-of-contract
+    // adapter that omits the field degrade the whole section to "unassessed" silently; the bare access makes
+    // that surface as a loud crash instead. [LAW:no-silent-failure] Only the go.mod-owning worker records
+    // any; dedupeAssessments (keyed by module) collapses the multi-go.mod case. Non-dependency PR → [].
+    assessments: dedupeAssessments(workerResults.flatMap(r => r.assessments)),
     usage: sumUsage([scoutResult.usage, ...workerResults.map(r => r.usage)]),
   };
 }

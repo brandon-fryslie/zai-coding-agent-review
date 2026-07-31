@@ -133,12 +133,20 @@ function parseAssessmentValue(assessment, index) {
 // assessed once. The dependency note reaches every worker, but the assess directive is gated to the ONE
 // worker that owns the bumped go.mod (buildReviewInput), so single authorship is the common case; this is
 // the safety net for the multi-go.mod PR (several workers each own a go.mod) and any model over-eagerness.
-// First-seen wins (a Map keeps a key's original position), so the aggregate order is stable, matching
-// dedupeFindings' discipline. [LAW:single-enforcer] one dedup rule, expressed once.
+//
+// [LAW:one-type-per-behavior] Conflict resolution mirrors dedupeFindings' severity merge, which is the same
+// behavior on the other record kind: two workers assessing one module with different verdicts must not let
+// arrival order (nondeterministic under concurrency — [LAW:no-ambient-temporal-coupling]) pick the winner.
+// The MORE CAUTIOUS verdict wins — a masked 'safe' over a real 'risky' would mislead the reader even though
+// the merge gate is findings-driven. ASSESSMENT_VERDICTS is ordered by ascending caution, so its index IS
+// the caution rank — no second table to drift. [LAW:one-source-of-truth] First-seen position is preserved
+// (a Map keeps a key's original slot when its value is replaced), matching dedupeFindings.
 function dedupeAssessments(assessments) {
+  const caution = a => ASSESSMENT_VERDICTS.indexOf(a.verdict);
   const byModule = new Map();
   for (const a of assessments) {
-    if (!byModule.has(a.module)) byModule.set(a.module, a);
+    const existing = byModule.get(a.module);
+    if (!existing || caution(a) > caution(existing)) byModule.set(a.module, a);
   }
   return [...byModule.values()];
 }

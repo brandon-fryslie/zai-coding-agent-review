@@ -240,15 +240,26 @@ describe('parseAssessmentValue', () => {
 });
 
 describe('dedupeAssessments', () => {
-  test('collapses repeat assessments of one module, keeping the first-seen (stable order)', () => {
+  test('collapses repeat assessments of one module to the MOST CAUTIOUS verdict, keeping first-seen position', () => {
     const out = dedupeAssessments([
-      { module: 'github.com/a/b', impact: 'first', affected: false, callSite: null, verdict: 'safe' },
+      { module: 'github.com/a/b', impact: 'safe take', affected: false, callSite: null, verdict: 'safe' },
       { module: 'github.com/c/d', impact: 'other', affected: false, callSite: null, verdict: 'review' },
-      { module: 'github.com/a/b', impact: 'second', affected: true, callSite: 'x', verdict: 'risky' },
+      { module: 'github.com/a/b', impact: 'risky take', affected: true, callSite: 'x.go:1', verdict: 'risky' },
     ]);
     assert.equal(out.length, 2);
-    assert.equal(out[0].impact, 'first'); // first-seen wins
-    assert.deepEqual(out.map(a => a.module), ['github.com/a/b', 'github.com/c/d']);
+    // risky (more cautious) beats the earlier safe — and the whole cautious assessment is what shows.
+    assert.equal(out[0].verdict, 'risky');
+    assert.equal(out[0].impact, 'risky take');
+    assert.deepEqual(out.map(a => a.module), ['github.com/a/b', 'github.com/c/d']); // position preserved
+  });
+
+  test('a later LESS-cautious verdict never downgrades an earlier cautious one', () => {
+    const out = dedupeAssessments([
+      { module: 'github.com/a/b', impact: 'risky', affected: true, callSite: 'x', verdict: 'risky' },
+      { module: 'github.com/a/b', impact: 'safe', affected: false, callSite: null, verdict: 'safe' },
+    ]);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].verdict, 'risky'); // safe-later never masks risky-earlier
   });
 
   test('an empty list is []', () => {
