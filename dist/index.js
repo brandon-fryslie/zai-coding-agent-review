@@ -32072,11 +32072,16 @@ const { runEngine } = __nccwpck_require__(8861);
 // implementation; each engine module supplies its spec.
 //
 // [FRAMING:parts-and-seams] The adapter contract is lifted to the judgment-vs-transport seam:
-// produceReview({config, buildPromptFor, instructionsPath}) -> {summary, findings, usage}. The whole
-// MCP-collector dance (createReviewCollector -> materializeHome -> spawn -> readCollectedReview) is a
-// PRIVATE detail in here — the registry/run.js contract is produceReview, never the subprocess
-// mechanics. A direct-API engine implements produceReview with one HTTPS call and never touches this
-// factory. [LAW:carrying-cost]
+// produceReview({config, buildPromptFor, instructionsPath}) -> {summary, findings, scopes, assessments, usage}.
+// The three record-kind fields are ALWAYS present arrays (empty when the spawn produced none), mirroring
+// readCollectedReview's shape — a scout run fills `scopes`, a worker run fills `findings` and (for the
+// go.mod-owning worker) `assessments`. This is a REQUIRED part of the contract, not optional: the
+// multi-scope aggregator accesses `r.findings`/`r.assessments` with no fallback, so an adapter that omits a
+// field fails loud rather than silently degrading (e.g. every bump rendering "unassessed"). A new engine —
+// including a direct-API one that never touches this factory — must return all five. [LAW:composability]
+// The whole MCP-collector dance (createReviewCollector -> materializeHome -> spawn -> readCollectedReview)
+// is a PRIVATE detail in here — the registry/run.js contract is produceReview, never the subprocess
+// mechanics. [LAW:carrying-cost]
 //
 // [LAW:single-enforcer] Instruction-injection guard: the engine spawns with its working directory
 // set to a fresh ISOLATED temp dir that is NOT an ancestor of the reviewed repo. Every engine
