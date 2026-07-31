@@ -703,17 +703,17 @@ describe('buildReviewInput focus', () => {
   const FILES = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
 
   test('empty focus renders no CONCENTRATE block (the broad whole-diff review)', () => {
-    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT);
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
     assert.doesNotMatch(prompt, /CONCENTRATE THIS REVIEW/);
   });
 
   test('a non-empty focus renders the CONCENTRATE block with the focus text', () => {
-    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, 'cost — src/usage.js');
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, focus: 'cost — src/usage.js' });
     assert.match(prompt, /CONCENTRATE THIS REVIEW on one part of the change: cost — src\/usage\.js/);
   });
 
   test('the focus block orders the worker to report issues found ANYWHERE, not withhold out-of-scope ones', () => {
-    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, 'cost — src/usage.js');
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, focus: 'cost — src/usage.js' });
     // Report everything: a real bug outside the scope is still recorded, dedup happens downstream.
     assert.match(prompt, /if you notice a genuine issue ANYWHERE in the diff, still record it/);
     assert.match(prompt, new RegExp(`still record it with ${TOOL_NAMES.requestChange}`));
@@ -734,23 +734,23 @@ describe('buildReviewInput dependency assess directive', () => {
   const BUMPS = [{ modulePath: 'github.com/a/b', from: 'v1.0.0', to: 'v1.1.0', resolved: true }];
 
   test('the go.mod-owning worker is told to call assess_dependency, naming the exact module', () => {
-    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, '', ['go.mod'], 'the note', BUMPS);
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, scopeFiles: ['go.mod'], dependencyDiffNote: 'the note', dependencyBumps: BUMPS });
     assert.match(prompt, new RegExp(`call ${TOOL_NAMES.assessDependency}`));
     assert.match(prompt, /copying the module path VERBATIM: github\.com\/a\/b/);
   });
 
   test('a worker that does NOT own the go.mod gets no assess directive, even with bumps present', () => {
-    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, '', ['src/other.js'], 'the note', BUMPS);
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, scopeFiles: ['src/other.js'], dependencyDiffNote: 'the note', dependencyBumps: BUMPS });
     assert.doesNotMatch(prompt, new RegExp(`call ${TOOL_NAMES.assessDependency}`));
   });
 
   test('a nested go.mod (tools/go.mod) still triggers the directive for its owner', () => {
-    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, '', ['tools/go.mod'], 'the note', BUMPS);
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, scopeFiles: ['tools/go.mod'], dependencyDiffNote: 'the note', dependencyBumps: BUMPS });
     assert.match(prompt, new RegExp(`call ${TOOL_NAMES.assessDependency}`));
   });
 
   test('no bumps means no directive even for a go.mod owner (a non-dependency PR touching go.mod)', () => {
-    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, '', ['go.mod'], '', []);
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, scopeFiles: ['go.mod'], dependencyDiffNote: '', dependencyBumps: [] });
     assert.doesNotMatch(prompt, new RegExp(`call ${TOOL_NAMES.assessDependency}`));
   });
 
@@ -759,7 +759,7 @@ describe('buildReviewInput dependency assess directive', () => {
       { modulePath: 'github.com/a/b', from: 'v1.0.0', to: 'v1.1.0', resolved: true },
       { modulePath: 'github.com/a/b', from: 'v1.0.0', to: 'v1.2.0', resolved: true },
     ];
-    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, '', ['go.mod'], 'the note', dupBumps);
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, scopeFiles: ['go.mod'], dependencyDiffNote: 'the note', dependencyBumps: dupBumps });
     assert.match(prompt, /VERBATIM: github\.com\/a\/b\./); // exactly one occurrence in the list, no ", github.com/a/b" repeat
   });
 });
@@ -772,7 +772,7 @@ describe('buildReviewInput dependency assess directive', () => {
 describe('buildReviewInput surfaces unshowable files', () => {
   test('a patchless file appears in the block with a read-in-full instruction and no diff fence', () => {
     const files = [{ filename: 'src/big.js', status: 'modified' }]; // no `patch` — GitHub omitted it
-    const { prompt } = buildReviewInput(files, 0, TOOL_NAMES, REPO_ROOT);
+    const { prompt } = buildReviewInput({ files, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
     assert.match(prompt, /could not be shown \(too large or binary/);
     assert.match(prompt, new RegExp(`${REPO_ROOT}/src/big\\.js`));
     assert.match(prompt, new RegExp(`report any issues via the ${TOOL_NAMES.finishReview} summary`));
@@ -786,14 +786,14 @@ describe('buildReviewInput surfaces unshowable files', () => {
       { filename: 'src/overbudget.js', status: 'modified', patch: big },
     ];
     // A tiny budget forces the patchable file to be skipped too.
-    const { prompt } = buildReviewInput(files, 50, TOOL_NAMES, REPO_ROOT);
+    const { prompt } = buildReviewInput({ files, maxDiffChars: 50, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
     assert.match(prompt, new RegExp(`${REPO_ROOT}/src/patchless\\.js`));
     assert.match(prompt, new RegExp(`${REPO_ROOT}/src/overbudget\\.js`));
   });
 
   test('a fully-shown diff renders no unshowable block', () => {
     const files = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
-    const { prompt } = buildReviewInput(files, 0, TOOL_NAMES, REPO_ROOT);
+    const { prompt } = buildReviewInput({ files, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
     assert.doesNotMatch(prompt, /could not be shown/);
   });
 });
@@ -809,7 +809,7 @@ describe('shipped prompts carry no reviewed-repo layout', () => {
   // be baked-in template text — never echoed input. (This is the 598.3 discipline: test the template by
   // feeding it inputs free of what you are hunting.)
   const NEUTRAL_FILES = [{ filename: 'lib/thing.go', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+x := 1' }];
-  const review = buildReviewInput(NEUTRAL_FILES, 0, TOOL_NAMES, REPO_ROOT).prompt;
+  const review = buildReviewInput({ files: NEUTRAL_FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT }).prompt;
   const prScout = buildPrScoutInput({ changedPaths: ['lib/thing.go', 'app/main.rb'], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT }).prompt;
   const repoScout = buildRepoScoutInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT }).prompt;
 

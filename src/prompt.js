@@ -87,7 +87,7 @@ function reviewCharter(toolNames) {
 // or the DEPENDENCY_DIFF input off) renders nothing; a non-empty note (src/dependency-diff.js)
 // appends the fetched upstream-change context after the diff, same placement as the unshowable-
 // files note below. [LAW:dataflow-not-control-flow]
-function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = [], dependencyDiffNote = '', dependencyBumps = []) {
+function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = [], dependencyDiffNote = '', dependencyBumps = [] }) {
   const patchableFiles = files.filter(f => f.patch);
   const includedDiffs = [];
   const includedFiles = [];
