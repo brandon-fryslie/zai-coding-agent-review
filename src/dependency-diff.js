@@ -270,12 +270,31 @@ function semverMagnitude(from, to) {
   return 'unknown';
 }
 
+// A real release tag is a strict semver ref: `vX.Y.Z` with an optional pre-release tail of the limited
+// tag alphabet. This is a TYPE constraint, not a display filter — the tag flows into a constructed release
+// URL, and `from`/`to` come from the go.mod diff (untrusted: GO_MOD_REQUIRE_LINE's `v\d\S*` admits `<`,
+// `>`, `)`), so a crafted version must be UNABLE to smuggle markup or a link-breaking `)` into that URL.
+// [LAW:types-are-the-program] the guard is the shape, applied once here, not an escape bolted on downstream.
+const SAFE_RELEASE_TAG = /^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+
 // [LAW:one-source-of-truth] A release tag exists only for a real tagged version — a pseudo-version encodes
-// an untagged commit, so it has no release page. The +incompatible suffix is build metadata, not part of
-// the git tag. Returns the tag to link, or null when there is nothing to link.
+// an untagged commit, so it has no release page; a version that is not a strict tag has none either. The
+// +incompatible suffix is build metadata, not part of the git tag. Returns the tag to link, or null.
 function releaseTag(version) {
   const stripped = version.replace(INCOMPATIBLE_SUFFIX, '');
-  return PSEUDO_VERSION_COMMIT.test(stripped) ? null : stripped;
+  if (PSEUDO_VERSION_COMMIT.test(stripped)) return null;
+  return SAFE_RELEASE_TAG.test(stripped) ? stripped : null;
+}
+
+// [LAW:single-enforcer] The ONE escape at the review-body boundary. The dependency section renders into a
+// GitHub review comment as inline HTML (<details>/<summary>) — which GitHub's sanitizer permits structurally
+// — so every dynamic value carried into that HTML or into markdown running-text (not a code span, which
+// GitHub already escapes) MUST be entity-encoded, or untrusted content (an upstream commit message, a
+// crafted go.mod version) could close the collapsible early and inject structure. [FRAMING:representation]
+// the escape matches the rendering context; renderDependencyDiffNote does NOT use this — its output is
+// prompt text wrapped as data, never displayed HTML.
+function escapeHtml(str) {
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // [LAW:one-source-of-truth] The verdict enum owns its glyph, label, and action at THIS one site — exactly
@@ -307,44 +326,55 @@ function renderDependencyReviewSection(summaries, assessments = []) {
   if (!summaries || summaries.length === 0) return '';
   const byModule = new Map(assessments.map(a => [a.module, a]));
 
+  // Collapse internal whitespace AND entity-encode: values on a single <summary> line or in markdown
+  // running-text where a stray newline or a raw `<` would break the collapsible / inject structure.
+  const esc = escapeHtml;
+  const escLine = str => escapeHtml(str.replace(/\s+/g, ' ').trim());
+
   const tally = { safe: 0, review: 0, risky: 0, unresolved: 0, unassessed: 0 };
   const blocks = summaries.map((s) => {
     if (!s.resolved) {
       tally.unresolved++;
-      return `- ${UNRESOLVED_GLYPH} \`${s.modulePath}\` \`${s.from} → ${s.to}\` — upstream not fetched (${s.reason}).`;
+      // modulePath/from/to sit inside backtick code spans — GitHub escapes code-span content itself, so
+      // they render literally and safely without manual encoding. reason is running text → escape it.
+      return `- ${UNRESOLVED_GLYPH} \`${s.modulePath}\` \`${s.from} → ${s.to}\` — upstream not fetched (${esc(s.reason)}).`;
     }
     const magnitude = semverMagnitude(s.from, s.to);
+    // URLs are built from host-owned, shape-constrained parts (owner/repoName from the resolved repo, sha
+    // hex, releaseTag strictly validated, compareUrl from GitHub's API) — a URL context, not HTML text, so
+    // it is not entity-encoded (that would corrupt the link). Only the link TEXT and running text are escaped.
     const commitUrl = sha => `https://github.com/${s.owner}/${s.repoName}/commit/${sha}`;
     const shown = s.commits.slice(0, MAX_COMMITS_SHOWN);
     const commitLines = shown.length > 0
-      ? shown.map(c => `  - [\`${c.sha}\`](${commitUrl(c.sha)}) ${c.message}`).join('\n')
+      ? shown.map(c => `  - [\`${c.sha}\`](${commitUrl(c.sha)}) ${esc(c.message)}`).join('\n')
         + (s.totalCommits > shown.length ? `\n  - …and ${s.totalCommits - shown.length} more (see the full comparison).` : '')
       : '  - (no commits listed)';
     const tag = releaseTag(s.to);
     const releaseLine = tag
-      ? `\n- **Release notes:** [${tag}](https://github.com/${s.owner}/${s.repoName}/releases/tag/${tag})`
+      ? `\n- **Release notes:** [${esc(tag)}](https://github.com/${s.owner}/${s.repoName}/releases/tag/${tag})`
       : '';
+    // Static link TEXT: the from→to versions are already shown (escaped) in the <summary> header, so the
+    // compare link needs no dynamic text — keeping untrusted from/to out of markdown link-text closes the
+    // markdown-metacharacter (`]`, `(`) injection vector that HTML-escaping alone does not cover. [LAW:types-are-the-program]
+    const compareLine = `- **Compare:** [full comparison](${s.compareUrl})`;
+    const codeHead = `<code>${esc(s.modulePath)}</code> <code>${esc(s.from)} → ${esc(s.to)}</code>`;
 
     const assessment = byModule.get(s.modulePath);
     if (!assessment) {
       tally.unassessed++;
-      return `<details>\n<summary>${UNRESOLVED_GLYPH} <code>${s.modulePath}</code> <code>${s.from} → ${s.to}</code> · ${magnitude}</summary>\n\n`
-        + `- **Compare:** [${s.from}...${s.to}](${s.compareUrl})\n`
+      return `<details>\n<summary>${UNRESOLVED_GLYPH} ${codeHead} · ${magnitude}</summary>\n\n`
+        + `${compareLine}\n`
         + `- **Notable commits:**\n${commitLines}${releaseLine}\n`
         + `- _No merge-risk assessment was recorded for this module._\n</details>`;
     }
 
     const v = VERDICT_PRESENTATION[assessment.verdict];
     tally[assessment.verdict]++;
-    // Collapse internal whitespace: the impact rides on a single <summary> line, where a stray newline
-    // would visually close the collapsible early; the call site rides on one list line. This is render
-    // correctness, not a null guard — the values are already present and valid. [LAW:no-defensive-null-guards]
-    const oneLine = str => str.replace(/\s+/g, ' ').trim();
     const repoImpact = assessment.affected
-      ? `Affected — ${oneLine(assessment.callSite || '(call site not named)')}`
+      ? `Affected — ${escLine(assessment.callSite || '(call site not named)')}`
       : 'Not affected.';
-    return `<details>\n<summary>${v.glyph} <code>${s.modulePath}</code> <code>${s.from} → ${s.to}</code> · ${magnitude} · ${oneLine(assessment.impact)}</summary>\n\n`
-      + `- **Compare:** [${s.from}...${s.to}](${s.compareUrl})\n`
+    return `<details>\n<summary>${v.glyph} ${codeHead} · ${magnitude} · ${escLine(assessment.impact)}</summary>\n\n`
+      + `${compareLine}\n`
       + `- **Notable commits:**\n${commitLines}${releaseLine}\n`
       + `- **Impact on this repo:** ${repoImpact}\n`
       + `- **Verdict:** ${v.glyph} ${v.label} — ${v.action}\n</details>`;

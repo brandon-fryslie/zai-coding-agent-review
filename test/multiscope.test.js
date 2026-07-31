@@ -290,6 +290,27 @@ describe('runMultiScopePass — spawn-level transient resilience', () => {
     assert.equal(calls.workers.c, 1);
   });
 
+  test("a worker's dependency assessments reach the aggregated review (they are not dropped at the worker seam)", async () => {
+    // Regression: runScopeWorker once destructured only {summary,findings,usage}, silently dropping the
+    // assessments the adapter returned — every bump then rendered "unassessed". This asserts the CONTRACT
+    // (a worker's assessments survive aggregation), independent of how runScopeWorker forwards them.
+    const adapter = {
+      async produceReview({ buildPromptFor }) {
+        const prompt = buildPromptFor({});
+        if (prompt === 'SCOUT') return { summary: 'ctx', findings: [], scopes: SCOPES, assessments: [], usage: null };
+        const scope = SCOPES.find(s => prompt.includes(`${s.name} — ${s.focus}`));
+        // Only scope 'b' owns the go.mod bump and records an assessment; the others record none.
+        const assessments = scope.name === 'b'
+          ? [{ module: 'github.com/a/b', impact: 'adds retries', affected: false, callSite: null, verdict: 'safe' }]
+          : [];
+        return { summary: `sum-${scope.name}`, findings: [], assessments, usage: null };
+      },
+    };
+    const review = await runMultiScopePass(passArgs({ get: () => adapter }));
+    assert.equal(review.assessments.length, 1, 'the single worker assessment must survive to the aggregate');
+    assert.deepEqual(review.assessments[0], { module: 'github.com/a/b', impact: 'adds retries', affected: false, callSite: null, verdict: 'safe' });
+  });
+
   test('a transient error that persists past spawn retries propagates loudly — no scope is silently dropped', async () => {
     const alwaysFlaky = {
       async produceReview({ buildPromptFor }) {

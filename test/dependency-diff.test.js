@@ -430,7 +430,7 @@ describe('renderDependencyReviewSection', () => {
 
   test("the expanded body links compare, commits, and release, and states repo impact + verdict", () => {
     const out = renderDependencyReviewSection([resolvedSummary()], [assessment()]);
-    assert.match(out, /\*\*Compare:\*\* \[v1\.7\.0\.\.\.v1\.8\.0\]\(https:\/\/github\.com\/gorilla\/mux\/compare\/v1\.7\.0\.\.\.v1\.8\.0\)/);
+    assert.match(out, /\*\*Compare:\*\* \[full comparison\]\(https:\/\/github\.com\/gorilla\/mux\/compare\/v1\.7\.0\.\.\.v1\.8\.0\)/);
     assert.match(out, /\[`abc123def456`\]\(https:\/\/github\.com\/gorilla\/mux\/commit\/abc123def456\) add context support/);
     assert.match(out, /\*\*Release notes:\*\* \[v1\.8\.0\]\(https:\/\/github\.com\/gorilla\/mux\/releases\/tag\/v1\.8\.0\)/);
     assert.match(out, /\*\*Impact on this repo:\*\* Not affected\./);
@@ -481,6 +481,33 @@ describe('renderDependencyReviewSection', () => {
     const commits = Array.from({ length: 25 }, (_, i) => ({ sha: `sha${i}`.padEnd(12, '0'), message: `commit ${i}` }));
     const out = renderDependencyReviewSection([resolvedSummary({ totalCommits: 25, commits })], [assessment()]);
     assert.match(out, /…and 15 more \(see the full comparison\)\./); // 25 total, 10 shown
+  });
+
+  test('untrusted content rendered into the HTML body is entity-encoded, not injected (impact + commit message)', () => {
+    const out = renderDependencyReviewSection(
+      [resolvedSummary({ commits: [{ sha: 'abc123def456', message: '</summary><details open><summary>gotcha' }] })],
+      [assessment({ impact: 'breaks </summary></details> the layout', affected: true, callSite: '<img src=x>router.go' })],
+    );
+    // The raw structural sequences must NOT appear; their encoded forms must.
+    assert.doesNotMatch(out, /<summary>gotcha/);
+    assert.doesNotMatch(out, /breaks <\/summary>/);
+    assert.match(out, /breaks &lt;\/summary&gt;&lt;\/details&gt; the layout/);
+    assert.match(out, /&lt;\/summary&gt;&lt;details open&gt;&lt;summary&gt;gotcha/);
+    assert.match(out, /&lt;img src=x&gt;router\.go/);
+    // Exactly one opening <summary> tag survives (ours) — the injected ones are encoded away.
+    assert.equal((out.match(/<summary>/g) || []).length, 1);
+  });
+
+  test('a crafted version string is HTML-escaped in the header and cannot become a release URL', () => {
+    const out = renderDependencyReviewSection(
+      [resolvedSummary({ to: 'v1.8.0<script>' })],
+      [assessment({ verdict: 'review' })],
+    );
+    assert.doesNotMatch(out, /Release notes:/);       // not a strict tag → no release URL built from it
+    assert.doesNotMatch(out, /v1\.8\.0<script>/);     // raw markup never reaches the body
+    assert.match(out, /v1\.8\.0&lt;script&gt;/);      // escaped inside the <code> header
+    // The compare link text is static, so a `]`/`(` in a version can't break the markdown link either.
+    assert.match(out, /\[full comparison\]/);
   });
 
   test('the roll-up tallies every non-zero bucket across mixed modules', () => {

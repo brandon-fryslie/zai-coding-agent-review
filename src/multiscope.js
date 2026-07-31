@@ -117,9 +117,13 @@ async function runScopeWorker({ scope, context, material, spawn, log }) {
   // the material threads scope.files into the read instruction. Repo material ignores it (no diff).
   const buildPromptFor = (toolNames) => material.buildWorkerPrompt(focusText, toolNames, scope.files);
   log(`scope '${scope.name}' starting…`);
-  const { summary, findings, usage } = await spawn(buildPromptFor, `scope '${scope.name}'`);
+  // [LAW:dataflow-not-control-flow] Every record kind the spawn produced flows through this seam
+  // unbroken — findings AND dependency assessments (the go.mod-owning worker's per-module judgments).
+  // Dropping assessments here would silently strip the whole feature: the aggregation's `|| []` fallback
+  // would fire on every worker and every bump would render "unassessed". [LAW:no-silent-failure]
+  const { summary, findings, assessments, usage } = await spawn(buildPromptFor, `scope '${scope.name}'`);
   log(`scope '${scope.name}' done — ${findings.length} finding(s)`);
-  return { name: scope.name, summary, findings, usage };
+  return { name: scope.name, summary, findings, assessments, usage };
 }
 
 // [LAW:effects-at-boundaries] Pure: given the scout's planned scopes and the changed paths the plan was
