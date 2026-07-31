@@ -22,6 +22,7 @@ const TOOL_NAMES = {
   requestChange: 'mcp__review_collector__request_change',
   finishReview: 'mcp__review_collector__finish_review',
   addScope: 'mcp__review_collector__add_scope',
+  assessDependency: 'mcp__review_collector__assess_dependency',
 };
 const REPO_ROOT = '/home/runner/work/acme/acme';
 
@@ -676,6 +677,37 @@ describe('buildReviewInput focus', () => {
     // The old suppression sentence must be gone — it is what taught the model to self-censor.
     assert.doesNotMatch(prompt, /only flag issues that belong to that part/);
     assert.doesNotMatch(prompt, /Other parts are reviewed separately/);
+  });
+});
+
+// ── buildReviewInput dependency assess directive — gated on owning the bumped go.mod ──────────────
+// [LAW:dataflow-not-control-flow] The assess directive is a VALUE rendered from scopeFiles + the bump
+// list: only the ONE worker whose assigned files include the bumped go.mod is asked to assess, so a
+// single author records each module's judgment. Every other worker — and every non-dependency PR —
+// renders nothing.
+describe('buildReviewInput dependency assess directive', () => {
+  const FILES = [{ filename: 'go.mod', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+require github.com/a/b v1.1.0' }];
+  const BUMPS = [{ modulePath: 'github.com/a/b', from: 'v1.0.0', to: 'v1.1.0', resolved: true }];
+
+  test('the go.mod-owning worker is told to call assess_dependency, naming the exact module', () => {
+    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, '', ['go.mod'], 'the note', BUMPS);
+    assert.match(prompt, new RegExp(`call ${TOOL_NAMES.assessDependency}`));
+    assert.match(prompt, /copying the module path VERBATIM: github\.com\/a\/b/);
+  });
+
+  test('a worker that does NOT own the go.mod gets no assess directive, even with bumps present', () => {
+    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, '', ['src/other.js'], 'the note', BUMPS);
+    assert.doesNotMatch(prompt, new RegExp(`call ${TOOL_NAMES.assessDependency}`));
+  });
+
+  test('a nested go.mod (tools/go.mod) still triggers the directive for its owner', () => {
+    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, '', ['tools/go.mod'], 'the note', BUMPS);
+    assert.match(prompt, new RegExp(`call ${TOOL_NAMES.assessDependency}`));
+  });
+
+  test('no bumps means no directive even for a go.mod owner (a non-dependency PR touching go.mod)', () => {
+    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, '', ['go.mod'], '', []);
+    assert.doesNotMatch(prompt, new RegExp(`call ${TOOL_NAMES.assessDependency}`));
   });
 });
 

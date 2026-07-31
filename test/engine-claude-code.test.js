@@ -58,7 +58,7 @@ describe('buildCommand — canonical claude-code args', () => {
       '--tools',
       'Read,Grep,Glob',
       '--allowedTools',
-      'Read,Grep,Glob,mcp__review_collector__request_change,mcp__review_collector__finish_review,mcp__review_collector__add_scope',
+      'Read,Grep,Glob,mcp__review_collector__request_change,mcp__review_collector__finish_review,mcp__review_collector__add_scope,mcp__review_collector__assess_dependency',
       '--disallowedTools',
       'Bash,Edit,Write,WebFetch,WebSearch',
       '--mcp-config',

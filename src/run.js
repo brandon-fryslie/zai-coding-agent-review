@@ -15,7 +15,7 @@ const { parseDailyBudgetUsd, defaultBudgetCandidates, chooseProfile, effectiveRo
 const { assessDifficulty } = require('./difficulty');
 const { difficultyCandidates, parseDifficultyScaling } = require('./difficulty-policy');
 const { readSpentToday, appendCost } = require('./ledger');
-const { parseDependencyDiffFlag, parseGoModBumps, fetchUpstreamChangeSummary, renderDependencyDiffNote } = require('./dependency-diff');
+const { parseDependencyDiffFlag, parseGoModBumps, fetchUpstreamChangeSummary, renderDependencyReviewSection } = require('./dependency-diff');
 const { renderCostLine, costWarning, costMarker } = require('./usage');
 const { renderRepoReport } = require('./report');
 const registry = require('./engine/registry');
@@ -229,14 +229,16 @@ const MAX_DEPENDENCY_BUMPS_FETCHED = 8;
 
 // [LAW:effects-at-boundaries] The dependency-diff boundary: parses go.mod's OWN diff for version
 // bumps and fetches each bumped module's upstream change via the trusted host's octokit client —
-// the reviewing engine never makes this call itself (src/dependency-diff.js). Off by default
-// (dependencyDiffOn=false) is byte-identical to before this feature: no go.mod scan, no fetch, ''
-// flows through buildPrMaterial unchanged. [LAW:no-silent-failure] a per-bump fetch failure (bad
-// ref, unresolvable module, rate limit) is carried as `resolved: false` and rendered into the note
-// rather than thrown — one unreachable upstream must never abort the whole review. A bump beyond
-// MAX_DEPENDENCY_BUMPS_FETCHED is the same shape: not fetched, but reported as such, not dropped.
-async function resolveDependencyDiffNote(octokit, filteredFiles, dependencyDiffOn) {
-  if (!dependencyDiffOn) return '';
+// the reviewing engine never makes this call itself (src/dependency-diff.js). Returns the STRUCTURED
+// summaries (the one source both renderings derive from — the prompt note via renderDependencyDiffNote,
+// the posted-review section via renderDependencyReviewSection). [LAW:one-source-of-truth] Off by default
+// (dependencyDiffOn=false) is byte-identical to before this feature: no go.mod scan, no fetch, [] flows
+// through unchanged. [LAW:no-silent-failure] a per-bump fetch failure (bad ref, unresolvable module,
+// rate limit) is carried as `resolved: false` rather than thrown — one unreachable upstream must never
+// abort the whole review. A bump beyond MAX_DEPENDENCY_BUMPS_FETCHED is the same shape: not fetched, but
+// reported as such, not dropped.
+async function resolveDependencySummaries(octokit, filteredFiles, dependencyDiffOn) {
+  if (!dependencyDiffOn) return [];
   // A monorepo can carry more than one go.mod (nested modules, e.g. tools/go.mod) — every one of
   // them is in scope, not just the root file, so a bump in a nested module is never silently skipped.
   // A vendored go.mod (vendor/.../go.mod) is excluded: it describes the VENDORED dependency's own
@@ -244,9 +246,9 @@ async function resolveDependencyDiffNote(octokit, filteredFiles, dependencyDiffO
   const goMods = filteredFiles.filter(f => f.patch
     && (f.filename === 'go.mod' || f.filename.endsWith('/go.mod'))
     && !f.filename.startsWith('vendor/'));
-  if (goMods.length === 0) return '';
+  if (goMods.length === 0) return [];
   const bumps = goMods.flatMap(f => parseGoModBumps(f.patch));
-  if (bumps.length === 0) return '';
+  if (bumps.length === 0) return [];
   const toFetch = bumps.slice(0, MAX_DEPENDENCY_BUMPS_FETCHED);
   const skipped = bumps.slice(MAX_DEPENDENCY_BUMPS_FETCHED).map(b => ({
     ...b, resolved: false, reason: `upstream context not fetched — this PR bumps more than ${MAX_DEPENDENCY_BUMPS_FETCHED} modules`,
@@ -260,7 +262,7 @@ async function resolveDependencyDiffNote(octokit, filteredFiles, dependencyDiffO
       ? `Dependency diff: ${s.modulePath} ${s.from} → ${s.to} — ${s.totalCommits} upstream commit(s) via github.com/${s.owner}/${s.repoName}.`
       : `Dependency diff: ${s.modulePath} ${s.from} → ${s.to} — ${s.reason}.`);
   }
-  return renderDependencyDiffNote(summaries);
+  return summaries;
 }
 
 // PR-diff review: fetch the PR, gate forks, build the diff material + anchors, run the engine
@@ -482,8 +484,8 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
   // produceReview) owns retry timing; the whole scout→workers pass is one attempt per config.
   const anchorInput = buildReviewInput(filteredFiles, maxDiffChars, registry.get(chain[0].engine).toolNames, REVIEWED_REPO_ROOT);
   const anchors = buildReviewAnchors(anchorInput.files);
-  const dependencyDiffNote = await resolveDependencyDiffNote(octokit, filteredFiles, dependencyDiffOn);
-  const material = buildPrMaterial({ files: filteredFiles, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencyDiffNote });
+  const dependencySummaries = await resolveDependencySummaries(octokit, filteredFiles, dependencyDiffOn);
+  const material = buildPrMaterial({ files: filteredFiles, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencySummaries });
 
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
@@ -501,10 +503,14 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
     core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
   }
 
+  // [LAW:one-source-of-truth] The dependency section is assembled once here, at the sink, from the SAME
+  // structured summaries the prompt note derived from — now enriched by the workers' per-module
+  // assessments. '' for a non-dependency PR, so the posted body is byte-identical to before. [LAW:dataflow-not-control-flow]
+  const dependencySection = renderDependencyReviewSection(dependencySummaries, review.assessments);
   const footer = buildReviewFooter(review.usage, configUsed, prior.cost);
   await submitReview(
     reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
-    { summary: review.summary, findings: anchored, unanchored },
+    { summary: review.summary, findings: anchored, unanchored, dependencySection },
     Boolean(reviewToken), transport, footer,
   );
 
@@ -611,4 +617,4 @@ async function run() {
   }
 }
 
-module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencyDiffNote, MAX_DEPENDENCY_BUMPS_FETCHED };
+module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, MAX_DEPENDENCY_BUMPS_FETCHED };

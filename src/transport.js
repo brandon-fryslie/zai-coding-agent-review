@@ -172,7 +172,12 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   const event = reviewEvent(requestsChanges, canApprove, transport);
   const verdict = requestsChanges ? REQUEST_CHANGES_MESSAGE : APPROVED_MESSAGE;
   const footer = attributionFooter ? `\n\n${attributionFooter}` : '';
-  const body = `## ${reviewerName}\n\n${review.summary}${renderUnanchoredSection(unanchored)}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
+  // [LAW:dataflow-not-control-flow] The dependency section is a VALUE prepended to the summary: a
+  // dependency-bump PR leads with its scannable roll-up + per-module breakdown; every other PR carries
+  // '' and the body is byte-identical to before. The section is assembled host-side in run.js (from the
+  // structured summaries + the model's assessments); this sink only places it. [LAW:single-enforcer]
+  const dependencySection = review.dependencySection ? `${review.dependencySection}\n\n` : '';
+  const body = `## ${reviewerName}\n\n${dependencySection}${review.summary}${renderUnanchoredSection(unanchored)}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
   const comments = review.findings.map(finding => transport.toComment({ ...finding, body: severityTaggedBody(finding) }));
 
   // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.

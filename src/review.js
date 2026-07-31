@@ -83,6 +83,66 @@ function parseScopeValue(scope, index) {
   return { name: name.trim(), focus: focus.trim(), files };
 }
 
+// [LAW:types-are-the-program] A dependency assessment is the same kind of typed, schema-validated
+// record as a finding or a scope: the model's per-module judgment about a resolved go.mod bump, recorded
+// through the assess_dependency collector tool (never parsed from prose). The HOST owns every structural
+// fact — module, from→to, magnitude, and the compare/commit/release links — so this record carries ONLY
+// what the host cannot derive: the model's judgment. [LAW:one-source-of-truth]
+//   - module: which bump this judges (matched back to a host-owned summary by exact module path).
+//   - impact: the one-line synthesis of what materially changed upstream — the headline, not a commit dump.
+//   - affected: does THIS repo's own usage break/change? A required boolean, so "we didn't check" can never
+//     masquerade as "not affected" — the model must commit to a call. [LAW:no-silent-failure]
+//   - callSite: where, when affected. Optional string: a genuine domain optional (there is no call site to
+//     name when affected is false), so its absence is a value the renderer handles, not a guard. When
+//     affected is true it SHOULD be named; a missing one degrades to an explicit "(call site not named)"
+//     rather than failing the whole review. [LAW:no-defensive-null-guards]
+//   - verdict: the merge-risk call, a closed enum — it owns its glyph and action string at the one render
+//     site, exactly as a finding's severity owns its tag (severityTaggedBody). The verdict is PRESENTATION;
+//     the actual merge gate stays driven by blocking findings, so a lenient verdict can never silently
+//     downgrade a real blocker. [LAW:single-enforcer]
+const ASSESSMENT_VERDICTS = ['safe', 'review', 'risky'];
+
+function parseAssessmentValue(assessment, index) {
+  if (!assessment || typeof assessment !== 'object' || Array.isArray(assessment)) {
+    throw new Error(`Review collector assessment ${index + 1} is not an object.`);
+  }
+  const module = assessment.module;
+  if (typeof module !== 'string' || module.trim().length === 0) {
+    throw new Error(`Review collector assessment ${index + 1} has an invalid module.`);
+  }
+  const impact = assessment.impact;
+  if (typeof impact !== 'string' || impact.trim().length === 0) {
+    throw new Error(`Review collector assessment ${index + 1} ('${module.trim()}') has an invalid impact.`);
+  }
+  if (typeof assessment.affected !== 'boolean') {
+    throw new Error(`Review collector assessment ${index + 1} ('${module.trim()}') has an invalid affected (expected boolean).`);
+  }
+  const verdict = assessment.verdict;
+  if (!ASSESSMENT_VERDICTS.includes(verdict)) {
+    throw new Error(`Review collector assessment ${index + 1} ('${module.trim()}') has an invalid verdict (expected ${ASSESSMENT_VERDICTS.map(v => `'${v}'`).join(', ')}).`);
+  }
+  // callSite is a genuine optional: absent/blank collapses to null (no call site to name), a value the
+  // renderer handles — never a guard skipping work. [LAW:no-defensive-null-guards]
+  const callSite = typeof assessment.callSite === 'string' && assessment.callSite.trim().length > 0
+    ? assessment.callSite.trim()
+    : null;
+  return { module: module.trim(), impact: impact.trim(), affected: assessment.affected, callSite, verdict };
+}
+
+// [LAW:one-source-of-truth] "The same assessed module": keyed on the module path alone — a module is
+// assessed once. The dependency note reaches every worker, but the assess directive is gated to the ONE
+// worker that owns the bumped go.mod (buildReviewInput), so single authorship is the common case; this is
+// the safety net for the multi-go.mod PR (several workers each own a go.mod) and any model over-eagerness.
+// First-seen wins (a Map keeps a key's original position), so the aggregate order is stable, matching
+// dedupeFindings' discipline. [LAW:single-enforcer] one dedup rule, expressed once.
+function dedupeAssessments(assessments) {
+  const byModule = new Map();
+  for (const a of assessments) {
+    if (!byModule.has(a.module)) byModule.set(a.module, a);
+  }
+  return [...byModule.values()];
+}
+
 // [LAW:one-source-of-truth] The single definition of "the same recorded finding, up to wording": a
 // body normalized by collapsing whitespace and lowercasing. Both dedup sites — the pre-anchor merge of
 // worker findings (dedupeFindings) and the post-anchor collapse of findings that snapped to one line
@@ -206,4 +266,4 @@ function severityTaggedBody(finding) {
     : finding.body;
 }
 
-module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTaggedBody };
+module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTaggedBody };

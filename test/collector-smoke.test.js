@@ -78,6 +78,7 @@ test('collector smoke: full MCP handshake produces valid records.jsonl', async (
     assert.ok(toolNames.includes('request_change'), 'tools must include request_change');
     assert.ok(toolNames.includes('finish_review'), 'tools must include finish_review');
     assert.ok(toolNames.includes('add_scope'), 'tools must include add_scope');
+    assert.ok(toolNames.includes('assess_dependency'), 'tools must include assess_dependency');
 
     // 3. tools/call request_change
     const changeResp = await rpc(child, 3, 'tools/call', {
@@ -144,6 +145,37 @@ test('collector smoke: a scout records scopes via add_scope and readCollectedRev
     assert.equal(review.scopes[1].focus, 'the run→transport boundary');
     assert.deepEqual(review.scopes[1].files, []); // files omitted → clean empty assignment
     assert.equal(review.summary, 'A code-review GitHub Action.');
+  } finally {
+    child.kill();
+    fs.rmSync(tmpDir, { recursive: true });
+  }
+});
+
+test('collector smoke: a worker records a dependency assessment and readCollectedReview returns it typed', async () => {
+  const { readCollectedReview } = require('../src/collector');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'collector-smoke-'));
+  const recordsPath = path.join(tmpDir, 'records.jsonl');
+
+  const child = spawn(process.execPath, [DIST, '--review-collector-server'], {
+    env: { ...process.env, REVIEW_COLLECTOR_RECORDS: recordsPath },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+
+  try {
+    await rpc(child, 1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'smoke', version: '0.0.1' } });
+
+    // A go.mod-owning worker: one assessment, then finish. callSite omitted (not affected) → null default.
+    const a = await rpc(child, 2, 'tools/call', {
+      name: 'assess_dependency',
+      arguments: { module: 'github.com/gorilla/mux', impact: 'adds context helpers', affected: false, verdict: 'safe' },
+    });
+    assert.ok(!a.error, `assess_dependency must not error: ${JSON.stringify(a.error)}`);
+    await rpc(child, 3, 'tools/call', { name: 'finish_review', arguments: { summary: 'One safe dependency bump.' } });
+
+    const review = readCollectedReview(recordsPath);
+    assert.deepEqual(review.findings, []);
+    assert.equal(review.assessments.length, 1);
+    assert.deepEqual(review.assessments[0], { module: 'github.com/gorilla/mux', impact: 'adds context helpers', affected: false, callSite: null, verdict: 'safe' });
   } finally {
     child.kill();
     fs.rmSync(tmpDir, { recursive: true });

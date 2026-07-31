@@ -56,9 +56,10 @@ function makeCliAdapter(spec) {
             const output = await runEngine(spec, config, prompt, home, collector, cwd);
             const usage = spec.extractUsage(output, config);
             const review = readCollectedReview(collector.recordsPath);
-            // [LAW:dataflow-not-control-flow] scopes (a scout run) and findings (a worker run) are
-            // both carried through as values; the caller uses whichever its pass produced.
-            return { summary: review.summary, findings: review.findings, scopes: review.scopes, usage };
+            // [LAW:dataflow-not-control-flow] scopes (a scout run), findings (a worker run), and
+            // dependency assessments (a worker that reviewed a go.mod bump) are all carried through as
+            // values; the caller uses whichever its pass produced, an empty list otherwise.
+            return { summary: review.summary, findings: review.findings, scopes: review.scopes, assessments: review.assessments, usage };
           } finally {
             fs.rmSync(home, { recursive: true });
           }

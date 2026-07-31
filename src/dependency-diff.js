@@ -248,12 +248,130 @@ function renderDependencyDiffNote(summaries) {
     + `${blocks.join('\n\n')}`;
 }
 
+// [LAW:effects-at-boundaries] Pure: the semver magnitude of a from→to jump, derived from the versions
+// themselves — the HOST owns this fact, the model never states it. Only the leading vX.Y.Z core is
+// compared (the +incompatible suffix and any pseudo/pre-release tail are irrelevant to the magnitude of
+// the release step). A version that is not a plain semver (a pseudo-version, or two that share a core but
+// differ only in an untagged-commit tail) is 'unknown' rather than a forced label — an honest gap, not a
+// guess. [LAW:no-silent-failure]
+function parseSemverCore(version) {
+  const stripped = version.replace(/^v/, '').replace(INCOMPATIBLE_SUFFIX, '');
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(stripped);
+  return m ? { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]) } : null;
+}
+
+function semverMagnitude(from, to) {
+  const a = parseSemverCore(from);
+  const b = parseSemverCore(to);
+  if (!a || !b) return 'unknown';
+  if (a.major !== b.major) return 'major';
+  if (a.minor !== b.minor) return 'minor';
+  if (a.patch !== b.patch) return 'patch';
+  return 'unknown';
+}
+
+// [LAW:one-source-of-truth] A release tag exists only for a real tagged version — a pseudo-version encodes
+// an untagged commit, so it has no release page. The +incompatible suffix is build metadata, not part of
+// the git tag. Returns the tag to link, or null when there is nothing to link.
+function releaseTag(version) {
+  const stripped = version.replace(INCOMPATIBLE_SUFFIX, '');
+  return PSEUDO_VERSION_COMMIT.test(stripped) ? null : stripped;
+}
+
+// [LAW:one-source-of-truth] The verdict enum owns its glyph, label, and action at THIS one site — exactly
+// as a finding's severity owns its tag (severityTaggedBody). Nothing else re-spells a verdict; every render
+// derives from here. The verdict is PRESENTATION — the merge gate is driven by blocking findings, not by
+// this glyph — so a lenient verdict can never silently downgrade a real blocker. [LAW:single-enforcer]
+const VERDICT_PRESENTATION = {
+  safe: { glyph: '✅', label: 'Safe', action: 'routine bump; safe to merge.' },
+  review: { glyph: '⚠️', label: 'Review', action: 'worth a human glance before merge.' },
+  risky: { glyph: '🛑', label: 'Risky', action: 'breaking change affecting this repo — address before merge.' },
+};
+const UNRESOLVED_GLYPH = '⚪';
+const MAX_COMMITS_SHOWN = 10;
+
+// [LAW:effects-at-boundaries] Pure: assemble the posted-review dependency section from the HOST-owned
+// structural summaries (module, from→to, links, commits) ENRICHED by the model-owned per-module
+// assessments (impact, repo impact, verdict). One source (summaries) rendered for the sink here, exactly as
+// renderDependencyDiffNote renders the SAME summaries for the prompt. [LAW:one-source-of-truth]
+//
+// Every summary renders as a VALUE, never a branch that drops one [LAW:dataflow-not-control-flow]:
+//   - unresolved → a plain, non-collapsed line stating upstream wasn't fetched and why (nothing to expand).
+//   - resolved + assessed → a collapsible <details>: the <summary> is the scannable one-liner (verdict glyph
+//     · module · from→to · magnitude · impact); the body carries the compare/commit/release links, the
+//     explicit repo impact, and the verdict with its action.
+//   - resolved but NOT assessed → the same <details> with host facts and an explicit "no assessment recorded"
+//     note, so a model that skipped the assess call degrades loudly, never silently drops the module.
+// '' when there are no bumps at all, so a non-dependency PR's posted summary is byte-identical to before.
+function renderDependencyReviewSection(summaries, assessments = []) {
+  if (!summaries || summaries.length === 0) return '';
+  const byModule = new Map(assessments.map(a => [a.module, a]));
+
+  const tally = { safe: 0, review: 0, risky: 0, unresolved: 0, unassessed: 0 };
+  const blocks = summaries.map((s) => {
+    if (!s.resolved) {
+      tally.unresolved++;
+      return `- ${UNRESOLVED_GLYPH} \`${s.modulePath}\` \`${s.from} → ${s.to}\` — upstream not fetched (${s.reason}).`;
+    }
+    const magnitude = semverMagnitude(s.from, s.to);
+    const commitUrl = sha => `https://github.com/${s.owner}/${s.repoName}/commit/${sha}`;
+    const shown = s.commits.slice(0, MAX_COMMITS_SHOWN);
+    const commitLines = shown.length > 0
+      ? shown.map(c => `  - [\`${c.sha}\`](${commitUrl(c.sha)}) ${c.message}`).join('\n')
+        + (s.totalCommits > shown.length ? `\n  - …and ${s.totalCommits - shown.length} more (see the full comparison).` : '')
+      : '  - (no commits listed)';
+    const tag = releaseTag(s.to);
+    const releaseLine = tag
+      ? `\n- **Release notes:** [${tag}](https://github.com/${s.owner}/${s.repoName}/releases/tag/${tag})`
+      : '';
+
+    const assessment = byModule.get(s.modulePath);
+    if (!assessment) {
+      tally.unassessed++;
+      return `<details>\n<summary>${UNRESOLVED_GLYPH} <code>${s.modulePath}</code> <code>${s.from} → ${s.to}</code> · ${magnitude}</summary>\n\n`
+        + `- **Compare:** [${s.from}...${s.to}](${s.compareUrl})\n`
+        + `- **Notable commits:**\n${commitLines}${releaseLine}\n`
+        + `- _No merge-risk assessment was recorded for this module._\n</details>`;
+    }
+
+    const v = VERDICT_PRESENTATION[assessment.verdict];
+    tally[assessment.verdict]++;
+    // Collapse internal whitespace: the impact rides on a single <summary> line, where a stray newline
+    // would visually close the collapsible early; the call site rides on one list line. This is render
+    // correctness, not a null guard — the values are already present and valid. [LAW:no-defensive-null-guards]
+    const oneLine = str => str.replace(/\s+/g, ' ').trim();
+    const repoImpact = assessment.affected
+      ? `Affected — ${oneLine(assessment.callSite || '(call site not named)')}`
+      : 'Not affected.';
+    return `<details>\n<summary>${v.glyph} <code>${s.modulePath}</code> <code>${s.from} → ${s.to}</code> · ${magnitude} · ${oneLine(assessment.impact)}</summary>\n\n`
+      + `- **Compare:** [${s.from}...${s.to}](${s.compareUrl})\n`
+      + `- **Notable commits:**\n${commitLines}${releaseLine}\n`
+      + `- **Impact on this repo:** ${repoImpact}\n`
+      + `- **Verdict:** ${v.glyph} ${v.label} — ${v.action}\n</details>`;
+  });
+
+  // [LAW:dataflow-not-control-flow] The roll-up is the non-zero tally buckets joined — a value assembled
+  // from counts, never a fixed set of branches. verdict buckets first (the headline), then the two
+  // not-fully-judged buckets.
+  const parts = [];
+  if (tally.safe) parts.push(`${tally.safe} ${VERDICT_PRESENTATION.safe.glyph} safe`);
+  if (tally.review) parts.push(`${tally.review} ${VERDICT_PRESENTATION.review.glyph} review`);
+  if (tally.risky) parts.push(`${tally.risky} ${VERDICT_PRESENTATION.risky.glyph} risky`);
+  if (tally.unassessed) parts.push(`${tally.unassessed} unassessed`);
+  if (tally.unresolved) parts.push(`${tally.unresolved} ${UNRESOLVED_GLYPH} unresolved`);
+  const rollup = `**Dependency review** — ${summaries.length} module(s): ${parts.join(' · ')}`;
+
+  return `${rollup}\n\n${blocks.join('\n\n')}`;
+}
+
 module.exports = {
   parseDependencyDiffFlag,
   parseGoModBumps,
   resolveModuleRepo,
   fetchUpstreamChangeSummary,
   renderDependencyDiffNote,
+  renderDependencyReviewSection,
+  semverMagnitude,
   refFor,
   // Exported for direct unit testing of the SSRF guard; not part of the feature's public surface.
   isPublicAddress,

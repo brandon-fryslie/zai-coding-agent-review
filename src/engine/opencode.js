@@ -26,6 +26,7 @@ const TOOL_NAMES = {
   requestChange: `${MCP_SERVER_NAME}_request_change`,
   finishReview: `${MCP_SERVER_NAME}_finish_review`,
   addScope: `${MCP_SERVER_NAME}_add_scope`,
+  assessDependency: `${MCP_SERVER_NAME}_assess_dependency`,
 };
 
 // [LAW:effects-at-boundaries] Pure: builds the opencode.json object from values, touches no

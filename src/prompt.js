@@ -87,7 +87,7 @@ function reviewCharter(toolNames) {
 // or the DEPENDENCY_DIFF input off) renders nothing; a non-empty note (src/dependency-diff.js)
 // appends the fetched upstream-change context after the diff, same placement as the unshowable-
 // files note below. [LAW:dataflow-not-control-flow]
-function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = [], dependencyDiffNote = '') {
+function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = [], dependencyDiffNote = '', dependencyBumps = []) {
   const patchableFiles = files.filter(f => f.patch);
   const includedDiffs = [];
   const includedFiles = [];
@@ -151,6 +151,26 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focu
     (see the unshowable-files note above) — never silently drop the finding because the anchor isn't available.\n`
     : '';
 
+  // [LAW:dataflow-not-control-flow] The assess directive is rendered by a VALUE, not a mode: it fires only
+  // for the worker whose assigned files include the bumped go.mod, so exactly ONE worker authors the
+  // per-module assessments (dedupeAssessments collapses the multi-go.mod case downstream). Any other
+  // worker — and every non-dependency PR (dependencyBumps === []) — renders nothing. The assessment is the
+  // SUMMARY-level judgment the host folds into the review's dependency section; it does NOT replace the
+  // blocking finding a real break still requires (that is what drives the merge verdict). [LAW:no-silent-failure]
+  const ownsBumpedGoMod = dependencyBumps.length > 0
+    && scopeFiles.some(f => f === 'go.mod' || f.endsWith('/go.mod'));
+  const dependencyAssessBlock = ownsBumpedGoMod
+    ? `\n    You own this PR's go.mod bump. For EACH of these bumped modules, call ${toolNames.assessDependency} exactly
+    ONCE, copying the module path VERBATIM: ${dependencyBumps.map(b => b.modulePath).join(', ')}. Provide your
+    merge-risk judgment as fields: 'impact' (ONE line synthesizing what materially changed upstream from the
+    commit context above — not a list of commits), 'affected' (true/false — does THIS repo's own usage break or
+    change?), 'callSite' (the file or file:line where, when affected — omit when not), and 'verdict' ('safe' =
+    routine, merge freely; 'review' = worth a human glance; 'risky' = a breaking change that touches this repo).
+    The host renders this into the review's dependency summary. It does NOT replace a finding: if the bump breaks
+    a symbol this repo uses, still record that as a 'blocking' ${toolNames.requestChange} (or in the ${toolNames.finishReview}
+    summary if unanchorable), because the assessment's verdict is presentation — findings drive the merge decision.\n`
+    : '';
+
   // [LAW:dataflow-not-control-flow] The set of files to read in full is a VALUE: a non-empty scopeFiles
   // narrows the full read to this worker's assigned files (another worker reads the rest — the read cost
   // is split, not duplicated N times); an empty scopeFiles reads the whole changed set (single-scope PR
@@ -171,7 +191,7 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focu
     prompt: `
 Review this pull request. The repository under review is checked out at ${reviewedRepoRoot}.
     Your working directory is intentionally outside the repository; reach it by that absolute path with your Read tool.
-${focusBlock}${dependencyInstructionBlock}
+${focusBlock}${dependencyInstructionBlock}${dependencyAssessBlock}
     BEFORE judging anything, ${readTargets} The diff shows only the changed hunks; most bugs are only
     visible in the full surrounding context of the function and module — a missing guard, a caller you'd
     break, a value that can't be what this line assumes. Do not form or report any judgment until you

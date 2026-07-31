@@ -1,7 +1,8 @@
 'use strict';
 const { produceReview, retryTransientSpawn, sleep } = require('./failover');
 const { defaultEffortProfile, maxTier } = require('./effort');
-const { dedupeFindings } = require('./review');
+const { dedupeFindings, dedupeAssessments } = require('./review');
+const { renderDependencyDiffNote } = require('./dependency-diff');
 const {
   buildReviewInput,
   buildRepoReviewInput,
@@ -221,6 +222,11 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   return {
     summary: composeSummary(scopes, workerResults),
     findings: dedupeFindings(workerResults.flatMap(r => r.findings)),
+    // [LAW:dataflow-not-control-flow] Dependency assessments aggregate exactly like findings — a flatMap
+    // over the workers plus one dedup. Only the worker that owns the bumped go.mod is asked to assess, so
+    // this is usually one author's list; dedupeAssessments (keyed by module) collapses the multi-go.mod
+    // case. A non-dependency PR yields [] by construction — an empty value, never a branch. [LAW:no-silent-failure]
+    assessments: dedupeAssessments(workerResults.flatMap(r => r.assessments || [])),
     usage: sumUsage([scoutResult.usage, ...workerResults.map(r => r.usage)]),
   };
 }
@@ -258,17 +264,24 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
 // (so every anchor stays valid) with its scope as the CONCENTRATE focus, but reads only its scope's
 // assigned files in full. files/maxDiffChars are the same values run.js uses to build the anchors, so
 // worker findings and anchors share one diff.
-// dependencyDiffNote is the (possibly empty) upstream-change context src/dependency-diff.js fetched
-// for any go.mod bump in this PR; '' is the common case (no bump, or the feature is off) and flows
-// through to buildReviewInput unchanged. [LAW:dataflow-not-control-flow]
-function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencyDiffNote = '' }) {
+// dependencySummaries is the (possibly empty) structured upstream-change context src/dependency-diff.js
+// fetched for any go.mod bump in this PR — the ONE source both the worker prompt (this material) and the
+// posted-review section (run.js) render from. [LAW:one-source-of-truth] The material derives the prompt
+// NOTE from it here (renderDependencyDiffNote) and threads the RESOLVED bumps to the worker so the assess
+// directive can name the exact modules. [] is the common case (no bump, or the feature is off): the note
+// is '' and the bump list empty, flowing through unchanged. [LAW:dataflow-not-control-flow]
+function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySummaries = [] }) {
   const changedPaths = files.map(f => f.filename);
+  const dependencyDiffNote = renderDependencyDiffNote(dependencySummaries);
+  // Only a resolved bump has upstream context to judge; an unresolved one renders as a plain line in the
+  // sink and carries no model assessment, so it is excluded from the assess directive. [LAW:no-silent-failure]
+  const dependencyBumps = dependencySummaries.filter(s => s.resolved);
   return {
     // [LAW:types-are-the-program] The changed-file list is a first-class field of the material, not
     // recovered from the prompt: runMultiScopePass verifies the scout's plan covers it (planScopes).
     changedPaths,
     buildScoutPrompt: (toolNames) => buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot }).prompt,
-    buildWorkerPrompt: (focusText, toolNames, scopeFiles) => buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focusText, scopeFiles, dependencyDiffNote).prompt,
+    buildWorkerPrompt: (focusText, toolNames, scopeFiles) => buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focusText, scopeFiles, dependencyDiffNote, dependencyBumps).prompt,
   };
 }
 

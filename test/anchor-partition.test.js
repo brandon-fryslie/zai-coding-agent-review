@@ -2,7 +2,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { partitionFindings, nearestAnchorableLine, parseFindingValue, severityTaggedBody } = require('../src/review');
+const { partitionFindings, nearestAnchorableLine, parseFindingValue, parseAssessmentValue, dedupeAssessments, severityTaggedBody } = require('../src/review');
 const { submitReview, gitHubTransport, giteaTransport } = require('../src/transport');
 const { buildReviewAnchors } = require('../src/diff');
 
@@ -188,6 +188,71 @@ describe('submitReview — unanchored findings', () => {
     const arg = octokit.calls[0];
     assert.equal(arg.event, 'COMMENT'); // not approvable, no findings
     assert.doesNotMatch(arg.body, /Findings outside the reviewed diff/);
+  });
+});
+
+describe('submitReview — dependency section placement', () => {
+  test('a dependencySection leads the body, before the summary', async () => {
+    const octokit = fakeOctokit();
+    const review = {
+      summary: 'The prose summary.',
+      findings: [],
+      unanchored: [],
+      dependencySection: '**Dependency review** — 1 module(s): 1 ✅ safe\n\n<details>...</details>',
+    };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    const { body } = octokit.calls[0];
+    assert.match(body, /\*\*Dependency review\*\* — 1 module\(s\): 1 ✅ safe/);
+    assert.ok(body.indexOf('Dependency review') < body.indexOf('The prose summary.'), 'the dependency section leads the summary');
+  });
+
+  test('no dependencySection leaves the body byte-identical to a plain review', async () => {
+    const withField = fakeOctokit();
+    const without = fakeOctokit();
+    const base = { summary: 'S.', findings: [], unanchored: [] };
+    await submitReview(withField, 'o', 'r', 1, 'sha', 'Reviewer', { ...base, dependencySection: '' }, true, gitHubTransport([]));
+    await submitReview(without, 'o', 'r', 1, 'sha', 'Reviewer', base, true, gitHubTransport([]));
+    assert.equal(withField.calls[0].body, without.calls[0].body);
+  });
+});
+
+// [LAW:types-are-the-program] The dependency-assessment record is validated at the one boundary, exactly
+// like a finding: the tool schema IS the type, so an illegal judgment is rejected on the way in.
+describe('parseAssessmentValue', () => {
+  test('accepts a well-formed assessment and trims strings', () => {
+    assert.deepEqual(
+      parseAssessmentValue({ module: ' github.com/a/b ', impact: ' adds retries ', affected: true, callSite: ' x.go:1 ', verdict: 'review' }, 0),
+      { module: 'github.com/a/b', impact: 'adds retries', affected: true, callSite: 'x.go:1', verdict: 'review' },
+    );
+  });
+
+  test('a blank/absent callSite collapses to null (a genuine optional, not a guard)', () => {
+    assert.equal(parseAssessmentValue({ module: 'm', impact: 'x', affected: false, verdict: 'safe' }, 0).callSite, null);
+    assert.equal(parseAssessmentValue({ module: 'm', impact: 'x', affected: false, callSite: '   ', verdict: 'safe' }, 0).callSite, null);
+  });
+
+  test('rejects a missing module, blank impact, non-boolean affected, or unknown verdict — naming the position', () => {
+    assert.throws(() => parseAssessmentValue({ impact: 'x', affected: true, verdict: 'safe' }, 0), /assessment 1 has an invalid module/);
+    assert.throws(() => parseAssessmentValue({ module: 'm', impact: '  ', affected: true, verdict: 'safe' }, 1), /assessment 2 \('m'\) has an invalid impact/);
+    assert.throws(() => parseAssessmentValue({ module: 'm', impact: 'x', affected: 'yes', verdict: 'safe' }, 2), /assessment 3 \('m'\) has an invalid affected/);
+    assert.throws(() => parseAssessmentValue({ module: 'm', impact: 'x', affected: true, verdict: 'meh' }, 3), /assessment 4 \('m'\) has an invalid verdict/);
+  });
+});
+
+describe('dedupeAssessments', () => {
+  test('collapses repeat assessments of one module, keeping the first-seen (stable order)', () => {
+    const out = dedupeAssessments([
+      { module: 'github.com/a/b', impact: 'first', affected: false, callSite: null, verdict: 'safe' },
+      { module: 'github.com/c/d', impact: 'other', affected: false, callSite: null, verdict: 'review' },
+      { module: 'github.com/a/b', impact: 'second', affected: true, callSite: 'x', verdict: 'risky' },
+    ]);
+    assert.equal(out.length, 2);
+    assert.equal(out[0].impact, 'first'); // first-seen wins
+    assert.deepEqual(out.map(a => a.module), ['github.com/a/b', 'github.com/c/d']);
+  });
+
+  test('an empty list is []', () => {
+    assert.deepEqual(dedupeAssessments([]), []);
   });
 });
 
