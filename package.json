@@ -1,6 +1,6 @@
 {
   "name": "copirate-code-review-agent",
-  "version": "1.35.0",
+  "version": "1.35.1",
   "description": "AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER",
   "license": "MIT",
   "repository": {

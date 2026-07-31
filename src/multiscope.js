@@ -288,7 +288,7 @@ function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySumm
     // recovered from the prompt: runMultiScopePass verifies the scout's plan covers it (planScopes).
     changedPaths,
     buildScoutPrompt: (toolNames) => buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot }).prompt,
-    buildWorkerPrompt: (focusText, toolNames, scopeFiles) => buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focusText, scopeFiles, dependencyDiffNote, dependencyBumps).prompt,
+    buildWorkerPrompt: (focusText, toolNames, scopeFiles) => buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus: focusText, scopeFiles, dependencyDiffNote, dependencyBumps }).prompt,
   };
 }
 

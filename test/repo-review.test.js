@@ -68,7 +68,7 @@ describe('buildReviewInput repo-root anchoring', () => {
   const FILES = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
 
   test('names the reviewed repo by absolute path and states cwd is outside it', () => {
-    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT);
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
     assert.match(prompt, /checked out at \/home\/runner\/work\/acme\/acme/);
     assert.match(prompt, /working directory is intentionally outside the repository/);
   });
