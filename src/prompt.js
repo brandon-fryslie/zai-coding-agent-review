@@ -204,8 +204,14 @@ ${focusBlock}${dependencyInstructionBlock}${dependencyAssessBlock}
     Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} for each issue you
     find. Every recorded change must use path, line (the displayed LINE value), body, and severity
     ('blocking' if it must change before merge, 'advisory' otherwise — see the charter below). When the
-    review is complete, call ${toolNames.finishReview} exactly once with a concise
-    summary. The collector tools are the only review output channel; you flag issues, you do not fix them.
+    review is complete, call ${toolNames.finishReview} exactly once. The summary is a one-line verdict
+    — what the change does and whether it needs fixing — plus any real problem you could not tie to a
+    specific changed line (state that problem here rather than drop it). It is NOT a place to praise the
+    code, describe what you read, narrate your review, or restate the inline findings — those are already
+    posted as comments via ${toolNames.requestChange}. Do not write giant blocks of text explaining why
+    well-implemented code is good; if the change is clean, the summary is a single short sentence saying
+    so, and nothing more. The collector tools are the only review output channel; you flag issues, you do
+    not fix them.
 
     Flag any problem this change introduces or is now responsible for — a bug or risk in the code this
     diff adds, or in existing code it now relies on or feeds. Pre-existing problems in code this PR does
@@ -251,7 +257,13 @@ Review this repository for what would hurt if it shipped. There is no diff — t
     Call ${toolNames.requestChange} for each issue you find, with path, line (any real line in that file —
     there is no diff grid here, so any line is valid), a body, and a severity ('blocking' if it must change
     before merge, 'advisory' otherwise — see the charter below). When the review is complete, call
-    ${toolNames.finishReview} exactly once with a concise summary. The collector tools are the only review output channel.
+    ${toolNames.finishReview} exactly once. The summary is a one-line verdict — what you audited and
+    whether it needs fixing — plus any real problem you could not tie to a specific file and line (state
+    that problem here rather than drop it). It is NOT a place to praise the code, describe what you read,
+    narrate your review, or restate the inline findings — those are already posted via
+    ${toolNames.requestChange}. Do not write giant blocks of text explaining why well-implemented code is
+    good; if nothing needs fixing, the summary is a single short sentence saying so, and nothing more. The
+    collector tools are the only review output channel.
 
     This is a whole-repository audit, so PRE-EXISTING issues in any file ARE in scope — that is the point of this mode.
     This is an informational report, not a merge gate.
