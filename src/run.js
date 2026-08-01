@@ -492,11 +492,22 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
   // bystander's reply is never misattributed as RA's finding / the author's rebuttal. The fetch is gated on
   // prior.count: with zero prior RA reviews there are no findings and thus no replies, so the result is
   // provably [] — the gate skips one round-trip on the common first review, mirroring how the budget block
-  // above only does its IO when active. [LAW:no-silent-failure] a listReviewComments error is not swallowed
-  // — it propagates to the top-level handler and reds the run, same as the other pre-review fetches.
-  const priorPushbacks = prior.count > 0
-    ? await fetchPriorPushbacks(octokit, owner, repo, pullNumber, { findingReviewIds: prior.reviewIds, authorLogin: pr.user?.login })
-    : [];
+  // above only does its IO when active.
+  //
+  // [LAW:no-silent-failure] Pushbacks are ADDITIVE context, not a gate: unlike the PR fetch and
+  // summarizePriorReviews (which gate the review's existence and the round cap, so they core.setFailed),
+  // a review is fully correct WITHOUT them — [] yields the same byte-identical cold review a PR with no
+  // pushbacks gets. So a listReviewComments failure degrades to [] with a LOUD, PR-named warning rather
+  // than aborting a paid review cycle for optional context. This is not a silent `|| []`: the warning
+  // announces the degradation, and [] is an HONEST "no pushback context this round", never wrong data.
+  let priorPushbacks = [];
+  if (prior.count > 0) {
+    try {
+      priorPushbacks = await fetchPriorPushbacks(octokit, owner, repo, pullNumber, { findingReviewIds: prior.reviewIds, authorLogin: pr.user?.login });
+    } catch (e) {
+      core.warning(`Failed to fetch prior-round pushbacks for PR #${pullNumber}: ${e.message}. Proceeding without pushback context.`);
+    }
+  }
   const material = buildPrMaterial({ files: filteredFiles, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencySummaries, priorPushbacks });
 
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
