@@ -625,6 +625,26 @@ describe('buildPrMaterial', () => {
     assert.match(prompt, new RegExp(`call ${TOOL_NAMES.assessDependency}`));
     assert.match(prompt, /VERBATIM: github\.com\/a\/b\. Provide/);
   });
+
+  // [LAW:behavior-not-structure] Covers the material→buildReviewInput SEAM: priorPushbacks must reach the
+  // worker prompt through buildPrMaterial's buildWorkerPrompt closure. Without this, dropping the
+  // priorPushbacks arg from that closure would leave every other test green — this is the mutation that kills.
+  test('priorPushbacks passed to buildPrMaterial reaches the worker prompt', () => {
+    const pbMaterial = buildPrMaterial({
+      files, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT,
+      priorPushbacks: [{ path: 'src/a.js', line: 3, finding: 'Bug: off-by-one', replies: ['Intentional — exclusive range.'] }],
+    });
+    const prompt = pbMaterial.buildWorkerPrompt('cost', TOOL_NAMES, ['src/a.js']);
+    assert.match(prompt, /PRIOR-ROUND PUSHBACKS/);
+    assert.match(prompt, /\[src\/a\.js:3\] your earlier finding: Bug: off-by-one/);
+    assert.match(prompt, /the author replied: Intentional — exclusive range\./);
+  });
+
+  // The default is the empty value: no priorPushbacks arg ⇒ no block ⇒ a byte-identical cold worker prompt.
+  test('with no priorPushbacks, the worker prompt carries no pushback block', () => {
+    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, ['src/a.js']);
+    assert.doesNotMatch(prompt, /PRIOR-ROUND PUSHBACKS/);
+  });
 });
 
 describe('buildRepoMaterial', () => {

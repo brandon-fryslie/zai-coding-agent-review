@@ -35536,6 +35536,11 @@ function pairPushbacks(comments, { findingReviewIds = [], authorLogin } = {}) {
   // authorLogin and a ghost-user reply (both undefined) would otherwise compare equal. [LAW:types-are-the-program]
   if (!authorLogin) return [];
   const raReviewIds = new Set(findingReviewIds);
+  // [LAW:comments-carry-meaning] GitHub (and Gitea) FLATTEN review-comment threads: every reply carries
+  // `in_reply_to_id` = the thread's ROOT (top-level) comment id, never an intermediate reply's id — a
+  // "reply to a reply" still resolves to the root finding. So grouping by `in_reply_to_id` here, then
+  // reading `get(finding.id)` below, captures the ENTIRE author-reply chain (including sequential
+  // follow-ups) with no tree walk; nested self-reply trees are not a shape these APIs can produce.
   const repliesByParent = new Map();
   for (const c of comments) {
     if (c.in_reply_to_id == null) continue;
