@@ -33,8 +33,23 @@ if [ "$#" -lt 4 ]; then
   exit 2
 fi
 NAME="$1"; REPO="$2"; PR="$3"; REVIEW_ID="$4"
-# Default matches action.yml's EXCLUDE_PATTERNS default; override per source workflow.
-EXCLUDE="${5:-*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml}"
+
+# The default exclude set has ONE source of truth: action.yml's EXCLUDE_PATTERNS
+# default. Read it from there rather than hardcoding a copy that would silently drift
+# from what the action actually does. [LAW:one-source-of-truth] Resolve the path from
+# the script's own location so cwd doesn't matter.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ACTION_YML="$SCRIPT_DIR/../action.yml"
+default_exclude() {
+  [ -f "$ACTION_YML" ] || { echo "action.yml not found at $ACTION_YML" >&2; return 1; }
+  awk '/^  EXCLUDE_PATTERNS:/{f=1} f&&/default:/{sub(/.*default:[ ]*/,""); gsub(/^"|"$/,""); print; exit}' "$ACTION_YML"
+}
+# The explicit 5th arg overrides (for a source workflow that sets its own patterns).
+EXCLUDE="${5:-}"
+if [ -z "$EXCLUDE" ]; then
+  EXCLUDE="$(default_exclude)" || { echo "FREEZE ERROR: could not read EXCLUDE_PATTERNS default from action.yml" >&2; exit 1; }
+  [ -n "$EXCLUDE" ] || { echo "FREEZE ERROR: EXCLUDE_PATTERNS default in action.yml is empty" >&2; exit 1; }
+fi
 
 # The action's current default engine (PROVIDER=auto → deepseek), which is also the
 # config that historically produced every golden review. Pinned explicitly so a later
@@ -118,7 +133,20 @@ jq --argjson r "$REVIEW_ID" --arg head "$HEAD_SHA" '{
     body: .body
   } ]
 }' "$COMMENTS" > "$CASE_DIR/expected.json" || fail "building expected.json failed"
-echo "  expected.json: $N_FINDINGS findings (annotation=UNREVIEWED)"
+
+# Assert the frozen diff and the findings are consistent: each finding's diffHunk body
+# (the lines after the @@ header — GitHub sometimes decorates the header with a section
+# heading git does not) must be a verbatim substring of change.diff. This makes the
+# anchors↔diff invariant a checked property of every case, not a hand-verified hope.
+# [LAW:verifiable-goals] jq --rawfile loads the diff as a string; no shell escaping.
+UNMATCHED="$(jq -r --rawfile diff "$CASE_DIR/change.diff" '
+  [ .findings[]
+    | (.diffHunk | split("\n")[1:] | join("\n")) as $body
+    | select($body != "" and (($diff | contains($body)) | not))
+    | "\(.path):\(.line)"
+  ] | .[]' "$CASE_DIR/expected.json")"
+[ -z "$UNMATCHED" ] || fail "diffHunk not found in change.diff for: $UNMATCHED"
+echo "  expected.json: $N_FINDINGS findings (annotation=UNREVIEWED), diffHunks verified ⊂ change.diff"
 
 # --- case.json: the manifest (single source of truth for identity) -----------
 jq -n \

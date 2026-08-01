@@ -84,8 +84,9 @@ Each finding:
 | `diffHunk`     | the exact hunk GitHub anchored the comment to (kept for matching)          |
 | `body`         | the verbatim finding text the agent posted                                |
 
-Every finding's `diffHunk` body is a **verbatim substring of `change.diff`** — verified
-at freeze time, so the anchors and the frozen diff are guaranteed consistent.
+Every finding's `diffHunk` body is a **verbatim substring of `change.diff`** — the
+freezer asserts this for each finding and aborts if any hunk is missing, so the anchors
+and the frozen diff cannot be committed inconsistent.
 
 ## The annotation vocabulary
 
