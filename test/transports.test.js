@@ -328,6 +328,8 @@ describe('fetchPriorPushbacks', () => {
 
   test('exhausts pagination before pairing — a reply on page 2 pairs a finding from page 1', async () => {
     const page1 = Array.from({ length: 100 }, (_, i) => ({ id: i + 1, pull_request_review_id: 7, path: 'a.js', line: i, body: `f${i}`, in_reply_to_id: null }));
+    // The reply intentionally omits pull_request_review_id: pairPushbacks only checks that field on a
+    // top-level finding, never on a reply — a reply is matched by in_reply_to_id + author login alone.
     const page2 = [{ id: 500, in_reply_to_id: 1, user: { login: 'oa' }, path: 'a.js', line: 0, body: 'rebuttal' }];
     const out = await fetchPriorPushbacks(fakeOctokit([page1, page2]), 'o', 'r', 1, { findingReviewIds: [7], authorLogin: 'oa' });
     // Only finding id=1 got an author reply (from page 2); the other 99 findings are unanswered and dropped.

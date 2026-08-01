@@ -133,12 +133,18 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
 // be noise. This spans rounds with no round bookkeeping — the DATA (an RA finding with an author reply) decides
 // which findings surface, never a round counter. [LAW:dataflow-not-control-flow]
 function pairPushbacks(comments, { findingReviewIds = [], authorLogin } = {}) {
+  // [LAW:no-defensive-null-guards] A real precondition at the trust boundary, not a defensive skip: a
+  // pushback is BY DEFINITION the PR author's reply, so an unknown author means there are no pushbacks to
+  // pair — return the empty value once here. Enforcing it up front (rather than per-reply) makes the
+  // downstream `c.user?.login !== authorLogin` a true identity match, closing the corner where an unknown
+  // authorLogin and a ghost-user reply (both undefined) would otherwise compare equal. [LAW:types-are-the-program]
+  if (!authorLogin) return [];
   const raReviewIds = new Set(findingReviewIds);
   const repliesByParent = new Map();
   for (const c of comments) {
     if (c.in_reply_to_id == null) continue;
-    // Only the PR author's reply is OA's pushback; a bystander's or reviewer's reply is not. authorLogin
-    // absent (unknown author) matches nothing, so the feature degrades to an empty value, never a wrong one.
+    // Only the PR author's reply is OA's pushback; a bystander's or reviewer's reply is not. authorLogin is
+    // guaranteed truthy by the guard above, so a ghost-user reply (c.user null → undefined) never matches.
     if (c.user?.login !== authorLogin) continue;
     const list = repliesByParent.get(c.in_reply_to_id) || [];
     list.push((c.body || '').trim());
