@@ -594,6 +594,9 @@ describe('buildPrMaterial', () => {
     // roaming is bounded: prefer Grep for imports, don't pre-read the tree
     assert.match(prompt, /prefer Grep/);
     assert.match(prompt, /Do not pre-read the tree/);
+    // depth beyond the assigned files reaches a caller elsewhere via its call sites (copirate-review-loop-5pw.2)
+    assert.match(prompt, /a caller elsewhere/);
+    assert.match(prompt, /call sites/);
     // the whole diff is still shown (report-anywhere + anchor validity preserved)
     assert.match(prompt, /```diff/);
   });
@@ -602,6 +605,21 @@ describe('buildPrMaterial', () => {
     const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, []);
     assert.match(prompt, /Read the complete content of every changed file/);
     assert.doesNotMatch(prompt, /Read the complete content of THESE files/);
+  });
+
+  // copirate-review-loop-5pw.2 — denser rounds via greater depth: the worker follows a changed symbol
+  // (signature/return shape, exported symbol, shared constant, invariant) to its call sites before judging
+  // it safe, because that failure surfaces at the callers, not in the diff. Unconditional — present whether
+  // or not the scope carries assigned files — and fenced as targeted reading, NOT a whole-tree sweep (the
+  // ticket's guiding intent: depth, not a completeness quota).
+  test('the review prompt directs following a changed symbol to its call sites, fenced against a whole-tree sweep', () => {
+    for (const scopeFiles of [[], ['src/usage.js']]) {
+      const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, scopeFiles);
+      assert.match(prompt, /surfaces at the call sites/);
+      assert.match(prompt, /Grep the repository for that symbol's other uses/);
+      // the anti-sweep guard: depth is targeted, not a completeness pass over the tree
+      assert.match(prompt, /targeted reading, not a sweep of the whole tree/);
+    }
   });
 
   // dependencySummaries is the ONE source buildPrMaterial derives both the prompt note (renderDependencyDiffNote)

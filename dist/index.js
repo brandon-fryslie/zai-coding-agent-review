@@ -33978,12 +33978,16 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // is split, not duplicated N times); an empty scopeFiles reads the whole changed set (single-scope PR
   // or repo mode). Either way the whole diff is shown, so cross-file context and report-anywhere are
   // unchanged — only the expensive full-file reads are partitioned.
+  // Depth beyond the assigned files is finding-driven, never a tree pre-read: a worker may Grep for the
+  // call sites of a symbol its change alters (a broken caller is often invisible in the diff) and read
+  // those specific sites, but Grep-first and full-reads-only-when-a-finding-needs-it keep this targeted —
+  // depth, not a completeness sweep (copirate-review-loop-5pw.2).
   const readTargets = scopeFiles.length > 0
     ? `Read the complete content of THESE files — this scope's assigned changed files: ${scopeFiles.join(', ')}. `
       + `Skip any among them that are generated or vendored artifacts (bundled or minified output, lockfiles) or pure documentation. `
       + `Another scope's worker reads the other changed files, so do NOT read them in full — that duplicates their work and their cost. `
-      + `You may consult a file your assigned files import when a specific finding needs it: prefer Grep to confirm a symbol or signature `
-      + `over Reading the whole file, and read an imported file in full only when a finding truly requires it. Do not pre-read the tree.`
+      + `You may consult another file when a specific finding needs it — one your assigned files import, or a caller elsewhere that uses a symbol they change: prefer Grep to confirm a symbol, signature, or its call sites `
+      + `over Reading the whole file, and read another file in full only when a finding truly requires it. Do not pre-read the tree.`
     : `Read the complete content of every changed file that contains code — skip only generated or vendored `
       + `artifacts (bundled or minified output, lockfiles) and pure documentation. Test files count: read them.`;
 
@@ -33997,7 +34001,12 @@ ${focusBlock}${pushbackBlock}${dependencyInstructionBlock}${dependencyAssessBloc
     BEFORE judging anything, ${readTargets} The diff shows only the changed hunks; most bugs are only
     visible in the full surrounding context of the function and module — a missing guard, a caller you'd
     break, a value that can't be what this line assumes. Do not form or report any judgment until you
-    have read the files you are responsible for in full.
+    have read the files you are responsible for in full. Then read past those files where the change
+    reaches past them: when it alters a function's signature or return shape, an exported symbol, a shared
+    constant, or an invariant other code assumes, the failure it introduces surfaces at the call sites,
+    not in the diff — Grep the repository for that symbol's other uses and read those specific sites before
+    you judge the change safe. Follow the exact thing the change touches to where it is used; this is
+    targeted reading, not a sweep of the whole tree.
 
     Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} for each issue you
     find. Every recorded change must use path, line (the displayed LINE value), body, and severity
