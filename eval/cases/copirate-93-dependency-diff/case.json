@@ -1,0 +1,26 @@
+{
+  "name": "copirate-93-dependency-diff",
+  "source": {
+    "repo": "promptctl/copirate-code-review-agent",
+    "pr": 93,
+    "reviewId": 4784762253,
+    "headSha": "1fa9f3cf302e2de7f9602a852e277f844cf0f0b7",
+    "baseSha": "04b6e8859e619008ec744fb309b006077650b39a"
+  },
+  "diff": "change.diff",
+  "tree": "repo.tar.gz",
+  "expected": "expected.json",
+  "engine": {
+    "provider": "deepseek",
+    "model": "deepseek-v4-pro",
+    "reasoning": null
+  },
+  "excludePatterns": [
+    "dist/**",
+    "*.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml"
+  ],
+  "producedBy": "auto→deepseek / claude-code / deepseek-v4-pro"
+}

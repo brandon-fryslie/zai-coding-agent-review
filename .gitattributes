@@ -1,0 +1,4 @@
+# Frozen eval case trees are gzipped tarballs — binary, never text-normalized or diffed.
+eval/cases/**/repo.tar.gz binary
+# Frozen diffs are captured verbatim; keep their line endings exactly as saved.
+eval/cases/**/change.diff -text

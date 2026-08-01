@@ -1,0 +1,25 @@
+{
+  "name": "cc-candybar-150-transcript-perf",
+  "source": {
+    "repo": "promptctl/cc-candybar",
+    "pr": 150,
+    "reviewId": 4669719961,
+    "headSha": "73d5bbd79472f59ebae6b3e079d09bd60c52f805",
+    "baseSha": "aa4bcd155e67d2027f08af0b23ec2c2c9c30bab0"
+  },
+  "diff": "change.diff",
+  "tree": "repo.tar.gz",
+  "expected": "expected.json",
+  "engine": {
+    "provider": "deepseek",
+    "model": "deepseek-v4-pro",
+    "reasoning": null
+  },
+  "excludePatterns": [
+    "*.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml"
+  ],
+  "producedBy": "auto→deepseek / claude-code / deepseek-v4-pro"
+}

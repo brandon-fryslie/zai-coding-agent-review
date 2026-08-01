@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+#
+# freeze-case.sh — freeze one real marker-bearing review into a golden eval case.
+#
+# A "case" is ONE review round: a single reviewed commit, the exact diff the agent
+# saw at that commit, the repo tree at that commit, and the findings it produced.
+# Everything here is FROZEN so the case replays identically forever — the head SHA's
+# tree is captured as a self-contained tarball (CI cannot fetch sibling private repos,
+# and PR refs get garbage-collected), and the diff is saved as a file rather than
+# recomputed from a live remote. [LAW:one-source-of-truth] The tree is a tarball, not
+# a git bundle, because the runner explores it read-only (Read/Grep/Glob) and takes
+# the diff from change.diff — it needs the files, not git history — and a depth-1 git
+# bundle is not clonable (its parent is a shallow boundary).
+#
+# The mechanical outputs are produced here; the finding ANNOTATIONS
+# (must-find/nice-to-find/noise + justification) are a human-judgment step done by
+# hand afterward — this script writes them as "UNREVIEWED" so an un-annotated case
+# is loud, never silently treated as scored. [LAW:no-silent-failure]
+#
+# Usage:
+#   eval/freeze-case.sh <case-name> <owner/repo> <pr-number> <review-id> [exclude-patterns]
+#
+# Example:
+#   eval/freeze-case.sh cc-candybar-150-transcript-perf promptctl/cc-candybar 150 4669719961
+#
+# Requires: gh (authenticated), git, jq. Run from the repo root.
+
+set -euo pipefail
+
+# --- args ---------------------------------------------------------------------
+if [ "$#" -lt 4 ]; then
+  echo "usage: $0 <case-name> <owner/repo> <pr-number> <review-id> [exclude-patterns]" >&2
+  exit 2
+fi
+NAME="$1"; REPO="$2"; PR="$3"; REVIEW_ID="$4"
+# Default matches action.yml's EXCLUDE_PATTERNS default; override per source workflow.
+EXCLUDE="${5:-*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml}"
+
+# The action's current default engine (PROVIDER=auto → deepseek), which is also the
+# config that historically produced every golden review. Pinned explicitly so a later
+# change to the default does not silently move the baseline. [LAW:no-silent-failure]
+PROVIDER="deepseek"
+MODEL="deepseek-v4-pro"
+
+CASE_DIR="eval/cases/$NAME"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+fail() { echo "FREEZE ERROR [$NAME]: $*" >&2; exit 1; }
+hex40() { [[ "$1" =~ ^[0-9a-f]{40}$ ]] || fail "not a 40-hex sha: '$1'"; }
+
+echo "== freezing $NAME ($REPO #$PR review $REVIEW_ID) =="
+
+# --- resolve the reviewed anchor ---------------------------------------------
+# headSha = the commit the review anchored to; baseSha = the PR base branch tip.
+# The diff is a three-dot base...head, whose merge-base is the branch fork point —
+# stable no matter how far the base branch later advanced.
+HEAD_SHA="$(gh api "repos/$REPO/pulls/$PR/reviews/$REVIEW_ID" --jq '.commit_id')" \
+  || fail "could not read review $REVIEW_ID"
+BASE_SHA="$(gh api "repos/$REPO/pulls/$PR" --jq '.base.sha')" \
+  || fail "could not read PR $PR"
+hex40 "$HEAD_SHA"; hex40 "$BASE_SHA"
+echo "  head=$HEAD_SHA base=$BASE_SHA"
+
+REMOTE="https://github.com/$REPO.git"
+GIT_AUTH=(-c credential.helper='!gh auth git-credential')
+
+# --- change.diff: the exact material the agent reviewed ----------------------
+DIFF_DIR="$WORK/diff"; git init -q "$DIFF_DIR"
+git -C "$DIFF_DIR" remote add origin "$REMOTE"
+git "${GIT_AUTH[@]}" -C "$DIFF_DIR" fetch -q origin "$BASE_SHA" || fail "fetch base $BASE_SHA failed"
+git "${GIT_AUTH[@]}" -C "$DIFF_DIR" fetch -q origin "$HEAD_SHA" || fail "fetch head $HEAD_SHA failed"
+git -C "$DIFF_DIR" merge-base "$BASE_SHA" "$HEAD_SHA" >/dev/null \
+  || fail "no merge-base between base and head (shallow history?)"
+mkdir -p "$CASE_DIR"
+CASE_ABS="$(cd "$CASE_DIR" && pwd)"  # git -C resolves output paths relative to its own cwd
+git -C "$DIFF_DIR" diff "$BASE_SHA...$HEAD_SHA" > "$CASE_DIR/change.diff" \
+  || fail "git diff failed"
+[ -s "$CASE_DIR/change.diff" ] || fail "change.diff is empty"
+DIFF_FILES="$(grep -c '^diff --git ' "$CASE_DIR/change.diff" || true)"
+[ "$DIFF_FILES" -gt 0 ] || fail "change.diff has no file headers"
+echo "  change.diff: $DIFF_FILES files, $(wc -l < "$CASE_DIR/change.diff" | tr -d ' ') lines"
+
+# --- repo.tar.gz: the head tree, self-contained (depth-1 fetch, minimal) ------
+TREE_DIR="$WORK/tree"; git init -q "$TREE_DIR"
+git -C "$TREE_DIR" remote add origin "$REMOTE"
+git "${GIT_AUTH[@]}" -C "$TREE_DIR" fetch -q --depth 1 origin "$HEAD_SHA" \
+  || fail "shallow fetch head $HEAD_SHA failed"
+git -C "$TREE_DIR" archive --format=tar.gz -o "$CASE_ABS/repo.tar.gz" FETCH_HEAD \
+  || fail "git archive failed"
+# Prove the tarball replays: extract it offline and confirm a non-empty tree.
+VERIFY="$WORK/verify"; mkdir -p "$VERIFY"
+tar -xzf "$CASE_ABS/repo.tar.gz" -C "$VERIFY" || fail "tarball does not extract"
+TREE_FILES="$(find "$VERIFY" -type f | wc -l | tr -d ' ')"
+[ "$TREE_FILES" -gt 0 ] || fail "tarball tree is empty at head"
+echo "  repo.tar.gz: $(du -h "$CASE_ABS/repo.tar.gz" | cut -f1), $TREE_FILES files at head"
+
+# --- expected.json: the finding inventory (annotations UNREVIEWED) ------------
+# Slurp all comment pages, keep only this review's inline findings. Anchor to the
+# reviewed side/line via original_* (a dismissed review nulls the live line/commit).
+COMMENTS="$WORK/comments.json"
+gh api --paginate "repos/$REPO/pulls/$PR/comments" --jq '.[]' | jq -s '.' > "$COMMENTS" \
+  || fail "could not read PR comments"
+N_FINDINGS="$(jq --argjson r "$REVIEW_ID" '[.[] | select(.pull_request_review_id == $r)] | length' "$COMMENTS")"
+[ "$N_FINDINGS" -gt 0 ] || fail "no inline findings for review $REVIEW_ID"
+
+jq --argjson r "$REVIEW_ID" --arg head "$HEAD_SHA" '{
+  reviewId: $r,
+  headSha: $head,
+  findings: [ .[] | select(.pull_request_review_id == $r) | {
+    commentId: .id,
+    path: .path,
+    line: (.original_line // .line),
+    side: .side,
+    annotation: "UNREVIEWED",
+    justification: "",
+    diffHunk: .diff_hunk,
+    body: .body
+  } ]
+}' "$COMMENTS" > "$CASE_DIR/expected.json" || fail "building expected.json failed"
+echo "  expected.json: $N_FINDINGS findings (annotation=UNREVIEWED)"
+
+# --- case.json: the manifest (single source of truth for identity) -----------
+jq -n \
+  --arg name "$NAME" --arg repo "$REPO" --argjson pr "$PR" --argjson rev "$REVIEW_ID" \
+  --arg head "$HEAD_SHA" --arg base "$BASE_SHA" \
+  --arg provider "$PROVIDER" --arg model "$MODEL" --arg exclude "$EXCLUDE" '{
+  name: $name,
+  source: { repo: $repo, pr: $pr, reviewId: $rev, headSha: $head, baseSha: $base },
+  diff: "change.diff",
+  tree: "repo.tar.gz",
+  expected: "expected.json",
+  engine: { provider: $provider, model: $model, reasoning: null },
+  excludePatterns: ($exclude | split(",")),
+  producedBy: "auto→deepseek / claude-code / deepseek-v4-pro"
+}' > "$CASE_DIR/case.json" || fail "building case.json failed"
+
+echo "== froze $NAME -> $CASE_DIR (annotate expected.json by hand) =="

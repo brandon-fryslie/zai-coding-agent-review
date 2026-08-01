@@ -1,0 +1,25 @@
+{
+  "name": "laws-4-eval-tasks",
+  "source": {
+    "repo": "promptctl/laws",
+    "pr": 4,
+    "reviewId": 4834666708,
+    "headSha": "13301af16a4a5f9db51c7a12a0c59d25b4fcf9ef",
+    "baseSha": "8b9cc89c095fc1b8f01ece977c3bfadef2133b75"
+  },
+  "diff": "change.diff",
+  "tree": "repo.tar.gz",
+  "expected": "expected.json",
+  "engine": {
+    "provider": "deepseek",
+    "model": "deepseek-v4-pro",
+    "reasoning": null
+  },
+  "excludePatterns": [
+    "*.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml"
+  ],
+  "producedBy": "auto→deepseek / claude-code / deepseek-v4-pro"
+}
