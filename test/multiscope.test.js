@@ -622,6 +622,26 @@ describe('buildPrMaterial', () => {
     }
   });
 
+  // copirate-review-loop-5pw.3 — fewer false positives via verification: the SAME call-site reading .2
+  // added for recall is turned the opposite way for precision. Before recording, the worker confirms a
+  // suspected fault against that fuller context, drops one the context refutes, and downgrades an
+  // inconclusive one to advisory rather than withholding it (recall preserved). This is woven INTO the .2
+  // passage as one lever, two directions — not a second "read more context" instruction — so it is present
+  // whether or not the scope carries assigned files, right alongside the .2 assertions above.
+  test('the review prompt directs verifying a suspicion against fuller context before recording, refuted findings dropped and inconclusive ones kept as advisory', () => {
+    for (const scopeFiles of [[], ['src/usage.js']]) {
+      const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, scopeFiles);
+      // the same call-site reading runs both directions (recall + precision), not a new context-read
+      assert.match(prompt, /That same reading cuts both ways/);
+      // verify-before-record against the fuller context, not the hunk alone
+      assert.match(prompt, /before you record any finding, confirm\s+the suspected fault against that fuller context/);
+      // fuller context refutes -> the finding is dropped (precision, no false positive)
+      assert.match(prompt, /if that context shows the code is actually correct, do not record it/);
+      // inconclusive -> advisory, never silently withheld (recall preserved)
+      assert.match(prompt, /if the check is\s+genuinely inconclusive, record the issue as advisory rather than withholding it/);
+    }
+  });
+
   // dependencySummaries is the ONE source buildPrMaterial derives both the prompt note (renderDependencyDiffNote)
   // and the resolved-only assess bumps from. [LAW:verifiable-goals]
   test('dependencySummaries drives the worker prompt: the note is injected and the assess directive lists only RESOLVED modules', () => {

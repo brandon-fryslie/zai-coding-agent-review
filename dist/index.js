@@ -33981,7 +33981,12 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // Depth beyond the assigned files is finding-driven, never a tree pre-read: a worker may Grep for the
   // call sites of a symbol its change alters (a broken caller is often invisible in the diff) and read
   // those specific sites, but Grep-first and full-reads-only-when-a-finding-needs-it keep this targeted —
-  // depth, not a completeness sweep (copirate-review-loop-5pw.2).
+  // depth, not a completeness sweep (copirate-review-loop-5pw.2). That same call-site reading runs both
+  // directions: it surfaces a break the hunk hides (recall, .2) AND refutes a false alarm the hunk suggests
+  // (precision, copirate-review-loop-5pw.3) — the worker verifies a suspicion against that fuller context
+  // before recording, dropping one the context refutes and downgrading an inconclusive one to advisory
+  // (never withheld — the severity charter owns that valve). One lever, two directions; the record-time
+  // consequence lives in the buildReviewInput passage below, not a second "read more context" instruction.
   const readTargets = scopeFiles.length > 0
     ? `Read the complete content of THESE files — this scope's assigned changed files: ${scopeFiles.join(', ')}. `
       + `Skip any among them that are generated or vendored artifacts (bundled or minified output, lockfiles) or pure documentation. `
@@ -34006,7 +34011,11 @@ ${focusBlock}${pushbackBlock}${dependencyInstructionBlock}${dependencyAssessBloc
     constant, or an invariant other code assumes, the failure it introduces surfaces at the call sites,
     not in the diff — Grep the repository for that symbol's other uses and read those specific sites before
     you judge the change safe. Follow the exact thing the change touches to where it is used; this is
-    targeted reading, not a sweep of the whole tree.
+    targeted reading, not a sweep of the whole tree. That same reading cuts both ways: it exposes a break
+    the hunk hides, and it clears a false alarm the hunk suggests. So before you record any finding, confirm
+    the suspected fault against that fuller context — the definition and callers the change reaches, not the
+    hunk alone; if that context shows the code is actually correct, do not record it, and if the check is
+    genuinely inconclusive, record the issue as advisory rather than withholding it.
 
     Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} for each issue you
     find. Every recorded change must use path, line (the displayed LINE value), body, and severity
