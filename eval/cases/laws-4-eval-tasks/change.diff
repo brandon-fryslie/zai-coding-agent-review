@@ -1,0 +1,494 @@
+diff --git a/evals/tasks/README.md b/evals/tasks/README.md
+new file mode 100644
+index 0000000..db450f6
+--- /dev/null
++++ b/evals/tasks/README.md
+@@ -0,0 +1,79 @@
++# Task specs (a real repo, a commit, the task text, and a machine-checked criterion)
++
++A **task** is a self-contained, reusable spec: a real repository owned by the owner, the commit
++to begin the work at, the text handed to the agent, and a programmatic success criterion a
++machine evaluates against the real repo at the end. A task knows **nothing** about which skill
++version or arm it runs under — that orthogonality is what lets the same task run honestly across
++arms. If the task knew the arm, task and configuration would tangle and the comparison would be a
++lie.
++
++## The format
++
++A task is a directory:
++
++```
++<task>/
++  manifest.sh   # DATA ONLY: TASK_REPO, TASK_COMMIT, TASK_SUMMARY. No skill field, no arm field.
++  prompt.md     # the task text handed to the agent
++  check.sh      # THE CRITERION: runs with CWD = the checkout; exit 0 = success, nonzero = not
++  setup.sh      # OPTIONAL: runs in the checkout to establish the STARTING state (e.g. the
++                #   regression the agent must fix — where check.sh is expected to fail)
++```
++
++**The criterion is a command, not a menu choice.** `check.sh` exits 0 or nonzero, and that one
++shape expresses every kind of ground truth — a test suite passing, a mechanical detector of a
++defect class, an assertion on a produced artifact — so a new criterion *type* is a new `check.sh`,
++never a change to the format. The criterion must be ground-truth / programmatic and must **not**
++grade the output against any skill, law, or rubric derived from the guidance under test: success
++is decided independent of the guidance's own vocabulary.
++
++**Orthogonality is structural.** The manifest has no field for a skill or an arm, and no code that
++consumes a task ever reads one — the arm is supplied entirely separately (the configuration
++format). `manifest.sh` setting an arm-shaped variable is rejected by the validator as a smell that
++the two concerns got confused.
++
++## The two tasks here (deliberately different shapes)
++
++| Task | Repo | Criterion type |
++|------|------|----------------|
++| `go-template-add-fix` | `promptctl/go-template-js` | the repo's **test suite** (`pnpm test`) |
++| `laws-scripts-parse`  | `promptctl/laws`          | a **mechanical detector** (`bash -n` every eval script) |
++
++Different repos *and* different criterion types — both validate against the same format with no
++edit to the format, which is the proof that the format is not shaped around one task.
++
++## Use it
++
++```sh
++evals/tasks/validate-task.sh evals/tasks/go-template-add-fix        # is it a well-formed spec?
++evals/tasks/check-task.sh   evals/tasks/go-template-add-fix <dir>   # run its criterion vs a state
++evals/tasks/verify-tasks.sh                                          # prove every task (below)
++```
++
++`verify-tasks.sh` is the done-claim proof. For **every** task directory it: validates the spec;
++clones the pinned commit and runs the criterion against that clean state (must **PASS** — the
++known-good reference); then clones again, runs `setup.sh` to establish the defect, and runs the
++criterion against that state (must **FAIL**). Exit 0 iff every task validates and its criterion
++discriminates good from defect. The loop is data-driven over whatever task dirs exist, so a new
++task is proven by adding its directory — nothing here changes.
++
++## Exit-code contract
++
++`check.sh` / `check-task.sh`: `0` = criterion passed, `1` = criterion failed, any other nonzero =
++the harness could not run the check (never a fabricated verdict). `validate-task.sh`: `0` = valid,
++nonzero = the first violation, named on stderr.
++
++## Files
++
++- `lib.sh` — the format and machinery: `task_validate` (parse the spec into validated fields),
++  `task_prepare` (clone + checkout the pinned commit), `task_setup` (establish the starting state),
++  `task_check` (run the criterion, return its verdict).
++- `validate-task.sh`, `check-task.sh` — the CLIs.
++- `verify-tasks.sh` — the done-claim proof over every task.
++- `<task>/` — one directory per task.
++
++## Environment
++
++`git` for all tasks; a task's `check.sh` may need its own tools (`go-template-add-fix` needs
++`pnpm` + `node`). A criterion whose tools are missing exits nonzero (a conservative FAIL), never a
++fabricated pass.
+diff --git a/evals/tasks/check-task.sh b/evals/tasks/check-task.sh
+new file mode 100755
+index 0000000..5ec3e3f
+--- /dev/null
++++ b/evals/tasks/check-task.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++# Run a task's criterion against an already-prepared repo state and report the verdict.
++# [LAW:cli] exit code is the contract: 0 = criterion PASSED, 1 = criterion FAILED, and any other
++# nonzero (via task_die) = the harness itself could not run the check - never a fabricated verdict.
++# Usage: check-task.sh <task_dir> <state_dir>
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++# shellcheck source=lib.sh
++source "$HERE/lib.sh"
++
++[ "$#" -eq 2 ] || task_die "usage: check-task.sh <task_dir> <state_dir>"
++if task_check "$1" "$2"; then
++  printf 'PASS: %s against %s\n' "$1" "$2"
++  exit 0
++else
++  printf 'FAIL: %s against %s\n' "$1" "$2"
++  exit 1
++fi
+diff --git a/evals/tasks/go-template-add-fix/check.sh b/evals/tasks/go-template-add-fix/check.sh
+new file mode 100755
+index 0000000..5d9af7e
+--- /dev/null
++++ b/evals/tasks/go-template-add-fix/check.sh
+@@ -0,0 +1,11 @@
++#!/usr/bin/env bash
++# THE CRITERION (test-suite shape). Runs with CWD = the repo checkout. Exit 0 = the task
++# succeeded (the suite passes), nonzero = it did not. This is ground truth: the repo's OWN tests,
++# not a judgment of the work against any skill, law, or rubric.
++# [LAW:no-silent-failure] a broken install aborts nonzero (a conservative FAIL) rather than
++# reporting a fabricated pass.
++set -euo pipefail
++
++command -v pnpm >/dev/null 2>&1 || { echo "check: pnpm is required to run this task's criterion" >&2; exit 1; }
++pnpm install --frozen-lockfile >/dev/null 2>&1 || { echo "check: dependency install failed" >&2; exit 1; }
++pnpm test
+diff --git a/evals/tasks/go-template-add-fix/manifest.sh b/evals/tasks/go-template-add-fix/manifest.sh
+new file mode 100644
+index 0000000..379246f
+--- /dev/null
++++ b/evals/tasks/go-template-add-fix/manifest.sh
+@@ -0,0 +1,5 @@
++# Task manifest - DATA ONLY, no logic. Sourced by the task machinery, which reads exactly these
++# three fields. There is no field for a skill or an arm: a task is orthogonal to configuration.
++TASK_REPO="https://github.com/promptctl/go-template-js"
++TASK_COMMIT="db35fb8cb5f78bcf75eefbfb46a57665584c6e06"
++TASK_SUMMARY="Fix the regression in the Sprig add() so the test suite passes again"
+diff --git a/evals/tasks/go-template-add-fix/prompt.md b/evals/tasks/go-template-add-fix/prompt.md
+new file mode 100644
+index 0000000..cfda7f7
+--- /dev/null
++++ b/evals/tasks/go-template-add-fix/prompt.md
+@@ -0,0 +1,10 @@
++A regression has been introduced into this repository: the Sprig `add` helper no longer
++computes a sum, and its test now fails. Several other tests may fail as a consequence.
++
++Your task: find and fix the bug in the library source so that the full test suite passes again.
++
++- Run the test suite with `pnpm install --frozen-lockfile` then `pnpm test`.
++- Fix the *implementation*, not the tests. Do not edit, skip, or delete any test.
++- The fix should be minimal and correct — restore the intended behavior of the function.
++
++You are done when `pnpm test` passes with no failures.
+diff --git a/evals/tasks/go-template-add-fix/setup.sh b/evals/tasks/go-template-add-fix/setup.sh
+new file mode 100755
+index 0000000..e7fa571
+--- /dev/null
++++ b/evals/tasks/go-template-add-fix/setup.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++# Establish the STARTING state: inject the regression the agent must fix. Runs with CWD = the
++# repo checkout. The Sprig add() sums its args (`acc + v`); flip it to `acc - v` so add(1,2,3)
++# returns -6 and the test suite fails. A correct fix restores the sum.
++# [LAW:no-silent-failure] Verify the edit actually landed; a regression that did not apply would
++# leave the "defect" state passing and silently invalidate the task.
++set -euo pipefail
++
++target="src/sprig/math/add.ts"
++[ -f "$target" ] || { echo "setup: expected source file not found: $target" >&2; exit 1; }
++
++# Turn the reducer's "+ v" into "- v". Anchored to the exact reduce expression so it can only
++# match the intended line.
++perl -0pi -e 's/\(acc, v\) => acc \+ v/(acc, v) => acc - v/' "$target"
++
++grep -q '=> acc - v' "$target" || { echo "setup: regression did not apply to $target" >&2; exit 1; }
++echo "setup: injected regression into $target (add now subtracts)"
+diff --git a/evals/tasks/laws-scripts-parse/check.sh b/evals/tasks/laws-scripts-parse/check.sh
+new file mode 100755
+index 0000000..51f9386
+--- /dev/null
++++ b/evals/tasks/laws-scripts-parse/check.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++# THE CRITERION (mechanical-detector shape). Runs with CWD = the repo checkout. Exit 0 = every
++# shell script under evals/ parses; nonzero = at least one does not. Ground truth via `bash -n`,
++# not a judgment of the work against any skill, law, or rubric.
++# [LAW:no-silent-failure] a missing evals/ tree is an infra fault, not a silent pass.
++set -euo pipefail
++
++[ -d evals ] || { echo "check: no evals/ directory in the checkout" >&2; exit 1; }
++
++failed=0
++while IFS= read -r script; do
++  if ! bash -n "$script" 2>/dev/null; then
++    echo "check: does not parse: $script" >&2
++    failed=1
++  fi
++done < <(find evals -name '*.sh' -type f | sort)
++
++exit "$failed"
+diff --git a/evals/tasks/laws-scripts-parse/manifest.sh b/evals/tasks/laws-scripts-parse/manifest.sh
+new file mode 100644
+index 0000000..4c3581f
+--- /dev/null
++++ b/evals/tasks/laws-scripts-parse/manifest.sh
+@@ -0,0 +1,5 @@
++# Task manifest - DATA ONLY. A different repo and a different criterion TYPE from the sibling
++# test-suite task, to prove the format is not shaped around one kind of check.
++TASK_REPO="https://github.com/promptctl/laws"
++TASK_COMMIT="8b9cc89c095fc1b8f01ece977c3bfadef2133b75"
++TASK_SUMMARY="Repair the eval shell script so every script under evals/ parses cleanly"
+diff --git a/evals/tasks/laws-scripts-parse/prompt.md b/evals/tasks/laws-scripts-parse/prompt.md
+new file mode 100644
+index 0000000..4db5da3
+--- /dev/null
++++ b/evals/tasks/laws-scripts-parse/prompt.md
+@@ -0,0 +1,9 @@
++One of the shell scripts under `evals/` has a syntax error and no longer parses, which breaks
++the eval harness. Find the broken script and fix the syntax so every script under `evals/`
++parses cleanly again.
++
++- You can check a script with `bash -n <script>` (it prints nothing and exits 0 when the script
++  parses).
++- Fix only the syntax error; do not change what the script does.
++
++You are done when `bash -n` succeeds for every `*.sh` under `evals/`.
+diff --git a/evals/tasks/laws-scripts-parse/setup.sh b/evals/tasks/laws-scripts-parse/setup.sh
+new file mode 100755
+index 0000000..56c1b3a
+--- /dev/null
++++ b/evals/tasks/laws-scripts-parse/setup.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++# Establish the STARTING state: inject a syntax error into one eval script so it no longer parses.
++# Runs with CWD = the repo checkout. Append an unterminated `if` - enough to make `bash -n` fail -
++# to a script that is not itself the criterion's own target ambiguity.
++# [LAW:no-silent-failure] verify the breakage actually took, or the "defect" state would parse
++# fine and silently invalidate the task.
++set -euo pipefail
++
++target="evals/driver/drive.sh"
++[ -f "$target" ] || { echo "setup: expected script not found: $target" >&2; exit 1; }
++
++printf '\nif then\n' >> "$target"   # a syntactically broken fragment: `if` with no condition
++
++! bash -n "$target" 2>/dev/null || { echo "setup: injected fragment did not break parsing of $target" >&2; exit 1; }
++echo "setup: injected a syntax error into $target"
+diff --git a/evals/tasks/lib.sh b/evals/tasks/lib.sh
+new file mode 100755
+index 0000000..22df41e
+--- /dev/null
++++ b/evals/tasks/lib.sh
+@@ -0,0 +1,141 @@
++#!/usr/bin/env bash
++# The task-spec format and the machinery that runs a task's success criterion against a real
++# repository. A task knows NOTHING about which skill version or arm it runs under - it names a
++# real repo, a commit to begin at, the task text handed to the agent, and a programmatic
++# criterion a machine evaluates against the real repo. That orthogonality is what lets one task
++# run honestly across arms; if the task knew the arm, the two would tangle.
++#
++# THE FORMAT. A task is a directory:
++#   <task>/manifest.sh  - sourced; sets TASK_REPO, TASK_COMMIT, TASK_SUMMARY. Data only, no logic.
++#   <task>/prompt.md    - the task text handed to the agent (multi-line).
++#   <task>/check.sh     - THE CRITERION. Runs with CWD = the repo checkout. Exit 0 = the task
++#                         succeeded, nonzero = it did not. This one shape - a command that exits
++#                         0/nonzero - expresses a test suite passing, a mechanical defect
++#                         detector, or an assertion on a produced artifact alike, so a new
++#                         criterion type is a new check.sh, never a change to this format.
++#   <task>/setup.sh     - OPTIONAL. Runs with CWD = the checkout to establish the STARTING state
++#                         the agent begins from (e.g. apply the regression the agent must fix).
++#                         The starting state is where check.sh is expected to FAIL; a correct
++#                         agent moves it to where check.sh passes.
++#
++# The criterion must be ground-truth / programmatic - the repo's own tests, a mechanical detector,
++# an assertion on the artifact - and must NOT grade the output against any skill, law, or rubric
++# derived from the guidance under test. Success is decided independent of the guidance's vocabulary.
++#
++# [LAW:dataflow-not-control-flow] The criterion is a value (a command), not one of a fixed set of
++#   modes. Variability in "what counts as success" flows as check.sh, not as branches here.
++# [LAW:no-silent-failure] The machinery's OWN failures (missing repo, unresolvable commit, absent
++#   check.sh) abort loudly and are never confused with the criterion's verdict. The criterion's
++#   nonzero is a real FAIL verdict; the machinery aborting is an infra error - two different things.
++# [LAW:effects-at-boundaries] git clone/checkout and running the task's scripts are gathered here.
++
++set -o pipefail
++
++task_die() { printf 'ERROR [task]: %s\n' "$*" >&2; exit 1; }
++task_log() { printf '[task] %s\n' "$*" >&2; }
++
++# ── Validate a task against the format (parse, don't validate) ───────────────────────────
++# Returns 0 and echoes the resolved TASK_REPO/TASK_COMMIT/TASK_SUMMARY on success; aborts with a
++# located message on the first violation. After this passes, every consumer can rely on the
++# fields and files existing. [LAW:parse-dont-validate]
++# Usage: task_validate <task_dir>
++task_validate() {
++  local dir="$1"
++  [ -n "$dir" ] || task_die "task_validate: no task dir given"
++  [ -d "$dir" ] || task_die "task_validate: not a directory: $dir"
++  local man="$dir/manifest.sh"
++  [ -f "$man" ] || task_die "task_validate: missing manifest.sh in $dir"
++  [ -f "$dir/prompt.md" ] || task_die "task_validate: missing prompt.md in $dir"
++  [ -s "$dir/prompt.md" ] || task_die "task_validate: prompt.md is empty in $dir"
++  [ -f "$dir/check.sh" ] || task_die "task_validate: missing check.sh (the criterion) in $dir"
++  [ -x "$dir/check.sh" ] || task_die "task_validate: check.sh is not executable in $dir"
++  [ ! -e "$dir/setup.sh" ] || [ -x "$dir/setup.sh" ] || task_die "task_validate: setup.sh present but not executable in $dir"
++
++  # Source the manifest in a subshell so its assignments cannot leak into the caller, and read
++  # back only the three fields. A manifest that sets none of them, or adds logic that fails, is
++  # caught here.
++  local vars
++  vars="$(set -e; TASK_REPO=""; TASK_COMMIT=""; TASK_SUMMARY=""
++          # shellcheck disable=SC1090
++          . "$man" >/dev/null 2>&1
++          printf '%s\n%s\n%s\n' "$TASK_REPO" "$TASK_COMMIT" "$TASK_SUMMARY")" \
++    || task_die "task_validate: manifest.sh failed to source cleanly: $man"
++  local repo commit summary
++  repo="$(printf '%s' "$vars" | sed -n '1p')"
++  commit="$(printf '%s' "$vars" | sed -n '2p')"
++  summary="$(printf '%s' "$vars" | sed -n '3p')"
++  [ -n "$repo" ] || task_die "task_validate: manifest sets no TASK_REPO in $man"
++  [ -n "$commit" ] || task_die "task_validate: manifest sets no TASK_COMMIT in $man"
++  [ -n "$summary" ] || task_die "task_validate: manifest sets no TASK_SUMMARY in $man"
++
++  # Orthogonality to configuration is structural, not grepped: the format has NO field for a
++  # skill, a skill version, or an arm, and no consumer of a task ever reads one - the arm is
++  # supplied entirely separately (by the configuration format). The one way a manifest could try
++  # to smuggle an arm in is by setting an arm-shaped variable, which would be dead (nothing reads
++  # it) but is a code smell that the author confused the two concerns; reject it so the confusion
++  # is caught, not silently ignored. [LAW:types-are-the-program] the illegal field is unrepresentable.
++  local smuggled
++  smuggled="$(grep -nE '^[[:space:]]*(TASK_SKILL|TASK_ARM|TASK_SKILL_REF|TASK_CONFIG|SKILL_REF|ARM)[[:space:]]*=' "$man" | head -1)"
++  [ -z "$smuggled" ] || task_die "task_validate: manifest sets a configuration/arm field (a task must be orthogonal to the arm): $smuggled"
++
++  # The repo must be reachable, so a typo'd URL fails now, not deep in a run.
++  git ls-remote "$repo" >/dev/null 2>&1 \
++    || task_die "task_validate: TASK_REPO is not reachable: $repo"
++
++  printf '%s\n%s\n%s\n' "$repo" "$commit" "$summary"
++}
++
++# ── Prepare the repo state (clone + checkout the pinned commit) ──────────────────────────
++# Clone TASK_REPO into <dest> and check out TASK_COMMIT. Does NOT run setup.sh - preparing the
++# clean pinned state and establishing the task's starting state are separate steps a caller
++# composes. Aborts loudly if the repo won't clone or the commit won't resolve.
++# Usage: task_prepare <task_dir> <dest_dir>
++task_prepare() {
++  local dir="$1" dest="$2"
++  [ -n "$dir" ] && [ -n "$dest" ] || task_die "task_prepare: need <task_dir> <dest_dir>"
++  local out; out="$(task_validate "$dir")" || exit 1
++  local repo commit
++  repo="$(printf '%s' "$out" | sed -n '1p')"
++  commit="$(printf '%s' "$out" | sed -n '2p')"
++
++  [ ! -e "$dest" ] || task_die "task_prepare: dest already exists: $dest (refusing to overwrite)"
++  git clone --quiet "$repo" "$dest" 2>/dev/null || task_die "task_prepare: git clone failed: $repo"
++  git -C "$dest" checkout --quiet "$commit" 2>/dev/null \
++    || task_die "task_prepare: TASK_COMMIT does not resolve in $repo: $commit"
++  task_log "prepared $repo @ $commit -> $dest"
++}
++
++# ── Establish the starting state (optional setup.sh) ────────────────────────────────────
++# Run the task's setup.sh in the checkout, if it has one. This is what makes the starting state
++# the agent begins from - typically the state where check.sh fails.
++# Usage: task_setup <task_dir> <state_dir>
++task_setup() {
++  local dir="$1" state="$2"
++  [ -n "$dir" ] && [ -n "$state" ] || task_die "task_setup: need <task_dir> <state_dir>"
++  [ -d "$state" ] || task_die "task_setup: state dir does not exist: $state"
++  [ -e "$dir/setup.sh" ] || { task_log "no setup.sh for $dir (nothing to establish)"; return 0; }
++  local abs; abs="$(cd "$dir" && pwd)"
++  ( cd "$state" && exec "$abs/setup.sh" ) 2>&1 | sed 's/^/[setup] /' >&2
++  local rc=${PIPESTATUS[0]}
++  [ "$rc" -eq 0 ] || task_die "task_setup: setup.sh failed (rc=$rc) for $dir"
++}
++
++# ── Run the criterion against a prepared state ──────────────────────────────────────────
++# Run check.sh with CWD = <state_dir> and return its verdict: 0 = pass, nonzero = fail. The
++# machinery aborts (nonzero, via task_die) only on ITS OWN errors - an absent check.sh or a
++# missing state dir - so a genuine FAIL verdict is never confused with a broken harness.
++# Usage: task_check <task_dir> <state_dir>   -> exit 0 (pass) / 1 (fail); prints PASS/FAIL to stderr
++task_check() {
++  local dir="$1" state="$2"
++  [ -n "$dir" ] && [ -n "$state" ] || task_die "task_check: need <task_dir> <state_dir>"
++  [ -x "$dir/check.sh" ] || task_die "task_check: no executable check.sh in $dir"
++  [ -d "$state" ] || task_die "task_check: state dir does not exist: $state"
++  local abs; abs="$(cd "$dir" && pwd)"
++  if ( cd "$state" && exec "$abs/check.sh" ) >&2; then
++    task_log "criterion PASS for $(basename "$dir") against $state"
++    return 0
++  else
++    task_log "criterion FAIL for $(basename "$dir") against $state"
++    return 1
++  fi
++}
+diff --git a/evals/tasks/validate-task.sh b/evals/tasks/validate-task.sh
+new file mode 100755
+index 0000000..73ae808
+--- /dev/null
++++ b/evals/tasks/validate-task.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++# Validate a task directory against the format. Exit 0 iff it is a well-formed task spec.
++# [LAW:cli] exit code is the contract: 0 = valid, nonzero = the first violation (named on stderr).
++# Usage: validate-task.sh <task_dir>
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++# shellcheck source=lib.sh
++source "$HERE/lib.sh"
++
++[ "$#" -eq 1 ] || task_die "usage: validate-task.sh <task_dir>"
++out="$(task_validate "$1")"   # aborts nonzero on any violation
++printf 'VALID: %s\n' "$1"
++printf '  repo:    %s\n' "$(printf '%s' "$out" | sed -n '1p')"
++printf '  commit:  %s\n' "$(printf '%s' "$out" | sed -n '2p')"
++printf '  summary: %s\n' "$(printf '%s' "$out" | sed -n '3p')"
+diff --git a/evals/tasks/verify-tasks.sh b/evals/tasks/verify-tasks.sh
+new file mode 100755
+index 0000000..fa7a95d
+--- /dev/null
++++ b/evals/tasks/verify-tasks.sh
+@@ -0,0 +1,73 @@
++#!/usr/bin/env bash
++# Prove the task-spec format and every task in it. For EACH task directory (any dir holding a
++# manifest.sh), assert three things:
++#   1. it validates against the format;
++#   2. its criterion PASSES against the clean pinned state (known-good reference);
++#   3. its criterion FAILS against the state with the task's defect established (setup.sh).
++# Exit 0 iff all three hold for every task. Because the loop is data-driven over whatever task
++# dirs exist, a second, differently-shaped task validates here with no edit to this script - which
++# is itself the proof that the format is not shaped around one task.
++#
++# [LAW:dataflow-not-control-flow] one loop over the discovered task list; no per-task code.
++# [LAW:no-silent-failure] a task that cannot even be prepared aborts loudly; a criterion that
++#   passes where it must fail (or vice-versa) is a hard failure, never glossed.
++set -uo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++# shellcheck source=lib.sh
++source "$HERE/lib.sh"
++
++WORK="$(mktemp -d)"
++trap 'rm -rf "$WORK"' EXIT
++
++fails=0
++pass() { printf '  PASS  %s\n' "$*" >&2; }
++fail() { printf '  FAIL  %s\n' "$*" >&2; fails=$((fails + 1)); }
++
++# Discover tasks: every directory under here that holds a manifest.sh.
++mapfile -t TASKS < <(find "$HERE" -mindepth 2 -maxdepth 2 -name manifest.sh -exec dirname {} \; | sort)
++[ "${#TASKS[@]}" -gt 0 ] || task_die "no task directories found under $HERE"
++task_log "found ${#TASKS[@]} task(s)"
++
++for task in "${TASKS[@]}"; do
++  name="$(basename "$task")"
++  printf '\n== task: %s ==\n' "$name" >&2
++
++  # 1) validates against the format
++  if ( task_validate "$task" ) >/dev/null 2>"$WORK/verr"; then
++    pass "$name: validates against the format"
++  else
++    fail "$name: does not validate — $(head -1 "$WORK/verr")"
++    continue
++  fi
++
++  # 2) criterion PASSES on the clean pinned state. Capture the (often verbose) criterion output
++  # to a log and surface it only when the outcome is NOT what we require, so a green run stays
++  # readable but a surprise is never swallowed. [LAW:no-silent-failure]
++  good="$WORK/$name-good"
++  task_prepare "$task" "$good"
++  if task_check "$task" "$good" >"$WORK/good.log" 2>&1; then
++    pass "$name: criterion PASSES on the known-good reference state"
++  else
++    fail "$name: criterion should PASS on the clean pinned state but did not"
++    sed 's/^/    | /' "$WORK/good.log" >&2
++  fi
++
++  # 3) criterion FAILS on the state with the defect established
++  bad="$WORK/$name-defect"
++  task_prepare "$task" "$bad"
++  task_setup "$task" "$bad"
++  if task_check "$task" "$bad" >"$WORK/bad.log" 2>&1; then
++    fail "$name: criterion should FAIL on the defect state but PASSED (the criterion does not discriminate)"
++    sed 's/^/    | /' "$WORK/bad.log" >&2
++  else
++    pass "$name: criterion FAILS on the state that contains the defect"
++  fi
++done
++
++echo "" >&2
++if [ "$fails" -eq 0 ]; then
++  printf 'TASKS OK - %d task(s), all validate and their criteria discriminate good from defect\n' "${#TASKS[@]}" >&2
++  exit 0
++fi
++printf 'TASKS FAILED - %d check(s) failed\n' "$fails" >&2
++exit 1

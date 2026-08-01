@@ -1,0 +1,1952 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 9794961..eb49229 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -60,7 +60,7 @@ Wire format lives in `src/daemon/protocol.ts`. The Rust client mirrors the wire
+ - Parent-death watchdog (`src/daemon/parent-watchdog.ts`): a daemon spawned with `CC_CANDYBAR_PARENT_PID` set polls that pid and shuts down (through the same `shutdown(code)` funnel) when it dies. The production daemon is spawned detached and never sees the var, so it outlives its spawner as designed. Test daemons inherit the var from the Jest worker (armed once in `test/setup.ts`), so a SIGKILLed/crashed/timed-out Jest cannot orphan a daemon to PID 1 — this closes the test-daemon leak.
+ - Caches owned by the daemon process (one each, not per-session):
+   - `src/daemon/cache/git.ts` — git state, keyed by **repo root** (not cwd, not session), invalidated by fs watchers on `.git/HEAD` and `.git/index` mtimes. The forge **PR/MR lookup** (`showPullRequest` option → `GitInfo.pullRequest`) lives here too but in a **separate cache with its own TTL** (`PR_TTL_OK_MS` / shorter `PR_TTL_FAIL_MS`), keyed `repoRoot|branch` — a network resource (`gh`/`glab`) gets a longer, independent lifecycle than fs-watched local state, so the per-render git fetch stays all-local. The lookup itself (`GitService.resolvePullRequest`: remote→forge detect→CLI→three-state `Outcome<PullRequest>`) is in `src/segments/git.ts`; `failed` is surfaced as a **visible** `git.prError` (distinct from no-PR), never collapsed to a missing key.
+-  - `src/daemon/cache/session-usage-store.ts` — the daemon's single owner of per-session usage records (one parse per session, keyed by transcript mtime). Both the `session` projection (whole-session totals) and the `today` projection (cross-session sum of per-day buckets) are **folds** over this one store — there is no per-render whole-tree scan. The whole transcript tree is read **exactly once**, lazily (a per-day seed), to backfill sessions that did work before the daemon saw them; every render after that is a single sync `statSync` on the active session's transcript plus an in-memory fold (`[LAW:dataflow-not-control-flow]` — `today` is derived state maintained incrementally, not recompute-if-stale).
++  - `src/daemon/cache/session-usage-store.ts` — the daemon's single owner of per-session usage records, keyed by transcript mtime. Both the `session` projection (whole-session totals) and the `today` projection (cross-session sum of per-day buckets) are **folds** over this one store — there is no per-render whole-tree scan. The whole transcript tree is read **exactly once**, lazily (a per-day seed), to backfill sessions that did work before the daemon saw them; every render after that is a single sync `statSync` on the active session's transcript plus an in-memory fold. The fold itself is **incremental and append-only** (brandon-daemon-perf-bb9): a record holds a per-file `FileFold` — a byte **cursor** plus running cost/token/day sums for the main transcript and each agent sidechain — so when an active session's transcript grows, only the **appended bytes** are read (`readAppendedEntries` → gated `readAppended` in `src/utils/transcript-fs.ts`) and folded in, never a whole-file re-parse. Per-render cost is **O(bytes appended since last render)**, not O(transcript length); a `/compact` rewrite (file shrinks below the cursor) is the one `reset` case that re-folds that file from zero. `src/segments/metrics.ts` folds the same reader the same way (`messageCount` + a recent-entry ring) so it doesn't re-inherit the whole-file parse the store dropped (`[LAW:dataflow-not-control-flow]` — `session`/`today`/metrics are all derived state maintained incrementally, not recompute-if-stale).
+   - `src/daemon/cache/render.ts` — per `(projectDir, cwd)` tuple, holds the live DSL state: parsed `DslConfig`, `VariableStore`, `SourceRegistry` (with timers/watchers/git-subscriptions), `CompiledSegments`, and resolved `basePalette`. LRU-capped at 256. Each entry watches every candidate config-file location (so creating one later triggers reload). `reloadInto` builds the new state into a local first and only swaps + disposes the old `SourceRegistry` on success, so a broken-config reload preserves last-known-good (`[LAW:single-enforcer]` — the registry owns async handles; dispose-before-swap is the contract).
+   - `src/daemon/session-state.ts` — per-session key/value store for click-driven state (currently active theme, toolbar-expanded, etc.).
+ - Stats snapshot at `cc-candybar daemon-stats --json` — uptime, RSS, cache hit rates, watcher count, request totals.
+diff --git a/package.json b/package.json
+index 0d073ba..484f913 100644
+--- a/package.json
++++ b/package.json
+@@ -24,6 +24,8 @@
+     "test:coverage": "jest --coverage",
+     "demo": "tsx src/demo/dsl.ts",
+     "benchmark:timing": "scripts/benchmark_timing.sh",
++    "loadtest": "node --import tsx scripts/daemon-load-harness.ts",
++    "loadtest:gate": "node --import tsx scripts/daemon-load-harness.ts --sessions 25 --interval 300 --duration 20 --churn --transcript-lines 5000",
+     "check:protocol": "node scripts/check-protocol.mjs",
+     "gen:schema": "tsx scripts/gen-schema.ts",
+     "check:schema": "tsx scripts/check-schema.ts",
+diff --git a/scripts/daemon-load-harness.ts b/scripts/daemon-load-harness.ts
+new file mode 100644
+index 0000000..6db513a
+--- /dev/null
++++ b/scripts/daemon-load-harness.ts
+@@ -0,0 +1,597 @@
++// Daemon render-latency load harness (brandon-daemon-perf-bb9).
++//
++// [LAW:verifiable-goals] The reproducible gate the ticket asks for: drive N
++// synthetic Claude sessions at a fixed tick rate against an ISOLATED daemon
++// (its own CC_CANDYBAR_SOCKET + XDG dirs, never the developer's real daemon),
++// measure the per-render round-trip distribution the way the *client* sees it,
++// and report p50/p95/p99/max plus a classified error count. The pass bar is the
++// Rust client's own budget, not the daemon's looser internal timeout:
++//   - TOTAL_BUDGET = 150ms round-trip (rust-client TOTAL_BUDGET)
++//   - CONNECT_TIMEOUT = 50ms connect (rust-client CONNECT_TIMEOUT)
++// A render slower than 150ms is a client give-up → stale bar → respawn, even
++// though the daemon (200ms REQUEST_TIMEOUT_MS) still thinks it answered. So the
++// harness gates on 150ms and reports connect-phase latency separately.
++//
++// [LAW:effects-at-boundaries] The harness is the world edge: it owns process
++// spawn, sockets, fs, and the clock. The measured subject (the daemon) is a
++// black box driven only over its wire — no in-process shortcuts, so the numbers
++// mean what production means.
++//
++// Faithful to production in the ways that matter for this bug:
++//   - ONE fresh connection per render (the Rust client connects, sends, prints,
++//     exits every tick) — this is what exercises the accept backlog where the
++//     storm's ECONNREFUSED/EPIPE originated.
++//   - The DEFAULT bundled config (no config file) drives the real provider mix:
++//     git (subprocess), session+today (transcript fold), context (transcript
++//     read) — the exact per-render fs/spawn work the ticket suspects.
++//   - project_dir points at a REAL git repo so git actually runs; each session
++//     gets its own synthetic JSONL transcript so the usage folds do real work.
++//
++// Run: pnpm build && node --import tsx scripts/daemon-load-harness.ts --sessions 25
++// Flags: --sessions N --interval MS --duration S --transcript-lines N
++//        --churn (append a transcript line each tick → invalidation bursts)
++//        --daemon dist|tsx (which daemon artifact; default dist)
++//        --profile (spawn daemon under --cpu-prof; writes .cpuprofile on exit)
++//        --json (emit the summary as one JSON line for regression gating)
++
++import { spawn, type ChildProcess } from "node:child_process";
++import fs from "node:fs";
++import net from "node:net";
++import os from "node:os";
++import path from "node:path";
++import { parseArgs } from "node:util";
++import {
++  PROTOCOL_VERSION,
++  encodeFrame,
++  makeFrameReader,
++} from "../src/daemon/protocol.js";
++
++// ─── Client budget (mirror of rust-client/src/main.rs) ──────────────────────
++const CONNECT_TIMEOUT_MS = 50;
++const TOTAL_BUDGET_MS = 150;
++
++const REPO_ROOT = path.resolve(
++  path.dirname(new URL(import.meta.url).pathname),
++  "..",
++);
++
++// ─── CLI ────────────────────────────────────────────────────────────────────
++const { values } = parseArgs({
++  options: {
++    sessions: { type: "string", default: "25" },
++    interval: { type: "string", default: "300" },
++    duration: { type: "string", default: "20" },
++    "transcript-lines": { type: "string", default: "800" },
++    churn: { type: "boolean", default: false },
++    daemon: { type: "string", default: "dist" },
++    profile: { type: "boolean", default: false },
++    json: { type: "boolean", default: false },
++    // A config.json5 to drop into the isolated XDG_CONFIG_HOME (else the daemon
++    // falls back to DEFAULT_DSL_CONFIG). Use to exercise provider mixes the
++    // default layout doesn't — e.g. a metrics/burn segment.
++    config: { type: "string" },
++  },
++});
++
++const SESSIONS = Number(values.sessions);
++const INTERVAL_MS = Number(values.interval);
++const DURATION_MS = Number(values.duration) * 1000;
++const TRANSCRIPT_LINES = Number(values["transcript-lines"]);
++
++// ─── Outcome classification ─────────────────────────────────────────────────
++// [LAW:types-are-the-program] Every render lands in exactly one bucket. The
++// classes mirror the failures the storm logs showed, so the report answers
++// "which failure mode" not just "how many failed".
++interface Sample {
++  totalMs: number;
++  connectMs: number;
++  // [LAW:types-are-the-program] connect_timeout (couldn't accept within 50ms —
++  // daemon alive but its accept backlog is saturated) is a DISTINCT failure from
++  // econnrefused (kernel refused — daemon not listening at all). Conflating them
++  // would recreate the exact misdiagnosis that drove the storm, so the harness
++  // that exists to tell failure modes apart must keep them apart.
++  outcome:
++    | "ok"
++    | "budget_exceeded"
++    | "connect_timeout"
++    | "econnrefused"
++    | "epipe"
++    | "other";
++  atMs: number; // elapsed since measurement start, for cold-start vs steady-state
++}
++
++const samples: Sample[] = [];
++let runStart = 0;
++
++// ─── One faithful render round-trip ─────────────────────────────────────────
++// Mirrors the Rust client's phase budget: 50ms connect, 150ms total. Fresh
++// connection per call. Resolves to a Sample; never rejects (a failure is a
++// classified Sample, not an exception — the loop must not stop on one bad tick).
++function oneRender(
++  sockPath: string,
++  hookData: unknown,
++  cwd: string,
++): Promise<Sample> {
++  return new Promise((resolve) => {
++    const t0 = performance.now();
++    let connectMs = 0;
++    let settled = false;
++    const sock = net.connect(sockPath);
++    const finish = (outcome: Sample["outcome"]): void => {
++      if (settled) return;
++      settled = true;
++      clearTimeout(totalTimer);
++      clearTimeout(connectTimer);
++      sock.removeAllListeners();
++      sock.destroy();
++      resolve({
++        totalMs: performance.now() - t0,
++        connectMs,
++        outcome,
++        atMs: runStart > 0 ? performance.now() - runStart : 0,
++      });
++    };
++    const connectTimer = setTimeout(
++      () => finish("connect_timeout"),
++      CONNECT_TIMEOUT_MS,
++    );
++    const totalTimer = setTimeout(
++      () => finish("budget_exceeded"),
++      TOTAL_BUDGET_MS,
++    );
++
++    sock.once("connect", () => {
++      connectMs = performance.now() - t0;
++      clearTimeout(connectTimer);
++      const reader = makeFrameReader(
++        () => finish("ok"),
++        () => finish("other"),
++      );
++      sock.on("data", reader);
++      sock.write(
++        encodeFrame({
++          v: PROTOCOL_VERSION,
++          kind: "render",
++          hookData,
++          args: [],
++          cwd,
++          termCols: 120,
++        }),
++      );
++    });
++    sock.on("error", (err: NodeJS.ErrnoException) => {
++      if (err.code === "ECONNREFUSED") finish("econnrefused");
++      else if (err.code === "EPIPE" || err.code === "ECONNRESET")
++        finish("epipe");
++      else finish("other");
++    });
++  });
++}
++
++// ─── Synthetic transcript ────────────────────────────────────────────────────
++// [LAW:one-source-of-truth] The usage fold reads message.usage.* and costUSD;
++// the size drives cold-parse cost. Realistic shape so the fold does real work,
++// not a no-op over an empty file.
++function writeTranscript(file: string, lines: number): void {
++  const rows: string[] = [];
++  const base = Date.parse("2026-07-09T09:00:00.000Z");
++  for (let i = 0; i < lines; i++) {
++    rows.push(
++      JSON.stringify({
++        timestamp: new Date(base + i * 1000).toISOString(),
++        costUSD: 0.0125,
++        message: {
++          usage: {
++            input_tokens: 1200,
++            output_tokens: 320,
++            cache_creation_input_tokens: 500,
++            cache_read_input_tokens: 8000,
++          },
++        },
++      }),
++    );
++  }
++  fs.writeFileSync(file, rows.join("\n") + "\n");
++}
++
++function makeHookData(
++  sessionId: string,
++  transcriptPath: string,
++  cwd: string,
++  projectDir: string,
++): unknown {
++  const nowSec = Math.floor(Date.now() / 1000);
++  return {
++    hook_event_name: "Status",
++    session_id: sessionId,
++    transcript_path: transcriptPath,
++    cwd,
++    model: { id: "claude-opus-4-8", display_name: "Claude Opus 4.8" },
++    workspace: { current_dir: cwd, project_dir: projectDir, added_dirs: [] },
++    version: "1.17.3",
++    cost: {
++      total_cost_usd: 4.21,
++      total_duration_ms: 1_800_000,
++      total_api_duration_ms: 900_000,
++      total_lines_added: 320,
++      total_lines_removed: 90,
++    },
++    context_window: {
++      total_input_tokens: 120_000,
++      total_output_tokens: 18_000,
++      context_window_size: 200_000,
++      used_percentage: 62,
++      remaining_percentage: 38,
++      current_usage: {
++        input_tokens: 1200,
++        output_tokens: 320,
++        cache_creation_input_tokens: 500,
++        cache_read_input_tokens: 8000,
++      },
++    },
++    rate_limits: {
++      five_hour: { used_percentage: 44, resets_at: nowSec + 3600 },
++      seven_day: { used_percentage: 22, resets_at: nowSec + 5 * 86400 },
++    },
++  };
++}
++
++// ─── Daemon lifecycle ─────────────────────────────────────────────────────────
++interface DaemonHandle {
++  child: ChildProcess;
++  sockPath: string;
++  profileDir: string | null;
++  cleanup(): void;
++}
++
++async function spawnDaemon(stateRoot: string): Promise<DaemonHandle> {
++  const stateDir = path.join(stateRoot, "cc-candybar");
++  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
++  const sockPath = path.join(stateDir, "socket");
++  // [LAW:locality-or-seam] cpuprof dir lives OUTSIDE stateRoot so the run's
++  // stateRoot cleanup doesn't delete the profile the operator wants to inspect.
++  const profileDir = values.profile
++    ? fs.mkdtempSync(path.join(os.tmpdir(), "cbh-cpuprof-"))
++    : null;
++
++  const env: NodeJS.ProcessEnv = {
++    ...process.env,
++    CC_CANDYBAR_SOCKET: sockPath,
++    XDG_STATE_HOME: stateRoot,
++    XDG_CACHE_HOME: fs.mkdtempSync(path.join(os.tmpdir(), "cbh-cache-")),
++    // Empty config dir → falls back to DEFAULT_DSL_CONFIG (the realistic mix).
++    XDG_CONFIG_HOME: fs.mkdtempSync(path.join(os.tmpdir(), "cbh-config-")),
++  };
++  if (values.config) {
++    const cfgDir = path.join(env.XDG_CONFIG_HOME!, "cc-candybar");
++    fs.mkdirSync(cfgDir, { recursive: true });
++    fs.copyFileSync(values.config, path.join(cfgDir, "config.json5"));
++  }
++
++  const nodeFlags = profileDir
++    ? ["--cpu-prof", "--cpu-prof-dir", profileDir]
++    : [];
++  const [cmd, args] =
++    values.daemon === "tsx"
++      ? [
++          process.execPath,
++          [
++            "--import",
++            "tsx",
++            ...nodeFlags,
++            path.join(REPO_ROOT, "src", "index.ts"),
++            "daemon",
++          ],
++        ]
++      : [
++          process.execPath,
++          [...nodeFlags, path.join(REPO_ROOT, "dist", "index.mjs"), "daemon"],
++        ];
++
++  const child = spawn(cmd, args, {
++    cwd: REPO_ROOT,
++    env,
++    stdio: ["ignore", "pipe", "pipe"],
++  });
++  child.stdout?.on("data", () => {});
++  child.stderr?.on("data", (b: Buffer) =>
++    process.stderr.write(`[daemon] ${b}`),
++  );
++
++  const cleanup = (): void => {
++    if (child.exitCode === null && child.signalCode === null) {
++      try {
++        child.kill("SIGKILL");
++      } catch {}
++    }
++    for (const d of [env.XDG_CACHE_HOME, env.XDG_CONFIG_HOME]) {
++      if (d)
++        try {
++          fs.rmSync(d, { recursive: true, force: true });
++        } catch {}
++    }
++  };
++
++  const deadline = Date.now() + 8000;
++  let alive = false;
++  while (!alive && Date.now() < deadline) {
++    if (fs.existsSync(sockPath)) {
++      alive = await new Promise<boolean>((resolve) => {
++        const s = net.connect(sockPath);
++        s.once("connect", () => {
++          s.destroy();
++          resolve(true);
++        });
++        s.once("error", () => resolve(false));
++      });
++    }
++    if (!alive) await new Promise((r) => setTimeout(r, 25));
++  }
++  if (!alive) {
++    cleanup();
++    throw new Error("daemon did not accept within 8s");
++  }
++  return { child, sockPath, profileDir, cleanup };
++}
++
++// Request the daemon's own stats snapshot (its view of the run).
++function fetchStats(sockPath: string): Promise<unknown> {
++  return new Promise((resolve) => {
++    const sock = net.connect(sockPath);
++    let done = false;
++    const finish = (v: unknown): void => {
++      if (done) return;
++      done = true;
++      sock.destroy();
++      resolve(v);
++    };
++    sock.once("connect", () => {
++      const reader = makeFrameReader(
++        (f) => finish(f),
++        () => finish(null),
++      );
++      sock.on("data", reader);
++      sock.write(encodeFrame({ v: PROTOCOL_VERSION, kind: "stats" }));
++    });
++    sock.on("error", () => finish(null));
++    setTimeout(() => finish(null), 1000);
++  });
++}
++
++function shutdownDaemon(sockPath: string): Promise<void> {
++  return new Promise((resolve) => {
++    const sock = net.connect(sockPath);
++    let done = false;
++    const finish = (): void => {
++      if (done) return;
++      done = true;
++      sock.destroy();
++      resolve();
++    };
++    sock.once("connect", () => {
++      const reader = makeFrameReader(
++        () => finish(),
++        () => finish(),
++      );
++      sock.on("data", reader);
++      sock.write(encodeFrame({ v: PROTOCOL_VERSION, kind: "shutdown" }));
++    });
++    sock.on("error", () => finish());
++    setTimeout(() => finish(), 2000);
++  });
++}
++
++// ─── Percentiles ──────────────────────────────────────────────────────────────
++function pct(sorted: number[], p: number): number {
++  if (sorted.length === 0) return 0;
++  const idx = Math.min(
++    sorted.length - 1,
++    Math.floor((p / 100) * sorted.length),
++  );
++  return sorted[idx]!;
++}
++
++// ─── Main ─────────────────────────────────────────────────────────────────────
++async function main(): Promise<void> {
++  const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cbh-state-"));
++  const transcriptDir = fs.mkdtempSync(
++    path.join(os.tmpdir(), "cbh-transcripts-"),
++  );
++  // [LAW:effects-at-boundaries] The caller owns these two temp dirs; a
++  // spawnDaemon throw (readiness timeout) mid-run must not leak them in /tmp.
++  // spawnDaemon already tears down its own child + cache/config dirs on failure;
++  // this finally covers stateRoot + transcriptDir on every exit path.
++  let exitCode = 1;
++  try {
++    // Each synthetic session: distinct id + transcript; cwd/project_dir = the real
++    // repo so git actually runs.
++    const sessions = Array.from({ length: SESSIONS }, (_, i) => {
++      const id = `load-sess-${i}-${process.pid}`;
++      const transcriptPath = path.join(transcriptDir, `${id}.jsonl`);
++      writeTranscript(transcriptPath, TRANSCRIPT_LINES);
++      return {
++        id,
++        transcriptPath,
++        hookData: makeHookData(id, transcriptPath, REPO_ROOT, REPO_ROOT),
++      };
++    });
++
++    const handle = await spawnDaemon(stateRoot);
++    // eslint-disable-next-line no-console
++    console.error(
++      `daemon up (${values.daemon}${values.profile ? " +cpuprof" : ""}); ` +
++        `${SESSIONS} sessions @ ${INTERVAL_MS}ms for ${DURATION_MS / 1000}s` +
++        `${values.churn ? " (churn)" : ""}`,
++    );
++
++    // Warm-up: establish every session's byte cursor and let the one-time cold
++    // full-read (O(transcript length), once per session per daemon lifetime) plus
++    // its GC settle BEFORE measurement. Steady state — incremental O(new bytes) —
++    // is what production renders are and what this gate measures; the cold read is
++    // amortized over a session's hundreds of renders and must not dominate p99.
++    for (let round = 0; round < 3; round++) {
++      await Promise.all(
++        sessions.map((s) => oneRender(handle.sockPath, s.hookData, REPO_ROOT)),
++      );
++    }
++    await new Promise((r) => setTimeout(r, 250));
++
++    const start = performance.now();
++    runStart = start;
++    const timers: NodeJS.Timeout[] = [];
++    let churnCounter = 0;
++    await new Promise<void>((resolveRun) => {
++      for (const s of sessions) {
++        const tick = setInterval(() => {
++          if (values.churn) {
++            // Append a line → transcript mtime bumps → next fold re-parses.
++            churnCounter++;
++            fs.appendFileSync(
++              s.transcriptPath,
++              JSON.stringify({
++                timestamp: new Date().toISOString(),
++                costUSD: 0.001,
++                message: {
++                  usage: {
++                    input_tokens: 10,
++                    output_tokens: 5,
++                    cache_creation_input_tokens: 0,
++                    cache_read_input_tokens: 0,
++                  },
++                },
++              }) + "\n",
++            );
++          }
++          void oneRender(handle.sockPath, s.hookData, REPO_ROOT).then(
++            (sample) => samples.push(sample),
++          );
++        }, INTERVAL_MS);
++        timers.push(tick);
++      }
++      setTimeout(() => {
++        for (const t of timers) clearInterval(t);
++        resolveRun();
++      }, DURATION_MS);
++    });
++    const elapsedS = (performance.now() - start) / 1000;
++    // Let any in-flight renders settle.
++    await new Promise((r) => setTimeout(r, TOTAL_BUDGET_MS + 50));
++
++    const stats = await fetchStats(handle.sockPath);
++
++    // ─── Report ─────────────────────────────────────────────────────────────
++    // [LAW:verifiable-goals] The ticket's bar is "under SUSTAINED load". A daemon's
++    // first seconds pay a one-time O(transcript length) cold read per session per
++    // provider (plus the GC of those transient parses) — real, but amortized over a
++    // session's hundreds of renders, NOT a sustained stall. So the gate scores
++    // STEADY-STATE (renders after the cold-start ramp); the ramp is reported
++    // separately, never hidden. A regression that slows steady renders still trips
++    // the gate; a slow cold start shows up as a large ramp count for the operator.
++    const RAMP_MS = 3000;
++    const steady = samples.filter((s) => s.atMs >= RAMP_MS);
++    const ramp = samples.filter((s) => s.atMs < RAMP_MS);
++    const totals = steady.map((s) => s.totalMs).sort((a, b) => a - b);
++    const connects = samples
++      .map((s) => s.connectMs)
++      .filter((c) => c > 0)
++      .sort((a, b) => a - b);
++    const byOutcome = (o: Sample["outcome"]): number =>
++      samples.filter((s) => s.outcome === o).length;
++    const steadyOver = steady.filter(
++      (s) => s.outcome === "budget_exceeded",
++    ).length;
++    const summary = {
++      sessions: SESSIONS,
++      intervalMs: INTERVAL_MS,
++      churn: values.churn,
++      transcriptLines: TRANSCRIPT_LINES,
++      daemon: values.daemon,
++      config: values.config ?? "default",
++      elapsedS: Number(elapsedS.toFixed(1)),
++      renders: samples.length,
++      achievedRatePerSec: Number((samples.length / elapsedS).toFixed(1)),
++      // Steady-state (post-ramp) round-trip — the sustained-load figure the gate
++      // scores against the Rust client's 150ms TOTAL_BUDGET.
++      steadyLatencyMs: {
++        p50: Number(pct(totals, 50).toFixed(1)),
++        p95: Number(pct(totals, 95).toFixed(1)),
++        p99: Number(pct(totals, 99).toFixed(1)),
++        max: Number((totals[totals.length - 1] ?? 0).toFixed(1)),
++        renders: steady.length,
++      },
++      connectMs: {
++        p50: Number(pct(connects, 50).toFixed(1)),
++        p99: Number(pct(connects, 99).toFixed(1)),
++        max: Number((connects[connects.length - 1] ?? 0).toFixed(1)),
++      },
++      outcomes: {
++        ok: byOutcome("ok"),
++        budget_exceeded: byOutcome("budget_exceeded"),
++        connect_timeout: byOutcome("connect_timeout"),
++        econnrefused: byOutcome("econnrefused"),
++        epipe: byOutcome("epipe"),
++        other: byOutcome("other"),
++      },
++      // The one-time startup ramp (first RAMP_MS): its render count and how many of
++      // those exceeded budget. Large numbers here mean slow cold reads, not a
++      // sustained-load regression.
++      coldStart: {
++        rampMs: RAMP_MS,
++        renders: ramp.length,
++        overBudget: ramp.filter((s) => s.outcome === "budget_exceeded").length,
++      },
++      // Timestamps (ms since measurement start) of any STEADY over-budget render —
++      // spread ⇒ a real periodic stall to chase; isolated/absent ⇒ scheduler noise.
++      steadyOverAtMs: steady
++        .filter((s) => s.outcome === "budget_exceeded")
++        .map((s) => Math.round(s.atMs)),
++      churnAppends: churnCounter,
++      budgetMs: TOTAL_BUDGET_MS,
++      // Pass = the ticket's acceptance under SUSTAINED load: steady p99 within the
++      // client budget, zero steady over-budget, and zero connection failures at any
++      // point — a saturated backlog (connect_timeout), a refused socket, or a
++      // broken pipe are each unacceptable, ramp or not.
++      pass:
++        pct(totals, 99) <= TOTAL_BUDGET_MS &&
++        steadyOver === 0 &&
++        byOutcome("epipe") === 0 &&
++        byOutcome("connect_timeout") === 0 &&
++        byOutcome("econnrefused") === 0,
++    };
++
++    if (values.json) {
++      // eslint-disable-next-line no-console
++      console.log(JSON.stringify({ summary, daemonStats: stats }));
++    } else {
++      // eslint-disable-next-line no-console
++      console.log("\n─── load-harness summary ───");
++      // eslint-disable-next-line no-console
++      console.log(JSON.stringify(summary, null, 2));
++    }
++
++    if (handle.profileDir) {
++      await shutdownDaemon(handle.sockPath);
++      await new Promise((r) => setTimeout(r, 500));
++      const profiles = fs.existsSync(handle.profileDir)
++        ? fs.readdirSync(handle.profileDir)
++        : [];
++      // eslint-disable-next-line no-console
++      console.error(
++        `cpu profiles: ${profiles.map((p) => path.join(handle.profileDir!, p)).join(", ")}`,
++      );
++    }
++
++    handle.cleanup();
++    exitCode = summary.pass ? 0 : 1;
++  } finally {
++    try {
++      fs.rmSync(stateRoot, { recursive: true, force: true });
++    } catch {}
++    try {
++      fs.rmSync(transcriptDir, { recursive: true, force: true });
++    } catch {}
++  }
++  process.exit(exitCode);
++}
++
++void main();
+diff --git a/src/daemon/cache/session-usage-store.ts b/src/daemon/cache/session-usage-store.ts
+index 72ab199..9d0523a 100644
+--- a/src/daemon/cache/session-usage-store.ts
++++ b/src/daemon/cache/session-usage-store.ts
+@@ -1,17 +1,20 @@
+ import fs from "node:fs";
+-import { join } from "node:path";
++import { dirname, join } from "node:path";
+ 
+ import {
+-  SessionProvider,
+   type SessionInfo,
+-  type SessionUsage,
+   type UsageInfo,
+   type TokenBreakdown,
+ } from "../../segments/session";
++import { PricingService } from "../../segments/pricing";
+ import {
+   getClaudePaths,
+   findProjectPaths,
++  findAgentTranscripts,
++  readAppendedEntries,
+   type ClaudeHookData,
++  type ParsedEntry,
++  type TranscriptCursor,
+ } from "../../utils/claude";
+ // [LAW:single-enforcer] The once-per-day seed's directory walk shares the same
+ // in-flight-I/O budget (gn4.2) as every other transcript scan.
+@@ -105,6 +108,10 @@ interface DayUsage {
+ }
+ 
+ interface SessionRecord {
++  // [LAW:one-source-of-truth] `files` is canonical (main transcript + agent
++  // sidechains, each its own incremental FileFold); `sessionInfo`/`days` are
++  // derived from mergeFolds and re-synced on every ingest — the single writer.
++  files: Map<string, FileFold>;
+   sessionInfo: SessionInfo;
+   days: Map<string, DayUsage>;
+   transcriptMtime: number;
+@@ -161,16 +168,63 @@ function statMtimeMs(filePath: string | undefined): number {
+   }
+ }
+ 
+-// dayKey strings sort lexically == chronologically, so "keep recent" is a
+-// string comparison against yesterday's key.
+-function bucketByDay(usage: SessionUsage): Map<string, DayUsage> {
++function emptyBreakdown(): TokenBreakdown {
++  return { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 };
++}
++
++// [LAW:one-source-of-truth] The incremental fold of ONE append-only transcript
++// file (a session's main transcript or one agent sidechain). `cursor` marks the
++// bytes already folded; the sums run over every usage-bearing entry seen so far.
++// The session aggregate is the MERGE of its files' folds (mergeFolds), so a file
++// rewritten by /compact re-folds in isolation without disturbing the others.
++interface FileFold {
++  cursor: TranscriptCursor;
++  entries: number; // usage-bearing entries folded (0 ⇒ empty session, all-null)
++  cost: number;
++  breakdown: TokenBreakdown;
++  days: Map<string, DayUsage>; // keys >= seed cutoff only (pruned on fold)
++}
++
++// [LAW:effects-at-boundaries] Pure fold of NEW entries onto a prior file fold.
++// Returns a FRESH FileFold (prior is never mutated) so two concurrent refolds
++// sharing one prior snapshot can't corrupt each other. `reset` (file rewritten)
++// discards the prior sums and folds `entries` — the whole new file — from zero.
++//
++// [LAW:one-source-of-truth] Cost has two tracks the from-scratch code also kept:
++// the SESSION cost prices an entry lacking costUSD (PricingService), while a DAY
++// bucket counts costUSD only (0 when absent). Preserved exactly so incremental
++// output equals the old whole-file recompute.
++async function foldFile(
++  prior: FileFold | undefined,
++  reset: boolean,
++  entries: readonly ParsedEntry[],
++  cursor: TranscriptCursor,
++): Promise<FileFold> {
++  // dayKey strings sort lexically == chronologically, so "keep recent" is a
++  // string comparison against yesterday's key.
+   const keep = dayKey(new Date(seedCutoffMs()));
++  const base = prior && !reset ? prior : undefined;
++  let count = base?.entries ?? 0;
++  let cost = base?.cost ?? 0;
++  const breakdown = base ? { ...base.breakdown } : emptyBreakdown();
+   const days = new Map<string, DayUsage>();
+-  for (const entry of usage.entries) {
++  if (base) {
++    for (const [k, v] of base.days) if (k >= keep) days.set(k, { ...v });
++  }
++  for (const entry of entries) {
++    const u = entry.message?.usage;
++    if (!u) continue;
++    count++;
++    const priced =
++      entry.costUSD ?? (await PricingService.calculateCostForEntry(entry.raw));
++    cost += priced;
++    breakdown.input += u.input_tokens || 0;
++    breakdown.output += u.output_tokens || 0;
++    breakdown.cacheCreation += u.cache_creation_input_tokens || 0;
++    breakdown.cacheRead += u.cache_read_input_tokens || 0;
+     const key = dayKey(new Date(entry.timestamp));
+     if (key < keep) continue;
+     const d = days.get(key) ?? { ...EMPTY_DAY };
+-    const u = entry.message.usage;
+     d.cost += entry.costUSD ?? 0;
+     d.input += u.input_tokens || 0;
+     d.output += u.output_tokens || 0;
+@@ -178,7 +232,50 @@ function bucketByDay(usage: SessionUsage): Map<string, DayUsage> {
+     d.cacheRead += u.cache_read_input_tokens || 0;
+     days.set(key, d);
+   }
+-  return days;
++  return { cursor, entries: count, cost, breakdown, days };
++}
++
++// [LAW:effects-at-boundaries] Pure merge of a session's file folds into the
++// derived record shape the read path serves. `entries === 0` across all files is
++// the empty session (all-null SessionInfo, whose fields the payload drops) — the
++// same distinction the old `entries.length === 0` arm carried.
++function mergeFolds(files: ReadonlyMap<string, FileFold>): {
++  sessionInfo: SessionInfo;
++  days: Map<string, DayUsage>;
++} {
++  let count = 0;
++  let cost = 0;
++  const bd = emptyBreakdown();
++  const days = new Map<string, DayUsage>();
++  for (const f of files.values()) {
++    count += f.entries;
++    cost += f.cost;
++    bd.input += f.breakdown.input;
++    bd.output += f.breakdown.output;
++    bd.cacheCreation += f.breakdown.cacheCreation;
++    bd.cacheRead += f.breakdown.cacheRead;
++    for (const [k, v] of f.days) {
++      const d = days.get(k) ?? { ...EMPTY_DAY };
++      d.cost += v.cost;
++      d.input += v.input;
++      d.output += v.output;
++      d.cacheCreation += v.cacheCreation;
++      d.cacheRead += v.cacheRead;
++      days.set(k, d);
++    }
++  }
++  if (count === 0) return { sessionInfo: EMPTY_SESSION_INFO, days };
++  const tokens = bd.input + bd.output + bd.cacheCreation + bd.cacheRead;
++  return {
++    sessionInfo: {
++      cost,
++      calculatedCost: cost,
++      officialCost: null,
++      tokens,
++      tokenBreakdown: bd,
++    },
++    days,
++  };
+ }
+ 
+ // Bounded-concurrency fan-out for the seed: at most `limit` parses in flight.
+@@ -201,7 +298,6 @@ async function mapPool<T>(
+ }
+ 
+ export class SessionUsageStore {
+-  private readonly sessions = new SessionProvider();
+   private readonly entries = new Map<string, SessionRecord>();
+   // [LAW:one-source-of-truth] Coalesces concurrent MISSES for the same
+   // (session, observed mtime) onto one parse; cleared on settle (a coalescer,
+@@ -424,15 +520,27 @@ export class SessionUsageStore {
+     if (!transcriptPath) return existing ? ok(existing) : ABSENT;
+ 
+     this.misses++;
+-    const aggregate = await this.flight.run(`${sessionId}:${mtime}`, () =>
+-      this.aggregate(sessionId, transcriptPath),
++    // [LAW:no-ambient-temporal-coupling] The flight thunk snapshots the prior
++    // record when it RUNS (first caller); coalesced callers share that one
++    // refold. Two concurrent DIFFERENT-mtime refolds each read the same prior and
++    // last-writer-wins. This is safe — and specifically NOT a double-count —
++    // because `refold` writes the byte cursor and the fold as ONE atomic pair
++    // (both from a single refold result), and the fold always covers exactly
++    // [0, cursor). A losing writer's fold is discarded WITH its cursor, not left
++    // beside a stale one. So even when last-writer-wins rewinds the stored cursor,
++    // it rewinds the paired fold with it; the next refold folds [cursor, end) onto
++    // a fold that lacks those bytes — each byte folded once. `foldFile` is pure
++    // (fresh FileFold, prior never mutated), so the shared prior can't corrupt.
++    // Pinned by the concurrency test in test/transcript-incremental.test.ts.
++    const outcome = await this.flight.run(`${sessionId}:${mtime}`, () =>
++      this.refold(sessionId, transcriptPath, this.entries.get(sessionId)),
+     );
+-    if (aggregate.kind !== "ok") return aggregate;
+-    // Tag with the mtime observed AFTER the read so the next render that sees
+-    // the same mtime is a safe hit.
++    if (outcome.kind !== "ok") return outcome;
+     const record: SessionRecord = {
+-      ...aggregate.value,
+-      transcriptMtime: statMtimeMs(transcriptPath),
++      files: outcome.value.files,
++      sessionInfo: outcome.value.sessionInfo,
++      days: outcome.value.days,
++      transcriptMtime: outcome.value.mainMtime,
+       transcriptPath,
+       lastSeenAt: Date.now(),
+     };
+@@ -442,23 +550,51 @@ export class SessionUsageStore {
+     return ok(record);
+   }
+ 
+-  private async aggregate(
++  // [LAW:dataflow-not-control-flow] Re-fold ONLY the bytes appended since the
++  // prior record — the transcript (and each agent sidechain) is append-only, so
++  // per-render work is O(new bytes), not O(file). The whole-file case (cold
++  // record, or a first-ever read) is the same path with an empty prior: the
++  // reader yields the whole file from offset 0. A `failed` read on any file
++  // fails the fold (the boundary logs it); an `absent` file (not yet written /
++  // agent removed) keeps its prior fold and contributes nothing new.
++  private async refold(
+     sessionId: string,
+     transcriptPath: string,
++    prior: SessionRecord | undefined,
+   ): Promise<
+-    Outcome<{ sessionInfo: SessionInfo; days: Map<string, DayUsage> }>
++    Outcome<{
++      files: Map<string, FileFold>;
++      sessionInfo: SessionInfo;
++      days: Map<string, DayUsage>;
++      mainMtime: number;
++    }>
+   > {
+-    const usage = await this.sessions.getSessionUsageFromPath(
++    // File set for this fold: the main transcript plus the session's current
++    // agent sidechains. Files no longer in the set (a removed sidechain) drop
++    // out of `newFiles`, so a rewritten/renamed file cannot linger in the merge.
++    const agentPaths = await findAgentTranscripts(
+       sessionId,
+-      transcriptPath,
++      dirname(transcriptPath),
+     );
+-    // getSessionUsageFromPath never produces absent (an empty transcript is a
+-    // real zero-entry usage); failed passes through to the boundary.
+-    if (usage.kind !== "ok") return usage;
+-    return ok({
+-      sessionInfo: this.sessions.toSessionInfo(usage.value),
+-      days: bucketByDay(usage.value),
+-    });
++    const newFiles = new Map<string, FileFold>();
++    let mainMtime = 0;
++    for (const filePath of [transcriptPath, ...agentPaths]) {
++      const priorFold = prior?.files.get(filePath);
++      const read = await readAppendedEntries(filePath, priorFold?.cursor);
++      if (read.kind === "failed") return read;
++      if (read.kind === "absent") {
++        // The file has no bytes yet (fresh main) or vanished (removed agent
++        // sidechain). Carry a prior fold forward; otherwise it contributes
++        // nothing. The main transcript's absence leaves mainMtime 0, so the next
++        // render's mtime gate re-attempts rather than caching an empty read.
++        if (priorFold) newFiles.set(filePath, priorFold);
++        continue;
++      }
++      const { entries, cursor, reset } = read.value;
++      newFiles.set(filePath, await foldFile(priorFold, reset, entries, cursor));
++      if (filePath === transcriptPath) mainMtime = cursor.mtimeMs;
++    }
++    return ok({ files: newFiles, ...mergeFolds(newFiles), mainMtime });
+   }
+ 
+   private ensureSeeded(day: string): Promise<void> {
+diff --git a/src/segments/metrics.ts b/src/segments/metrics.ts
+index 9e11679..75f5f8b 100644
+--- a/src/segments/metrics.ts
++++ b/src/segments/metrics.ts
+@@ -1,10 +1,14 @@
++import fs from "node:fs";
+ import type { ClaudeHookData, ParsedEntry } from "../utils/claude";
+ 
+-// [LAW:one-source-of-truth] Metrics reads the transcript through the shared
+-// mtime-keyed parse LRU — the same parse the session/context segments already
+-// performed this render — instead of a private readFile+parse. One parse path,
+-// one cache; the multi-MB content arrays are dropped at parse time.
+-import { parseJsonlFile } from "../utils/claude";
++// [LAW:one-source-of-truth] Metrics reads the transcript through the SAME
++// incremental append reader the usage store uses, folding only the bytes added
++// since last render into a running message count + a bounded recent-entry ring —
++// never a whole-file re-parse. Before this, metrics re-parsed the entire growing
++// transcript every render (free only while it piggybacked the store's cache hit);
++// once the store went incremental, a full re-parse here would have re-inherited
++// the very stall the store fix removed. Now both consumers are O(new bytes).
++import { readAppendedEntries, type TranscriptCursor } from "../utils/claude";
+ import { debug } from "../utils/logger";
+ import { ABSENT, failed, ok, type Outcome } from "../utils/outcome";
+ 
+@@ -21,6 +25,25 @@ export interface MetricsInfo {
+   linesRemoved: number;
+ }
+ 
++// lastResponseTime only inspects the most recent turns for a user→assistant
++// pair; a bounded tail of non-sidechain entries is all it needs. The ring caps
++// per-session retained memory at O(1) regardless of transcript length.
++const RECENT_WINDOW = 20;
++// Bound the per-session fold map like the usage store's records — a long-lived
++// daemon sees many sessions; the ring is tiny, but the map must not grow without
++// limit. LRU by insertion order (delete+set on write), evict oldest past the cap.
++const MAX_SESSIONS = 256;
++
++// [LAW:one-source-of-truth] The incremental fold of one session's metrics: the
++// byte cursor already consumed, the running real-user message count, and the
++// recent-entry ring. Canonical; MetricsInfo's transcript-derived fields derive
++// from it, the hookData-derived fields (durations, lines) are always fresh.
++interface MetricsState {
++  cursor: TranscriptCursor;
++  messageCount: number;
++  recent: ParsedEntry[];
++}
++
+ // A real user turn vs. a tool_result echoed back as a "user" line. The
+ // discriminator is metrics-local policy over the shared ParsedEntry scalars.
+ function isRealUserMessage(entry: ParsedEntry): boolean {
+@@ -30,20 +53,26 @@ function isRealUserMessage(entry: ParsedEntry): boolean {
+   return messageType === "user" && !isToolResult;
+ }
+ 
+-export class MetricsProvider {
+-  private calculateMessageCount(entries: ParsedEntry[]): number {
+-    return entries.filter(isRealUserMessage).length;
++function statMtimeMs(filePath: string): number {
++  try {
++    return fs.statSync(filePath).mtimeMs;
++  } catch {
++    return 0;
+   }
++}
++
++export class MetricsProvider {
++  // [LAW:no-shared-mutable-globals] Single owner, hard cap, LRU eviction — the
++  // per-session incremental fold state. One instance per daemon.
++  private readonly state = new Map<string, MetricsState>();
+ 
+   private calculateLastResponseTime(entries: ParsedEntry[]): number | null {
+     if (entries.length === 0) return null;
+ 
+-    const recentEntries = entries.slice(-20);
+-
+     let lastUserTime: Date | null = null;
+     let bestResponseTime: number | null = null;
+ 
+-    for (const entry of recentEntries) {
++    for (const entry of entries) {
+       const messageType =
+         entry.type || entry.message?.role || entry.message?.type;
+ 
+@@ -61,6 +90,67 @@ export class MetricsProvider {
+     return bestResponseTime;
+   }
+ 
++  // [LAW:dataflow-not-control-flow] Fold the appended entries onto the prior
++  // state, producing a FRESH state (prior is never mutated) so two concurrent
++  // renders of one session both fold from the same prior and last-writer-wins is
++  // a correct answer, never a double-count. `reset` (a /compact rewrite) folds
++  // from empty. Returns the transcript-derived fields the caller composes with
++  // the always-fresh hookData fields.
++  private async foldMetrics(
++    sessionId: string,
++    transcriptPath: string,
++  ): Promise<
++    // [LAW:types-are-the-program] Never `absent` — a missing transcript is a real
++    // zero-count fold (ok), so the caller has exactly two arms to handle.
++    | { kind: "ok"; value: { messageCount: number; recent: ParsedEntry[] } }
++    | { kind: "failed"; reason: string }
++  > {
++    const prior = this.state.get(sessionId);
++    const mtime = statMtimeMs(transcriptPath);
++    // [LAW:no-ambient-temporal-coupling] Fast hit: the transcript is unchanged
++    // since we last folded it, so the message count + ring stand.
++    if (prior && mtime !== 0 && prior.cursor.mtimeMs === mtime) {
++      return {
++        kind: "ok",
++        value: { messageCount: prior.messageCount, recent: prior.recent },
++      };
++    }
++
++    const read = await readAppendedEntries(transcriptPath, prior?.cursor);
++    if (read.kind === "failed") return read;
++    if (read.kind === "absent") {
++      // No transcript yet (fresh session) — keep prior if any, don't cache a
++      // cursor so the next render retries when the file appears.
++      return {
++        kind: "ok",
++        value: {
++          messageCount: prior?.messageCount ?? 0,
++          recent: prior?.recent ?? [],
++        },
++      };
++    }
++
++    const { entries, cursor, reset } = read.value;
++    const base = prior && !reset ? prior : undefined;
++    let messageCount = base?.messageCount ?? 0;
++    let recent = base ? [...base.recent] : [];
++    for (const entry of entries) {
++      if (entry.isSidechain) continue;
++      if (isRealUserMessage(entry)) messageCount++;
++      recent.push(entry);
++    }
++    if (recent.length > RECENT_WINDOW) recent = recent.slice(-RECENT_WINDOW);
++
++    this.state.delete(sessionId);
++    this.state.set(sessionId, { cursor, messageCount, recent });
++    while (this.state.size > MAX_SESSIONS) {
++      const oldest = this.state.keys().next().value;
++      if (oldest === undefined) break;
++      this.state.delete(oldest);
++    }
++    return { kind: "ok", value: { messageCount, recent } };
++  }
++
+   // [LAW:no-silent-failure] A hook payload with no cost block is `absent`
+   // (old clients); a transcript parse error is `failed`, carried to the
+   // payload boundary — the old catch dressed it as the same all-null record
+@@ -69,33 +159,24 @@ export class MetricsProvider {
+     sessionId: string,
+     hookData: ClaudeHookData,
+   ): Promise<Outcome<MetricsInfo>> {
+-    try {
+-      debug(`Getting metrics from hook data for session: ${sessionId}`);
++    debug(`Getting metrics from hook data for session: ${sessionId}`);
+ 
+-      if (!hookData.cost) {
+-        return ABSENT;
+-      }
++    if (!hookData.cost) {
++      return ABSENT;
++    }
+ 
+-      // parseJsonlFile keeps sidechain entries (usage needs them); metrics
+-      // counts only main-thread turns, so the sidechain exclusion is local.
+-      const entries = (await parseJsonlFile(hookData.transcript_path)).filter(
+-        (entry) => !entry.isSidechain,
+-      );
+-      const messageCount = this.calculateMessageCount(entries);
+-      const lastResponseTime = this.calculateLastResponseTime(entries);
+-
+-      return ok({
+-        responseTime: hookData.cost.total_api_duration_ms / 1000,
+-        lastResponseTime,
+-        sessionDuration: hookData.cost.total_duration_ms / 1000,
+-        messageCount,
+-        linesAdded: hookData.cost.total_lines_added,
+-        linesRemoved: hookData.cost.total_lines_removed,
+-      });
+-    } catch (error) {
+-      return failed(
+-        `metrics (${sessionId}): ${error instanceof Error ? error.message : String(error)}`,
+-      );
++    const folded = await this.foldMetrics(sessionId, hookData.transcript_path);
++    if (folded.kind === "failed") {
++      return failed(`metrics (${sessionId}): ${folded.reason}`);
+     }
++
++    return ok({
++      responseTime: hookData.cost.total_api_duration_ms / 1000,
++      lastResponseTime: this.calculateLastResponseTime(folded.value.recent),
++      sessionDuration: hookData.cost.total_duration_ms / 1000,
++      messageCount: folded.value.messageCount,
++      linesAdded: hookData.cost.total_lines_added,
++      linesRemoved: hookData.cost.total_lines_removed,
++    });
+   }
+ }
+diff --git a/src/segments/session.ts b/src/segments/session.ts
+index cefb88e..d755203 100644
+--- a/src/segments/session.ts
++++ b/src/segments/session.ts
+@@ -1,30 +1,7 @@
+-import { debug } from "../utils/logger";
+-import { PricingService } from "./pricing";
+-import { failed, ok, type Outcome } from "../utils/outcome";
+-import {
+-  findAgentTranscripts,
+-  parseJsonlFile,
+-  type ParsedEntry,
+-} from "../utils/claude";
+-import { dirname } from "node:path";
+-
+-export interface SessionUsageEntry {
+-  timestamp: string;
+-  message: {
+-    usage: {
+-      input_tokens: number;
+-      output_tokens: number;
+-      cache_creation_input_tokens?: number;
+-      cache_read_input_tokens?: number;
+-    };
+-  };
+-  costUSD?: number;
+-}
+-
+-export interface SessionUsage {
+-  totalCost: number;
+-  entries: SessionUsageEntry[];
+-}
++// [LAW:decomposition] The session usage CONTRACT — the shapes the daemon's
++// SessionUsageStore produces and the render payload reads. The transcript fold
++// that produces them is incremental and lives in the store (its single owner);
++// this module is the type seam both sides agree on.
+ 
+ export interface TokenBreakdown {
+   input: number;
+@@ -44,145 +21,3 @@ export interface SessionInfo {
+ export interface UsageInfo {
+   session: SessionInfo;
+ }
+-
+-function convertToSessionEntry(entry: ParsedEntry): SessionUsageEntry {
+-  return {
+-    timestamp: entry.timestamp.toISOString(),
+-    message: {
+-      usage: {
+-        input_tokens: entry.message?.usage?.input_tokens || 0,
+-        output_tokens: entry.message?.usage?.output_tokens || 0,
+-        cache_creation_input_tokens:
+-          entry.message?.usage?.cache_creation_input_tokens,
+-        cache_read_input_tokens: entry.message?.usage?.cache_read_input_tokens,
+-      },
+-    },
+-    costUSD: entry.costUSD,
+-  };
+-}
+-
+-export class SessionProvider {
+-  // [LAW:one-source-of-truth] The transcript path is always in hand — the
+-  // daemon's SessionUsageStore holds it (hookData.transcript_path or its seed
+-  // scan) and passes it straight here. There is no lookup-by-id path: recovering
+-  // a path we already hold by scanning every project dir is the data-duplication
+-  // this method exists to avoid.
+-  // [LAW:no-silent-failure] A transcript that exists but can't be read or
+-  // parsed is `failed`, not an empty session — the old catch-to-null dressed
+-  // a read failure as "no usage", and the lie survived all the way to the
+-  // rendered bar. An empty transcript is a real (zero-entry) usage, not
+-  // absence.
+-  async getSessionUsageFromPath(
+-    sessionId: string,
+-    transcriptPath: string,
+-  ): Promise<Outcome<SessionUsage>> {
+-    try {
+-      debug(`Found transcript at: ${transcriptPath}`);
+-
+-      const mainEntries = await parseJsonlFile(transcriptPath);
+-      const projectPath = dirname(transcriptPath);
+-      const agentTranscripts = await findAgentTranscripts(
+-        sessionId,
+-        projectPath,
+-      );
+-
+-      debug(`Found ${agentTranscripts.length} agent transcripts for session`);
+-
+-      // [LAW:one-source-of-truth] parseJsonlFile returns its cached entries
+-      // array BY REFERENCE; the parse cache is the canonical store of a file's
+-      // parsed entries and is shared across providers. Mutating that array
+-      // (the old `push`) corrupted the cache — agent entries leaked into the
+-      // main transcript's cached value and re-appended on every warm hit.
+-      // Build a fresh combined list instead so no shared array is touched.
+-      const agentEntries = (
+-        await Promise.all(agentTranscripts.map((p) => parseJsonlFile(p)))
+-      ).flat();
+-      const parsedEntries = [...mainEntries, ...agentEntries];
+-
+-      if (parsedEntries.length === 0) {
+-        return ok({ totalCost: 0, entries: [] });
+-      }
+-
+-      const entries: SessionUsageEntry[] = [];
+-      let totalCost = 0;
+-
+-      for (const entry of parsedEntries) {
+-        if (entry.message?.usage) {
+-          const sessionEntry = convertToSessionEntry(entry);
+-
+-          if (sessionEntry.costUSD !== undefined) {
+-            totalCost += sessionEntry.costUSD;
+-          } else {
+-            const cost = await PricingService.calculateCostForEntry(entry.raw);
+-            sessionEntry.costUSD = cost;
+-            totalCost += cost;
+-          }
+-
+-          entries.push(sessionEntry);
+-        }
+-      }
+-
+-      debug(
+-        `Parsed ${entries.length} usage entries, total cost: $${totalCost.toFixed(4)}`,
+-      );
+-      return ok({ totalCost, entries });
+-    } catch (error) {
+-      return failed(
+-        `session transcript (${sessionId}): ${error instanceof Error ? error.message : String(error)}`,
+-      );
+-    }
+-  }
+-
+-  calculateTokenBreakdown(entries: SessionUsageEntry[]): TokenBreakdown {
+-    return entries.reduce(
+-      (breakdown, entry) => ({
+-        input: breakdown.input + (entry.message.usage.input_tokens || 0),
+-        output: breakdown.output + (entry.message.usage.output_tokens || 0),
+-        cacheCreation:
+-          breakdown.cacheCreation +
+-          (entry.message.usage.cache_creation_input_tokens || 0),
+-        cacheRead:
+-          breakdown.cacheRead +
+-          (entry.message.usage.cache_read_input_tokens || 0),
+-      }),
+-      { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 },
+-    );
+-  }
+-
+-  // [LAW:types-are-the-program] Pure projection SessionUsage → SessionInfo, no
+-  // I/O. The store computes it once per ingest from already-parsed usage; the
+-  // empty-usage arm yields the all-null SessionInfo (which the payload drops).
+-  toSessionInfo(sessionUsage: SessionUsage): SessionInfo {
+-    if (sessionUsage.entries.length === 0) {
+-      return {
+-        cost: null,
+-        calculatedCost: null,
+-        officialCost: null,
+-        tokens: null,
+-        tokenBreakdown: null,
+-      };
+-    }
+-
+-    const tokenBreakdown = this.calculateTokenBreakdown(sessionUsage.entries);
+-    const totalTokens =
+-      tokenBreakdown.input +
+-      tokenBreakdown.output +
+-      tokenBreakdown.cacheCreation +
+-      tokenBreakdown.cacheRead;
+-
+-    // [LAW:single-enforcer] Transcript-derived projection only. `cost` is the
+-    // priced-transcript total; the authoritative native cost (officialCost =
+-    // hook total_cost_usd) is overlaid by the store at READ time — it is
+-    // per-render and must not be frozen into this mtime-keyed record, so it is
+-    // null here by construction.
+-    const calculatedCost = sessionUsage.totalCost;
+-
+-    return {
+-      cost: calculatedCost,
+-      calculatedCost,
+-      officialCost: null,
+-      tokens: totalTokens,
+-      tokenBreakdown,
+-    };
+-  }
+-}
+diff --git a/src/utils/claude.ts b/src/utils/claude.ts
+index d53c80c..aa28c48 100644
+--- a/src/utils/claude.ts
++++ b/src/utils/claude.ts
+@@ -1,11 +1,12 @@
+ import { existsSync, createReadStream } from "node:fs";
+ // [LAW:single-enforcer] readdir/readFile/stat come from the gated transcript-fs
+ // owner, not node:fs/promises — the in-flight-I/O bound lives at one seam.
+-import { readdir, readFile, stat } from "./transcript-fs";
++import { readdir, readFile, readAppended, stat } from "./transcript-fs";
+ import { join } from "node:path";
+ import { homedir } from "node:os";
+ import { createInterface } from "node:readline";
+ import { debug } from "./logger";
++import { ok, type Outcome } from "./outcome";
+ 
+ export interface ClaudeHookData {
+   // cc-candybar internal — not part of Anthropic's schema
+@@ -436,17 +437,13 @@ function makeEntry(parsed: Record<string, unknown>): ParsedEntry | null {
+   };
+ }
+ 
+-async function parseJsonlFileInMemory(
+-  filePath: string,
+-): Promise<ParsedEntry[]> {
+-  const content = await readFile(filePath, "utf-8");
+-  const lines = content
+-    .trim()
+-    .split("\n")
+-    .filter((line) => line.trim());
++// [LAW:one-source-of-truth] The one line→entry loop. Both the whole-file parse
++// and the incremental append reader frame their text into lines through here, so
++// a malformed-line policy or a projected field can never diverge between the two.
++function parseJsonlLines(text: string): ParsedEntry[] {
+   const entries: ParsedEntry[] = [];
+-
+-  for (const line of lines) {
++  for (const line of text.split("\n")) {
++    if (!line.trim()) continue;
+     try {
+       const entry = makeEntry(JSON.parse(line));
+       if (entry) entries.push(entry);
+@@ -455,10 +452,70 @@ async function parseJsonlFileInMemory(
+       continue;
+     }
+   }
+-
+   return entries;
+ }
+ 
++async function parseJsonlFileInMemory(
++  filePath: string,
++): Promise<ParsedEntry[]> {
++  const content = await readFile(filePath, "utf-8");
++  return parseJsonlLines(content);
++}
++
++// A byte cursor into an append-only transcript: the offset consumed through the
++// last complete line, the mtime observed at that read, and the inode. The store
++// keys its per-file fold by this — `offset` bounds the next read to only what's
++// new; `mtimeMs` lets an unchanged file skip the read entirely; `ino` detects a
++// rewrite (a rename-based /compact swaps the inode) so the fold resets instead
++// of splicing new bytes onto a stale prefix.
++export interface TranscriptCursor {
++  readonly offset: number;
++  readonly mtimeMs: number;
++  readonly ino: number;
++}
++
++// [LAW:dataflow-not-control-flow][LAW:one-source-of-truth] Read only the entries
++// appended to an append-only transcript since `prior`. The returned `entries`
++// are TRANSIENT — the caller folds them into its own compact aggregate and drops
++// them, so this reader (unlike the retained parseCache) pins no O(file) memory:
++// its cost is O(bytes appended since last render), which is the whole point.
++//
++// A partial trailing line (a render observing the file mid-write, before its
++// newline) is NOT consumed: the cursor advances only through the last complete
++// line, so the partial line is re-read intact once its newline lands. Cutting at
++// a newline also guarantees clean UTF-8 boundaries (0x0A is never a continuation
++// byte), so no multibyte codepoint is split across reads.
++//
++// `reset` (from readAppended) means the file shrank/was rewritten (a /compact):
++// `entries` then cover the whole new file from offset 0 and the caller discards
++// its prior fold for this file. Absent/failed pass straight through.
++export async function readAppendedEntries(
++  filePath: string,
++  prior: TranscriptCursor | undefined,
++): Promise<
++  Outcome<{ entries: ParsedEntry[]; cursor: TranscriptCursor; reset: boolean }>
++> {
++  const r = await readAppended(
++    filePath,
++    prior === undefined ? undefined : { offset: prior.offset, ino: prior.ino },
++  );
++  if (r.kind !== "ok") return r;
++  const { buf, start, mtimeMs, ino, reset } = r.value;
++  // Consume only through the last newline; a trailing partial line waits.
++  const lastNl = buf.lastIndexOf(0x0a);
++  if (lastNl < 0) {
++    return ok({ entries: [], cursor: { offset: start, mtimeMs, ino }, reset });
++  }
++  const entries = parseJsonlLines(
++    buf.subarray(0, lastNl + 1).toString("utf-8"),
++  );
++  return ok({
++    entries,
++    cursor: { offset: start + lastNl + 1, mtimeMs, ino },
++    reset,
++  });
++}
++
+ async function parseJsonlFileStreaming(
+   filePath: string,
+ ): Promise<ParsedEntry[]> {
+diff --git a/src/utils/transcript-fs.ts b/src/utils/transcript-fs.ts
+index 7ff1918..51604b2 100644
+--- a/src/utils/transcript-fs.ts
++++ b/src/utils/transcript-fs.ts
+@@ -120,6 +120,88 @@ export const stat = gated(fsStat);
+ // (permissions, I/O) is a real read failure — `failed`, carrying its reason
+ // to whichever boundary owns the log effect. Folding both into one null made
+ // a broken transcript indistinguishable from a missing one.
++// [LAW:single-enforcer] The forward complement of readTail, through the SAME
++// gate: read the bytes of an append-only file from `priorOffset` to EOF (the
++// whole file when `priorOffset` is undefined). One open→stat→read→close per
++// gate slot, exactly like readTail. A transcript scanner that maintains a byte
++// cursor to re-read only what was appended MUST use this, not raw node:fs, or it
++// reintroduces the unbounded-fs state the gate forbids.
++//
++// [LAW:one-source-of-truth] `reset` is the single signal that the file shrank
++// below the caller's cursor — a truncation or /compact rewrite — so the caller
++// discards its prior fold for this file and re-folds from the returned bytes
++// (which then start at offset 0). Append-only monotonicity makes every other
++// case a pure suffix read: `start..size` is exactly what's new.
++//
++// [LAW:no-silent-failure] ENOENT (fresh session, no transcript yet) is `absent`;
++// any other error is `failed`, carrying its reason to the boundary that logs.
++export async function readAppended(
++  path: string,
++  prior: { offset: number; ino: number } | undefined,
++): Promise<
++  Outcome<{
++    buf: Buffer;
++    start: number;
++    size: number;
++    mtimeMs: number;
++    ino: number;
++    reset: boolean;
++  }>
++> {
++  return gate.run(async () => {
++    let fh: FileHandle | null = null;
++    try {
++      fh = await fsOpen(path, "r");
++      const { size, mtimeMs, ino } = await fh.stat();
++      // [LAW:one-source-of-truth] The prior fold is a valid PREFIX of this file
++      // only while the file stays append-only. Two independent signals break
++      // that: the inode changed (a rename-based /compact or log rotation swapped
++      // the file under the path — the realistic rewrite mechanism), or the file
++      // shrank below our cursor (an in-place truncate). Either ⇒ re-read from 0;
++      // the suffix-only read would otherwise splice new bytes onto a fold of a
++      // file that no longer exists. (A cursor-only size check missed a rewrite
++      // that grew back to ≥ the cursor.)
++      const reset =
++        prior !== undefined && (ino !== prior.ino || size < prior.offset);
++      const start = reset || prior === undefined ? 0 : prior.offset;
++      if (start >= size) {
++        return ok({ buf: Buffer.alloc(0), start, size, mtimeMs, ino, reset });
++      }
++      const buf = Buffer.alloc(size - start);
++      // [LAW:no-silent-fallbacks] A single read may return short — parsing a
++      // zero-padded tail would fabricate entries. Loop until the window fills or
++      // EOF; on a short final read (the file shrank under us) return only the
++      // bytes actually read, never the zero padding.
++      let off = 0;
++      while (off < buf.length) {
++        const { bytesRead } = await fh.read(
++          buf,
++          off,
++          buf.length - off,
++          start + off,
++        );
++        if (bytesRead === 0) break;
++        off += bytesRead;
++      }
++      return ok({
++        buf: off === buf.length ? buf : buf.subarray(0, off),
++        start,
++        size,
++        mtimeMs,
++        ino,
++        reset,
++      });
++    } catch (e) {
++      if ((e as NodeJS.ErrnoException).code === "ENOENT") return ABSENT;
++      return failed(
++        `readAppended ${path}: ${e instanceof Error ? e.message : String(e)}`,
++      );
++    } finally {
++      await fh?.close();
++    }
++  });
++}
++
+ export async function readTail(
+   path: string,
+   maxBytes: number,
+diff --git a/test/metrics.test.ts b/test/metrics.test.ts
+index e84ec18..b06ba82 100644
+--- a/test/metrics.test.ts
++++ b/test/metrics.test.ts
+@@ -140,17 +140,20 @@ describe("Metrics Provider", () => {
+     expect(outcome.kind).toBe("absent");
+   });
+ 
+-  it("reads through the shared parse cache — no re-read when mtime+size unchanged", async () => {
++  it("reuses the folded result when transcript mtime is unchanged (foldMetrics fast-hit, no re-read)", async () => {
+     const transcriptPath = join(tempDir, "test.jsonl");
+     const fixedMtime = new Date(Date.now() - 60_000);
+     // Two `user` lines → messageCount 2. v2 flips the second line's type
+     // "user" → "xxxx" (byte-length identical) → a fresh parse would count 1.
++    // Each record is newline-terminated: the incremental reader consumes only
++    // complete lines (a trailing partial line waits for its \n), matching how
++    // Claude writes JSONL — so a complete transcript ends in \n.
+     const line = (type: string, ts: string) =>
+-      `{"timestamp":"${ts}","type":"${type}","message":{"content":"hi"}}`;
++      `{"timestamp":"${ts}","type":"${type}","message":{"content":"hi"}}\n`;
+     const t0 = new Date("2024-01-01T00:00:00.000Z").toISOString();
+     const t1 = new Date("2024-01-01T00:00:01.000Z").toISOString();
+-    const v1 = [line("user", t0), line("user", t1)].join("\n");
+-    const v2 = [line("user", t0), line("xxxx", t1)].join("\n");
++    const v1 = line("user", t0) + line("user", t1);
++    const v2 = line("user", t0) + line("xxxx", t1);
+ 
+     const hookData = createMockHookData("cache-session", transcriptPath);
+ 
+@@ -159,9 +162,9 @@ describe("Metrics Provider", () => {
+     const warm = await metricsProvider.getMetricsInfo("cache-session", hookData);
+     expect(warm.kind === "ok" && warm.value.messageCount).toBe(2);
+ 
+-    // Mutate content but hold mtime+size identical: the cache key is unchanged,
+-    // so a correct shared-cache read returns the stale 2; a private re-read
+-    // would observe v2 and return 1.
++    // Mutate content but hold mtime identical: foldMetrics's mtime gate is
++    // unchanged, so the fast-hit returns the folded 2; a re-read would observe
++    // v2 and return 1.
+     expect(v2.length).toBe(v1.length);
+     writeFileSync(transcriptPath, v2);
+     utimesSync(transcriptPath, fixedMtime, fixedMtime);
+diff --git a/test/session-provider.test.ts b/test/session-provider.test.ts
+deleted file mode 100644
+index 5f84867..0000000
+--- a/test/session-provider.test.ts
++++ /dev/null
+@@ -1,78 +0,0 @@
+-// [LAW:one-source-of-truth] parseJsonlFile hands out its cached entries array
+-// by reference; that cache is the canonical parsed form of a file, shared
+-// across providers. getSessionUsageFromPath combines a session's main + agent
+-// transcripts — it must do so WITHOUT mutating the cached arrays, or a warm
+-// cache hit double-counts agents and leaks them into the main transcript's
+-// cached value (the bug Copilot caught on PR #50).
+-
+-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+-import { tmpdir } from "node:os";
+-import { join } from "node:path";
+-
+-import { SessionProvider } from "../src/segments/session";
+-import { parseJsonlFile, clearParseCache } from "../src/utils/claude";
+-
+-function line(tag: string, cost: number, extra: object = {}): string {
+-  return (
+-    JSON.stringify({
+-      timestamp: new Date().toISOString(),
+-      requestId: `req-${tag}`,
+-      costUSD: cost,
+-      message: {
+-        id: `msg-${tag}`,
+-        model: "claude-opus-4-8",
+-        usage: { input_tokens: 1, output_tokens: 1 },
+-      },
+-      ...extra,
+-    }) + "\n"
+-  );
+-}
+-
+-describe("SessionProvider.getSessionUsageFromPath", () => {
+-  let dir: string;
+-  let mainPath: string;
+-  const sid = "sess-1";
+-
+-  beforeEach(() => {
+-    dir = mkdtempSync(join(tmpdir(), "cc-candybar-sp-"));
+-    mainPath = join(dir, `${sid}.jsonl`);
+-    writeFileSync(mainPath, line("main", 0.01));
+-    // Agent transcript discovered via <projectDir>/<sid>/subagents/agent-*.jsonl;
+-    // findAgentTranscripts keeps it only when its first line's sessionId matches.
+-    const subagents = join(dir, sid, "subagents");
+-    mkdirSync(subagents, { recursive: true });
+-    writeFileSync(
+-      join(subagents, "agent-1.jsonl"),
+-      line("agent", 0.02, { sessionId: sid }),
+-    );
+-    clearParseCache();
+-  });
+-  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+-
+-  test("combines main + agents without double-counting on a warm parse cache", async () => {
+-    const sp = new SessionProvider();
+-    const first = await sp.getSessionUsageFromPath(sid, mainPath);
+-    expect(first.kind).toBe("ok");
+-    if (first.kind !== "ok") return;
+-    expect(first.value.totalCost).toBeCloseTo(0.03, 5);
+-    expect(first.value.entries).toHaveLength(2);
+-
+-    // Second call with the parse cache warm (same mtime) must yield the SAME
+-    // totals — the old push-into-cached-array mutated the main transcript's
+-    // cached entries, so this returned 0.05 / 3 entries.
+-    const second = await sp.getSessionUsageFromPath(sid, mainPath);
+-    expect(second.kind).toBe("ok");
+-    if (second.kind !== "ok") return;
+-    expect(second.value.totalCost).toBeCloseTo(0.03, 5);
+-    expect(second.value.entries).toHaveLength(2);
+-  });
+-
+-  test("does not corrupt the shared parse cache for the main transcript", async () => {
+-    const sp = new SessionProvider();
+-    await sp.getSessionUsageFromPath(sid, mainPath);
+-    // A direct read of the main transcript must still see ONLY its own entry —
+-    // agent entries must never have leaked into its cached array.
+-    const mainOnly = await parseJsonlFile(mainPath);
+-    expect(mainOnly).toHaveLength(1);
+-  });
+-});
+diff --git a/test/transcript-incremental.test.ts b/test/transcript-incremental.test.ts
+new file mode 100644
+index 0000000..16ddd31
+--- /dev/null
++++ b/test/transcript-incremental.test.ts
+@@ -0,0 +1,332 @@
++// [LAW:verifiable-goals] The incremental append-fold (brandon-daemon-perf-bb9):
++// an active session's transcript grows every render, and the store must fold ONLY
++// the appended bytes rather than re-parse the whole file. These tests pin two
++// contracts: (1) the reader yields exactly the new complete lines since a cursor,
++// waiting on a partial trailing line and resetting on a rewrite; (2) the store's
++// incremental fold is OBSERVATIONALLY EQUAL to a from-scratch read of the final
++// file — the optimization changes cost, never output.
++
++import {
++  mkdtempSync,
++  mkdirSync,
++  writeFileSync,
++  appendFileSync,
++  renameSync,
++  rmSync,
++  utimesSync,
++} from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++
++import {
++  readAppendedEntries,
++  clearParseCache,
++  type TranscriptCursor,
++} from "../src/utils/claude";
++import { SessionUsageStore } from "../src/daemon/cache/session-usage-store";
++import type { ClaudeHookData } from "../src/utils/claude";
++
++let seq = 0;
++// One newline-terminated usage line. Unique tags keep every entry distinct.
++function line(day: Date, cost: number, inTok = 10, outTok = 5): string {
++  const tag = `e${seq++}`;
++  return (
++    JSON.stringify({
++      timestamp: day.toISOString(),
++      requestId: `req-${tag}`,
++      costUSD: cost,
++      message: {
++        id: `msg-${tag}`,
++        model: "claude-opus-4-8",
++        usage: { input_tokens: inTok, output_tokens: outTok },
++      },
++    }) + "\n"
++  );
++}
++
++function hook(sessionId: string, transcriptPath: string): ClaudeHookData {
++  return {
++    session_id: sessionId,
++    transcript_path: transcriptPath,
++  } as ClaudeHookData;
++}
++
++// Advance mtime a step so the store's sync mtime gate registers a change — a real
++// append across render ticks always moves the clock; tests are too fast to rely on
++// wall-clock granularity.
++let clock = Math.floor(Date.now() / 1000);
++function touch(path: string): void {
++  clock += 1;
++  utimesSync(path, clock, clock);
++}
++
++describe("readAppendedEntries — the incremental reader primitive", () => {
++  let dir: string;
++  beforeEach(() => {
++    dir = mkdtempSync(join(tmpdir(), "cc-candybar-inc-"));
++    seq = 0;
++  });
++  afterEach(() => rmSync(dir, { recursive: true, force: true }));
++
++  test("first read yields all complete lines; a later read yields ONLY the appended ones", async () => {
++    const t = join(dir, "A.jsonl");
++    writeFileSync(t, line(new Date(), 0.01) + line(new Date(), 0.02));
++
++    const first = await readAppendedEntries(t, undefined);
++    expect(first.kind).toBe("ok");
++    if (first.kind !== "ok") return;
++    expect(first.value.entries).toHaveLength(2);
++    expect(first.value.reset).toBe(false);
++
++    appendFileSync(t, line(new Date(), 0.03));
++    const second = await readAppendedEntries(t, first.value.cursor);
++    expect(second.kind).toBe("ok");
++    if (second.kind !== "ok") return;
++    // Only the one appended entry — not a re-read of the first two.
++    expect(second.value.entries).toHaveLength(1);
++    expect(second.value.entries[0]!.costUSD).toBeCloseTo(0.03, 5);
++  });
++
++  test("a partial trailing line (no newline yet) is NOT consumed until its newline lands", async () => {
++    const t = join(dir, "A.jsonl");
++    const complete = line(new Date(), 0.01);
++    // Write one complete line + a half-written second line (no \n).
++    const partial = '{"timestamp":"2024-01-01T00:00:00.000Z","costUSD":0.02';
++    writeFileSync(t, complete + partial);
++
++    const first = await readAppendedEntries(t, undefined);
++    if (first.kind !== "ok") throw new Error("expected ok");
++    expect(first.value.entries).toHaveLength(1); // partial line waits
++    const afterComplete = first.value.cursor.offset;
++    expect(afterComplete).toBe(Buffer.byteLength(complete)); // cursor at the newline
++
++    // The writer finishes the second line.
++    appendFileSync(t, ',"message":{"usage":{"input_tokens":1,"output_tokens":1}}}\n');
++    const second = await readAppendedEntries(t, first.value.cursor);
++    if (second.kind !== "ok") throw new Error("expected ok");
++    expect(second.value.entries).toHaveLength(1); // the now-complete line, once
++    expect(second.value.entries[0]!.costUSD).toBeCloseTo(0.02, 5);
++  });
++
++  test("a rewritten (shrunk) file signals reset and re-reads from the start", async () => {
++    const t = join(dir, "A.jsonl");
++    writeFileSync(t, line(new Date(), 0.01) + line(new Date(), 0.02) + line(new Date(), 0.03));
++    const first = await readAppendedEntries(t, undefined);
++    if (first.kind !== "ok") throw new Error("expected ok");
++    expect(first.value.entries).toHaveLength(3);
++
++    // /compact rewrites the transcript smaller than our cursor. Capture the
++    // exact bytes written so the offset assertion pins the real content length,
++    // not an incidentally-equal-length regenerated line.
++    const compacted = line(new Date(), 0.09);
++    writeFileSync(t, compacted);
++    const after = await readAppendedEntries(t, first.value.cursor);
++    if (after.kind !== "ok") throw new Error("expected ok");
++    expect(after.value.reset).toBe(true);
++    expect(after.value.entries).toHaveLength(1); // the whole new file
++    expect(after.value.cursor.offset).toBe(Buffer.byteLength(compacted));
++  });
++
++  test("an inode change (rename-based rewrite) signals reset even when size >= cursor", async () => {
++    const t = join(dir, "A.jsonl");
++    writeFileSync(t, line(new Date(), 0.01) + line(new Date(), 0.02));
++    const first = await readAppendedEntries(t, undefined);
++    if (first.kind !== "ok") throw new Error("expected ok");
++    const priorOffset = first.value.cursor.offset;
++
++    // Atomic rewrite: write a DIFFERENT file (>= the old size, so a size-only
++    // check would miss it) and rename it over the path → new inode, same-or-
++    // larger size, different content. Only the inode signal catches this.
++    const other = join(dir, "A.new.jsonl");
++    const rewritten =
++      line(new Date(), 0.03) + line(new Date(), 0.04) + line(new Date(), 0.05);
++    writeFileSync(other, rewritten);
++    expect(Buffer.byteLength(rewritten)).toBeGreaterThanOrEqual(priorOffset);
++    renameSync(other, t);
++
++    const after = await readAppendedEntries(t, first.value.cursor);
++    if (after.kind !== "ok") throw new Error("expected ok");
++    expect(after.value.reset).toBe(true);
++    expect(after.value.entries).toHaveLength(3); // the whole new file, not a suffix
++  });
++
++  test("absent file (fresh session) is the absent outcome, not an error", async () => {
++    const res = await readAppendedEntries(join(dir, "missing.jsonl"), undefined);
++    expect(res.kind).toBe("absent");
++  });
++});
++
++describe("SessionUsageStore — incremental fold equals from-scratch", () => {
++  let dir: string;
++  beforeEach(() => {
++    dir = mkdtempSync(join(tmpdir(), "cc-candybar-inc-store-"));
++    clearParseCache();
++    seq = 0;
++  });
++  afterEach(() => rmSync(dir, { recursive: true, force: true }));
++
++  test("folding appends incrementally yields the same totals as one whole-file read", async () => {
++    const today = new Date();
++    const contents = [
++      line(today, 0.01, 100, 20),
++      line(today, 0.02, 200, 40),
++      line(today, 0.03, 300, 60),
++      line(today, 0.04, 400, 80),
++    ];
++
++    // Incremental: append one line per "render", ingesting between each.
++    const incPath = join(dir, "inc.jsonl");
++    writeFileSync(incPath, "");
++    const incStore = new SessionUsageStore({ sweepIntervalMs: 0 });
++    let incInfo;
++    try {
++      for (const c of contents) {
++        appendFileSync(incPath, c);
++        touch(incPath);
++        incInfo = await incStore.getUsageInfo("INC", hook("INC", incPath));
++      }
++    } finally {
++      incStore.close();
++    }
++
++    // From-scratch: the same final file read once by a cold store.
++    const fullPath = join(dir, "full.jsonl");
++    writeFileSync(fullPath, contents.join(""));
++    const freshStore = new SessionUsageStore({ sweepIntervalMs: 0 });
++    let freshInfo;
++    try {
++      freshInfo = await freshStore.getUsageInfo("FULL", hook("FULL", fullPath));
++    } finally {
++      freshStore.close();
++    }
++
++    expect(incInfo?.kind).toBe("ok");
++    expect(freshInfo?.kind).toBe("ok");
++    if (incInfo?.kind !== "ok" || freshInfo?.kind !== "ok") return;
++    // The whole point: incremental output == from-scratch output.
++    expect(incInfo.value.session.cost).toBeCloseTo(
++      freshInfo.value.session.cost!,
++      5,
++    );
++    expect(incInfo.value.session.tokens).toBe(freshInfo.value.session.tokens);
++    expect(incInfo.value.session.cost).toBeCloseTo(0.1, 5);
++    expect(incInfo.value.session.tokens).toBe(1000 + 200); // inputs + outputs
++  });
++
++  test("concurrent different-mtime refolds do not double-count (last-writer-wins is consistent)", async () => {
++    // The race the reviewer flagged: two renders observing DIFFERENT mtimes hit
++    // different SingleFlight keys, both read the same prior, and last-writer-wins.
++    // The invariant that makes it safe: `refold` writes the byte cursor and the
++    // fold as one atomic pair, so whoever wins leaves a consistent (cursor, fold)
++    // covering exactly [0, cursor); the next ingest extends from there. This test
++    // pins the OBSERVABLE consequence — no matter which racer wins, a final read
++    // equals a from-scratch read of the same file (a double-count would exceed it).
++    const t = join(dir, "R.jsonl");
++    const l1 = line(new Date(), 0.01, 100, 20);
++    const l2 = line(new Date(), 0.02, 200, 40);
++    const l3 = line(new Date(), 0.03, 300, 60);
++
++    const store = new SessionUsageStore({ sweepIntervalMs: 0 });
++    try {
++      // Prior established.
++      writeFileSync(t, l1);
++      touch(t);
++      await store.getUsageInfo("R", hook("R", t));
++
++      // Grow to mtime M1, fire A (sees M1) WITHOUT awaiting.
++      appendFileSync(t, l2);
++      touch(t);
++      const a = store.getUsageInfo("R", hook("R", t));
++      // Grow again to mtime M2, fire B (sees M2) WITHOUT awaiting → different
++      // flight keys, both racing off the same prior.
++      appendFileSync(t, l3);
++      touch(t);
++      const b = store.getUsageInfo("R", hook("R", t));
++      await Promise.all([a, b]);
++
++      // A settling read must reflect the whole file regardless of who won.
++      const finalInfo = await store.getUsageInfo("R", hook("R", t));
++      if (finalInfo.kind !== "ok") throw new Error("expected ok");
++
++      const fullPath = join(dir, "Rfull.jsonl");
++      writeFileSync(fullPath, l1 + l2 + l3);
++      const fresh = new SessionUsageStore({ sweepIntervalMs: 0 });
++      try {
++        const freshInfo = await fresh.getUsageInfo("Rf", hook("Rf", fullPath));
++        if (freshInfo.kind !== "ok") throw new Error("expected ok");
++        expect(finalInfo.value.session.cost).toBeCloseTo(
++          freshInfo.value.session.cost!,
++          5,
++        );
++        expect(finalInfo.value.session.tokens).toBe(
++          freshInfo.value.session.tokens,
++        );
++        // And concretely: 0.06 total, 660 input+output tokens — folded once.
++        expect(finalInfo.value.session.cost).toBeCloseTo(0.06, 5);
++      } finally {
++        fresh.close();
++      }
++    } finally {
++      store.close();
++    }
++  });
++
++  test("combines main + agent transcripts and a warm re-read does not double-count", async () => {
++    const sid = "S";
++    const mainPath = join(dir, `${sid}.jsonl`);
++    writeFileSync(mainPath, line(new Date(), 0.01));
++    // Agent sidechain discovered at <dir>/<sid>/subagents/agent-*.jsonl whose
++    // first line's sessionId matches.
++    const subagents = join(dir, sid, "subagents");
++    mkdirSync(subagents, { recursive: true });
++    writeFileSync(
++      join(subagents, "agent-1.jsonl"),
++      JSON.stringify({
++        timestamp: new Date().toISOString(),
++        sessionId: sid,
++        requestId: "req-agent",
++        costUSD: 0.02,
++        message: {
++          id: "msg-agent",
++          model: "claude-opus-4-8",
++          usage: { input_tokens: 1, output_tokens: 1 },
++        },
++      }) + "\n",
++    );
++
++    const store = new SessionUsageStore({ sweepIntervalMs: 0 });
++    try {
++      const first = await store.getUsageInfo(sid, hook(sid, mainPath));
++      if (first.kind !== "ok") throw new Error("expected ok");
++      expect(first.value.session.cost).toBeCloseTo(0.03, 5);
++
++      // A warm re-read (mtime unchanged) must return the same total — the old
++      // push-into-shared-array bug double-counted agents here.
++      const second = await store.getUsageInfo(sid, hook(sid, mainPath));
++      if (second.kind !== "ok") throw new Error("expected ok");
++      expect(second.value.session.cost).toBeCloseTo(0.03, 5);
++    } finally {
++      store.close();
++    }
++  });
++
++  test("a compacted (rewritten smaller) transcript re-folds to the new file's totals", async () => {
++    const t = join(dir, "C.jsonl");
++    writeFileSync(t, line(new Date(), 0.01) + line(new Date(), 0.02) + line(new Date(), 0.03));
++    const store = new SessionUsageStore({ sweepIntervalMs: 0 });
++    try {
++      const before = await store.getUsageInfo("C", hook("C", t));
++      if (before.kind !== "ok") throw new Error("expected ok");
++      expect(before.value.session.cost).toBeCloseTo(0.06, 5);
++
++      // /compact: fewer, different entries; file shrinks below the cursor.
++      writeFileSync(t, line(new Date(), 0.005));
++      touch(t);
++      const after = await store.getUsageInfo("C", hook("C", t));
++      if (after.kind !== "ok") throw new Error("expected ok");
++      expect(after.value.session.cost).toBeCloseTo(0.005, 5);
++    } finally {
++      store.close();
++    }
++  });
++});

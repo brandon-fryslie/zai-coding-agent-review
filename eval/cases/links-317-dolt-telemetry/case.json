@@ -1,0 +1,25 @@
+{
+  "name": "links-317-dolt-telemetry",
+  "source": {
+    "repo": "promptctl/links-issue-tracker",
+    "pr": 317,
+    "reviewId": 4785029291,
+    "headSha": "cd4aa83f892fb776d1276c09e4f6759f77339b07",
+    "baseSha": "2f3beec746f1e3a9cedd111b8af9953cd3de2e4e"
+  },
+  "diff": "change.diff",
+  "tree": "repo.tar.gz",
+  "expected": "expected.json",
+  "engine": {
+    "provider": "deepseek",
+    "model": "deepseek-v4-pro",
+    "reasoning": null
+  },
+  "excludePatterns": [
+    "*.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml"
+  ],
+  "producedBy": "auto→deepseek / claude-code / deepseek-v4-pro"
+}
