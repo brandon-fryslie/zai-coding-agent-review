@@ -485,14 +485,17 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
   const anchorInput = buildReviewInput({ files: filteredFiles, maxDiffChars, toolNames: registry.get(chain[0].engine).toolNames, reviewedRepoRoot: REVIEWED_REPO_ROOT });
   const anchors = buildReviewAnchors(anchorInput.files);
   const dependencySummaries = await resolveDependencySummaries(octokit, filteredFiles, dependencyDiffOn);
-  // [LAW:dataflow-not-control-flow] Prior-round pushbacks (the author's replies to earlier findings) feed
-  // this round's workers so RA stops re-litigating soundly-rebutted points. The fetch is gated on
-  // prior.count: with zero prior RA reviews there can be no findings and thus no replies, so the result is
+  // [LAW:dataflow-not-control-flow] Prior-round pushbacks (the PR author's replies to earlier findings)
+  // feed this round's workers so RA stops re-litigating soundly-rebutted points. The pairing is keyed by
+  // IDENTITY: findings are the inline comments of RA's marker-bearing reviews (prior.reviewIds), and a
+  // pushback is a reply authored by the PR author (pr.user.login) — so a human reviewer's thread or a
+  // bystander's reply is never misattributed as RA's finding / the author's rebuttal. The fetch is gated on
+  // prior.count: with zero prior RA reviews there are no findings and thus no replies, so the result is
   // provably [] — the gate skips one round-trip on the common first review, mirroring how the budget block
   // above only does its IO when active. [LAW:no-silent-failure] a listReviewComments error is not swallowed
   // — it propagates to the top-level handler and reds the run, same as the other pre-review fetches.
   const priorPushbacks = prior.count > 0
-    ? await fetchPriorPushbacks(octokit, owner, repo, pullNumber)
+    ? await fetchPriorPushbacks(octokit, owner, repo, pullNumber, { findingReviewIds: prior.reviewIds, authorLogin: pr.user?.login })
     : [];
   const material = buildPrMaterial({ files: filteredFiles, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencySummaries, priorPushbacks });
 
