@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { filterFiles, buildReviewAnchors, diffChurn } = require('./diff');
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, roundCapReached, parseMaxRounds } = require('./transport');
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, fetchPriorPushbacks, roundCapReached, parseMaxRounds } = require('./transport');
 const { buildReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
@@ -485,7 +485,16 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
   const anchorInput = buildReviewInput({ files: filteredFiles, maxDiffChars, toolNames: registry.get(chain[0].engine).toolNames, reviewedRepoRoot: REVIEWED_REPO_ROOT });
   const anchors = buildReviewAnchors(anchorInput.files);
   const dependencySummaries = await resolveDependencySummaries(octokit, filteredFiles, dependencyDiffOn);
-  const material = buildPrMaterial({ files: filteredFiles, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencySummaries });
+  // [LAW:dataflow-not-control-flow] Prior-round pushbacks (the author's replies to earlier findings) feed
+  // this round's workers so RA stops re-litigating soundly-rebutted points. The fetch is gated on
+  // prior.count: with zero prior RA reviews there can be no findings and thus no replies, so the result is
+  // provably [] — the gate skips one round-trip on the common first review, mirroring how the budget block
+  // above only does its IO when active. [LAW:no-silent-failure] a listReviewComments error is not swallowed
+  // — it propagates to the top-level handler and reds the run, same as the other pre-review fetches.
+  const priorPushbacks = prior.count > 0
+    ? await fetchPriorPushbacks(octokit, owner, repo, pullNumber)
+    : [];
+  const material = buildPrMaterial({ files: filteredFiles, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencySummaries, priorPushbacks });
 
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);

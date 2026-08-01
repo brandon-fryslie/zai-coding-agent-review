@@ -110,6 +110,63 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
   return { count, cost: { usd, knownRounds, unknownRounds } };
 }
 
+// [LAW:effects-at-boundaries] Pure, split from the fetch below so it is testable without a fake API:
+// pair each earlier RA finding with the author's (OA's) reply to it. The review-comment thread already
+// encodes the roles STRUCTURALLY — RA posts each finding as a top-level inline review comment
+// (`in_reply_to_id` absent) via createReview, and the address-pr-reviews loop posts the author's
+// pushback as a REPLY to that thread (`in_reply_to_id` set) — so no author-identity lookup or
+// keyword heuristic is needed to tell a finding from a response. [LAW:types-are-the-program]
+//
+// [LAW:no-silent-failure] Only a finding that RECEIVED a reply is returned: a finding with no reply is
+// one the author silently applied or ignored — there is no rebuttal to learn from, and the fresh diff
+// already reflects any fix, so replaying it would be noise. This naturally spans rounds and needs no
+// round bookkeeping: a still-unanswered finding from THIS round (no reply yet) is simply excluded, and
+// any answered finding from ANY earlier round is included. [LAW:dataflow-not-control-flow] the "which
+// findings" is decided by the data (has a reply?), never by a round counter.
+function pairPushbacks(comments) {
+  const repliesByParent = new Map();
+  for (const c of comments) {
+    if (c.in_reply_to_id == null) continue;
+    const list = repliesByParent.get(c.in_reply_to_id) || [];
+    list.push((c.body || '').trim());
+    repliesByParent.set(c.in_reply_to_id, list);
+  }
+  const pushbacks = [];
+  for (const c of comments) {
+    if (c.in_reply_to_id != null) continue; // a reply, not a finding
+    const replies = (repliesByParent.get(c.id) || []).filter(Boolean);
+    if (replies.length === 0) continue; // no author response ⇒ nothing to weigh
+    // line is display-only context (not an anchor), so a host that omits it (Gitea) degrades to
+    // path-only rather than failing — the reviewer still locates the finding by path + body.
+    pushbacks.push({ path: c.path, line: c.line ?? c.original_line ?? null, finding: (c.body || '').trim(), replies });
+  }
+  return pushbacks;
+}
+
+// [LAW:effects-at-boundaries] The one I/O edge: exhaust the PR's inline review-comment pages, then hand
+// the raw comments to the pure pairing above. listReviewComments is served by GitHub and Gitea alike
+// and both carry in_reply_to_id, so this is host-agnostic like summarizePriorReviews. [LAW:decomposition]
+// This is a SEPARATE concern from summarizePriorReviews (which reads review BODIES for round-count + cost)
+// — a different endpoint (inline COMMENTS) and a different product (finding↔reply pairs) — so it is its
+// own function, not an "and" bolted onto that one.
+async function fetchPriorPushbacks(octokit, owner, repo, pullNumber) {
+  const comments = [];
+  let page = 1;
+  while (true) {
+    const { data } = await octokit.rest.pulls.listReviewComments({
+      owner,
+      repo,
+      pull_number: pullNumber,
+      per_page: 100,
+      page,
+    });
+    comments.push(...data);
+    if (data.length < 100) break;
+    page++;
+  }
+  return pairPushbacks(comments);
+}
+
 // [LAW:effects-at-boundaries] Pure decision, split from the I/O above so it is testable without a
 // fake API. [LAW:dataflow-not-control-flow] The cap is a value, not a mode: maxRounds <= 0 is the
 // documented "unlimited" sentinel (matching MAX_DIFF_CHARS), so there is no separate enable flag.
@@ -235,6 +292,8 @@ module.exports = {
   resolveReviewTarget,
   prIsFromFork,
   summarizePriorReviews,
+  fetchPriorPushbacks,
+  pairPushbacks,
   roundCapReached,
   parseMaxRounds,
   REVIEW_MARKER,

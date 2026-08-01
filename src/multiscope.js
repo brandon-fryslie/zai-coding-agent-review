@@ -277,7 +277,11 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
 // NOTE from it here (renderDependencyDiffNote) and threads the RESOLVED bumps to the worker so the assess
 // directive can name the exact modules. [] is the common case (no bump, or the feature is off): the note
 // is '' and the bump list empty, flowing through unchanged. [LAW:dataflow-not-control-flow]
-function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySummaries = [] }) {
+// priorPushbacks is the (possibly empty) set of this PR's earlier findings the author replied to
+// (fetchPriorPushbacks, src/transport.js). Every worker receives all of them — like the whole diff, which
+// each worker also sees — so a rebuttal about any file informs whichever worker owns it, and the scout
+// need not partition them. [] (a first round, or no replies) flows through unchanged. [LAW:dataflow-not-control-flow]
+function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySummaries = [], priorPushbacks = [] }) {
   const changedPaths = files.map(f => f.filename);
   const dependencyDiffNote = renderDependencyDiffNote(dependencySummaries);
   // Only a resolved bump has upstream context to judge; an unresolved one renders as a plain line in the
@@ -288,7 +292,7 @@ function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySumm
     // recovered from the prompt: runMultiScopePass verifies the scout's plan covers it (planScopes).
     changedPaths,
     buildScoutPrompt: (toolNames) => buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot }).prompt,
-    buildWorkerPrompt: (focusText, toolNames, scopeFiles) => buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus: focusText, scopeFiles, dependencyDiffNote, dependencyBumps }).prompt,
+    buildWorkerPrompt: (focusText, toolNames, scopeFiles) => buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus: focusText, scopeFiles, dependencyDiffNote, dependencyBumps, priorPushbacks }).prompt,
   };
 }
 

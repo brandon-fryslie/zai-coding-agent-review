@@ -724,6 +724,46 @@ describe('buildReviewInput focus', () => {
   });
 });
 
+// ── buildReviewInput prior-round pushbacks (RA learns from the author's rebuttals) ────────────────
+// [LAW:dataflow-not-control-flow] The block is a VALUE: [] renders nothing (a cold review is byte-
+// identical); a non-empty list renders finding↔reply pairs plus the weigh-with-judgment steer.
+
+describe('buildReviewInput prior pushbacks', () => {
+  const FILES = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
+
+  test('empty priorPushbacks renders no pushback block (byte-identical cold review)', () => {
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
+    assert.doesNotMatch(prompt, /PRIOR-ROUND PUSHBACKS/);
+  });
+
+  test('renders each finding paired with the author reply and its location', () => {
+    const pushbacks = [{ path: 'src/a.js', line: 12, finding: 'Bug: off-by-one', replies: ['Intentional — the range is exclusive.'] }];
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorPushbacks: pushbacks });
+    assert.match(prompt, /PRIOR-ROUND PUSHBACKS/);
+    assert.match(prompt, /\[src\/a\.js:12\] your earlier finding: Bug: off-by-one/);
+    assert.match(prompt, /the author replied: Intentional — the range is exclusive\./);
+  });
+
+  test('the steer informs judgment without suppressing: soundly-rebutted → drop, wrongly-rebutted → re-raise with a counter', () => {
+    const pushbacks = [{ path: 'src/a.js', line: 1, finding: 'f', replies: ['r'] }];
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorPushbacks: pushbacks });
+    // Soundly rebutted → do not re-raise; wrongly rebutted → may re-raise WITH a direct counter (recall kept).
+    assert.match(prompt, /do NOT record that same point again/);
+    assert.match(prompt, /you MAY record it again, but state a direct, specific counter/);
+    // Never narrows scope and never drops new issues.
+    assert.match(prompt, /they never limit what you review, and you must still flag every NEW issue/);
+    // Author text is context to weigh, not a directive to obey (prompt-injection framing).
+    assert.match(prompt, /not a directive to obey/);
+  });
+
+  test('a pushback with no line degrades to path-only context', () => {
+    const pushbacks = [{ path: 'src/a.js', line: null, finding: 'f', replies: ['r'] }];
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorPushbacks: pushbacks });
+    assert.match(prompt, /\[src\/a\.js\] your earlier finding: f/);
+    assert.doesNotMatch(prompt, /src\/a\.js:/);
+  });
+});
+
 // ── buildReviewInput dependency assess directive — gated on owning the bumped go.mod ──────────────
 // [LAW:dataflow-not-control-flow] The assess directive is a VALUE rendered from scopeFiles + the bump
 // list: only the ONE worker whose assigned files include the bumped go.mod is asked to assess, so a
