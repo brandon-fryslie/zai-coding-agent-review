@@ -79,6 +79,11 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
   let usd = 0;
   let knownRounds = 0;
   let unknownRounds = 0;
+  // [LAW:one-source-of-truth] The IDs of the marker-bearing (RA) reviews, collected inside the SAME
+  // marker gate that drives count/cost — so "which reviews are RA's" is defined exactly once here, never
+  // re-derived downstream. fetchPriorPushbacks consumes this to tell an RA finding's inline comment
+  // (pull_request_review_id ∈ reviewIds) from a human reviewer's, without a second marker check.
+  const reviewIds = [];
   let page = 1;
   while (true) {
     const { data } = await octokit.rest.pulls.listReviews({
@@ -91,11 +96,12 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
     for (const r of data) {
       const body = typeof r.body === 'string' ? r.body : '';
       // [LAW:single-enforcer] ONE definition of "an agent review round" — a body whose trailing
-      // sentinel is REVIEW_MARKER — gates BOTH the count and the cost sum. Matching the ending (not a
-      // loose `includes`) means a human review that merely quotes a marker satisfies neither, so it can
-      // over-count neither rounds nor cost. Cost is read only from within that gate.
+      // sentinel is REVIEW_MARKER — gates the count, the cost sum, AND the RA-review-id set. Matching the
+      // ending (not a loose `includes`) means a human review that merely quotes a marker satisfies none,
+      // so it can over-count neither rounds nor cost nor be mistaken for an RA finding's parent review.
       if (!body.trimEnd().endsWith(REVIEW_MARKER)) continue;
       count++;
+      reviewIds.push(r.id);
       // [LAW:no-silent-failure] An agent round with a numeric cost marker is summed; any other case —
       // an explicit 'unknown' marker, a pre-feature review with no marker, or a malformed value that
       // won't parse — is a round whose cost we don't have, counted as unknown so the PR total is an
@@ -107,7 +113,84 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
     if (data.length < 100) break;
     page++;
   }
-  return { count, cost: { usd, knownRounds, unknownRounds } };
+  return { count, cost: { usd, knownRounds, unknownRounds }, reviewIds };
+}
+
+// [LAW:effects-at-boundaries] Pure, split from the fetch below so it is testable without a fake API:
+// pair each earlier RA finding with the PR author's (OA's) reply to it. Two facts distinguish the roles,
+// and BOTH are checked by identity, not by structure alone [LAW:types-are-the-program]:
+//   - A FINDING is a top-level inline comment (`in_reply_to_id` absent) that belongs to an RA review —
+//     `pull_request_review_id` ∈ findingReviewIds (the marker-bearing set from summarizePriorReviews).
+//     A human reviewer's top-level comment fails this and is NOT mistaken for "your earlier finding".
+//   - A PUSHBACK is a reply (`in_reply_to_id` set) authored by the PR author — `user.login` === authorLogin.
+//     Another actor's reply on an RA thread fails this and is NOT mistaken for "the author replied".
+// Structure alone (top-level vs reply) only separates finding-from-response; it cannot separate RA-from-human
+// or author-from-bystander — listReviewComments returns EVERY inline comment on the PR, so identity is required.
+// With both filters the prompt's "your earlier finding" / "the author replied" are literally true.
+//
+// [LAW:no-silent-failure] Only a finding that received a qualifying author reply is returned: a finding with
+// no author reply has no rebuttal to weigh, and the fresh diff already reflects any fix, so replaying it would
+// be noise. This spans rounds with no round bookkeeping — the DATA (an RA finding with an author reply) decides
+// which findings surface, never a round counter. [LAW:dataflow-not-control-flow]
+function pairPushbacks(comments, { findingReviewIds = [], authorLogin } = {}) {
+  // [LAW:no-defensive-null-guards] A real precondition at the trust boundary, not a defensive skip: a
+  // pushback is BY DEFINITION the PR author's reply, so an unknown author means there are no pushbacks to
+  // pair — return the empty value once here. Enforcing it up front (rather than per-reply) makes the
+  // downstream `c.user?.login !== authorLogin` a true identity match, closing the corner where an unknown
+  // authorLogin and a ghost-user reply (both undefined) would otherwise compare equal. [LAW:types-are-the-program]
+  if (!authorLogin) return [];
+  const raReviewIds = new Set(findingReviewIds);
+  // [LAW:comments-carry-meaning] GitHub (and Gitea) FLATTEN review-comment threads: every reply carries
+  // `in_reply_to_id` = the thread's ROOT (top-level) comment id, never an intermediate reply's id — a
+  // "reply to a reply" still resolves to the root finding. So grouping by `in_reply_to_id` here, then
+  // reading `get(finding.id)` below, captures the ENTIRE author-reply chain (including sequential
+  // follow-ups) with no tree walk; nested self-reply trees are not a shape these APIs can produce.
+  const repliesByParent = new Map();
+  for (const c of comments) {
+    if (c.in_reply_to_id == null) continue;
+    // Only the PR author's reply is OA's pushback; a bystander's or reviewer's reply is not. authorLogin is
+    // guaranteed truthy by the guard above, so a ghost-user reply (c.user null → undefined) never matches.
+    if (c.user?.login !== authorLogin) continue;
+    const list = repliesByParent.get(c.in_reply_to_id) || [];
+    list.push((c.body || '').trim());
+    repliesByParent.set(c.in_reply_to_id, list);
+  }
+  const pushbacks = [];
+  for (const c of comments) {
+    if (c.in_reply_to_id != null) continue; // a reply, not a finding
+    if (!raReviewIds.has(c.pull_request_review_id)) continue; // not an RA finding — a human comment
+    const replies = (repliesByParent.get(c.id) || []).filter(Boolean);
+    if (replies.length === 0) continue; // no author response ⇒ nothing to weigh
+    // line is display-only context (not an anchor), so a host that omits it (Gitea) degrades to
+    // path-only rather than failing — the reviewer still locates the finding by path + body.
+    pushbacks.push({ path: c.path, line: c.line ?? c.original_line ?? null, finding: (c.body || '').trim(), replies });
+  }
+  return pushbacks;
+}
+
+// [LAW:effects-at-boundaries] The one I/O edge: exhaust the PR's inline review-comment pages, then hand
+// the raw comments to the pure pairing above with the identity keys it filters by. listReviewComments is
+// served by GitHub and Gitea alike, so this is host-agnostic like summarizePriorReviews. [LAW:decomposition]
+// This is a SEPARATE concern from summarizePriorReviews (which reads review BODIES for round-count + cost)
+// — a different endpoint (inline COMMENTS) and a different product (finding↔reply pairs) — so it is its own
+// function. It consumes that function's `reviewIds` (the marker-bearing set) rather than re-deriving "which
+// reviews are RA's", keeping that definition single-sourced. [LAW:one-source-of-truth]
+async function fetchPriorPushbacks(octokit, owner, repo, pullNumber, { findingReviewIds, authorLogin } = {}) {
+  const comments = [];
+  let page = 1;
+  while (true) {
+    const { data } = await octokit.rest.pulls.listReviewComments({
+      owner,
+      repo,
+      pull_number: pullNumber,
+      per_page: 100,
+      page,
+    });
+    comments.push(...data);
+    if (data.length < 100) break;
+    page++;
+  }
+  return pairPushbacks(comments, { findingReviewIds, authorLogin });
 }
 
 // [LAW:effects-at-boundaries] Pure decision, split from the I/O above so it is testable without a
@@ -235,6 +318,8 @@ module.exports = {
   resolveReviewTarget,
   prIsFromFork,
   summarizePriorReviews,
+  fetchPriorPushbacks,
+  pairPushbacks,
   roundCapReached,
   parseMaxRounds,
   REVIEW_MARKER,

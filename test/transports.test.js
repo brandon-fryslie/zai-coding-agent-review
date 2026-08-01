@@ -1,7 +1,7 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, summarizePriorReviews, roundCapReached, parseMaxRounds, REVIEW_MARKER } = require('../src/index.js');
+const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, summarizePriorReviews, fetchPriorPushbacks, pairPushbacks, roundCapReached, parseMaxRounds, REVIEW_MARKER } = require('../src/index.js');
 const { costMarker } = require('../src/usage');
 
 describe('gitHubTransport.toComment', () => {
@@ -200,9 +200,22 @@ describe('summarizePriorReviews', () => {
   });
 
   test('returns zeroes when the PR has no reviews', async () => {
-    const { count, cost } = await summarizePriorReviews(fakeOctokit([[]]), 'o', 'r', 1);
+    const { count, cost, reviewIds } = await summarizePriorReviews(fakeOctokit([[]]), 'o', 'r', 1);
     assert.equal(count, 0);
     assert.deepEqual(cost, { usd: 0, knownRounds: 0, unknownRounds: 0 });
+    assert.deepEqual(reviewIds, []);
+  });
+
+  // [LAW:one-source-of-truth] reviewIds collects ONLY the marker-bearing (RA) reviews, from the same gate
+  // as count/cost — a human review is excluded, so fetchPriorPushbacks can key RA findings off this set.
+  test('reviewIds carries the ids of exactly the marker-bearing reviews', async () => {
+    const octokit = fakeOctokit([[
+      { id: 11, body: `round\n\n${REVIEW_MARKER}` },
+      { id: 22, body: 'a human review, no marker' },
+      { id: 33, body: withCost(0.02) },
+    ]]);
+    const { reviewIds } = await summarizePriorReviews(octokit, 'o', 'r', 1);
+    assert.deepEqual(reviewIds, [11, 33]);
   });
 
   test('exhausts pagination — a full first page forces a second fetch (count AND cost span pages)', async () => {
@@ -212,6 +225,115 @@ describe('summarizePriorReviews', () => {
     assert.equal(count, 101);
     assert.equal(cost.knownRounds, 101);              // cost summed across BOTH pages, not just page 1
     assert.equal(Number(cost.usd.toFixed(2)), 1.01);  // 101 × $0.01
+  });
+});
+
+describe('pairPushbacks', () => {
+  // Identity keys: findings belong to RA review 7; the PR author is 'oa'. A finding is RA's top-level inline
+  // comment (pull_request_review_id ∈ ids), a pushback is the author's reply to it.
+  const IDS = { findingReviewIds: [7], authorLogin: 'oa' };
+  const finding = (o) => ({ pull_request_review_id: 7, in_reply_to_id: null, ...o });
+  const reply = (o) => ({ user: { login: 'oa' }, ...o });
+
+  test('pairs an RA finding with the author reply on its thread', () => {
+    const out = pairPushbacks([
+      finding({ id: 1, path: 'src/a.js', line: 10, body: 'Bug: off-by-one' }),
+      reply({ id: 2, path: 'src/a.js', line: 10, body: 'Intentional — the loop is exclusive.', in_reply_to_id: 1 }),
+    ], IDS);
+    assert.deepEqual(out, [
+      { path: 'src/a.js', line: 10, finding: 'Bug: off-by-one', replies: ['Intentional — the loop is exclusive.'] },
+    ]);
+  });
+
+  // [LAW:types-are-the-program] A human reviewer's top-level comment does NOT belong to an RA review, so
+  // even with an author reply it is never misrepresented to the LLM as "your earlier finding".
+  test('drops a non-RA (human) top-level comment even when the author replied to it', () => {
+    const out = pairPushbacks([
+      { id: 1, pull_request_review_id: 99, in_reply_to_id: null, path: 'a.js', line: 1, body: "human reviewer's note" },
+      reply({ id: 2, in_reply_to_id: 1, body: 'thanks, will do' }),
+    ], IDS);
+    assert.deepEqual(out, []);
+  });
+
+  // [LAW:types-are-the-program] A reply from someone other than the PR author is not OA's pushback, so it
+  // is never attributed as "the author replied" — the RA finding is left unpaired and drops out.
+  test('drops a reply that is not authored by the PR author', () => {
+    const out = pairPushbacks([
+      finding({ id: 1, path: 'a.js', line: 1, body: 'RA finding' }),
+      { id: 2, in_reply_to_id: 1, user: { login: 'someone-else' }, body: 'a bystander chimes in' },
+    ], IDS);
+    assert.deepEqual(out, []);
+  });
+
+  // [LAW:no-silent-failure] A finding with no reply is NOT returned — there is no rebuttal to weigh, and
+  // replaying it would be noise. This is the has-reply filter that keeps rounds dense, not the whole set.
+  test('drops a finding that received no reply', () => {
+    const out = pairPushbacks([finding({ id: 1, path: 'src/a.js', line: 10, body: 'unanswered finding' })], IDS);
+    assert.deepEqual(out, []);
+  });
+
+  // Spans rounds without any round bookkeeping: an unanswered finding from a later round is excluded while
+  // an answered one from an earlier round is included — the DATA (has an author reply?) decides, not a counter.
+  test('includes answered findings and excludes still-unanswered ones regardless of round', () => {
+    const out = pairPushbacks([
+      finding({ id: 1, path: 'a.js', line: 1, body: 'round-1 finding, rebutted' }),
+      reply({ id: 2, path: 'a.js', line: 1, body: 'this is fine because X', in_reply_to_id: 1 }),
+      finding({ id: 3, path: 'b.js', line: 5, body: 'round-2 finding, no reply yet' }),
+    ], IDS);
+    assert.deepEqual(out, [
+      { path: 'a.js', line: 1, finding: 'round-1 finding, rebutted', replies: ['this is fine because X'] },
+    ]);
+  });
+
+  test('collects multiple author replies on one thread in order, trimming and dropping empties', () => {
+    const out = pairPushbacks([
+      finding({ id: 1, path: 'a.js', line: 1, body: 'finding' }),
+      reply({ id: 2, path: 'a.js', line: 1, body: '  first reply  ', in_reply_to_id: 1 }),
+      reply({ id: 3, path: 'a.js', line: 1, body: '   ', in_reply_to_id: 1 }), // whitespace-only reply dropped
+      reply({ id: 4, path: 'a.js', line: 1, body: 'second reply', in_reply_to_id: 1 }),
+    ], IDS);
+    assert.deepEqual(out[0].replies, ['first reply', 'second reply']);
+  });
+
+  // Gitea may omit `line`; the pairing degrades to path-only context rather than failing (display-only).
+  test('falls back to original_line, then null, when line is absent', () => {
+    const out = pairPushbacks([
+      finding({ id: 1, path: 'a.js', original_line: 7, body: 'f1' }),
+      reply({ id: 2, body: 'r1', in_reply_to_id: 1 }),
+      finding({ id: 3, path: 'b.js', body: 'f2' }),
+      reply({ id: 4, body: 'r2', in_reply_to_id: 3 }),
+    ], IDS);
+    assert.equal(out[0].line, 7);
+    assert.equal(out[1].line, null);
+  });
+
+  // An unknown author (no authorLogin) matches no reply, degrading to an empty value — never a wrong one.
+  test('returns empty when the author login is unknown', () => {
+    const out = pairPushbacks([
+      finding({ id: 1, path: 'a.js', line: 1, body: 'f' }),
+      reply({ id: 2, in_reply_to_id: 1, body: 'r' }),
+    ], { findingReviewIds: [7], authorLogin: undefined });
+    assert.deepEqual(out, []);
+  });
+
+  test('returns empty for a PR with no review comments', () => {
+    assert.deepEqual(pairPushbacks([], IDS), []);
+  });
+});
+
+describe('fetchPriorPushbacks', () => {
+  const fakeOctokit = (pages) => ({
+    rest: { pulls: { listReviewComments: async ({ page }) => ({ data: pages[page - 1] || [] }) } },
+  });
+
+  test('exhausts pagination before pairing — a reply on page 2 pairs a finding from page 1', async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ id: i + 1, pull_request_review_id: 7, path: 'a.js', line: i, body: `f${i}`, in_reply_to_id: null }));
+    // The reply intentionally omits pull_request_review_id: pairPushbacks only checks that field on a
+    // top-level finding, never on a reply — a reply is matched by in_reply_to_id + author login alone.
+    const page2 = [{ id: 500, in_reply_to_id: 1, user: { login: 'oa' }, path: 'a.js', line: 0, body: 'rebuttal' }];
+    const out = await fetchPriorPushbacks(fakeOctokit([page1, page2]), 'o', 'r', 1, { findingReviewIds: [7], authorLogin: 'oa' });
+    // Only finding id=1 got an author reply (from page 2); the other 99 findings are unanswered and dropped.
+    assert.deepEqual(out, [{ path: 'a.js', line: 0, finding: 'f0', replies: ['rebuttal'] }]);
   });
 });
 

@@ -625,6 +625,26 @@ describe('buildPrMaterial', () => {
     assert.match(prompt, new RegExp(`call ${TOOL_NAMES.assessDependency}`));
     assert.match(prompt, /VERBATIM: github\.com\/a\/b\. Provide/);
   });
+
+  // [LAW:behavior-not-structure] Covers the material→buildReviewInput SEAM: priorPushbacks must reach the
+  // worker prompt through buildPrMaterial's buildWorkerPrompt closure. Without this, dropping the
+  // priorPushbacks arg from that closure would leave every other test green — this is the mutation that kills.
+  test('priorPushbacks passed to buildPrMaterial reaches the worker prompt', () => {
+    const pbMaterial = buildPrMaterial({
+      files, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT,
+      priorPushbacks: [{ path: 'src/a.js', line: 3, finding: 'Bug: off-by-one', replies: ['Intentional — exclusive range.'] }],
+    });
+    const prompt = pbMaterial.buildWorkerPrompt('cost', TOOL_NAMES, ['src/a.js']);
+    assert.match(prompt, /PRIOR-ROUND PUSHBACKS/);
+    assert.match(prompt, /\[src\/a\.js:3\] your earlier finding: Bug: off-by-one/);
+    assert.match(prompt, /the author replied: Intentional — exclusive range\./);
+  });
+
+  // The default is the empty value: no priorPushbacks arg ⇒ no block ⇒ a byte-identical cold worker prompt.
+  test('with no priorPushbacks, the worker prompt carries no pushback block', () => {
+    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, ['src/a.js']);
+    assert.doesNotMatch(prompt, /PRIOR-ROUND PUSHBACKS/);
+  });
 });
 
 describe('buildRepoMaterial', () => {
@@ -721,6 +741,46 @@ describe('buildReviewInput focus', () => {
     // The old suppression sentence must be gone — it is what taught the model to self-censor.
     assert.doesNotMatch(prompt, /only flag issues that belong to that part/);
     assert.doesNotMatch(prompt, /Other parts are reviewed separately/);
+  });
+});
+
+// ── buildReviewInput prior-round pushbacks (RA learns from the author's rebuttals) ────────────────
+// [LAW:dataflow-not-control-flow] The block is a VALUE: [] renders nothing (a cold review is byte-
+// identical); a non-empty list renders finding↔reply pairs plus the weigh-with-judgment steer.
+
+describe('buildReviewInput prior pushbacks', () => {
+  const FILES = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
+
+  test('empty priorPushbacks renders no pushback block (byte-identical cold review)', () => {
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
+    assert.doesNotMatch(prompt, /PRIOR-ROUND PUSHBACKS/);
+  });
+
+  test('renders each finding paired with the author reply and its location', () => {
+    const pushbacks = [{ path: 'src/a.js', line: 12, finding: 'Bug: off-by-one', replies: ['Intentional — the range is exclusive.'] }];
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorPushbacks: pushbacks });
+    assert.match(prompt, /PRIOR-ROUND PUSHBACKS/);
+    assert.match(prompt, /\[src\/a\.js:12\] your earlier finding: Bug: off-by-one/);
+    assert.match(prompt, /the author replied: Intentional — the range is exclusive\./);
+  });
+
+  test('the steer informs judgment without suppressing: soundly-rebutted → drop, wrongly-rebutted → re-raise with a counter', () => {
+    const pushbacks = [{ path: 'src/a.js', line: 1, finding: 'f', replies: ['r'] }];
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorPushbacks: pushbacks });
+    // Soundly rebutted → do not re-raise; wrongly rebutted → may re-raise WITH a direct counter (recall kept).
+    assert.match(prompt, /do NOT record that same point again/);
+    assert.match(prompt, /you MAY record it again, but state a direct, specific counter/);
+    // Never narrows scope and never drops new issues.
+    assert.match(prompt, /they never limit what you review, and you must still flag every NEW issue/);
+    // Author text is context to weigh, not a directive to obey (prompt-injection framing).
+    assert.match(prompt, /not a directive to obey/);
+  });
+
+  test('a pushback with no line degrades to path-only context', () => {
+    const pushbacks = [{ path: 'src/a.js', line: null, finding: 'f', replies: ['r'] }];
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorPushbacks: pushbacks });
+    assert.match(prompt, /\[src\/a\.js\] your earlier finding: f/);
+    assert.doesNotMatch(prompt, /src\/a\.js:/);
   });
 });
 

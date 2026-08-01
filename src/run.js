@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { filterFiles, buildReviewAnchors, diffChurn } = require('./diff');
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, roundCapReached, parseMaxRounds } = require('./transport');
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, fetchPriorPushbacks, roundCapReached, parseMaxRounds } = require('./transport');
 const { buildReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
@@ -485,7 +485,30 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
   const anchorInput = buildReviewInput({ files: filteredFiles, maxDiffChars, toolNames: registry.get(chain[0].engine).toolNames, reviewedRepoRoot: REVIEWED_REPO_ROOT });
   const anchors = buildReviewAnchors(anchorInput.files);
   const dependencySummaries = await resolveDependencySummaries(octokit, filteredFiles, dependencyDiffOn);
-  const material = buildPrMaterial({ files: filteredFiles, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencySummaries });
+  // [LAW:dataflow-not-control-flow] Prior-round pushbacks (the PR author's replies to earlier findings)
+  // feed this round's workers so RA stops re-litigating soundly-rebutted points. The pairing is keyed by
+  // IDENTITY: findings are the inline comments of RA's marker-bearing reviews (prior.reviewIds), and a
+  // pushback is a reply authored by the PR author (pr.user.login) — so a human reviewer's thread or a
+  // bystander's reply is never misattributed as RA's finding / the author's rebuttal. The fetch is gated on
+  // prior.count: with zero prior RA reviews there are no findings and thus no replies, so the result is
+  // provably [] — the gate skips one round-trip on the common first review, mirroring how the budget block
+  // above only does its IO when active.
+  //
+  // [LAW:no-silent-failure] Pushbacks are ADDITIVE context, not a gate: unlike the PR fetch and
+  // summarizePriorReviews (which gate the review's existence and the round cap, so they core.setFailed),
+  // a review is fully correct WITHOUT them — [] yields the same byte-identical cold review a PR with no
+  // pushbacks gets. So a listReviewComments failure degrades to [] with a LOUD, PR-named warning rather
+  // than aborting a paid review cycle for optional context. This is not a silent `|| []`: the warning
+  // announces the degradation, and [] is an HONEST "no pushback context this round", never wrong data.
+  let priorPushbacks = [];
+  if (prior.count > 0) {
+    try {
+      priorPushbacks = await fetchPriorPushbacks(octokit, owner, repo, pullNumber, { findingReviewIds: prior.reviewIds, authorLogin: pr.user?.login });
+    } catch (e) {
+      core.warning(`Failed to fetch prior-round pushbacks for PR #${pullNumber}: ${e.message}. Proceeding without pushback context.`);
+    }
+  }
+  const material = buildPrMaterial({ files: filteredFiles, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencySummaries, priorPushbacks });
 
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
