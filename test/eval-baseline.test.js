@@ -201,6 +201,17 @@ test('buildBaseline counts uncosted runs and excludes them from the total', () =
   assert.equal(b.suite.totalCostUsd, 0.15);
   assert.equal(b.suite.costedRuns, 1);
   assert.equal(b.suite.uncostedRuns, 1);
+  // Per-full-run cost is NOT computed from a partial sum — it's null when any run is uncosted, never a
+  // misleadingly precise underestimate.
+  assert.equal(b.suite.costPerFullRunUsd, null);
+});
+
+test('buildBaseline computes per-full-run cost only when every run is costed', () => {
+  const cases = [caseEntry('case-a', { mean: 0.5, min: 0.5, max: 0.5, n: 2 })]; // default perRun both costed (0.1, 0.3)
+  const b = buildBaseline({ cases, provenance: { sha: 'abc', date: '2026-08-01' } });
+  assert.equal(b.suite.uncostedRuns, 0);
+  assert.equal(b.suite.totalCostUsd, 0.4);
+  assert.equal(b.suite.costPerFullRunUsd, 0.2); // 0.4 / 2 repeats
 });
 
 test('buildBaseline refuses an inconsistent or empty suite loudly', () => {

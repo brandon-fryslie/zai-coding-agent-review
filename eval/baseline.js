@@ -286,7 +286,11 @@ function buildBaseline({ cases, provenance }) {
       },
       meanMustFindRecall: round(suiteMeanRecall, 4),
       totalCostUsd: round(totalCostUsd, 4),
-      costPerFullRunUsd: round(totalCostUsd / repeats, 4),
+      // Per full suite run = totalCostUsd / repeats — but ONLY well-defined when every run is costed. With
+      // any uncosted run, totalCostUsd is a partial sum while `repeats` still counts all full runs, so the
+      // quotient underestimates; there is no correct single divisor. Emit null rather than a misleadingly
+      // precise number — costedRuns/uncostedRuns disclose what's known. [LAW:no-silent-failure]
+      costPerFullRunUsd: uncostedRuns === 0 ? round(totalCostUsd / repeats, 4) : null,
       costedRuns,
       uncostedRuns,
     },
