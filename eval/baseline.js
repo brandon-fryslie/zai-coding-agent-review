@@ -8,8 +8,8 @@
 // never an assumed ceiling. [LAW:verifiable-goals]
 //
 // This is an INSTRUMENT, not a second scorer: it never re-runs the engine (run-case.js) and never re-scores
-// (score.js). It only COLLECTS the per-case bands score.js already computed, adds provenance, derives each
-// case's gate floor + the suite cost, and freezes the result. [LAW:decomposition]
+// (score.js). It only COLLECTS the per-case bands score.js already computed, adds provenance, derives the
+// suite's pooled gate floor + each case's diagnostic floor + the suite cost, and freezes the result. [LAW:decomposition]
 //
 //   node eval/baseline.js [--out-dir eval/out] [--cases-dir eval/cases] [--dest eval/baseline]
 //                         [--sha <git-sha>] [--date <YYYY-MM-DD>]
@@ -388,8 +388,9 @@ function renderBaselineMarkdown(baseline) {
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
 
 // Enumerate the golden case set from cases-dir: every subdir with a case.json. The case set is the frozen
-// ground truth, so the baseline must cover exactly it — a case frozen but not scored (or scored but not
-// frozen) is a partial/stray baseline masquerading as complete, and aborts. [LAW:no-silent-failure]
+// ground truth, so the baseline must cover exactly it — a golden case with no scored summary aborts (main),
+// so a partial baseline never masquerades as complete. A scored dir with no matching golden case is not part
+// of the suite and is ignored, never enumerated here. [LAW:no-silent-failure]
 function findGoldenCases(casesDir) {
   if (!fs.existsSync(casesDir)) throw new Error(`Cases dir not found: ${casesDir}.`);
   const names = fs.readdirSync(casesDir, { withFileTypes: true })

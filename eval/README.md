@@ -219,8 +219,9 @@ the version.
 (`copirate-eval-harness-2fk.5`) measures a candidate engine change against. It is an
 instrument, not a third scorer: it never re-runs the engine and never re-scores. It only
 *collects* the per-case `scorecard-summary.json` bands `score.js` already wrote, tags them
-with the exact `main` SHA + pinned engine that produced them, derives each case's gate
-floor and the suite cost, and writes the result under `eval/baseline/<date>-<short-sha>/`.
+with the exact `main` SHA + pinned engine that produced them, derives the suite's pooled gate
+floor + each case's diagnostic floor and the suite cost, and writes the result under
+`eval/baseline/<date>-<short-sha>/`.
 
 Full-suite workflow (run → score → freeze):
 
