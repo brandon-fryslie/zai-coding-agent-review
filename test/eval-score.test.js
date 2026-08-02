@@ -6,7 +6,7 @@ const {
   parseArgs, parseExpected, parseProduced, parseUsage, parseMeta,
   normalizeBody, pairCandidates, computeMetrics, scoreRun, aggregateRuns, renderTable,
   makeLexicalJudge, jaccard, wordSet,
-  judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge,
+  judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, loadCache,
 } = require('../eval/score');
 
 // [LAW:verifiable-goals] AC: the scorer reduces a run's findings.json + a case's expected.json to
@@ -258,6 +258,22 @@ test('makeLlmJudge caches by content and only fetches uncached pairs', async () 
   assert.equal(second.get('0:0').match, true);
   assert.equal(fetchCalls, 1);
   require('fs').rmSync(tmp, { force: true });
+});
+
+test('loadCache returns {} when absent and aborts loudly on a corrupt or wrong-typed cache', () => {
+  const os = require('os'), fs = require('fs'), path = require('path');
+  const f = path.join(os.tmpdir(), `judge-cache-load-${process.pid}-${Date.now()}.json`);
+  assert.deepEqual(loadCache(f), {}); // missing file → empty map, not an error
+  fs.writeFileSync(f, '{not json');
+  assert.throws(() => loadCache(f), /unreadable/);
+  // Valid JSON of the wrong type must be rejected at the boundary — otherwise `ck in cache` crashes inland.
+  for (const bad of ['123', '"a string"', '[1,2,3]', 'null']) {
+    fs.writeFileSync(f, bad);
+    assert.throws(() => loadCache(f), /not a JSON object/, `expected reject for ${bad}`);
+  }
+  fs.writeFileSync(f, '{"ck":{"match":true,"reason":"r"}}');
+  assert.deepEqual(loadCache(f), { ck: { match: true, reason: 'r' } });
+  fs.rmSync(f, { force: true });
 });
 
 test('makeLlmJudge surfaces a non-200 loudly', async () => {

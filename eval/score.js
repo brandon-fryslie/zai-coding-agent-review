@@ -451,13 +451,22 @@ function parseJudgeResponse(text, batchLen) {
 
 function loadCache(file) {
   if (!fs.existsSync(file)) return {};
+  let parsed;
   try {
-    return parseJson(fs.readFileSync(file, 'utf8'), file);
+    parsed = parseJson(fs.readFileSync(file, 'utf8'), file);
   } catch (e) {
     // [LAW:no-silent-failure] A corrupt cache is a real problem to surface, not to paper over by silently
     // discarding every prior decision (which would also break determinism). Refuse and name the file.
     throw new Error(`Judge cache ${file} is unreadable: ${e.message}. Delete it to rebuild.`);
   }
+  // [LAW:parse-dont-validate] The cache is a string→decision MAP, so the parse isn't done until the type
+  // is proven. Valid-but-wrong-typed JSON (a number, string, or array) parses fine but then breaks the
+  // `ck in cache` lookup inland with a cryptic TypeError — complete the parse here so a corrupt cache
+  // fails at the boundary with the same delete-and-rebuild message. [LAW:no-silent-failure]
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`Judge cache ${file} is not a JSON object (found ${Array.isArray(parsed) ? 'array' : typeof parsed}). Delete it to rebuild.`);
+  }
+  return parsed;
 }
 
 function saveCache(file, cache) {
@@ -606,5 +615,5 @@ module.exports = {
   parseArgs, parseExpected, parseProduced, parseUsage, parseMeta,
   normalizeBody, pairCandidates, computeMetrics, scoreRun, aggregateRuns, renderTable,
   makeLexicalJudge, jaccard, wordSet,
-  judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, callJudge,
+  judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, callJudge, loadCache,
 };
