@@ -254,9 +254,21 @@ async function main() {
     // and the diff (from change.diff) supplies the anchors. The tarball unpacks at root (no wrapper dir),
     // so destDir itself is the repo root.
     extractTree(manifest.treePath, treeTemp);
-    const files = loadDiffFiles(manifest.diffPath);
+    const allFiles = loadDiffFiles(manifest.diffPath);
+    // [LAW:one-source-of-truth] Strip the case's EXCLUDE_PATTERNS through production's own filterFiles
+    // seam, in the SAME order run.js does (before buildPrMaterial). The freezer saves the RAW three-dot
+    // diff and stores the patterns separately, so an unfiltered replay would review files the original
+    // review's EXCLUDE_PATTERNS stripped — a superset that corrupts the measured verdict. Reusing the one
+    // enforcer keeps this faithful for every case, present and future, and makes excludePatterns a live field.
+    const { filterFiles } = require('../src/diff');
+    const files = filterFiles(allFiles, manifest.excludePatterns);
+    const excluded = allFiles.length - files.length;
+    if (excluded > 0) process.stderr.write(`Excluded ${excluded} file(s) matching the case's EXCLUDE_PATTERNS.\n`);
+    // [LAW:no-silent-failure] Every changed file excluded means there is nothing to review — a case that
+    // would replay as a vacuous empty review must say so, not quietly produce a zero-finding artifact.
+    if (files.length === 0) throw new Error(`All ${allFiles.length} changed file(s) were excluded by the case's EXCLUDE_PATTERNS — nothing to review.`);
     // buildPrMaterial with maxDiffChars: 0 (no truncation) exactly as scripts/local-review.js does — the
-    // frozen diff is the whole material the workers see, anchored against the same files.
+    // frozen diff is the whole material the workers see, anchored against the same (filtered) files.
     const material = buildPrMaterial({ files, maxDiffChars: 0, reviewedRepoRoot: treeTemp });
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
