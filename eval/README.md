@@ -122,6 +122,47 @@ epic notes).
 **37 findings total — 15 must-find.** Diverse across language (TS/Go/JS/Markdown) and
 change kind (perf, supply-chain, feature, spec/CI).
 
+## Replaying a case
+
+`eval/run-case.js` (`npm run review:case`) re-runs a frozen case through the **real**
+review engine — the same prompts, the same adaptive scout→workers `runMultiScope` pass,
+and the same MCP collector production uses — with **no GitHub**. It reuses the action's
+own seams (`synthesizeProviderConfig`, `parseUnifiedDiff`, `buildPrMaterial`,
+`runMultiScope`), exactly as `scripts/local-review.js` does, so it is an **instrument,
+not a second review implementation**: a measured difference between two engine versions
+is attributable to the code change under test, never to a replay that drifted.
+
+```bash
+DEEPSEEK_API_KEY=… node eval/run-case.js eval/cases/<case-name> -n 3
+# options: -n/--repeats <N> (default 1), --out <dir> (default eval/out), --workers <N> (default 4)
+```
+
+It extracts `repo.tar.gz` to a temp dir (that becomes `REVIEWED_REPO_ROOT`), feeds
+`change.diff` through the real diff seam, and drives the engine on the case's **pinned**
+provider/model. The credential is read from the same env var the action uses
+(`DEEPSEEK_API_KEY` / `ZAI_API_KEY` / `OPENAI_API_KEY`, selected by `case.json`'s
+provider). The engine cannot be overridden on the command line — a replay on a different
+model than the pin is **refused loudly**, since it would corrupt any baseline comparison.
+It also refuses loudly on a missing credential or a missing/corrupt `repo.tar.gz`.
+
+Each replay is **append-only**: one invocation stamps a timestamp and writes one
+directory per repeat, so a re-run never clobbers a prior batch's artifacts.
+
+```
+eval/out/<case-name>/<timestamp>-run<i>/
+  findings.json   — the raw merged findings from runMultiScope, PRE anchor-partition:
+                    an array of { path, line, body, severity }. This is what the scorer
+                    (copirate-eval-harness-2fk.3) matches against expected.json.
+  summary.txt     — the aggregated multi-scope review summary.
+  usage.json      — { inputTokens, outputTokens, cost } (cost is the existing discriminated
+                    value: { available:true, usd } or { available:false, reason }).
+  meta.json       — provenance: case, timestamp, run index, the resolved engine config, findingCount.
+  transcripts/    — the full per-spawn session transcripts (scout + one per scope).
+```
+
+`eval/out/` is git-ignored — run artifacts are never committed. Like everything under
+`eval/`, `run-case.js` is dev-only tooling and does **not** bump the version.
+
 ## Adding a new case
 
 1. **Freeze the mechanical inputs** with the freezer, which resolves the reviewed head

@@ -136,3 +136,6 @@ out
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Eval harness run artifacts (eval/run-case.js writes replays here; never committed)
+eval/out/
