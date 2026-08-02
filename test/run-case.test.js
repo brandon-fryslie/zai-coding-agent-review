@@ -71,7 +71,13 @@ test('parseCaseManifest fails loudly on malformed input', () => {
   assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'x', diff: 'd', tree: 't', engine: { model: 'm' } }), '/c'), /engine\.provider/);
   assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'x', diff: 'd', tree: 't', engine: { provider: 'p' } }), '/c'), /engine\.model/);
   assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'x', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm' }, excludePatterns: 'no' }), '/c'), /excludePatterns.*array/);
-  assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'x', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm', reasoning: 3 } }), '/c'), /reasoning.*string or null/);
+  assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'x', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm', reasoning: 3 } }), '/c'), /reasoning.*non-empty string/);
+  // An empty-string reasoning is rejected at the boundary, not surfaced as a confusing pin mismatch later.
+  assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'x', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm', reasoning: '' } }), '/c'), /reasoning.*non-empty string/);
+  // A name that isn't a plain path component can't reach path.join.
+  assert.throws(() => parseCaseManifest(JSON.stringify({ name: '../evil', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm' } }), '/c'), /plain directory component/);
+  assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'a/b', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm' } }), '/c'), /plain directory component/);
+  assert.throws(() => parseCaseManifest(JSON.stringify({ name: '..', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm' } }), '/c'), /plain directory component/);
 });
 
 test('buildProviderInputs reads each provider credential from its own env var and pins the model', () => {

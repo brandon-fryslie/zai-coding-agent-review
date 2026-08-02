@@ -109,6 +109,13 @@ function parseCaseManifest(raw, caseDir) {
     return v;
   };
   const name = req(json.name, 'name');
+  // [LAW:parse-dont-validate] name is used as a single path COMPONENT (path.join(caseOutRoot, name) and
+  // meta.json provenance), so parse it as one: a name with a separator or `..` would write output
+  // outside eval/out/ or nest it unexpectedly while meta.json still records the raw name. Reject any
+  // non-plain-component name here so it can never reach path.join. [LAW:no-silent-failure]
+  if (name !== path.basename(name) || name === '.' || name === '..') {
+    throw new Error(`case.json (${caseDir}) 'name' must be a plain directory component (no path separators or '..'), got ${JSON.stringify(name)}.`);
+  }
   const diff = req(json.diff, 'diff');
   const tree = req(json.tree, 'tree');
   const engine = json.engine;
@@ -118,7 +125,13 @@ function parseCaseManifest(raw, caseDir) {
   // reasoning is genuinely optional in the domain (deepseek carries none); normalize absent → null so
   // the pin check compares one representation of "no reasoning", never undefined-vs-null. [LAW:one-source-of-truth]
   const reasoning = engine.reasoning ?? null;
-  if (reasoning !== null && typeof reasoning !== 'string') throw new Error(`case.json (${caseDir}) 'engine.reasoning' must be a string or null.`);
+  // [LAW:parse-dont-validate] reasoning is null OR a non-empty tier string. An empty string is neither —
+  // left unrejected it slips past a bare typeof check, then buildProviderInputs coerces it to undefined
+  // and the pin check reports a confusing "Reasoning-pin mismatch" instead of the real problem. Reject it
+  // here, at the boundary, exactly as `req` rejects an empty provider/model. [LAW:no-silent-failure]
+  if (reasoning !== null && (typeof reasoning !== 'string' || reasoning.trim() === '')) {
+    throw new Error(`case.json (${caseDir}) 'engine.reasoning' must be null or a non-empty string.`);
+  }
   const excludePatterns = json.excludePatterns ?? [];
   if (!Array.isArray(excludePatterns)) throw new Error(`case.json (${caseDir}) 'excludePatterns' must be an array.`);
   return {
