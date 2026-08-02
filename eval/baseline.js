@@ -64,9 +64,10 @@ Usage: node eval/baseline.js [options]
 
   --out-dir <dir>    Where scored run artifacts live (default: eval/out). Each golden case must have a
                      scorecard-summary.json under <out-dir>/<case>/ — run eval/score.js first.
-  --cases-dir <dir>  Where the frozen golden cases live (default: eval/cases). Enumerates the case set and
-                     reads each case's pinned engine, so a case scored but not frozen (or vice versa) is
-                     caught, not silently dropped.
+  --cases-dir <dir>  Where the frozen golden cases live (default: eval/cases). The golden set is enumerated
+                     from here; a frozen case with no scored summary aborts (a partial baseline is never
+                     silently completed). A scored dir under <out-dir> with no matching golden case is not
+                     part of the suite and is ignored.
   --dest <dir>       Baseline output root (default: eval/baseline). Writes <dest>/<date>-<shortsha>/.
   --sha <git-sha>    The main commit this baseline characterizes (default: git rev-parse HEAD).
   --date <date>      YYYY-MM-DD stamp for the baseline dir (default: today, UTC).
@@ -237,7 +238,13 @@ function buildBaseline({ cases, provenance }) {
       costedRuns++;
     });
   }
-  const pooledRate = pooledTotal ? pooledFound / pooledTotal : null;
+  // [LAW:one-source-of-truth] A suite with zero must-find opportunities has no pooled rate and a null gate
+  // floor — it cannot gate, and parseBaseline (the loader) requires opportunities>=1 + a finite floor. Refuse
+  // it at the producer so every baseline buildBaseline emits is one parseBaseline can load back. [LAW:no-silent-failure]
+  if (pooledTotal === 0) {
+    throw new Error('buildBaseline: the suite has zero must-find opportunities — not a gradeable baseline (every case has an empty must-find set). Check the annotations.');
+  }
+  const pooledRate = pooledFound / pooledTotal;
 
   const caseEntries = cases.map(c => ({
     case: c.summary.case,

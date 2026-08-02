@@ -245,10 +245,10 @@ still dev-only tooling and does **not** bump the version.
 
 ```
 eval/baseline/<date>-<short-sha>/
-  baseline.json   — the frozen distribution: per-case must-find recall band (mean/min/max), each case's
-                    gate floor, the suite cost, the pinned engine, and the degradation rule. parseBaseline
-                    (exported) is the loader the compare gate (2fk.5) reuses, so producer and reader share
-                    one shape.
+  baseline.json   — the frozen distribution: the suite's pooled must-find gate floor (the one gate number),
+                    each case's must-find recall band (mean/min/max) + diagnostic floor, the suite cost, the
+                    pinned engine, and the degradation rule. parseBaseline (exported) is the loader the
+                    compare gate (2fk.5) reuses.
   baseline.md     — the same, human-readable: the per-case band table, suite cost, and the rule.
 ```
 

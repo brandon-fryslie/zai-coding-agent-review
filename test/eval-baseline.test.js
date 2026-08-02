@@ -220,6 +220,14 @@ test('buildBaseline refuses an inconsistent or empty suite loudly', () => {
     cases: [caseEntry('a', { mean: 1, min: 1, max: 1, n: 2 }), caseEntry('b', { mean: 1, min: 1, max: 1, n: 2 }, { engine: { provider: 'zai', model: 'glm', reasoning: null } })],
     provenance: { sha: 'a', date: 'd' },
   }), /one engine/);
+  // Zero must-find opportunities (every perRun is 0/0) — not a gradeable baseline. Refusing at the producer
+  // keeps its output loadable by parseBaseline (which requires opportunities>=1 + a finite gate floor).
+  assert.throws(() => buildBaseline({
+    cases: [caseEntry('a', { mean: null, min: null, max: null, n: 0 }, {
+      perRun: [{ mustFind: { found: 0, total: 0 }, costUsd: 0.1 }, { mustFind: { found: 0, total: 0 }, costUsd: 0.1 }],
+    })],
+    provenance: { sha: 'a', date: 'd' },
+  }), /zero must-find opportunities/);
 });
 
 // ── parseBaseline (the loader 2fk.5 reuses) round-trips buildBaseline ────────────────────────────────
