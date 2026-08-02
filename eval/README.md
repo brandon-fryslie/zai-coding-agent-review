@@ -163,6 +163,55 @@ eval/out/<case-name>/<timestamp>-run<i>/
 `eval/out/` is git-ignored — run artifacts are never committed. Like everything under
 `eval/`, `run-case.js` is dev-only tooling and does **not** bump the version.
 
+## Scoring a replay
+
+`eval/score.js` (`npm run review:score`) reduces a case's replay artifacts to the
+number the harness exists to protect: **must-find recall** (found / total must-find),
+plus nice-to-find recall, noise count, and cost — the secondary metrics. It is an
+**instrument, not a second review implementation**: it never re-runs the engine and
+never re-derives the expected set; it only *matches* the frozen `expected.json` against
+a run's `findings.json` and reduces the match to metrics.
+
+```bash
+DEEPSEEK_API_KEY=… node eval/score.js eval/out/<case-name> [options]
+# options: --matcher llm|lexical (default llm), --cases-dir <dir> (default eval/cases),
+#          --cache <file> (default eval/out/.judge-cache.json)
+```
+
+The match is **two stages, cheap first**:
+
+1. **Candidate pairing** (pure, deterministic) — a produced finding can match an
+   expected one only when the **path is identical** and the new-file line is within a
+   ±10 window (findings legitimately anchor a few lines off; `partitionFindings`'
+   `MAX_ANCHOR_SNAP_DISTANCE` is the precedent).
+2. **Semantic identity** — does the produced body describe the **same defect** as the
+   expected body? This is the one judgment that isn't lexical, so it is the one
+   **effect**: an LLM judge (a cheap pinned model, `deepseek-v4-flash`, over the same
+   `DEEPSEEK_API_KEY`) rules match / no-match on each candidate pair. The scoring core
+   never knows which judge it holds — the offline `--matcher lexical` (deterministic
+   word-overlap) is the same `judge(pairs) → decisions` shape and needs no credential.
+
+**Determinism** (scoring the same `findings.json` twice yields the identical scorecard)
+is a *structural* property of a **content-keyed cache**, not a hope about LLM
+temperature: the first scoring populates `eval/out/.judge-cache.json`; every later
+scoring reads it, so the judge is never re-consulted for a pair it already ruled on.
+The cache key includes a `JUDGE_VERSION` token, so changing the judge prompt or model
+can never silently reuse a stale ruling.
+
+```
+eval/out/<case-name>/
+  <ts>-run<i>/scorecard.json   — per run: must-find/nice-to-find recall (found, total, foundIds,
+                                 missedIds), noise items, cost, and the per-pair match detail.
+  scorecard-summary.json       — across the case's runs: mean/min/max recall band, the shape 2fk.4
+                                 (baseline/variance) reduces.
+```
+
+The judge is a **measurement instrument** and is validated once: hand-match the
+flagship case, run the judge, and require ≥90% agreement before trusting it (recorded on
+`copirate-eval-harness-2fk.3`). If agreement ever fails, `--matcher lexical` is the
+declared fallback. Like the rest of `eval/`, `score.js` is dev-only and does **not** bump
+the version.
+
 ## Adding a new case
 
 1. **Freeze the mechanical inputs** with the freezer, which resolves the reviewed head
