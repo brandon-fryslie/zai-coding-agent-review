@@ -712,4 +712,8 @@ module.exports = {
   normalizeBody, pairCandidates, computeMetrics, scoreRun, aggregateRuns, renderTable,
   makeLexicalJudge, jaccard, wordSet,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, callJudge, loadCache,
+  // The pinned judge model, so the compare gate (2fk.5) can build the exact matcher label the scorer
+  // records ('llm/<JUDGE_MODEL>') and reject a matcher mismatch against the baseline BEFORE spending a
+  // full suite run — not only in the post-run buildBaseline consistency check. [LAW:one-source-of-truth]
+  JUDGE_MODEL,
 };
