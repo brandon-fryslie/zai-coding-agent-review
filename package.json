@@ -15,7 +15,8 @@
   "scripts": {
     "build": "ncc build src/index.js -o dist --license licenses.txt",
     "test": "node --test",
-    "review:local": "node scripts/local-review.js"
+    "review:local": "node scripts/local-review.js",
+    "review:case": "node eval/run-case.js"
   },
   "dependencies": {
     "@actions/core": "^1.10.1",
