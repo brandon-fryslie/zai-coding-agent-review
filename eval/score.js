@@ -526,7 +526,15 @@ async function callJudge(doFetch, apiKey, model, batch) {
     const detail = await res.text().catch(() => '');
     throw new Error(`Judge request failed: HTTP ${res.status} ${detail.slice(0, 200)}`);
   }
-  const envelope = await res.json();
+  // [LAW:no-silent-failure] A 200 with a non-JSON body (a proxy/gateway HTML page, a truncated response)
+  // makes res.json() throw a bare `Unexpected token <` with no hint of the source. Name the judge as the
+  // failure point, exactly as the non-200 arm and extractText/parseJudgeResponse do.
+  let envelope;
+  try {
+    envelope = await res.json();
+  } catch (e) {
+    throw new Error(`Judge response was HTTP ${res.status} but not valid JSON (a proxy/gateway page?): ${e.message}`);
+  }
   return parseJudgeResponse(extractText(envelope), batch.length);
 }
 

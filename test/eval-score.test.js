@@ -282,3 +282,11 @@ test('makeLlmJudge surfaces a non-200 loudly', async () => {
   await assert.rejects(() => judge([{ key: '0:0', expectedBody: 'E', producedBody: 'P' }]), /HTTP 401/);
   require('fs').rmSync(tmp, { force: true });
 });
+
+test('makeLlmJudge names the judge when a 200 body is not JSON', async () => {
+  const tmp = require('path').join(require('os').tmpdir(), `judge-cache-badjson-${process.pid}-${Date.now()}.json`);
+  // A 200 whose body is an HTML proxy page: json() throws a bare parse error, re-thrown with judge context.
+  const judge = makeLlmJudge({ apiKey: 'k', model: 'm', cacheFile: tmp, fetchImpl: async () => ({ ok: true, status: 200, json: async () => { throw new Error('Unexpected token <'); } }) });
+  await assert.rejects(() => judge([{ key: '0:0', expectedBody: 'E', producedBody: 'P' }]), /Judge response was HTTP 200 but not valid JSON/);
+  require('fs').rmSync(tmp, { force: true });
+});
