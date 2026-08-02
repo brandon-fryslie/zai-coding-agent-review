@@ -432,20 +432,31 @@ function extractText(envelope) {
   return texts[texts.length - 1].text;
 }
 
-// Parse the judge's JSON array into decisions by 1-based pair number. [LAW:no-silent-failure] A response
-// that isn't the promised array, or that omits a pair, aborts loudly (with the raw text) rather than
-// silently treating the missing pair as a no-match — a missing decision is a judge failure, not a verdict.
+// Extract the judge's decision list from its raw text. The output contract is "one decision object per
+// pair"; the model honors it as a JSON array for a multi-pair batch but drops the brackets and emits a
+// BARE OBJECT for a single-pair batch (`{"i":1,...}` not `[{"i":1,...}]`) — a valid instance of the same
+// contract. [LAW:one-type-per-behavior] Both are read to ONE shape (a list of decision objects) here, so
+// parseJudgeResponse validates a single path. Array is preferred, so a well-formed array whose text also
+// contains braces is never mis-read as an object. [LAW:no-silent-failure] Neither shape present ⇒ throw.
+function extractDecisionList(text) {
+  const tryParse = (open, close) => {
+    const start = text.indexOf(open);
+    const end = text.lastIndexOf(close);
+    if (start === -1 || end === -1 || end < start) return undefined;
+    try { return JSON.parse(text.slice(start, end + 1)); } catch { return undefined; }
+  };
+  const arr = tryParse('[', ']');
+  if (Array.isArray(arr)) return arr;
+  const obj = tryParse('{', '}');
+  if (obj && typeof obj === 'object' && !Array.isArray(obj)) return [obj];
+  throw new Error(`Judge response is not a JSON array or object: ${text.slice(0, 300)}`);
+}
+
+// Parse the judge's decision list into decisions by 1-based pair number. [LAW:no-silent-failure] A response
+// that carries neither shape, or that omits a pair, aborts loudly (with the raw text) rather than silently
+// treating the missing pair as a no-match — a missing decision is a judge failure, not a verdict.
 function parseJudgeResponse(text, batchLen) {
-  const start = text.indexOf('[');
-  const end = text.lastIndexOf(']');
-  if (start === -1 || end === -1 || end < start) throw new Error(`Judge response is not a JSON array: ${text.slice(0, 300)}`);
-  let arr;
-  try {
-    arr = JSON.parse(text.slice(start, end + 1));
-  } catch (e) {
-    throw new Error(`Judge response did not parse as JSON: ${e.message} — ${text.slice(0, 300)}`);
-  }
-  if (!Array.isArray(arr)) throw new Error(`Judge response JSON is not an array: ${text.slice(0, 300)}`);
+  const arr = extractDecisionList(text);
   const byI = new Map();
   for (const item of arr) {
     if (!item || !Number.isInteger(item.i) || typeof item.match !== 'boolean') {
@@ -626,7 +637,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  parseArgs, parseExpected, parseProduced, parseUsage, parseMeta,
+  parseArgs, parseJson, parseJsonObject, parseExpected, parseProduced, parseUsage, parseMeta,
   normalizeBody, pairCandidates, computeMetrics, scoreRun, aggregateRuns, renderTable,
   makeLexicalJudge, jaccard, wordSet,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, callJudge, loadCache,

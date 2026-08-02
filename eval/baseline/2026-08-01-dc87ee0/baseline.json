@@ -1,0 +1,174 @@
+{
+  "schema": "copirate-eval-baseline/v1",
+  "generatedAt": "2026-08-01",
+  "mainSha": "dc87ee0ec4fdf590839c5a89a14d98e7a00d584b",
+  "engine": {
+    "provider": "deepseek",
+    "model": "deepseek-v4-pro",
+    "reasoning": null
+  },
+  "matcher": "llm/deepseek-v4-flash",
+  "repeats": 5,
+  "degradationRule": {
+    "metric": "pooledMustFindRecall",
+    "comparator": "lt",
+    "floorSource": "suite.pooledMustFind.gateFloor",
+    "description": "PRIMARY GATE (pooled): the suite is DEGRADED when a candidate's pooled must-find recall — total must-finds found across all N×cases runs ÷ total must-find opportunities — falls below this baseline's pooled gate floor (the baseline pooled rate minus a ~2σ binomial sampling margin). Pooling is used because per-case recall means are too noisy to gate on at these tiny denominators (run-to-run spread exceeds the mean for 3 of 4 cases; 3 per-case floors are 0%). The per-case bands below are DIAGNOSTICS — they localize which case moved — not independent gates."
+  },
+  "suite": {
+    "cases": 4,
+    "pooledMustFind": {
+      "found": 14,
+      "opportunities": 75,
+      "rate": 0.1867,
+      "gateFloor": 0.0985
+    },
+    "meanMustFindRecall": 0.194,
+    "totalCostUsd": 3.4762,
+    "costPerFullRunUsd": 0.6952,
+    "costedRuns": 20,
+    "uncostedRuns": 0
+  },
+  "cases": [
+    {
+      "case": "cc-candybar-150-transcript-perf",
+      "mustFindRecall": {
+        "mean": 0.14285714285714285,
+        "min": 0,
+        "max": 0.42857142857142855,
+        "n": 5
+      },
+      "niceToFindRecall": {
+        "mean": 0.175,
+        "min": 0,
+        "max": 0.375,
+        "n": 5
+      },
+      "noiseCount": {
+        "mean": 4,
+        "min": 1,
+        "max": 8,
+        "n": 5
+      },
+      "costUsd": {
+        "mean": 0.21196246160000004,
+        "min": 0.124663721,
+        "max": 0.30525167999999997,
+        "n": 5
+      },
+      "diagnosticFloor": 0,
+      "perRun": [
+        "1/7",
+        "3/7",
+        "0/7",
+        "0/7",
+        "1/7"
+      ]
+    },
+    {
+      "case": "copirate-93-dependency-diff",
+      "mustFindRecall": {
+        "mean": 0.13333333333333333,
+        "min": 0,
+        "max": 0.3333333333333333,
+        "n": 5
+      },
+      "niceToFindRecall": {
+        "mean": 0.15,
+        "min": 0,
+        "max": 0.25,
+        "n": 5
+      },
+      "noiseCount": {
+        "mean": 1.4,
+        "min": 1,
+        "max": 2,
+        "n": 5
+      },
+      "costUsd": {
+        "mean": 0.1608130156,
+        "min": 0.130001113,
+        "max": 0.233460846,
+        "n": 5
+      },
+      "diagnosticFloor": 0,
+      "perRun": [
+        "0/3",
+        "1/3",
+        "1/3",
+        "0/3",
+        "0/3"
+      ]
+    },
+    {
+      "case": "laws-4-eval-tasks",
+      "mustFindRecall": {
+        "mean": 0.1,
+        "min": 0,
+        "max": 0.5,
+        "n": 5
+      },
+      "niceToFindRecall": {
+        "mean": 0.06666666666666667,
+        "min": 0,
+        "max": 0.3333333333333333,
+        "n": 5
+      },
+      "noiseCount": {
+        "mean": 5.2,
+        "min": 3,
+        "max": 7,
+        "n": 5
+      },
+      "costUsd": {
+        "mean": 0.07841571580000001,
+        "min": 0.074778124,
+        "max": 0.083451299,
+        "n": 5
+      },
+      "diagnosticFloor": 0,
+      "perRun": [
+        "0/2",
+        "0/2",
+        "1/2",
+        "0/2",
+        "0/2"
+      ]
+    },
+    {
+      "case": "links-317-dolt-telemetry",
+      "mustFindRecall": {
+        "mean": 0.39999999999999997,
+        "min": 0.3333333333333333,
+        "max": 0.6666666666666666,
+        "n": 5
+      },
+      "niceToFindRecall": {
+        "mean": 0,
+        "min": 0,
+        "max": 0,
+        "n": 5
+      },
+      "noiseCount": {
+        "mean": 3.6,
+        "min": 2,
+        "max": 6,
+        "n": 5
+      },
+      "costUsd": {
+        "mean": 0.24404657679999997,
+        "min": 0.209327916,
+        "max": 0.314348313,
+        "n": 5
+      },
+      "diagnosticFloor": 0.3333333333333333,
+      "perRun": [
+        "1/3",
+        "1/3",
+        "1/3",
+        "2/3",
+        "1/3"
+      ]
+    }
+  ]
+}

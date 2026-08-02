@@ -212,6 +212,108 @@ flagship case, run the judge, and require ≥90% agreement before trusting it (r
 declared fallback. Like the rest of `eval/`, `score.js` is dev-only and does **not** bump
 the version.
 
+## Freezing a baseline
+
+`eval/baseline.js` (`npm run review:baseline`) reduces the whole scored suite into one
+**frozen baseline** — the reference distribution the compare gate
+(`copirate-eval-harness-2fk.5`) measures a candidate engine change against. It is an
+instrument, not a third scorer: it never re-runs the engine and never re-scores. It only
+*collects* the per-case `scorecard-summary.json` bands `score.js` already wrote, tags them
+with the exact `main` SHA + pinned engine that produced them, derives the suite's pooled gate
+floor + each case's diagnostic floor and the suite cost, and writes the result under
+`eval/baseline/<date>-<short-sha>/`.
+
+Full-suite workflow (run → score → freeze):
+
+```bash
+# 1. Replay every golden case N times (N=5 for the current baseline; rationale below).
+for c in eval/cases/*/; do DEEPSEEK_API_KEY=… node eval/run-case.js "$c" -n 5; done
+# 2. Score each case (writes scorecard-summary.json per case).
+for c in eval/out/*/; do DEEPSEEK_API_KEY=… node eval/score.js "$c"; done
+# 3. Freeze the scored suite into a committed baseline (baseline.json + baseline.md).
+node eval/baseline.js
+```
+
+`baseline.js` refuses to freeze an inconsistent suite loudly: every case must have been
+scored over the same N, with the same matcher, on the same pinned engine, and every frozen
+golden case must have a scored summary — a golden case with no summary aborts, so a partial
+baseline never masquerades as complete. (The golden set is `cases-dir`, so a scored dir under
+`eval/out/` with no matching golden case — an experimental or stale run — is simply not part
+of the suite and is ignored, not an error.) Unlike the run/score artifacts
+under `eval/out/` (git-ignored), the baseline directory is **committed**: it is the
+ground-truth reference, versioned alongside the code it characterizes. `baseline.js` is
+still dev-only tooling and does **not** bump the version.
+
+```
+eval/baseline/<date>-<short-sha>/
+  baseline.json   — the frozen distribution: the suite's pooled must-find gate floor (the one gate number),
+                    each case's must-find recall band (mean/min/max) + diagnostic floor, the suite cost, the
+                    pinned engine, and the degradation rule. parseBaseline (exported) is the loader the
+                    compare gate (2fk.5) reuses.
+  baseline.md     — the same, human-readable: the per-case band table, suite cost, and the rule.
+```
+
+### The degradation rule
+
+A candidate (an engine/prompt/effort change under test) is scored by replaying the **same**
+suite at the **same** N, **pooling** every run's must-find finds into one rate, and comparing
+it to the frozen baseline:
+
+> **The suite is DEGRADED when the candidate's *pooled* must-find recall — total must-finds
+> found across all N×cases runs ÷ total must-find opportunities — falls below this baseline's
+> pooled gate floor (the pooled rate minus a ~2σ binomial sampling margin).**
+
+The gate is **pooled, not per-case**, and that choice is forced by the data. Must-find
+denominators are tiny (7, 3, 2, 3 across the four cases), so per-case recall is **quantized
+and jittery**: for a 3-finding case it can only be 0, ⅓, ⅔, or 1, a single finding flipping
+swings it 33 points, and — as the baseline below shows — the run-to-run spread exceeds the
+mean for three of the four cases, with three per-case floors sitting at 0 % (a "mean below the
+floor" rule can never fire there). A per-case gate is false precision. Pooling all the
+must-find opportunities into one binomial rate restores a sample large enough to carry a real
+sampling margin, so the floor is a meaningful line rather than noise. The per-case bands are
+kept only as **diagnostics** — they localize *which* case moved a pooled regression; they do
+not gate on their own.
+
+### The first baseline, and the variance that shaped the rule
+
+The first frozen baseline is
+[`eval/baseline/2026-08-01-dc87ee0/`](baseline/2026-08-01-dc87ee0/baseline.md) — `main` at
+`dc87ee0`, engine `deepseek-v4-pro`, N=5. Headline: **pooled must-find recall 19 % (14 of
+75 opportunities), gate floor 10 %.** A full suite run (all four cases once) costs ≈ $0.70;
+the whole N=5 baseline cost **$3.48**.
+
+The per-case variance behind the pooled rule (above) is stark — every case's run-to-run
+spread is large relative to its mean, and for three of the four the spread *exceeds* the mean:
+
+| case | must-find | mean | min–max | per-run finds |
+|------|-----------|------|---------|---------------|
+| `cc-candybar-150-transcript-perf` | /7 | 14 % | 0–43 % | 1·3·0·0·1 |
+| `copirate-93-dependency-diff`     | /3 | 13 % | 0–33 % | 0·1·1·0·0 |
+| `laws-4-eval-tasks`               | /2 | 10 % | 0–50 % | 0·0·1·0·0 |
+| `links-317-dolt-telemetry`        | /3 | 40 % | 33–67 % | 1·1·1·2·1 |
+
+The three 0 % floors are why a per-case gate would police only `links-317`; the pooled rate
+folds all 75 opportunities into one number instead.
+
+### Is N stable enough to gate on?
+
+**For the pooled rate, yes at N=5; for per-case recall, no at any practical N.** The pooled
+rate aggregates 75 Bernoulli trials, so its ~2σ sampling margin is about ±9 points (a 10 %
+floor under a 19 % mean) — tight enough that a candidate dipping below the floor is real
+degradation, not jitter. Per-case recall is the opposite: with denominators of 2–7 findings
+a single finding flipping swings recall 33–50 points, the run-to-run spread exceeds the mean
+for three of four cases, and shrinking a per-case mean's standard error enough to gate would
+take ~30+ repeats per case (~$20 and hours) — not worth it. So the harness gates on the
+pooled suite rate, uses the per-case bands only to localize a regression, and **N=5 is the
+standing baseline depth.**
+
+The deeper result is the epic's headline, and it is not a defect in the harness: current
+must-find recall is **~19 %** — the engine reproduces roughly one in five of the golden
+set's hardest findings. The instrument is faithful (the LLM judge agreed with hand-matching
+11/11 during `copirate-eval-harness-2fk.3`); the low number is the truth it was built to
+measure. It is the floor the efficiency epic (`copirate-efficiency-235`) must not push
+lower, and the bar the quality work must raise.
+
 ## Adding a new case
 
 1. **Freeze the mechanical inputs** with the freezer, which resolves the reviewed head
