@@ -289,8 +289,12 @@ function buildBaseline({ cases, provenance }) {
 
 // [LAW:parse-dont-validate] The loader the compare gate (2fk.5) reuses: a frozen baseline.json is only
 // accepted once its schema, the pooled gate floor (the number the gate actually compares against), and each
-// per-case diagnostic band are proven, so the gate never re-checks. Round-trips buildBaseline's output.
-// Kept here so the producer and the reader of the baseline share one shape. [LAW:one-source-of-truth]
+// per-case diagnostic band are proven, so the gate never re-checks. This is deliberately a LOSSY GATE
+// SUBSET, not a full round-trip of buildBaseline's output — it returns only what the gate consumes (pooled
+// floor + per-case id/band), NOT the display fields (perRun/noiseCount/costUsd/suite cost). Widening it to
+// carry those would validate surface no consumer needs. [LAW:carrying-cost] Consequently its output is not
+// a valid input to renderBaselineMarkdown (which needs the rich freeze object); a committed baseline is
+// re-read from baseline.md, never re-rendered from a loaded value.
 function parseBaseline(raw, label) {
   const json = parseJsonObject(raw, label);
   if (json.schema !== 'copirate-eval-baseline/v1') throw new Error(`${label} is not a v1 baseline (schema=${JSON.stringify(json.schema)}).`);
@@ -325,6 +329,10 @@ function parseBaseline(raw, label) {
 // Human-readable rendering (pure).
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
 
+// Renders the RICH freeze-time baseline — buildBaseline's output, with the full suite cost + per-case
+// perRun/noiseCount/costUsd. NOT parseBaseline's gate subset (which omits those); pairing them is a
+// category error, not a supported composition. main() calls this once, at freeze time, on fresh
+// buildBaseline output. [LAW:comments-carry-meaning]
 function renderBaselineMarkdown(baseline) {
   const pct = (v) => (v === null || v === undefined ? 'n/a' : `${(v * 100).toFixed(0)}%`);
   const usd = (v) => (v === null || v === undefined ? 'n/a' : `$${v.toFixed(4)}`);

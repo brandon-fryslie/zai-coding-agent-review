@@ -235,8 +235,10 @@ node eval/baseline.js
 
 `baseline.js` refuses to freeze an inconsistent suite loudly: every case must have been
 scored over the same N, with the same matcher, on the same pinned engine, and every frozen
-golden case must have a scored summary (a case scored-but-not-frozen, or the reverse,
-aborts — a partial baseline never masquerades as complete). Unlike the run/score artifacts
+golden case must have a scored summary — a golden case with no summary aborts, so a partial
+baseline never masquerades as complete. (The golden set is `cases-dir`, so a scored dir under
+`eval/out/` with no matching golden case — an experimental or stale run — is simply not part
+of the suite and is ignored, not an error.) Unlike the run/score artifacts
 under `eval/out/` (git-ignored), the baseline directory is **committed**: it is the
 ground-truth reference, versioned alongside the code it characterizes. `baseline.js` is
 still dev-only tooling and does **not** bump the version.
