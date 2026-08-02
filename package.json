@@ -17,7 +17,8 @@
     "test": "node --test",
     "review:local": "node scripts/local-review.js",
     "review:case": "node eval/run-case.js",
-    "review:score": "node eval/score.js"
+    "review:score": "node eval/score.js",
+    "review:baseline": "node eval/baseline.js"
   },
   "dependencies": {
     "@actions/core": "^1.10.1",

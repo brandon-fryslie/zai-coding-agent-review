@@ -231,9 +231,19 @@ test('extractText returns the LAST text block (past a leading thinking block)', 
 test('parseJudgeResponse reads the array, tolerates surrounding prose, and aborts on gaps', () => {
   const ds = parseJudgeResponse('here you go: [{"i":1,"match":true,"reason":"same"},{"i":2,"match":false,"reason":"diff"}]', 2);
   assert.deepEqual(ds, [{ match: true, reason: 'same' }, { match: false, reason: 'diff' }]);
-  assert.throws(() => parseJudgeResponse('no array here', 1), /not a JSON array/);
+  assert.throws(() => parseJudgeResponse('no array here', 1), /not a JSON array or object/);
   assert.throws(() => parseJudgeResponse('[{"i":1,"match":true}]', 2), /omitted a decision for pair 2/);
   assert.throws(() => parseJudgeResponse('[{"i":1,"match":"yes"}]', 1), /malformed/);
+});
+
+// The judge drops the [] and emits a BARE OBJECT for a single-pair batch — a valid instance of the
+// one-object-per-pair contract that must read identically to a one-element array. [LAW:one-type-per-behavior]
+test('parseJudgeResponse accepts a bare single object for a one-pair batch', () => {
+  assert.deepEqual(parseJudgeResponse('{"i":1,"match":false,"reason":"different defects"}', 1), [{ match: false, reason: 'different defects' }]);
+  // Prose around the bare object is still tolerated (outermost braces).
+  assert.deepEqual(parseJudgeResponse('sure: {"i":1,"match":true,"reason":"same"}', 1), [{ match: true, reason: 'same' }]);
+  // A bare object that omits the pair it claims still aborts loudly.
+  assert.throws(() => parseJudgeResponse('{"i":2,"match":true}', 1), /omitted a decision for pair 1/);
 });
 
 test('buildJudgePrompt numbers pairs and states the JSON contract', () => {
