@@ -35,6 +35,10 @@ test('parseArgs rejects bad input loudly', () => {
   assert.throws(() => parseArgs(['foo', '-n', '2abc']), /positive integer/);
   // A valid positive integer still parses to a number.
   assert.equal(parseArgs(['foo', '-n', '3']).repeats, 3);
+  // A `--`-prefixed value is a swallowed flag, not a path — rejected rather than silently consumed.
+  assert.throws(() => parseArgs(['foo', '--out', '--workers=2']), /looks like another flag/);
+  // A single-dash value (a negative number) still routes to its own validator, not the flag guard.
+  assert.throws(() => parseArgs(['foo', '--workers', '-1']), /positive integer/);
 });
 
 const VALID_CASE = JSON.stringify({

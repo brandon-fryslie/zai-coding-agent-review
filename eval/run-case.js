@@ -63,6 +63,12 @@ function parseArgs(argv) {
     if (!known.has(name)) throw new Error(`Unknown option: ${arg.slice(0, eq === -1 ? undefined : eq)}`);
     const value = eq === -1 ? argv[++i] : arg.slice(eq + 1);
     if (value === undefined) throw new Error(`Option --${name} requires a value.`);
+    // [LAW:no-silent-failure] A space-separated value that is itself a long option (starts with `--`)
+    // is a missing value, not a directory literally named '--workers=2'; consuming it would silently
+    // swallow the next flag and drop the user's intent. `--` is the exact discriminator — a negative
+    // number like `-1` (single dash) is NOT caught here, so it still reaches its own validator
+    // (parsePositiveInt) for the accurate "positive integer" error. The `=` form is explicit, so honored.
+    if (eq === -1 && value.startsWith('--')) throw new Error(`Option --${name} requires a value, but got what looks like another flag: ${JSON.stringify(value)}.`);
     opts[name] = value;
   }
   if (opts.caseDir === null) throw new Error('Missing required <case-dir> argument. See --help.');
