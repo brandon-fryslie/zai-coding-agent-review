@@ -89,9 +89,11 @@ function parseArgs(argv) {
     const rawName = arg.slice(2, eq === -1 ? undefined : eq);
     if (!(rawName in keyFor)) throw new Error(`Unknown option: ${arg.slice(0, eq === -1 ? undefined : eq)}`);
     // [LAW:no-silent-failure] A space-separated value that is itself a flag is a missing value, not a
-    // literal argument — consuming it would swallow the next flag and drop the user's intent.
+    // literal argument — consuming it would swallow the next flag and drop the user's intent. An EMPTY
+    // value (`--out-dir=` or `--out-dir ''`) is likewise rejected: left through, path.resolve('') silently
+    // becomes cwd, writing the baseline into the wrong directory instead of failing loudly.
     const value = eq === -1 ? argv[++i] : arg.slice(eq + 1);
-    if (value === undefined || (eq === -1 && value.startsWith('--'))) throw new Error(`Option --${rawName} requires a value.`);
+    if (value === undefined || value === '' || (eq === -1 && value.startsWith('--'))) throw new Error(`Option --${rawName} requires a non-empty value.`);
     opts[keyFor[rawName]] = value;
   }
   return opts;
@@ -116,13 +118,21 @@ function parseBand(v, at) {
 }
 
 // The per-case scorecard-summary.json (score.js's aggregateRuns output). Only the fields the baseline
-// reduces are required. `runs` is the N this case was scored over; the bands are its variance.
+// reduces are required. `runs` is the N this case was scored over; the bands are its variance. This is the
+// BOUNDARY: each perRun's mustFind is parsed to a typed {found,total} here (via parseFraction, the single
+// fraction enforcer), so buildBaseline consumes typed numbers and never re-parses or receives a null.
+// [LAW:parse-dont-validate] [LAW:single-enforcer]
 function parseCaseSummary(raw, label) {
   const json = parseJsonObject(raw, label);
   if (typeof json.case !== 'string' || json.case.trim() === '') throw new Error(`${label} has no 'case' name.`);
   if (!Number.isInteger(json.runs) || json.runs < 1) throw new Error(`${label} 'runs' must be a positive integer (got ${JSON.stringify(json.runs)}).`);
   if (typeof json.matcher !== 'string' || json.matcher.trim() === '') throw new Error(`${label} has no 'matcher'.`);
   if (!Array.isArray(json.perRun)) throw new Error(`${label} has no 'perRun' array.`);
+  // [LAW:no-silent-failure] perRun IS the N runs; a length that disagrees with `runs` means the summary is
+  // corrupt, and buildBaseline would pool only the shorter array — a silently wrong rate + gate floor.
+  if (json.perRun.length !== json.runs) {
+    throw new Error(`${label} has ${json.perRun.length} perRun entries but claims runs=${json.runs} — they must agree (the pooled rate sums perRun).`);
+  }
   return {
     case: json.case,
     runs: json.runs,
@@ -131,13 +141,18 @@ function parseCaseSummary(raw, label) {
     niceToFindRecall: parseBand(json.niceToFindRecall, `${label}.niceToFindRecall`),
     noiseCount: parseBand(json.noiseCount, `${label}.noiseCount`),
     costUsd: parseBand(json.costUsd, `${label}.costUsd`),
-    // perRun costs are summed for the suite total; each is a number or null (cost unavailable that run).
     perRun: json.perRun.map((r, i) => {
+      const at = `${label}.perRun[${i}]`;
+      // mustFind is the pooled numerator/denominator source — parse it to {found,total} at the boundary so
+      // buildBaseline can't see an absent/non-string value (which would coerce to "null" deep in the reduction).
+      if (typeof r.mustFind !== 'string') throw new Error(`${at}.mustFind must be a 'found/total' string (got ${JSON.stringify(r.mustFind)}).`);
+      const mustFind = parseFraction(r.mustFind, `${at}.mustFind`);
+      // perRun costs are summed for the suite total; each is a number or null (cost unavailable that run).
       const costUsd = r.costUsd ?? null;
       if (costUsd !== null && (typeof costUsd !== 'number' || !Number.isFinite(costUsd))) {
-        throw new Error(`${label}.perRun[${i}].costUsd must be a finite number or null (got ${JSON.stringify(r.costUsd)}).`);
+        throw new Error(`${at}.costUsd must be a finite number or null (got ${JSON.stringify(r.costUsd)}).`);
       }
-      return { mustFind: r.mustFind ?? null, niceToFind: r.niceToFind ?? null, noise: r.noise ?? null, costUsd };
+      return { mustFind, niceToFind: r.niceToFind ?? null, noise: r.noise ?? null, costUsd };
     }),
   };
 }
@@ -213,10 +228,10 @@ function buildBaseline({ cases, provenance }) {
   let costedRuns = 0;
   let uncostedRuns = 0;
   for (const c of cases) {
-    c.summary.perRun.forEach((r, i) => {
-      const f = parseFraction(r.mustFind, `${c.summary.case}.perRun[${i}].mustFind`);
-      pooledFound += f.found;
-      pooledTotal += f.total;
+    c.summary.perRun.forEach((r) => {
+      // mustFind is already the typed {found,total} parseCaseSummary produced at the boundary.
+      pooledFound += r.mustFind.found;
+      pooledTotal += r.mustFind.total;
       if (r.costUsd === null) { uncostedRuns++; return; }
       totalCostUsd += r.costUsd;
       costedRuns++;
@@ -235,7 +250,8 @@ function buildBaseline({ cases, provenance }) {
     // the pooled gate trips. null only if the case has zero must-finds (band n===0), which the annotator
     // should never produce — surfaced, not hidden.
     diagnosticFloor: c.summary.mustFindRecall.min,
-    perRun: c.summary.perRun.map(r => r.mustFind),
+    // Reconstruct the "found/total" display string from the typed value (identical to what score.js rendered).
+    perRun: c.summary.perRun.map(r => `${r.mustFind.found}/${r.mustFind.total}`),
   }));
 
   // Suite headline: the unweighted mean of the per-case mean recalls. Informational only — a summary of the

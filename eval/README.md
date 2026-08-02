@@ -253,20 +253,23 @@ eval/baseline/<date>-<short-sha>/
 ### The degradation rule
 
 A candidate (an engine/prompt/effort change under test) is scored by replaying the **same**
-suite at the **same** N and comparing its per-case must-find recall to the frozen baseline:
+suite at the **same** N, **pooling** every run's must-find finds into one rate, and comparing
+it to the frozen baseline:
 
-> **A case is DEGRADED when the candidate's mean must-find recall (over the same N repeats)
-> falls below this baseline's observed *min* for that case — the band floor. The suite is
-> DEGRADED when any single case is degraded.**
+> **The suite is DEGRADED when the candidate's *pooled* must-find recall — total must-finds
+> found across all N×cases runs ÷ total must-find opportunities — falls below this baseline's
+> pooled gate floor (the pooled rate minus a ~2σ binomial sampling margin).**
 
-The floor is the observed **worst run** (min), not `mean − k·spread`, and that choice is
-forced by the data. Must-find denominators are tiny (7, 3, 3, 2 across the four cases), so
-recall is **quantized**: for a 3-finding case it can only be 0, ⅓, ⅔, or 1, and a single
-finding flipping in or out swings it by 33 percentage points. Against that granularity a
-parametric band (mean ± k·σ) is false precision; the honest floor is simply *the lowest
-recall the current engine was actually seen to produce*. A candidate need only stay inside
-the band the current engine already reproduces — not beat its average — which is exactly the
-epic's charter: **improve, or at minimum do not degrade.**
+The gate is **pooled, not per-case**, and that choice is forced by the data. Must-find
+denominators are tiny (7, 3, 2, 3 across the four cases), so per-case recall is **quantized
+and jittery**: for a 3-finding case it can only be 0, ⅓, ⅔, or 1, a single finding flipping
+swings it 33 points, and — as the baseline below shows — the run-to-run spread exceeds the
+mean for three of the four cases, with three per-case floors sitting at 0 % (a "mean below the
+floor" rule can never fire there). A per-case gate is false precision. Pooling all the
+must-find opportunities into one binomial rate restores a sample large enough to carry a real
+sampling margin, so the floor is a meaningful line rather than noise. The per-case bands are
+kept only as **diagnostics** — they localize *which* case moved a pooled regression; they do
+not gate on their own.
 
 ### The first baseline, and the variance that shaped the rule
 
@@ -276,9 +279,8 @@ The first frozen baseline is
 75 opportunities), gate floor 10 %.** A full suite run (all four cases once) costs ≈ $0.70;
 the whole N=5 baseline cost **$3.48**.
 
-The observed per-case variance is what forced the pooled rule. Every case's run-to-run
-spread is large relative to its mean, and for three of the four the spread *exceeds* the
-mean:
+The per-case variance behind the pooled rule (above) is stark — every case's run-to-run
+spread is large relative to its mean, and for three of the four the spread *exceeds* the mean:
 
 | case | must-find | mean | min–max | per-run finds |
 |------|-----------|------|---------|---------------|
@@ -287,10 +289,8 @@ mean:
 | `laws-4-eval-tasks`               | /2 | 10 % | 0–50 % | 0·0·1·0·0 |
 | `links-317-dolt-telemetry`        | /3 | 40 % | 33–67 % | 1·1·1·2·1 |
 
-Three floors are 0 %: on those cases a per-case "mean below the floor" rule can never fire —
-recall cannot fall below zero — so a per-case gate would police only `links-317`. Pooling
-all 75 must-find opportunities into one binomial rate restores a signal with a real sampling
-margin, which is why the primary gate is pooled and the per-case bands are diagnostics.
+The three 0 % floors are why a per-case gate would police only `links-317`; the pooled rate
+folds all 75 opportunities into one number instead.
 
 ### Is N stable enough to gate on?
 

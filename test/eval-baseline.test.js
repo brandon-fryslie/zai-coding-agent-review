@@ -30,7 +30,8 @@ function summaryFixture(overrides = {}) {
 
 const ENGINE = JSON.stringify({ name: 'case-a', engine: { provider: 'deepseek', model: 'deepseek-v4-pro', reasoning: null } });
 
-// A parsed {summary, engine} case entry buildBaseline consumes.
+// A parsed {summary, engine} case entry buildBaseline consumes. perRun.mustFind is the TYPED {found,total}
+// parseCaseSummary produces at the boundary (buildBaseline no longer parses strings).
 function caseEntry(name, mustFindBand, opts = {}) {
   return {
     summary: {
@@ -39,7 +40,7 @@ function caseEntry(name, mustFindBand, opts = {}) {
       niceToFindRecall: { mean: 0, min: 0, max: 0, n: 2 },
       noiseCount: { mean: 1, min: 0, max: 2, n: 2 },
       costUsd: { mean: 0.2, min: 0.1, max: 0.3, n: 2 },
-      perRun: opts.perRun ?? [{ mustFind: '1/3', costUsd: 0.1 }, { mustFind: '2/3', costUsd: 0.3 }],
+      perRun: opts.perRun ?? [{ mustFind: { found: 1, total: 3 }, costUsd: 0.1 }, { mustFind: { found: 2, total: 3 }, costUsd: 0.3 }],
     },
     engine: opts.engine ?? { provider: 'deepseek', model: 'deepseek-v4-pro', reasoning: null },
   };
@@ -63,9 +64,12 @@ test('parseArgs applies defaults and honors flags', () => {
 test('parseArgs rejects bad input loudly', () => {
   assert.throws(() => parseArgs(['positional']), /Unexpected argument/);
   assert.throws(() => parseArgs(['--nope', 'v']), /Unknown option/);
-  assert.throws(() => parseArgs(['--sha']), /requires a value/);
+  assert.throws(() => parseArgs(['--sha']), /requires a non-empty value/);
   // A --prefixed value is a swallowed flag, not the argument.
-  assert.throws(() => parseArgs(['--sha', '--date=x']), /requires a value/);
+  assert.throws(() => parseArgs(['--sha', '--date=x']), /requires a non-empty value/);
+  // An empty value (=form or space-form) is rejected, not resolved to cwd downstream.
+  assert.throws(() => parseArgs(['--out-dir=']), /requires a non-empty value/);
+  assert.throws(() => parseArgs(['--out-dir', '']), /requires a non-empty value/);
 });
 
 // ── parseBand ──────────────────────────────────────────────────────────────────────────────────────
@@ -91,6 +95,8 @@ test('parseCaseSummary keeps the reduced fields and rejects malformed summaries'
   assert.deepEqual(s.mustFindRecall, { mean: 0.5, min: 0.3333, max: 0.6667, n: 2 });
   assert.equal(s.perRun.length, 2);
   assert.equal(s.perRun[0].costUsd, 0.18);
+  // mustFind is parsed to a typed {found,total} at the boundary, not kept as a raw string.
+  assert.deepEqual(s.perRun[0].mustFind, { found: 1, total: 3 });
   // Valid-but-wrong-typed JSON is rejected at the shared object boundary.
   assert.throws(() => parseCaseSummary('123', 'x'), /not a JSON object/);
   assert.throws(() => parseCaseSummary(summaryFixture({ case: '' }), 'x'), /no 'case' name/);
@@ -98,12 +104,21 @@ test('parseCaseSummary keeps the reduced fields and rejects malformed summaries'
   assert.throws(() => parseCaseSummary(summaryFixture({ matcher: '' }), 'x'), /no 'matcher'/);
   assert.throws(() => parseCaseSummary(summaryFixture({ perRun: 'x' }), 'x'), /no 'perRun' array/);
   assert.throws(() => parseCaseSummary(summaryFixture({ mustFindRecall: { mean: 1 } }), 'x'), /mustFindRecall.*non-negative integer/s);
+  // perRun length must agree with `runs` — a desync would silently pool the wrong total.
+  assert.throws(() => parseCaseSummary(summaryFixture({ runs: 3 }), 'x'), /2 perRun entries but claims runs=3/);
+  // A perRun entry with an absent or non-string mustFind is rejected at the boundary (never leaks a null
+  // into the reduction). Length is kept at 1 so the mustFind check — not the length check — fires.
+  assert.throws(() => parseCaseSummary(summaryFixture({ runs: 1, perRun: [{ costUsd: 0.1 }] }), 'x'), /mustFind must be a 'found\/total' string/);
+  assert.throws(() => parseCaseSummary(summaryFixture({ runs: 1, perRun: [{ mustFind: 5 }] }), 'x'), /mustFind must be a 'found\/total' string/);
+  // A mustFind string that isn't a fraction is rejected too (parseFraction at the boundary).
+  assert.throws(() => parseCaseSummary(summaryFixture({ runs: 1, perRun: [{ mustFind: 'n/a' }] }), 'x'), /not a 'found\/total' fraction/);
   // A non-numeric perRun cost is a corrupt summary, not a silent null.
-  assert.throws(() => parseCaseSummary(summaryFixture({ perRun: [{ mustFind: '1/3', costUsd: 'free' }] }), 'x'), /perRun\[0\]\.costUsd/);
+  assert.throws(() => parseCaseSummary(summaryFixture({ runs: 1, perRun: [{ mustFind: '1/3', costUsd: 'free' }] }), 'x'), /perRun\[0\]\.costUsd/);
 });
 
 test('parseCaseSummary treats an absent perRun cost as null (cost unavailable that run)', () => {
-  const s = parseCaseSummary(summaryFixture({ perRun: [{ mustFind: '1/3' }] }), 'x');
+  const s = parseCaseSummary(summaryFixture({ runs: 1, perRun: [{ mustFind: '1/3' }] }), 'x');
+  assert.deepEqual(s.perRun[0].mustFind, { found: 1, total: 3 });
   assert.equal(s.perRun[0].costUsd, null);
 });
 
@@ -180,7 +195,7 @@ test('pooledFloor is a ~2σ binomial lower bound in [0, rate)', () => {
 
 test('buildBaseline counts uncosted runs and excludes them from the total', () => {
   const cases = [caseEntry('case-a', { mean: 0.5, min: 0.5, max: 0.5, n: 1 }, {
-    perRun: [{ mustFind: '1/2', costUsd: 0.15 }, { mustFind: '1/2', costUsd: null }],
+    perRun: [{ mustFind: { found: 1, total: 2 }, costUsd: 0.15 }, { mustFind: { found: 1, total: 2 }, costUsd: null }],
   })];
   const b = buildBaseline({ cases, provenance: { sha: 'abc', date: '2026-08-01' } });
   assert.equal(b.suite.totalCostUsd, 0.15);
