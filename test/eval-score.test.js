@@ -63,6 +63,9 @@ test('parseExpected keeps the scoring fields and rejects bad ones', () => {
   assert.throws(() => parseExpected(JSON.stringify({ findings: [{ path: 'a', line: 1, body: 'b', annotation: 'maybe' }] }), 'x'), /invalid annotation/);
   assert.throws(() => parseExpected(JSON.stringify({ findings: [{ path: 'a', line: 0, body: 'b', annotation: 'noise' }] }), 'x'), /invalid line/);
   assert.throws(() => parseExpected(JSON.stringify({ findings: [{ path: '', line: 1, body: 'b', annotation: 'noise' }] }), 'x'), /invalid path/);
+  // Valid-but-wrong-typed JSON is rejected at the shared object boundary, not with a cryptic field-access crash.
+  assert.throws(() => parseExpected('123', 'x'), /not a JSON object/);
+  assert.throws(() => parseExpected('null', 'x'), /not a JSON object/);
 });
 
 test('parseProduced accepts the raw merged-findings shape and rejects malformed', () => {
@@ -76,12 +79,17 @@ test('parseUsage passes cost through and tolerates missing fields', () => {
   assert.deepEqual(parseUsage(JSON.stringify({ inputTokens: 100, outputTokens: 20, cost: { available: true, usd: 0.01 } }), 'u'),
     { inputTokens: 100, outputTokens: 20, cost: { available: true, usd: 0.01 } });
   assert.deepEqual(parseUsage('{}', 'u'), { inputTokens: null, outputTokens: null, cost: null });
+  // A wrong-typed usage.json is rejected loudly, never silently treated as {} (all-null).
+  assert.throws(() => parseUsage('123', 'u'), /not a JSON object/);
+  assert.throws(() => parseUsage('null', 'u'), /not a JSON object/);
 });
 
 test('parseMeta reads the case name and rejects a path-shaped one', () => {
   assert.equal(parseMeta(JSON.stringify({ case: 'demo', config: { model: 'm' } }), 'm').case, 'demo');
   assert.throws(() => parseMeta('{}', 'm'), /no 'case' name/);
   assert.throws(() => parseMeta(JSON.stringify({ case: '../evil' }), 'm'), /plain directory component/);
+  // `null` is valid JSON but not an object — rejected at the boundary, not a `null.case` crash.
+  assert.throws(() => parseMeta('null', 'm'), /not a JSON object/);
 });
 
 // ── candidate pairing (stage 1) ────────────────────────────────────────────────────────────────────
@@ -265,11 +273,11 @@ test('loadCache returns {} when absent and aborts loudly on a corrupt or wrong-t
   const f = path.join(os.tmpdir(), `judge-cache-load-${process.pid}-${Date.now()}.json`);
   assert.deepEqual(loadCache(f), {}); // missing file → empty map, not an error
   fs.writeFileSync(f, '{not json');
-  assert.throws(() => loadCache(f), /unreadable/);
+  assert.throws(() => loadCache(f), /not valid JSON.*Delete it to rebuild/s);
   // Valid JSON of the wrong type must be rejected at the boundary — otherwise `ck in cache` crashes inland.
   for (const bad of ['123', '"a string"', '[1,2,3]', 'null']) {
     fs.writeFileSync(f, bad);
-    assert.throws(() => loadCache(f), /not a JSON object/, `expected reject for ${bad}`);
+    assert.throws(() => loadCache(f), /not a JSON object.*Delete it to rebuild/s, `expected reject for ${bad}`);
   }
   fs.writeFileSync(f, '{"ck":{"match":true,"reason":"r"}}');
   assert.deepEqual(loadCache(f), { ck: { match: true, reason: 'r' } });

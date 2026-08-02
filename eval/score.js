@@ -121,13 +121,26 @@ function parseJson(raw, label) {
   }
 }
 
+// [LAW:single-enforcer] The one boundary for every object-shaped input (expected.json, usage.json,
+// meta.json, the judge cache): valid-but-wrong-typed JSON (a number, string, array, or null) parses fine
+// but then breaks any field access downstream, so the parse isn't done until the object shape is proven
+// here — one definition of "valid JSON that is a plain object", not a copy per caller. Array-shaped input
+// (findings.json) stays on parseJson, which requires the array itself. [LAW:parse-dont-validate]
+function parseJsonObject(raw, label) {
+  const json = parseJson(raw, label);
+  if (typeof json !== 'object' || json === null || Array.isArray(json)) {
+    throw new Error(`${label} is not a JSON object (found ${json === null ? 'null' : Array.isArray(json) ? 'array' : typeof json}).`);
+  }
+  return json;
+}
+
 // The frozen ground truth. Only the fields the scorer matches on are required — path/line for stage-1
 // pairing, annotation for bucketing, body for the semantic judge, commentId for traceability back to the
 // source PR. An UNREVIEWED annotation is intentionally loud: an un-annotated case must never be silently
 // scored (it would report a meaningless recall). [LAW:no-silent-failure]
 function parseExpected(raw, label) {
-  const json = parseJson(raw, label);
-  if (!json || !Array.isArray(json.findings)) throw new Error(`${label} has no 'findings' array.`);
+  const json = parseJsonObject(raw, label);
+  if (!Array.isArray(json.findings)) throw new Error(`${label} has no 'findings' array.`);
   return json.findings.map((f, i) => {
     const at = `${label} findings[${i}]`;
     if (typeof f.path !== 'string' || f.path.trim() === '') throw new Error(`${at} has an invalid path.`);
@@ -157,7 +170,7 @@ function parseProduced(raw, label) {
 // nor recomputes it (run-case.js already captured it from the engine). Missing fields become null rather
 // than aborting: a run with no usage is still scorable for recall (the primary metric).
 function parseUsage(raw, label) {
-  const json = parseJson(raw, label);
+  const json = parseJsonObject(raw, label);
   return {
     inputTokens: Number.isFinite(json.inputTokens) ? json.inputTokens : null,
     outputTokens: Number.isFinite(json.outputTokens) ? json.outputTokens : null,
@@ -168,7 +181,7 @@ function parseUsage(raw, label) {
 // meta.json carries provenance the scorer reads instead of parsing the run-dir name: the case name (which
 // resolves expected.json) and the resolved engine config (echoed into the scorecard). [LAW:one-source-of-truth]
 function parseMeta(raw, label) {
-  const json = parseJson(raw, label);
+  const json = parseJsonObject(raw, label);
   if (typeof json.case !== 'string' || json.case.trim() === '') throw new Error(`${label} has no 'case' name.`);
   if (json.case !== path.basename(json.case) || json.case === '.' || json.case === '..') {
     throw new Error(`${label} 'case' must be a plain directory component, got ${JSON.stringify(json.case)}.`);
@@ -451,22 +464,15 @@ function parseJudgeResponse(text, batchLen) {
 
 function loadCache(file) {
   if (!fs.existsSync(file)) return {};
-  let parsed;
   try {
-    parsed = parseJson(fs.readFileSync(file, 'utf8'), file);
+    // The cache is a string→decision MAP: route it through the shared object boundary so a bad-JSON or
+    // wrong-typed cache is rejected before the inland `ck in cache` lookup can crash on it. [LAW:single-enforcer]
+    return parseJsonObject(fs.readFileSync(file, 'utf8'), `Judge cache ${file}`);
   } catch (e) {
-    // [LAW:no-silent-failure] A corrupt cache is a real problem to surface, not to paper over by silently
-    // discarding every prior decision (which would also break determinism). Refuse and name the file.
-    throw new Error(`Judge cache ${file} is unreadable: ${e.message}. Delete it to rebuild.`);
+    // [LAW:no-silent-failure] Both failures (bad JSON, wrong type) surface with the delete-and-rebuild
+    // hint — never silently discarding prior decisions, which would also break determinism.
+    throw new Error(`${e.message} Delete it to rebuild.`);
   }
-  // [LAW:parse-dont-validate] The cache is a string→decision MAP, so the parse isn't done until the type
-  // is proven. Valid-but-wrong-typed JSON (a number, string, or array) parses fine but then breaks the
-  // `ck in cache` lookup inland with a cryptic TypeError — complete the parse here so a corrupt cache
-  // fails at the boundary with the same delete-and-rebuild message. [LAW:no-silent-failure]
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new Error(`Judge cache ${file} is not a JSON object (found ${Array.isArray(parsed) ? 'array' : typeof parsed}). Delete it to rebuild.`);
-  }
-  return parsed;
 }
 
 function saveCache(file, cache) {
