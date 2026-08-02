@@ -29,6 +29,12 @@ test('parseArgs rejects bad input loudly', () => {
   assert.throws(() => parseArgs(['foo', '-n', '0']), /positive integer/);
   assert.throws(() => parseArgs(['foo', '-n', 'x']), /positive integer/);
   assert.throws(() => parseArgs(['foo', '--workers', '-1']), /positive integer/);
+  // Non-integers are rejected, never silently truncated (parseInt('2.5') would have accepted 2).
+  assert.throws(() => parseArgs(['foo', '-n', '2.5']), /positive integer/);
+  assert.throws(() => parseArgs(['foo', '--workers', '3.7']), /positive integer/);
+  assert.throws(() => parseArgs(['foo', '-n', '2abc']), /positive integer/);
+  // A valid positive integer still parses to a number.
+  assert.equal(parseArgs(['foo', '-n', '3']).repeats, 3);
 });
 
 const VALID_CASE = JSON.stringify({

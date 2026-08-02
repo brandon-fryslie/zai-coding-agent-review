@@ -67,12 +67,21 @@ function parseArgs(argv) {
   }
   if (opts.caseDir === null) throw new Error('Missing required <case-dir> argument. See --help.');
   // [LAW:parse-dont-validate] The counts leave this parser as integers, not strings — a bad value is
-  // rejected here, at the boundary, so no downstream code re-checks NaN.
-  opts.repeats = parseInt(opts.repeats, 10);
-  if (isNaN(opts.repeats) || opts.repeats < 1) throw new Error('-n/--repeats must be a positive integer.');
-  opts.workers = parseInt(opts.workers, 10);
-  if (isNaN(opts.workers) || opts.workers < 1) throw new Error('--workers must be a positive integer.');
+  // rejected here, at the boundary, so no downstream code re-checks. parsePositiveInt rejects
+  // non-integers outright rather than truncating (a baseline comparison depends on the EXACT repeat count).
+  opts.repeats = parsePositiveInt(opts.repeats, '-n/--repeats');
+  opts.workers = parsePositiveInt(opts.workers, '--workers');
   return opts;
+}
+
+// [LAW:parse-dont-validate] Parse a CLI flag as a positive integer — the accept set is exactly
+// {1,2,3,…}. Number() + Number.isInteger rejects '2.5'/'3.7'/'abc' where parseInt would SILENTLY
+// TRUNCATE ('2.5' → 2), so the check finally matches the "positive integer" the error promises.
+// [LAW:no-silent-failure] The rejected value is echoed so a typo is located, not guessed.
+function parsePositiveInt(raw, flag) {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) throw new Error(`${flag} must be a positive integer (got ${JSON.stringify(raw)}).`);
+  return n;
 }
 
 // [LAW:parse-dont-validate] Parse the raw case.json into a validated manifest — a value whose existence
