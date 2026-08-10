@@ -104,6 +104,23 @@ function effectiveRounds(roundCap) {
   return roundCap === 0 ? UNLIMITED_EFFECTIVE_ROUNDS : roundCap;
 }
 
+// [LAW:effects-at-boundaries] Pure. The per-round cost multiplier of a profile's convergence-sweep
+// bound (zai-recall-upr.2): each sweep re-runs the whole worker layer over the same material, so a
+// round costs up to (1 + sweepCap) worker passes. Priced at the CAP, not the expectation — sweeps
+// terminate early on convergence, but roundCap already prices its cap the same way, and over-pricing
+// only de-rates earlier (the safe direction for a budget). The scout a sweep skips is one spawn among
+// many, so a sweep pricing as a full pass is a conservative, monotonic approximation.
+// [LAW:verifiable-goals] like the tier multiplier, this is a RANKER term: what must hold is strict
+// monotonicity in sweepCap, not dollar accuracy. [LAW:no-silent-failure] a malformed cap is a caller
+// bug — throw rather than silently pricing a profile at NaN (a NaN estimate never satisfies `<= cap`,
+// silently skipping the candidate).
+function sweepFactor(sweepCap) {
+  if (!Number.isInteger(sweepCap) || sweepCap < 0) {
+    throw new Error(`Invalid sweepCap ${JSON.stringify(sweepCap)}: expected a non-negative integer.`);
+  }
+  return 1 + sweepCap;
+}
+
 // [LAW:effects-at-boundaries] Pure. The per-round cost multiplier of a reasoning tier.
 // [LAW:dataflow-not-control-flow] the baseline `null`/`undefined` tier is a VALUE mapped to 1.0 (no
 // raise), not a branch that skips the multiply — so estimatedCostUsd multiplies unconditionally and a
@@ -125,15 +142,20 @@ function reasoningFactor(tier) {
 // (cache-ratio variance), but at a FIXED diff perRoundBase is constant, so the ordering across
 // candidates is driven purely by the monotonic cost-bearing axes → exact tier ranking despite the
 // absolute noise. Tests assert monotonicity + reproducibility, NEVER absolute dollars.
-// [LAW:types-are-the-program] EffortProfile now carries TWO cost-bearing axes, both priced HERE as
-// independent monotonic multiplicands on the per-round base: roundCap (how many rounds) and
-// reasoningTier (how hard each round reasons — landed in zai-difficulty-0ea.3 with its consumer, the
-// reasoning fold at the runMultiScope seam). modelTier becomes a third when its consumer migrates;
-// reading an axis before the type carries it would be the false theorem effort.js refuses.
-// [LAW:dataflow-not-control-flow] the product is total — every profile prices, and a null reasoningTier
-// multiplies by 1.0, so a roundCap-only profile is unchanged.
+// [LAW:types-are-the-program] EffortProfile now carries THREE cost-bearing axes, all priced HERE as
+// independent monotonic multiplicands on the per-round base: roundCap (how many rounds), sweepCap
+// (how many convergence passes each round runs — landed in zai-recall-upr.2 with its consumer, the
+// sweep loop in runMultiScopePass), and reasoningTier (how hard each pass reasons — landed in
+// zai-difficulty-0ea.3 with its consumer, the reasoning fold at the runMultiScope seam). modelTier
+// becomes a fourth when its consumer migrates; reading an axis before the type carries it would be
+// the false theorem effort.js refuses.
+// [LAW:dataflow-not-control-flow] the product is total — every profile prices, a null reasoningTier
+// multiplies by 1.0 and a sweepCap of 0 by 1, so a roundCap-only profile is unchanged.
 function estimatedCostUsd(profile, diffSize) {
-  return perRoundBaseUsd(diffSize) * effectiveRounds(profile.roundCap) * reasoningFactor(profile.reasoningTier);
+  return perRoundBaseUsd(diffSize)
+    * effectiveRounds(profile.roundCap)
+    * sweepFactor(profile.sweepCap)
+    * reasoningFactor(profile.reasoningTier);
 }
 
 // [LAW:effects-at-boundaries] Pure. The per-review spend cap: a floored fraction of REMAINING budget.
@@ -228,6 +250,7 @@ module.exports = {
   DERATE_ROUNDCAPS,
   REASONING_COST_MULTIPLIER,
   effectiveRounds,
+  sweepFactor,
   reasoningFactor,
   estimatedCostUsd,
   perReviewCapUsd,

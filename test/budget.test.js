@@ -7,6 +7,7 @@ const {
   MIN_CAP_USD,
   CAP_FRACTION,
   estimatedCostUsd,
+  sweepFactor,
   reasoningFactor,
   perReviewCapUsd,
   chooseProfile,
@@ -99,6 +100,26 @@ describe('estimatedCostUsd — a fixed-diff RANKER, asserted by ordering never b
   });
 });
 
+// The convergence-sweep multiplicand (zai-recall-upr.2): each sweep re-runs the worker layer, so a
+// round prices at (1 + sweepCap) passes — priced at the cap, like roundCap, never the expectation.
+describe('sweepFactor — the convergence-sweep cost multiplicand', () => {
+  test('monotonic in sweepCap, with 0 sweeps as the neutral 1× (a pre-sweep profile is unchanged)', () => {
+    assert.equal(sweepFactor(0), 1);
+    assert.ok(sweepFactor(1) < sweepFactor(2) && sweepFactor(2) < sweepFactor(3));
+  });
+
+  test('estimatedCostUsd is monotonic in sweepCap at a fixed diff and roundCap', () => {
+    const at = (sweepCap) => estimatedCostUsd(defaultEffortProfile({ roundCap: 2, sweepCap }), 100);
+    assert.ok(at(0) < at(1) && at(1) < at(2), `expected strictly increasing, got ${at(0)}, ${at(1)}, ${at(2)}`);
+  });
+
+  test('a malformed sweepCap throws loudly — never a NaN estimate that silently skips the candidate', () => {
+    for (const bad of [undefined, null, -1, 1.5, 'two']) {
+      assert.throws(() => sweepFactor(bad), /Invalid sweepCap/);
+    }
+  });
+});
+
 describe('perReviewCapUsd — a floored fraction of REMAINING budget', () => {
   test('is CAP_FRACTION of remaining when that exceeds the floor (decays as the day depletes)', () => {
     assert.equal(perReviewCapUsd(0, 10), CAP_FRACTION * 10);
@@ -128,9 +149,11 @@ describe('chooseProfile — the gradient: pick the affordable best, always retur
     const pick = (spentToday) => chooseProfile({
       candidates: LADDER, spentToday, dailyBudget: 10, diffSize: 100,
     }).profile.roundCap;
+    // Depletion points chosen to hit three distinct rungs at the default profile's estimate scale
+    // (which includes the convergence-sweep multiplicand, zai-recall-upr.2).
     const early = pick(0);
-    const mid = pick(8);
-    const late = pick(9);
+    const mid = pick(5);
+    const late = pick(8);
     assert.ok(early > mid && mid > late, `expected strictly decreasing effort, got ${early}, ${mid}, ${late}`);
   });
 

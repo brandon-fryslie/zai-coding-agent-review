@@ -7,7 +7,13 @@ const registry = require('../src/engine/registry');
 
 describe('defaultEffortProfile', () => {
   test('reproduces the pre-profile scope concurrency (4)', () => {
-    assert.deepEqual(defaultEffortProfile(), { scopeConcurrency: 4, roundCap: 0, reasoningTier: null });
+    assert.deepEqual(defaultEffortProfile(), { scopeConcurrency: 4, roundCap: 0, sweepCap: 2, reasoningTier: null });
+  });
+
+  test('defaults sweepCap to the convergence-sweep bound (2) and folds a supplied one', () => {
+    assert.equal(defaultEffortProfile().sweepCap, 2);
+    assert.equal(defaultEffortProfile({ sweepCap: 0 }).sweepCap, 0);
+    assert.equal(defaultEffortProfile({ sweepCap: 5 }).sweepCap, 5);
   });
 
   test('defaults reasoningTier to null (propose no raise; the config tier stands)', () => {
