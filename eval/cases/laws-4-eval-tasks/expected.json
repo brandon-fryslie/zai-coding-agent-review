@@ -61,6 +61,96 @@
       "justification": "Real bug (the review's own 'blocking' call): laws-scripts-parse/check.sh exits 1 for a missing evals/ directory \u2014 an infra fault indistinguishable from a criterion failure \u2014 so lib.sh task_check fabricates a FAIL verdict instead of surfacing a harness error. Contract-violating [no-silent-failure] defect with a fix (exit >1).",
       "diffHunk": "@@ -0,0 +1,18 @@\n+#!/usr/bin/env bash\n+# THE CRITERION (mechanical-detector shape). Runs with CWD = the repo checkout. Exit 0 = every\n+# shell script under evals/ parses; nonzero = at least one does not. Ground truth via `bash -n`,\n+# not a judgment of the work against any skill, law, or rubric.\n+# [LAW:no-silent-failure] a missing evals/ tree is an infra fault, not a silent pass.\n+set -euo pipefail\n+\n+[ -d evals ] || { echo \"check: no evals/ directory in the checkout\" >&2; exit 1; }",
       "body": "Bug \u2014 exit code violates the documented contract. The README (line 62-64) states check.sh exits 1 = criterion failed, any other nonzero = harness couldn't run. But here a missing evals/ directory (an infra fault) exits 1, which is indistinguishable from a genuine criterion failure. The caller (lib.sh:task_check, line 134) treats ALL nonzero as \"criterion FAIL,\" so a missing evals/ tree produces a fabricated fail verdict instead of surfacing as a harness error. Fix: use exit 2 (or another value >1) to signal harness-couldn't-run, matching the contract."
+    },
+    {
+      "commentId": 3695636846,
+      "reviewId": 4834682938,
+      "path": "evals/tasks/README.md",
+      "line": 78,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real doc contradiction, confirmed and fixed in 0715133: the Environment line calls missing tools 'a conservative FAIL' while the exit-code contract distinguishes FAIL from could-not-run. Present verbatim at the frozen head (line 78). Distinct line and claim from frozen 3695621387 (the task_die contract inconsistency at :62), though the same document. Round-2 finding, re-anchored from :87@c3ecc1a.",
+      "body": "**Advisory (non-blocking):** [LAW:one-source-of-truth] Documentation contradicts both the implementation and the fine-grained exit-code contract stated on lines 65-68. The text says missing tools is \"a conservative FAIL\" (implying exit 1), but both `check.sh` files and `task_check` treat missing tools as a harness error (exit 2, distinct from FAIL). The contract on lines 65-68 correctly distinguishes FAIL (exit 1, a verdict about the work) from \"could not run\" (exit 2, a harness error). Fix: s/\"exits nonzero (a conservative FAIL)\"/\"exits 2 (a harness/infra error, never a fabricated pass or a fabricated FAIL)\"/ to match both the implementation and the stated contract."
+    },
+    {
+      "commentId": 3695636851,
+      "reviewId": 4834682938,
+      "path": "evals/tasks/go-template-add-fix/check.sh",
+      "line": 10,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real silent-failure, confirmed and fixed in 0715133: pnpm install's stderr goes to /dev/null, so the actual failure reason (network, lockfile, disk) is discarded and only 'dependency install failed' remains. Present verbatim at the frozen head (line 10). Round-2 finding, re-anchored from :11@c3ecc1a.",
+      "body": "**Advisory (non-blocking):** Silent failure: pnpm install stderr redirected to /dev/null, hiding the diagnostic reason for failures. The script is annotated [LAW:no-silent-failure] yet when pnpm install fails, the only output is \"check: dependency install failed\" \u2014 the actual error (network timeout, lockfile mismatch, missing registry, disk full, etc.) is discarded. The maintainer has no information to debug with without modifying the script. Fix: capture pnpm output to a temp file instead of /dev/null, and cat it on failure; or keep stderr unsuppressed."
+    },
+    {
+      "commentId": 3695649795,
+      "reviewId": 4834694758,
+      "path": "evals/tasks/lib.sh",
+      "line": 102,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real silent-failure, confirmed and fixed in 3c77022: git clone/checkout 2>/dev/null swallow git's own diagnostic, so a clone failure reports only the repo name with no reason. Present verbatim at the frozen head (lines 102-104). Round-3 finding, re-anchored from :106@0715133.",
+      "body": "**Advisory (non-blocking):** Silent failure: `git clone --quiet \"$repo\" \"$dest\" 2>/dev/null` swallows git's stderr diagnostic. When the clone fails (auth error, network timeout, TLS cert expired, disk full), the user sees only \"git clone failed: $repo\" with no clue why. Same pattern at line 107-108 with `git checkout 2>/dev/null` \u2014 the commit resolution failure message names the problem but hides the reason. [LAW:no-silent-failure] Fix: capture stderr (e.g., `err=$(git clone ... 2>&1 >/dev/null)`) and feed it into the task_die message, or let stderr pass through unsuppressed."
+    },
+    {
+      "commentId": 3695649798,
+      "reviewId": 4834694758,
+      "path": "evals/tasks/lib.sh",
+      "line": 60,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real silent-failure, confirmed and fixed in 3c77022: sourcing the manifest with >/dev/null 2>&1 discards bash's diagnostic, so a manifest syntax error reports only 'failed to source cleanly'. Present verbatim at the frozen head (line 60). Round-3 finding, re-anchored from :64@0715133.",
+      "body": "**Advisory (non-blocking):** Silent failure: `. \"$man\" >/dev/null 2>&1` swallows bash's diagnostic when a manifest fails to source. The failure IS caught (`|| task_die` fires with exit 2), but the reason is lost \u2014 a syntax error, an unterminated string, a command that returned non-zero. The maintainer sees \"manifest.sh failed to source cleanly\" and must re-run manually to diagnose. [LAW:no-silent-failure] Fix: capture stderr from the source command and include it in the task_die message so the first violation is self-diagnosing."
+    },
+    {
+      "commentId": 3695649800,
+      "reviewId": 4834694758,
+      "path": "evals/tasks/laws-scripts-parse/check.sh",
+      "line": 16,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real fabricated-pass edge, confirmed and fixed in 3c77022: a find runtime error inside the process substitution never reaches the parent, so the loop runs zero iterations and the criterion exits 0 having checked nothing. Present at the frozen head (line 16). Round-3 finding, re-anchored from :18@0715133.",
+      "body": "**Advisory (non-blocking):** [LAW:no-silent-failure] If `find` encounters a runtime error (e.g. permission denied in a subdirectory, I/O error), the process substitution subshell fails but its exit code never reaches the parent \u2014 bash does not expose process-substitution exit codes. The `while read` loop runs zero iterations, `failed` stays 0, and the criterion exits 0, falsely reporting that all scripts parsed when in fact the detector could not run at all. This is the fabricated-pass scenario the harness contract promises to prevent. The script already guards against a missing `evals/` directory (line 10, exit 2), which covers the most common case, but not `find` errors during traversal. Fix: capture the pipeline into a temp file or pipe it explicitly (e.g. `find ... > \"$tmp\"; rc=$?; while ... done < \"$tmp\"; [ \"$rc\" -eq 0 ] || exit 2`) so a `find` error is detected and surfaced as exit 2."
+    },
+    {
+      "commentId": 3695649802,
+      "reviewId": 4834694758,
+      "path": "evals/tasks/laws-scripts-parse/check.sh",
+      "line": 12,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real silent-failure, confirmed and fixed in 3c77022: bash -n 2>/dev/null suppresses the parser's own diagnostic (line, token), leaving only the script name. Present verbatim at the frozen head (line 12). Round-3 finding, re-anchored from :14@0715133.",
+      "body": "**Advisory (non-blocking):** [LAW:no-silent-failure] `bash -n \"$script\" 2>/dev/null` suppresses the syntax error message (line number, token, description) that `bash -n` emits to stderr. The criterion reports *which* script failed (line 15) but discards *why* \u2014 the actual diagnostic a human needs to debug. The script is annotated `[LAW:no-silent-failure]`, yet the only diagnostic output about the failure is the script's name. If a human runs check.sh directly to investigate a failure, they get no actionable information without editing the script. Fix: capture `bash -n` stderr to a variable or temp file and include it in the failure message, or simply drop the `2>/dev/null` so the parser's own error surfaces naturally."
+    },
+    {
+      "commentId": 3695660957,
+      "reviewId": 4834704464,
+      "path": "evals/tasks/lib.sh",
+      "line": 134,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real misclassification edge, confirmed and fixed in c350084: if the state dir vanishes between the -d guard and the subshell's cd, the cd failure lands in the else branch and is reported as a criterion FAIL \u2014 exactly the machinery-vs-verdict confusion lib.sh's own header forbids. Present at the frozen head (line 134). Round-4 finding, re-anchored from :146@3c77022.",
+      "body": "**Advisory (non-blocking):** Edge case \u2014 TOCTOU produces a fabricated FAIL verdict when the state dir vanishes between the check and the cd. Line 144's `[ -d \"$state\" ]` guards, but line 146's `cd \"$state\"` can still fail if the directory is removed externally in between. When cd fails (exit 1), the subshell exits 1, `rc=$?` captures 1, and the case statement at line 148 maps it to `return 1` \u2014 \"criterion FAIL\" \u2014 rather than surfacing a harness error (exit 2). Same TOCTOU pattern also present between line 124 and 127 in task_setup, though there the failure hits `task_die` correctly since PIPESTATUS[0] captures the non-zero subshell exit and feeds it into the rc comparison. Fix: either capture the subshell exit as the case value and distinguish cd failure from genuine criterion failure (e.g., `[ -d \"$state\" ] && cd \"$state\"` in the subshell itself, or fold the directory check into the cd), or guard the subshell's exit code explicitly to treat any unexpected failure as a harness error."
+    },
+    {
+      "commentId": 3695660959,
+      "reviewId": 4834704464,
+      "path": "evals/tasks/laws-scripts-parse/check.sh",
+      "line": 17,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real vacuous-pass edge, confirmed and fixed in c350084: evals/ present but containing no .sh files yields an empty loop, failed=0, exit 0 \u2014 a pass that checked nothing. Present at the frozen head (the loop/exit at lines 11-18). Distinct from 3695649800 (find runtime error) \u2014 different trigger, same symptom. Round-4 finding, re-anchored from :17@3c77022.",
+      "body": "**Advisory (non-blocking):** Edge case: zero scripts yields a vacuous pass. If `find` returns no matching files (evals/ exists but has no `.sh` files), `scripts=\"\"`, the while loop runs zero meaningful iterations, `failed` stays 0, and the criterion exits 0 \u2014 reporting \"all scripts parsed\" when it checked nothing. This is a fabricated pass, the very thing [LAW:no-silent-failure] and the harness contract promise to prevent. While the pinned commit is known to have scripts under evals/, the criterion implementation should be correct in isolation. Fix: count processed scripts in the loop and exit 2 if zero were found, treating \"nothing to check\" as a harness error."
+    },
+    {
+      "commentId": 3695676539,
+      "reviewId": 4834717921,
+      "path": "evals/tasks/lib.sh",
+      "line": 52,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real validation edge, confirmed and fixed in 7a7bbee: setup.sh is validated with [ -e ]/[ -x ] (a directory passes both) while check.sh uses [ -f ]; a directory named setup.sh passes validation and then fails weirdly at exec in task_setup. Present verbatim at the frozen head (line 52). Round-5 finding, re-anchored from :56@c350084.",
+      "body": "**Advisory (non-blocking):** Edge case: setup.sh validation uses `[ -e ]` (exists, any type) rather than `[ -f ]` (regular file). A directory named `setup.sh` inside a task directory passes this guard \u2014 `[ -e dir ]` and `[ -x dir ]` are both true \u2014 but later `task_setup` at line 127 executes `exec \"$abs/setup.sh\"` which fails because a directory cannot be `exec`'d. Compare with `check.sh` validation at line 54 which correctly uses `[ -f \"$dir/check.sh\" ]`. Fix: use `[ -f \"$dir/setup.sh\" ]` instead of `[ -e \"$dir/setup.sh\" ]` to match the pattern on line 54 and reject non-regular files."
     }
   ]
 }

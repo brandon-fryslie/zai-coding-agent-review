@@ -171,6 +171,156 @@
       "justification": "AMBIGUOUS \u2014 a documentation finding, not a code bug, but the epic maintainer explicitly prized this '/compact cursor-reset detection' catch: CLAUDE.md describes only the size-shrink reset trigger while readAppended has two (inode change OR size<offset), so a rename-based /compact with equal/larger size resets via inode only. Reflects deep code understanding [one-source-of-truth]; flag for maintainer if doc findings should cap at nice-to-find.",
       "diffHunk": "@@ -60,7 +60,7 @@ Wire format lives in `src/daemon/protocol.ts`. The Rust client mirrors the wire\n - Parent-death watchdog (`src/daemon/parent-watchdog.ts`): a daemon spawned with `CC_CANDYBAR_PARENT_PID` set polls that pid and shuts down (through the same `shutdown(code)` funnel) when it dies. The production daemon is spawned detached and never sees the var, so it outlives its spawner as designed. Test daemons inherit the var from the Jest worker (armed once in `test/setup.ts`), so a SIGKILLed/crashed/timed-out Jest cannot orphan a daemon to PID 1 \u2014 this closes the test-daemon leak.\n - Caches owned by the daemon process (one each, not per-session):\n   - `src/daemon/cache/git.ts` \u2014 git state, keyed by **repo root** (not cwd, not session), invalidated by fs watchers on `.git/HEAD` and `.git/index` mtimes. The forge **PR/MR lookup** (`showPullRequest` option \u2192 `GitInfo.pullRequest`) lives here too but in a **separate cache with its own TTL** (`PR_TTL_OK_MS` / shorter `PR_TTL_FAIL_MS`), keyed `repoRoot|branch` \u2014 a network resource (`gh`/`glab`) gets a longer, independent lifecycle than fs-watched local state, so the per-render git fetch stays all-local. The lookup itself (`GitService.resolvePullRequest`: remote\u2192forge detect\u2192CLI\u2192three-state `Outcome<PullRequest>`) is in `src/segments/git.ts`; `failed` is surfaced as a **visible** `git.prError` (distinct from no-PR), never collapsed to a missing key.\n-  - `src/daemon/cache/session-usage-store.ts` \u2014 the daemon's single owner of per-session usage records (one parse per session, keyed by transcript mtime). Both the `session` projection (whole-session totals) and the `today` projection (cross-session sum of per-day buckets) are **folds** over this one store \u2014 there is no per-render whole-tree scan. The whole transcript tree is read **exactly once**, lazily (a per-day seed), to backfill sessions that did work before the daemon saw them; every render after that is a single sync `statSync` on the active session's transcript plus an in-memory fold (`[LAW:dataflow-not-control-flow]` \u2014 `today` is derived state maintained incrementally, not recompute-if-stale).\n+  - `src/daemon/cache/session-usage-store.ts` \u2014 the daemon's single owner of per-session usage records, keyed by transcript mtime. Both the `session` projection (whole-session totals) and the `today` projection (cross-session sum of per-day buckets) are **folds** over this one store \u2014 there is no per-render whole-tree scan. The whole transcript tree is read **exactly once**, lazily (a per-day seed), to backfill sessions that did work before the daemon saw them; every render after that is a single sync `statSync` on the active session's transcript plus an in-memory fold. The fold itself is **incremental and append-only** (brandon-daemon-perf-bb9): a record holds a per-file `FileFold` \u2014 a byte **cursor** plus running cost/token/day sums for the main transcript and each agent sidechain \u2014 so when an active session's transcript grows, only the **appended bytes** are read (`readAppendedEntries` \u2192 gated `readAppended` in `src/utils/transcript-fs.ts`) and folded in, never a whole-file re-parse. Per-render cost is **O(bytes appended since last render)**, not O(transcript length); a `/compact` rewrite (file shrinks below the cursor) is the one `reset` case that re-folds that file from zero. `src/segments/metrics.ts` folds the same reader the same way (`messageCount` + a recent-entry ring) so it doesn't re-inherit the whole-file parse the store dropped (`[LAW:dataflow-not-control-flow]` \u2014 `session`/`today`/metrics are all derived state maintained incrementally, not recompute-if-stale).",
       "body": "**Advisory (non-blocking):** [LAW:one-source-of-truth] Documentation inaccuracy: the CLAUDE.md describes \"a `/compact` rewrite (file shrinks below the cursor)\" as \"the one `reset` case that re-folds that file from zero.\" The actual `readAppended` implementation at `src/utils/transcript-fs.ts:164-165` has two independent reset triggers: `ino !== prior.ino` (inode change from a rename-based rewrite) AND `size < prior.offset` (in-place truncation). The inode check is the more realistic signal \u2014 a `/compact` typically creates a new file then renames it over the old path, changing the inode. A rename-based rewrite with the same or larger file size would trip a reset via the inode check but NOT via the size check. The test at `test/transcript-incremental.test.ts:130` explicitly covers this case. Fix: rephrase to mention both signals, e.g. \"a `/compact` rewrite (detected by an inode change or the file shrinking below the cursor) is the one scenario that triggers a full re-fold from zero.\""
+    },
+    {
+      "commentId": 3557267348,
+      "reviewId": 4669580321,
+      "path": "src/daemon/cache/session-usage-store.ts",
+      "line": 535,
+      "side": "RIGHT",
+      "annotation": "noise",
+      "justification": "Proven not-a-bug: the author's pushback (with a concurrency regression test added in 73d5bbd) shows ingest writes (cursor, fold) as one atomic pair, so last-writer-wins stays consistent and nothing double-counts. Known plausible false positive \u2014 a produced repeat must not count as novel noise. Round-1 finding, re-anchored from :530@5293653 to the flight.run region at the frozen head.",
+      "body": "Bug \u2014 Race between concurrent different-mtime refolds causes double-counting. Two renders observing different mtimes (e.g. mtime=100 and mtime=110) hit different SingleFlight keys on line 530. Both thunks capture `this.entries.get(sessionId)` (line 531) \u2014 the same prior record \u2014 because neither has written yet. The faster refold (mtime=110) writes its record with a cursor at the current file end. The slower refold (mtime=100) then overwrites with a stale cursor behind that position, and with a stale `transcriptMtime`. The next render's mtime gate (line 511) misses, so `refold` runs again from the stale cursor \u2192 `readAppendedEntries` re-reads bytes the winner already folded \u2192 `foldFile` folds them a second time, double-counting cost, tokens, and day buckets.\n\nFix: before writing in `ingest`, re-read the current record and, if its cursor is ahead of the just-computed outcome's cursor, merge the gap by re-folding from the current record's cursor to the just-computed cursor; or key the flight on sessionId alone so all concurrent refolds for one session coalesce regardless of mtime (with the risk of serialising unrelated mtimes)."
+    },
+    {
+      "commentId": 3557553837,
+      "reviewId": 4669899587,
+      "path": "src/utils/transcript-fs.ts",
+      "line": 165,
+      "side": "RIGHT",
+      "annotation": "noise",
+      "justification": "Documented limitation, deliberately unfixed: the in-place same-inode >=cursor rewrite is outside the append-only-with-rename contract /compact honors, and a prefix hash would defeat the O(appended) goal. Ruled no-change in round 3 and again in round 5 (3557758980, deduped into this entry). Round-3 finding, re-anchored from :181@556775b.",
+      "body": "**Advisory (non-blocking):** [LAW:one-source-of-truth] The `reset` check uses only two signals \u2014 `ino !== prior.ino` (rename-based /compact) and `size < prior.offset` (truncation) \u2014 but cannot detect an in-place rewrite where the new file content is entirely different yet its size is \u2265 the old cursor position and the inode is unchanged. In that case `reset = false`, so `start = prior.offset`, and the suffix read splices new bytes onto a fold of the old (now-replaced) prefix, producing incorrect aggregates. The comment on lines 177\u2013179 acknowledges this limitation but does not address it. Since /compact uses atomic rename (caught by inode change), this gap only bites on manual in-place transcript edits; the documented contract is append-only-with-rename. A complete fix would need a content hash of the cursor prefix or an explicit generation marker."
+    },
+    {
+      "commentId": 3557553839,
+      "reviewId": 4669899587,
+      "path": "src/utils/transcript-fs.ts",
+      "line": 167,
+      "side": "RIGHT",
+      "annotation": "noise",
+      "justification": "Pushed back as wrong analysis: removing the start>=size guard would not capture TOCTOU growth (the read is bounded by the stat size either way; growth lands next render via the mtime gate), and the guard is load-bearing. Round-3 finding, re-anchored from :183@556775b.",
+      "body": "**Advisory (non-blocking):** Edge case: when `start >= size`, `readAppended` returns `buf: Buffer.alloc(0)` with `size` from the stat. In `readAppendedEntries`, this empty buffer produces `lastNl < 0`, yielding `cursor.offset = start`. For the normal no-new-bytes case (`start = prior.offset >= 0`), this is correct. But if the file was truncated to exactly `prior.offset` bytes (size equals cursor, not less) AND then content was appended between the stat and the subsequent read, this early return would miss the newly appended bytes. The `size` is stale from the pre-appending stat, so `start >= size` passes incorrectly. The fix: remove the `start >= size` early-return guard \u2014 let the read loop naturally return empty if there truly are 0 bytes to read, so TOCTOU growth is always captured."
+    },
+    {
+      "commentId": 3557553843,
+      "reviewId": 4669899587,
+      "path": "src/daemon/cache/session-usage-store.ts",
+      "line": 219,
+      "side": "RIGHT",
+      "annotation": "must-find",
+      "justification": "Real regression, confirmed and fixed in 3ce854e: foldFile awaits PricingService.calculateCostForEntry with no catch, so a pricing throw escapes the Outcome contract (callers get a rejected promise, not failed()); the deleted getSessionUsageFromPath wrapped this. Present in the frozen material since round 1 but only surfaced in round 3 \u2014 the dribble this inventory exists to measure. Re-anchored from :214@556775b to the pricing call at the frozen head.",
+      "body": "Bug \u2014 Uncaught PricingService exception breaks Outcome contract. `foldFile` awaits `PricingService.calculateCostForEntry(entry.raw)` (line 214) inside a loop with no try-catch. If pricing throws (network timeout, DNS failure, invalid raw data), the exception propagates uncaught through `foldFile` \u2192 `refold` \u2192 `this.flight.run(...)` (SingleFlight forwards the rejected promise) \u2192 `ingest` \u2192 callers (`getUsageInfo`, `getTodayInfo`, `observeSpeed`). These callers all return `Promise<Outcome<T>>` but a pricing failure causes them to return a rejected Promise instead of `failed(reason)`. The old `SessionProvider.getSessionUsageFromPath` (deleted from session.ts) wrapped the entire body including the pricing call in a catch and returned `failed(...)`, so this is a regression. Fix: wrap the `await this.flight.run(...)` call in `ingest` (or the `foldFile` call in `refold`) in a try-catch that returns `failed(...)`, preserving the Outcome contract for all callers."
+    },
+    {
+      "commentId": 3557553848,
+      "reviewId": 4669899587,
+      "path": "src/segments/metrics.ts",
+      "line": 112,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real advisory, confirmed and fixed in 3ce854e: the metrics fast-hit never re-orders the LRU, so an active-but-unchanged session can be evicted under churn (the usage store's hit path does re-order). Narrow practical window at MAX_SESSIONS=256. Round-3 finding, re-anchored from :140@556775b to the fast-hit at the frozen head.",
+      "body": "**Advisory (non-blocking):** [LAW:one-source-of-truth] Advisory \u2014 LRU eviction operates on write-time ordering (delete+set on miss), not read-time. Fast-hit renders (line 104\u2013113) never update the session's position in the state Map. A session that receives many renders with an unchanged transcript stays at its original insertion position; if 256 other sessions are created or miss-updated in the meantime, this active session is evicted and its next render does a cold full re-fold. With MAX_SESSIONS=256 the practical window is narrow, but the eviction ordering does not match the usual LRU definition of \"least recently used.\" Fix: on the fast-hit path, also re-order the session by doing `this.state.delete(sessionId); this.state.set(sessionId, prior);` before returning."
+    },
+    {
+      "commentId": 3557553852,
+      "reviewId": 4669899587,
+      "path": "scripts/daemon-load-harness.ts",
+      "line": 559,
+      "side": "RIGHT",
+      "annotation": "must-find",
+      "justification": "Real gate-trust bug, confirmed and fixed in 3ce854e: the pass condition never checks byOutcome('other'), so framing errors and unexpected socket codes (EMFILE, EACCES) pass the gate. Silent-failure severity, matching the frozen set's harness must-find calibration. Round-3 finding, re-anchored from :589@556775b.",
+      "body": "Silent failure: the pass condition does not check `byOutcome(\"other\")`. The `\"other\"` outcome covers: (a) framing errors from `makeFrameReader` (daemon sending garbage/unparseable frames), and (b) any socket error code not in the explicit set (EADDRNOTAVAIL, EACCES, EMFILE, etc.). These are real failures \u2014 a daemon that sends malformed responses or hits EMFILE would pass the gate. Add `&& byOutcome(\"other\") === 0` to the pass condition."
+    },
+    {
+      "commentId": 3557553856,
+      "reviewId": 4669899587,
+      "path": "scripts/daemon-load-harness.ts",
+      "line": 554,
+      "side": "RIGHT",
+      "annotation": "must-find",
+      "justification": "Real gate-trust bug, confirmed and fixed in 3ce854e: zero executed renders (interval > duration) yields a vacuous pass \u2014 p99 of [] is 0 and every error count is 0, so a run that measured nothing reports success. Round-3 finding, re-anchored from :583@556775b to the pass: condition.",
+      "body": "Edge case: the pass condition gives a vacuous pass when zero renders execute. If `INTERVAL_MS > DURATION_MS` (both are positive integers, so `posInt` lets them through even when the interval exceeds the duration), `setInterval` never fires before the duration `setTimeout` resolves. `samples` is empty, `pct(totals, 99)` returns 0 \u2264 150ms, and all error counts are zero \u2014 the gate reports \"pass\" despite having measured nothing. Add `samples.length > 0` (or `steady.length > 0`) to the pass condition."
+    },
+    {
+      "commentId": 3557553857,
+      "reviewId": 4669899587,
+      "path": "scripts/daemon-load-harness.ts",
+      "line": 254,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real advisory leak, confirmed and fixed in 3ce854e: the profileDir tempdir is in no cleanup path, so a failed --profile run orphans it. Round-3 finding, re-anchored from :279@556775b to the mkdtemp at the frozen head.",
+      "body": "**Advisory (non-blocking):** Resource leak: the `profileDir` temp directory created on line 279 is never cleaned up in any code path. It is not in the `cleanup` closure (lines 326-338), not in the `finally` block, and not removed on the error path inside `spawnDaemon` (line 356 calls `cleanup()` before throwing, which does not include `profileDir`). When `--profile` is used and `spawnDaemon` throws (e.g., daemon didn't start within 8s), an empty temp directory is orphaned. On success, the dir is preserved for operator inspection (intentional), but even empty/unused dirs from failed `spawnDaemon` calls are never removed. Add `profileDir` cleanup to the `cleanup` closure conditional on whether any `.cpuprofile` files were written, or at minimum clean it in the `spawnDaemon` error path."
+    },
+    {
+      "commentId": 3557553861,
+      "reviewId": 4669899587,
+      "path": "scripts/daemon-load-harness.ts",
+      "line": 389,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real advisory, confirmed and fixed in 3ce854e: Math.floor((p/100)*N) makes p99 the max for N=100 (nearest-rank wants ceil-1), so the CI gate is slightly stricter than intended at small N. Round-3 finding, re-anchored from :414@556775b to the pct helper.",
+      "body": "**Advisory (non-blocking):** The percentile formula `Math.floor((p/100) * sorted.length)` (line 414) is non-standard and slightly off. For p99 with N=100, it yields `sorted[99]` (the max), not the 99th percentile \u2014 the max should only be p100. For p50 with N=2, it yields the max instead of the median. The standard nearest-rank method uses `Math.ceil((p/100) * N) - 1`. In practice the error shrinks with sample size and the formula is used consistently for both gate and report, but a CI gate wired to p99 will be slightly stricter for small sample counts than expected."
+    },
+    {
+      "commentId": 3557683213,
+      "reviewId": 4670045919,
+      "path": "src/segments/metrics.ts",
+      "line": 128,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real advisory, confirmed and fixed in f7ec991: the absent path returns `prior?.recent ?? []` \u2014 the stored array reference \u2014 while the hit path copies; a future caller mutating it would corrupt retained daemon state. Verified present at the frozen head (line 128). Distinct from frozen must-find 3557390520, which is the fast-hit path. Round-4 finding, re-anchored from :130@3ce854e.",
+      "body": "**Advisory (non-blocking):** Inconsistency [LAW:no-shared-mutable-globals]: The absent path returns `prior?.recent ?? []` \u2014 the stored array reference \u2014 while the hit path (line 117) returns `[...prior.recent]` (copy) and the miss path always creates fresh arrays. The current caller (`calculateLastResponseTime`) only reads, so no active bug, but the inconsistency means a future caller mutating the returned `recent` array on the absent path would silently corrupt the stored `MetricsState.recent`. Bring the absent path in line: wrap with `[...(prior?.recent ?? [])]` or other copy."
+    },
+    {
+      "commentId": 3557683214,
+      "reviewId": 4670045919,
+      "path": "scripts/daemon-load-harness.ts",
+      "line": 512,
+      "side": "RIGHT",
+      "annotation": "noise",
+      "justification": "Pushed back as wrong: warmup renders are awaited and discarded, never pushed to samples \u2014 only the measurement interval records, so achievedRatePerSec's numerator and denominator cover the same window. Round-4 finding, re-anchored from :549@3ce854e.",
+      "body": "**Advisory (non-blocking):** Bug: `achievedRatePerSec` divides `samples.length` by `elapsedS`, but `samples` includes warmup renders (3 rounds \u00d7 SESSIONS) that ran BEFORE the measurement clock started (`runStart` set at line 477). `elapsedS` is only the measurement window, so the numerator and denominator cover different time spans. For the default gate (25 sessions, 20s), ~75 warmup renders inflate the reported rate by roughly 4 renders/sec. The `renders` count at line 548 and the `coldStart.renders` count (via `ramp` including warmup atMs=0) are similarly inflated. Fix: either skip pushing warmup renders to `samples`, or subtract them from `samples.length` when computing these reporting fields, or record `samples` in a measurement-only array that starts at `runStart`."
+    },
+    {
+      "commentId": 3557758994,
+      "reviewId": 4670129801,
+      "path": "src/utils/claude.ts",
+      "line": 506,
+      "side": "RIGHT",
+      "annotation": "noise",
+      "justification": "Flagged-for-awareness, benign by the finding's own analysis (author concurs, no change): the partial-line cursor pair (unchanged offset, current mtime) is internally consistent and self-heals when the line completes. Round-5 finding, re-anchored from :516@f7ec991.",
+      "body": "**Advisory (non-blocking):** Edge case: When `lastNl < 0` (no complete newline-terminated line in the appended bytes), `readAppendedEntries` returns the cursor with `offset: start` and `mtimeMs` / `ino` from the current file's stat. The cursor now carries a current `mtimeMs` at a stale offset. If the caller (metrics provider at line 104, or the usage store's mtime gate) checks `statMtimeMs === cursor.mtimeMs` on the next render and the file hasn't changed, it gets a fast-hit returning prior data even though new bytes (a partial line) exist at the file level. This is not a correctness bug \u2014 the partial line contributes no valid JSONL entries and is rightfully excluded \u2014 but it means the cursor's mtime and offset are out of sync (the mtime says \"up-to-date through this timestamp\" while the offset says \"up to this byte position\"). The partial line is correctly re-read when the next newline lands (mtime change), so the effect is transient and benign; the mtime/offset pair is consistent with \"no valid entries were intercepted.\" Flagged for awareness because this subtlety is not tested directly (the partial-line test only exercises the two-phase re-read, not the fast-hit interposition)."
+    },
+    {
+      "commentId": 3557758997,
+      "reviewId": 4670129801,
+      "path": "test/transcript-incremental.test.ts",
+      "line": 71,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real coverage gap, confirmed and fixed in 2f953c5: no dedicated test pins the unchanged-file fast path of readAppendedEntries (prior cursor, same mtime, zero new entries). Low severity by the finding's own admission. Round-5 finding, re-anchored from @f7ec991 to the covering test at the frozen head.",
+      "body": "**Advisory (non-blocking):** Missing test: The test \"first read yields all complete lines; a later read yields ONLY the appended ones\" covers the core incremental path, but does not verify that `readAppendedEntries` with a prior cursor whose mtime matches the current file (the unchanged-file fast-hit path) correctly returns zero new entries. Both the metrics provider (line 104) and the usage store rely on the mtime gate BEFORE calling `readAppendedEntries`, so an unchanged file never reaches this reader. However, if a future caller calls `readAppendedEntries` directly with a stale cursor on an unchanged file, the `readAppended` \u2192 `start >= size` path would return an empty buffer correctly \u2014 this path IS exercised implicitly by the `start` variable's computation but a dedicated test would pin the contract. Low severity; the fast-hit path is covered by the metrics and store tests separately."
+    },
+    {
+      "commentId": 3557759010,
+      "reviewId": 4670129801,
+      "path": "scripts/daemon-load-harness.ts",
+      "line": 597,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real advisory, confirmed and fixed in 2f953c5: `void main()` discards the promise, so an unexpected throw relies on Node's default unhandled-rejection exit instead of an explicit process.exit(1). Round-5 finding, re-anchored from :643@f7ec991.",
+      "body": "**Advisory (non-blocking):** [LAW:no-silent-failure] `void main()` discards the promise. If the `try` body throws (e.g., an unexpected async rejection from fetchStats or an operation inside the measurement loop), the `finally` block runs (cleanup completes), but `process.exit(exitCode)` at line 640 never executes \u2014 the rejection escapes to the module top level. Node.js defaults for unhandled rejections set `exitCode = 1`, but this is a weaker guarantee than an explicit `process.exit`. Fix: append `.catch((e) => { console.error('harness crash', e); process.exit(1); })` to `main()` so every error path exits explicitly non-zero."
+    },
+    {
+      "commentId": 3557759014,
+      "reviewId": 4670129801,
+      "path": "scripts/daemon-load-harness.ts",
+      "line": 261,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real advisory leak, confirmed and fixed in 2f953c5: the XDG cache/config tempdirs are created before spawn(), which can throw synchronously (EMFILE/ENOMEM) with cleanup() defined only afterwards \u2014 main()'s finally removes stateRoot/transcriptDir but not these. Distinct from frozen 3557390539/3557390565 (post-spawn handle.cleanup placement). Round-5 finding, re-anchored from :286@f7ec991.",
+      "body": "**Advisory (non-blocking):** Resource leak: XDG temp dirs created synchronously at lines 286 (`cbh-cache-*`) and 288 (`cbh-config-*`) leak if `child_process.spawn()` at line 316 throws (e.g., EMFILE, ENOMEM). In that path, `cleanup()` is never reached, and back in `main()`, `handle` remains `null`, so `handle?.cleanup()` is a no-op. The `finally` block only removes `stateRoot` and `transcriptDir` \u2014 the XDG temp dirs persist in /tmp/. Fix: wrap the `spawn()` call in a try/catch that removes the temp dirs on failure, or move the dir creation into the `cleanup` closure's scope."
     }
   ]
 }

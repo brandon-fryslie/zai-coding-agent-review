@@ -13,11 +13,16 @@ changes here **do not bump the version**.
 
 ## What a "case" is
 
-One case = **one review round**: a single reviewed commit, the exact diff the agent saw
-at that commit, the repo tree at that commit, and the findings it produced — all
-**frozen** so the case replays identically forever. A PR that was re-reviewed across
-several pushes yields one case per round; each case here freezes the single richest
-round of its PR (see the table below).
+One case = **one frozen review round plus its PR's pooled finding inventory**. The
+*replay material* is a single reviewed commit: the exact diff the agent saw at that
+commit and the repo tree at that commit, frozen so the case replays identically forever.
+The *ground truth* is wider than that one round: the `expected.json` findings array
+pools **every distinct finding from all of the source PR's review rounds that exists in
+the frozen material** — because in practice a PR's full finding set dribbled out across
+up to five push-triggered rounds (typically 1–2 findings per round on largely unchanged
+code), and the recall epic (`zai-recall-upr`) asks whether **one** round can surface
+what five rounds found together. That question is unmeasurable if each case's ground
+truth is only its own round's findings.
 
 The design mirrors the one production and `scripts/local-review.js` already use: a case
 is *frozen inputs* (repo tree + saved diff + a pinned engine), and the only variance
@@ -76,17 +81,47 @@ Each finding:
 | field          | meaning                                                                   |
 |----------------|---------------------------------------------------------------------------|
 | `commentId`    | the GitHub review-comment id (provenance back to the source PR)           |
+| `reviewId`     | *(inventory findings only)* the source round that reported it; absent = the frozen round (the top-level `reviewId`) |
 | `path`         | file the finding anchors to                                               |
-| `line`         | new-file line (the reviewed anchor; `original_line` on a dismissed review)|
+| `line`         | new-file line **in the frozen material** (re-anchored by hand for inventory findings) |
 | `side`         | diff side, always `RIGHT`                                                  |
 | `annotation`   | `must-find` \| `nice-to-find` \| `noise` (see below)                       |
-| `justification`| written rationale for the annotation                                       |
-| `diffHunk`     | the exact hunk GitHub anchored the comment to (kept for matching)          |
+| `justification`| written rationale for the annotation (for inventory findings: also the eligibility evidence and the original anchor) |
+| `diffHunk`     | *(frozen-round findings only)* the exact hunk GitHub anchored the comment to |
 | `body`         | the verbatim finding text the agent posted                                |
 
-Every finding's `diffHunk` body is a **verbatim substring of `change.diff`** — the
-freezer asserts this for each finding and aborts if any hunk is missing, so the anchors
-and the frozen diff cannot be committed inconsistent.
+Every frozen-round finding's `diffHunk` body is a **verbatim substring of
+`change.diff`** — the freezer asserts this for each finding and aborts if any hunk is
+missing, so the anchors and the frozen diff cannot be committed inconsistent. Inventory
+findings carry no `diffHunk`: their GitHub hunk belongs to a *different* commit, so
+committing it here would misdescribe the frozen material; their anchor is instead
+verified at curation time (see below).
+
+### The pooled inventory, and its eligibility rule
+
+A finding from a non-frozen round may be added to `expected.json` only when **the
+defect it describes exists in the frozen material**, and its `path`/`line` must be
+**re-anchored to the frozen head's coordinates** on an anchorable line of
+`change.diff`. That rule is what keeps the map true (`[FRAMING:representation]`):
+
+- A finding **fixed before the frozen head** is not a recall opportunity there —
+  including it would inflate the denominator with permanently-unrecallable entries.
+- A finding about **code a post-frozen fix introduced** (a missed spot *of a fix*, a
+  refinement of a fix's new code) does not exist in the frozen material — same
+  exclusion.
+- A finding that **duplicates** a frozen or inventory entry (later rounds re-tell
+  earlier stories) is deduplicated into the one entry; the justification names the
+  duplicate.
+- A finding the PR author **refuted with proof** (pushback accepted, no change) enters
+  as `noise` — a known plausible false positive, so an engine that repeats it is not
+  charged with *novel* noise, and it never counts toward recall.
+
+Each inventory entry's `justification` records the verdict evidence (confirmed + fix
+commit, or refuted), the original anchor (`:line@commit`), and — where relevant — the
+frozen-tree verification. Curation is a hand-judgment step, exactly like annotation:
+mine the non-frozen marker rounds with `gh api`, read each finding against the frozen
+tree (`repo.tar.gz`) and the author's reply threads, and verify every new anchor lands
+on an anchorable `change.diff` line (`patchLines` in `src/diff.js` is the authority).
 
 ## The annotation vocabulary
 
@@ -112,15 +147,20 @@ epic notes).
 
 ## The current golden set
 
-| case                              | repo (lang)               | PR   | change kind          | findings (must/nice/noise) |
-|-----------------------------------|---------------------------|------|----------------------|----------------------------|
-| `cc-candybar-150-transcript-perf` | cc-candybar (TS)          | #150 | perf refactor        | 17 (7 / 8 / 2)             |
-| `links-317-dolt-telemetry`        | links-issue-tracker (Go)  | #317 | supply-chain removal | 7 (3 / 3 / 1)              |
-| `copirate-93-dependency-diff`     | copirate-code-review (JS) | #93  | feature              | 7 (3 / 4 / 0)              |
-| `laws-4-eval-tasks`               | laws (Markdown/shell)     | #4   | eval task specs      | 6 (2 / 3 / 1)              |
+Every source PR took **five** review rounds; each case freezes its richest round as the
+replay material and pools the other rounds' eligible findings as inventory.
 
-**37 findings total — 15 must-find.** Diverse across language (TS/Go/JS/Markdown) and
-change kind (perf, supply-chain, feature, spec/CI).
+| case                              | repo (lang)               | PR   | change kind          | inventory (must/nice/noise) | of which frozen round |
+|-----------------------------------|---------------------------|------|----------------------|-----------------------------|-----------------------|
+| `cc-candybar-150-transcript-perf` | cc-candybar (TS)          | #150 | perf refactor        | 32 (10 / 15 / 7)            | 17 (7 / 8 / 2)        |
+| `links-317-dolt-telemetry`        | links-issue-tracker (Go)  | #317 | supply-chain removal | 14 (4 / 9 / 1)              | 7 (3 / 3 / 1)         |
+| `copirate-93-dependency-diff`     | copirate-code-review (JS) | #93  | feature              | 9 (4 / 5 / 0)               | 7 (3 / 4 / 0)         |
+| `laws-4-eval-tasks`               | laws (Markdown/shell)     | #4   | eval task specs      | 15 (2 / 12 / 1)             | 6 (2 / 3 / 1)         |
+
+**70 findings total — 20 inventory must-finds (15 of them in the frozen rounds).**
+Diverse across language (TS/Go/JS/Markdown) and change kind (perf, supply-chain,
+feature, spec/CI). `laws-4`'s dribble was entirely advisory, so its inventory adds
+nice-to-finds but no must-finds — an honest reflection of that PR, not a curation gap.
 
 ## Replaying a case
 
@@ -166,8 +206,13 @@ eval/out/<case-name>/<timestamp>-run<i>/
 ## Scoring a replay
 
 `eval/score.js` (`npm run review:score`) reduces a case's replay artifacts to the
-number the harness exists to protect: **must-find recall** (found / total must-find),
-plus nice-to-find recall, noise count, and cost — the secondary metrics. It is an
+number the harness exists to protect: **inventory must-find recall** (found / total
+must-find across the whole pooled inventory — the gate metric), reported alongside the
+frozen-round must-find recall (the pre-inventory view, comparable with older runs),
+plus nice-to-find recall, noise count, and cost — the secondary metrics. Matching runs
+round-agnostically over the whole inventory; the frozen-round and inventory views are
+derived per-bucket filters of one matched set, so a produced finding that matches a
+*later-round* defect counts as an early find, never as noise. It is an
 **instrument, not a second review implementation**: it never re-runs the engine and
 never re-derives the expected set; it only *matches* the frozen `expected.json` against
 a run's `findings.json` and reduces the match to metrics.
@@ -246,41 +291,67 @@ still dev-only tooling and does **not** bump the version.
 
 ```
 eval/baseline/<date>-<short-sha>/
-  baseline.json   — the frozen distribution: the suite's pooled must-find gate floor (the one gate number),
-                    each case's must-find recall band (mean/min/max) + diagnostic floor, the suite cost, the
-                    pinned engine, and the degradation rule. parseBaseline (exported) is the loader the
-                    compare gate (2fk.5) reuses.
+  baseline.json   — the frozen distribution (schema v2): the suite's pooled INVENTORY must-find gate floor
+                    (the one gate number), the frozen-round pooled rate (continuity diagnostic), each case's
+                    inventory + frozen-round recall bands (mean/min/max) + diagnostic floor, the suite cost,
+                    the pinned engine, and the degradation rule. parseBaseline (exported) is the loader the
+                    compare gate (2fk.5) reuses, and evaluateGate is the one predicate that applies the rule.
   baseline.md     — the same, human-readable: the per-case band table, suite cost, and the rule.
 ```
 
 ### The degradation rule
 
 A candidate (an engine/prompt/effort change under test) is scored by replaying the **same**
-suite at the **same** N, **pooling** every run's must-find finds into one rate, and comparing
-it to the frozen baseline:
+suite at the **same** N, **pooling** every run's inventory must-find finds into one rate, and
+comparing it to the frozen baseline:
 
-> **The suite is DEGRADED when the candidate's *pooled* must-find recall — total must-finds
-> found across all N×cases runs ÷ total must-find opportunities — falls below this baseline's
+> **The suite is DEGRADED when the candidate's *pooled inventory* must-find recall — total
+> inventory must-finds found across all N×cases runs ÷ total inventory must-find
+> opportunities, where a case's inventory pools every distinct must-find from all of its
+> source PR's review rounds that exists in the frozen material — falls below this baseline's
 > pooled gate floor (the pooled rate minus a ~2σ binomial sampling margin).**
 
-The gate is **pooled, not per-case**, and that choice is forced by the data. Must-find
-denominators are tiny (7, 3, 2, 3 across the four cases), so per-case recall is **quantized
-and jittery**: for a 3-finding case it can only be 0, ⅓, ⅔, or 1, a single finding flipping
-swings it 33 points, and — as the baseline below shows — the run-to-run spread exceeds the
-mean for three of the four cases, with three per-case floors sitting at 0 % (a "mean below the
-floor" rule can never fire there). A per-case gate is false precision. Pooling all the
-must-find opportunities into one binomial rate restores a sample large enough to carry a real
-sampling margin, so the floor is a meaningful line rather than noise. The per-case bands are
-kept only as **diagnostics** — they localize *which* case moved a pooled regression; they do
-not gate on their own.
+`evaluateGate` in `eval/baseline.js` is the single enforcer of this rule
+(`[LAW:single-enforcer]`): the compare CLI (2fk.5) wraps it, and its behavior — the gate
+fails a candidate whose pooled inventory recall drops below the frozen floor — is pinned by
+`test/eval-baseline.test.js`. For a case with no inventory rounds the inventory equals the
+frozen round, so this gate is a strict generalization of the earlier frozen-round gate; the
+frozen-round pooled rate stays in the baseline as a continuity diagnostic comparable with
+the pre-inventory (v1) baseline.
+
+The gate is **pooled across runs, not per-case**, and that choice is forced by the data.
+Must-find denominators are small, so per-case recall is **quantized and jittery**: for a
+3-finding case it can only be 0, ⅓, ⅔, or 1, a single finding flipping swings it 33 points,
+and — as the first baseline showed — the run-to-run spread exceeds the mean for three of the
+four cases, with three per-case floors sitting at 0 % (a "mean below the floor" rule can
+never fire there). A per-case gate is false precision. Pooling all the must-find
+opportunities into one binomial rate restores a sample large enough to carry a real sampling
+margin, so the floor is a meaningful line rather than noise. The per-case bands are kept only
+as **diagnostics** — they localize *which* case moved a pooled regression; they do not gate
+on their own.
+
+### The current baseline (v2, inventory-gated)
+
+The gate reference is
+[`eval/baseline/2026-08-10-787df41/`](baseline/2026-08-10-787df41/baseline.md) — the engine
+of `main` at `787df41`, `deepseek-v4-pro`, N=5, schema v2. Headline: **pooled inventory
+must-find recall 22 % (22 of 100 opportunities), gate floor 14 %.** The frozen-round pooled
+rate measured 21 % (16/75) — statistically consistent with the v1 baseline's 19 % on the same
+engine, so the instrument is stable; the inventory gate simply measures against the fuller
+ground truth (100 opportunities vs 75). A full suite run still costs ≈ $0.68; the whole N=5
+baseline cost $3.41. The headline result carries over: the engine surfaces roughly **one in
+five** of the pooled inventory's must-finds in a single round — that is the number the recall
+epic (`zai-recall-upr`) exists to raise, and the floor the efficiency work must not sink.
 
 ### The first baseline, and the variance that shaped the rule
 
 The first frozen baseline is
 [`eval/baseline/2026-08-01-dc87ee0/`](baseline/2026-08-01-dc87ee0/baseline.md) — `main` at
-`dc87ee0`, engine `deepseek-v4-pro`, N=5. Headline: **pooled must-find recall 19 % (14 of
-75 opportunities), gate floor 10 %.** A full suite run (all four cases once) costs ≈ $0.70;
-the whole N=5 baseline cost **$3.48**.
+`dc87ee0`, engine `deepseek-v4-pro`, N=5, **schema v1** (pre-inventory: its ground truth was
+each case's frozen round only, and its gate metric the frozen-round pooled rate — kept as
+history; the current v2 baseline supersedes it as the gate reference). Headline: **pooled
+must-find recall 19 % (14 of 75 opportunities), gate floor 10 %.** A full suite run (all four
+cases once) costs ≈ $0.70; the whole N=5 baseline cost **$3.48**.
 
 The per-case variance behind the pooled rule (above) is stark — every case's run-to-run
 spread is large relative to its mean, and for three of the four the spread *exceeds* the mean:
@@ -343,5 +414,12 @@ lower, and the bar the quality work must raise.
    left-over `UNREVIEWED` is intentionally loud so an un-annotated case is never
    silently scored.
 
-3. **Commit** the whole case dir (`case.json`, `change.diff`, `repo.tar.gz`,
+3. **Curate the pooled inventory by hand** (the freezer only extracts the frozen
+   round). Mine the PR's other marker-bearing rounds, apply the eligibility rule above
+   (defect exists in the frozen material; re-anchor to frozen coordinates; dedupe;
+   refuted findings become `noise`), and append each eligible finding with its source
+   `reviewId`. A case may ship without inventory rounds — it then scores identically on
+   both views — but the recall epic's metric only bites on cases that carry one.
+
+4. **Commit** the whole case dir (`case.json`, `change.diff`, `repo.tar.gz`,
    `expected.json`). No version bump — `eval/` is dev-only tooling.

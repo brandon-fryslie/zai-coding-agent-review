@@ -138,18 +138,28 @@ function parseJsonObject(raw, label) {
 // pairing, annotation for bucketing, body for the semantic judge, commentId for traceability back to the
 // source PR. An UNREVIEWED annotation is intentionally loud: an un-annotated case must never be silently
 // scored (it would report a meaningless recall). [LAW:no-silent-failure]
+//
+// The findings array is the case's POOLED INVENTORY — every distinct finding of the source PR that exists
+// in the frozen material, whichever review round reported it. A finding's `reviewId` names its source
+// round; absent, it belongs to the frozen round (the top-level reviewId), so a pre-inventory case parses
+// unchanged. The optionality is resolved HERE, once: every finding leaves this boundary with a concrete
+// reviewId, and the frozen-round vs whole-inventory views downstream are derived subsets of this one
+// array — never a second copy. [LAW:one-source-of-truth] [LAW:parse-dont-validate]
 function parseExpected(raw, label) {
   const json = parseJsonObject(raw, label);
+  if (!Number.isInteger(json.reviewId)) throw new Error(`${label} has no integer top-level 'reviewId' (the frozen round).`);
   if (!Array.isArray(json.findings)) throw new Error(`${label} has no 'findings' array.`);
-  return json.findings.map((f, i) => {
+  const findings = json.findings.map((f, i) => {
     const at = `${label} findings[${i}]`;
     if (typeof f.path !== 'string' || f.path.trim() === '') throw new Error(`${at} has an invalid path.`);
     if (!Number.isInteger(f.line) || f.line <= 0) throw new Error(`${at} has an invalid line.`);
     if (typeof f.body !== 'string' || f.body.trim() === '') throw new Error(`${at} has an invalid body.`);
     if (f.annotation === 'UNREVIEWED') throw new Error(`${at} is still UNREVIEWED — annotate the case (must-find | nice-to-find | noise) before scoring it.`);
     if (!ANNOTATIONS.has(f.annotation)) throw new Error(`${at} has an invalid annotation ${JSON.stringify(f.annotation)} (expected must-find | nice-to-find | noise).`);
-    return { commentId: f.commentId ?? null, path: f.path.trim(), line: f.line, annotation: f.annotation, body: f.body };
+    if (f.reviewId !== undefined && !Number.isInteger(f.reviewId)) throw new Error(`${at} has a non-integer reviewId ${JSON.stringify(f.reviewId)}.`);
+    return { commentId: f.commentId ?? null, path: f.path.trim(), line: f.line, annotation: f.annotation, body: f.body, reviewId: f.reviewId ?? json.reviewId };
   });
+  return { reviewId: json.reviewId, findings };
 }
 
 // The raw merged findings from runMultiScope, PRE anchor-partition (run-case.js writes them). Same shape a
@@ -217,9 +227,16 @@ function pairCandidates(expected, produced, window) {
 
 // Stage 2 → metrics (pure): apply the judge's decisions to the candidate pairs and reduce to the buckets.
 // An expected finding is FOUND if ANY candidate pair with match:true names it; a produced finding is NOISE
-// if no candidate pair with match:true names it (it matched nothing known). [LAW:no-silent-failure] Every
+// if no candidate pair with match:true names it (it matched nothing in the whole inventory — matching a
+// later-round finding is an early find, the epic's goal, never noise). [LAW:no-silent-failure] Every
 // candidate pair MUST carry a decision — a missing one is a bug in the judge, not a silent no-match.
+//
+// `expected` is parseExpected's {reviewId, findings}: matching runs over the WHOLE inventory uniformly,
+// and the two reported views — the frozen round (existing buckets, unchanged for pre-inventory cases) and
+// the pooled inventory (all rounds) — are derived per-bucket filters over the same matched set.
+// [LAW:dataflow-not-control-flow]
 function computeMetrics(expected, produced, candidatePairs, decisions) {
+  const findings = expected.findings;
   const expectedMatched = new Set();
   const producedMatched = new Set();
   const pairDetail = [];
@@ -227,8 +244,9 @@ function computeMetrics(expected, produced, candidatePairs, decisions) {
     const d = decisions.get(pair.key);
     if (!d) throw new Error(`Judge returned no decision for candidate pair ${pair.key}.`);
     pairDetail.push({
-      expectedCommentId: expected[pair.expectedIdx].commentId,
-      expectedAnnotation: expected[pair.expectedIdx].annotation,
+      expectedCommentId: findings[pair.expectedIdx].commentId,
+      expectedAnnotation: findings[pair.expectedIdx].annotation,
+      expectedReviewId: findings[pair.expectedIdx].reviewId,
       produced: `${produced[pair.producedIdx].path}:${produced[pair.producedIdx].line}`,
       lineDelta: pair.lineDelta,
       match: d.match,
@@ -239,24 +257,29 @@ function computeMetrics(expected, produced, candidatePairs, decisions) {
       producedMatched.add(pair.producedIdx);
     }
   }
-  const bucket = (annotation) => {
+  const bucket = (annotation, member) => {
     const idxs = [];
-    for (let i = 0; i < expected.length; i++) if (expected[i].annotation === annotation) idxs.push(i);
+    for (let i = 0; i < findings.length; i++) if (findings[i].annotation === annotation && member(findings[i])) idxs.push(i);
     const foundIdxs = idxs.filter(i => expectedMatched.has(i));
     return {
       total: idxs.length,
       found: foundIdxs.length,
       recall: idxs.length ? foundIdxs.length / idxs.length : null,
-      foundIds: foundIdxs.map(i => expected[i].commentId),
-      missedIds: idxs.filter(i => !expectedMatched.has(i)).map(i => expected[i].commentId),
+      foundIds: foundIdxs.map(i => findings[i].commentId),
+      missedIds: idxs.filter(i => !expectedMatched.has(i)).map(i => findings[i].commentId),
     };
   };
+  const frozenRound = (f) => f.reviewId === expected.reviewId;
+  const anyRound = () => true;
   const noiseIdxs = [];
   for (let i = 0; i < produced.length; i++) if (!producedMatched.has(i)) noiseIdxs.push(i);
   return {
-    mustFind: bucket('must-find'),
-    niceToFind: bucket('nice-to-find'),
-    knownNoise: bucket('noise'),
+    mustFind: bucket('must-find', frozenRound),
+    niceToFind: bucket('nice-to-find', frozenRound),
+    knownNoise: bucket('noise', frozenRound),
+    inventoryMustFind: bucket('must-find', anyRound),
+    inventoryNiceToFind: bucket('nice-to-find', anyRound),
+    inventoryKnownNoise: bucket('noise', anyRound),
     noise: {
       count: noiseIdxs.length,
       items: noiseIdxs.map(i => ({ path: produced[i].path, line: produced[i].line, severity: produced[i].severity, bodyPreview: bodyPreview(produced[i].body) })),
@@ -275,10 +298,10 @@ function bodyPreview(body) {
 // it's the LLM+cache. [LAW:effects-at-boundaries] The output carries no timestamp or ambient value, so it
 // is byte-stable across re-scorings that share a judge cache. [LAW:one-source-of-truth]
 async function scoreRun({ expected, produced, usage, meta, judge, matcherLabel }) {
-  const candidatePairs = pairCandidates(expected, produced, LINE_WINDOW);
+  const candidatePairs = pairCandidates(expected.findings, produced, LINE_WINDOW);
   const judgePairs = candidatePairs.map(p => ({
     key: p.key,
-    expectedBody: expected[p.expectedIdx].body,
+    expectedBody: expected.findings[p.expectedIdx].body,
     producedBody: produced[p.producedIdx].body,
   }));
   const decisions = await judge(judgePairs);
@@ -292,6 +315,9 @@ async function scoreRun({ expected, produced, usage, meta, judge, matcherLabel }
     mustFind: metrics.mustFind,
     niceToFind: metrics.niceToFind,
     knownNoise: metrics.knownNoise,
+    inventoryMustFind: metrics.inventoryMustFind,
+    inventoryNiceToFind: metrics.inventoryNiceToFind,
+    inventoryKnownNoise: metrics.inventoryKnownNoise,
     noise: metrics.noise,
     usage,
     pairs: metrics.pairs,
@@ -299,7 +325,7 @@ async function scoreRun({ expected, produced, usage, meta, judge, matcherLabel }
 }
 
 // Reduce a case's per-run scorecards to a mean/min/max band per metric. Null recalls (a bucket with zero
-// expected findings) are skipped, never counted as zero. This is the shape 2fk.4 (baseline/variance) reads.
+// expected findings) are skipped, never counted as zero. This is the shape baseline.js (freeze/variance) reads.
 function aggregateRuns(caseName, scorecards) {
   const band = (values) => {
     const nums = values.filter(v => v !== null && v !== undefined);
@@ -317,12 +343,16 @@ function aggregateRuns(caseName, scorecards) {
     runs: scorecards.length,
     matcher: scorecards.length ? scorecards[0].matcher : null,
     mustFindRecall: band(scorecards.map(s => s.mustFind.recall)),
+    inventoryMustFindRecall: band(scorecards.map(s => s.inventoryMustFind.recall)),
     niceToFindRecall: band(scorecards.map(s => s.niceToFind.recall)),
+    inventoryNiceToFindRecall: band(scorecards.map(s => s.inventoryNiceToFind.recall)),
     noiseCount: band(scorecards.map(s => s.noise.count)),
     costUsd: band(scorecards.map(s => costUsd(s.usage))),
     perRun: scorecards.map(s => ({
       mustFind: `${s.mustFind.found}/${s.mustFind.total}`,
+      inventoryMustFind: `${s.inventoryMustFind.found}/${s.inventoryMustFind.total}`,
       niceToFind: `${s.niceToFind.found}/${s.niceToFind.total}`,
+      inventoryNiceToFind: `${s.inventoryNiceToFind.found}/${s.inventoryNiceToFind.total}`,
       noise: s.noise.count,
       costUsd: costUsd(s.usage),
     })),
@@ -336,14 +366,18 @@ function renderTable(summary) {
   const num = (v) => (v === null ? 'n/a' : v.toFixed(2));
   const usd = (v) => (v === null ? 'n/a' : `$${v.toFixed(4)}`);
   const mf = summary.mustFindRecall;
+  const inv = summary.inventoryMustFindRecall;
   const nf = summary.niceToFindRecall;
+  const invNf = summary.inventoryNiceToFindRecall;
   const lines = [
     `Case: ${summary.case}   (matcher: ${summary.matcher}, ${summary.runs} run${summary.runs === 1 ? '' : 's'})`,
-    `  must-find recall:    mean ${pct(mf.mean)}  min ${pct(mf.min)}  max ${pct(mf.max)}   [PRIMARY]`,
-    `  nice-to-find recall: mean ${pct(nf.mean)}  min ${pct(nf.min)}  max ${pct(nf.max)}`,
-    `  noise / run:         mean ${num(summary.noiseCount.mean)}  min ${num(summary.noiseCount.min)}  max ${num(summary.noiseCount.max)}`,
-    `  cost / run (est.):   mean ${usd(summary.costUsd.mean)}`,
-    `  per run (must/nice): ${summary.perRun.map(r => `${r.mustFind}·${r.niceToFind}`).join('   ')}`,
+    `  must-find recall (frozen round):  mean ${pct(mf.mean)}  min ${pct(mf.min)}  max ${pct(mf.max)}`,
+    `  inventory recall (all rounds):    mean ${pct(inv.mean)}  min ${pct(inv.min)}  max ${pct(inv.max)}   [PRIMARY]`,
+    `  nice-to-find recall (frozen):     mean ${pct(nf.mean)}  min ${pct(nf.min)}  max ${pct(nf.max)}`,
+    `  nice-to-find recall (inventory):  mean ${pct(invNf.mean)}  min ${pct(invNf.min)}  max ${pct(invNf.max)}`,
+    `  noise / run:                      mean ${num(summary.noiseCount.mean)}  min ${num(summary.noiseCount.min)}  max ${num(summary.noiseCount.max)}`,
+    `  cost / run (est.):                mean ${usd(summary.costUsd.mean)}`,
+    `  per run (must·invMust·nice·invNice): ${summary.perRun.map(r => `${r.mustFind}·${r.inventoryMustFind}·${r.niceToFind}·${r.inventoryNiceToFind}`).join('   ')}`,
   ];
   return lines.join('\n');
 }

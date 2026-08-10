@@ -23,25 +23,32 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { parseJsonObject } = require('./score');
 
-// [LAW:one-source-of-truth] THE degradation rule, defined once — the compare gate (2fk.5) applies it,
-// README.md documents it, baseline.md renders it: one wording, several consumers. The rule is POOLED, and
-// that choice is forced by the observed variance, not a preference. Per-case must-find denominators are
-// tiny (7,3,2,3), so a per-case recall MEAN is dominated by run-to-run jitter — for 3 of the 4 cases the
-// spread exceeds the mean, and 3 floors sit at 0% (a candidate cannot score below 0, so a per-case floor
-// rule is unfalsifiable there). Pooling every run's must-find finds across all cases into ONE binomial rate
-// (found / opportunities over N×cases runs) recovers a gateable signal with a real sampling margin. The
-// per-case bands are kept as DIAGNOSTICS to localize a regression, never as independent gates.
+// [LAW:one-source-of-truth] THE degradation rule, defined once — evaluateGate applies it, the compare
+// CLI (2fk.5) wraps it, README.md documents it, baseline.md renders it: one wording, several consumers.
+// The gated metric is INVENTORY must-find recall — recall against each case's pooled multi-round finding
+// inventory (every distinct defect any review round of the source PR surfaced that exists in the frozen
+// material), so "one round finds what five rounds found together" is what the gate protects. For a case
+// with no inventory rounds the inventory equals the frozen round, so this is a strict generalization of
+// the earlier frozen-round gate (kept in the baseline as a continuity diagnostic).
+// The rule is POOLED across runs, and that choice is forced by the observed variance, not a preference.
+// Per-case must-find denominators are tiny, so a per-case recall MEAN is dominated by run-to-run jitter —
+// in the 2026-08-01 baseline the spread exceeded the mean for 3 of 4 cases, and 3 floors sat at 0% (a
+// candidate cannot score below 0, so a per-case floor rule is unfalsifiable there). Pooling every run's
+// inventory must-find finds across all cases into ONE binomial rate (found / opportunities over N×cases
+// runs) recovers a gateable signal with a real sampling margin. The per-case bands are kept as
+// DIAGNOSTICS to localize a regression, never as independent gates.
 const DEGRADATION_RULE = {
-  metric: 'pooledMustFindRecall',
+  metric: 'pooledInventoryMustFindRecall',
   comparator: 'lt',
-  floorSource: 'suite.pooledMustFind.gateFloor',
+  floorSource: 'suite.pooledInventoryMustFind.gateFloor',
   description:
-    'PRIMARY GATE (pooled): the suite is DEGRADED when a candidate\'s pooled must-find recall — total ' +
-    'must-finds found across all N×cases runs ÷ total must-find opportunities — falls below this ' +
-    'baseline\'s pooled gate floor (the baseline pooled rate minus a ~2σ binomial sampling margin). ' +
-    'Pooling is used because per-case recall means are too noisy to gate on at these tiny denominators ' +
-    '(run-to-run spread exceeds the mean for 3 of 4 cases; 3 per-case floors are 0%). The per-case bands ' +
-    'below are DIAGNOSTICS — they localize which case moved — not independent gates.',
+    'PRIMARY GATE (pooled): the suite is DEGRADED when a candidate\'s pooled inventory must-find recall — ' +
+    'total inventory must-finds found across all N×cases runs ÷ total inventory must-find opportunities, ' +
+    'where a case\'s inventory pools every distinct must-find from all of its source PR\'s review rounds ' +
+    'that exists in the frozen material — falls below this baseline\'s pooled gate floor (the baseline ' +
+    'pooled rate minus a ~2σ binomial sampling margin). Pooling across runs is used because per-case ' +
+    'recall means are too noisy to gate on at these tiny denominators. The frozen-round pooled rate and ' +
+    'the per-case bands below are DIAGNOSTICS — they localize which case moved — not independent gates.',
 };
 
 // A ~2σ (z≈1.96) normal-approximation lower confidence bound on a binomial rate, clamped to [0,1]. It is
@@ -139,21 +146,33 @@ function parseCaseSummary(raw, label) {
     runs: json.runs,
     matcher: json.matcher,
     mustFindRecall: parseBand(json.mustFindRecall, `${label}.mustFindRecall`),
+    inventoryMustFindRecall: parseBand(json.inventoryMustFindRecall, `${label}.inventoryMustFindRecall`),
     niceToFindRecall: parseBand(json.niceToFindRecall, `${label}.niceToFindRecall`),
+    inventoryNiceToFindRecall: parseBand(json.inventoryNiceToFindRecall, `${label}.inventoryNiceToFindRecall`),
     noiseCount: parseBand(json.noiseCount, `${label}.noiseCount`),
     costUsd: parseBand(json.costUsd, `${label}.costUsd`),
     perRun: json.perRun.map((r, i) => {
       const at = `${label}.perRun[${i}]`;
-      // mustFind is the pooled numerator/denominator source — parse it to {found,total} at the boundary so
-      // buildBaseline can't see an absent/non-string value (which would coerce to "null" deep in the reduction).
-      if (typeof r.mustFind !== 'string') throw new Error(`${at}.mustFind must be a 'found/total' string (got ${JSON.stringify(r.mustFind)}).`);
-      const mustFind = parseFraction(r.mustFind, `${at}.mustFind`);
+      // mustFind + inventoryMustFind are the pooled numerator/denominator sources — parse each to a typed
+      // {found,total} at the boundary so buildBaseline can't see an absent/non-string value (which would
+      // coerce to "null" deep in the reduction).
+      const fraction = (v, field) => {
+        if (typeof v !== 'string') throw new Error(`${at}.${field} must be a 'found/total' string (got ${JSON.stringify(v)}).`);
+        return parseFraction(v, `${at}.${field}`);
+      };
+      const mustFind = fraction(r.mustFind, 'mustFind');
+      const inventoryMustFind = fraction(r.inventoryMustFind, 'inventoryMustFind');
+      // The inventory is a superset of the frozen round by construction (score.js buckets one findings
+      // array two ways); a summary that violates that is corrupt, not a legal input.
+      if (inventoryMustFind.total < mustFind.total || inventoryMustFind.found < mustFind.found) {
+        throw new Error(`${at}.inventoryMustFind (${inventoryMustFind.found}/${inventoryMustFind.total}) is smaller than mustFind (${mustFind.found}/${mustFind.total}) — the inventory pools a superset of the frozen round.`);
+      }
       // perRun costs are summed for the suite total; each is a number or null (cost unavailable that run).
       const costUsd = r.costUsd ?? null;
       if (costUsd !== null && (typeof costUsd !== 'number' || !Number.isFinite(costUsd))) {
         throw new Error(`${at}.costUsd must be a finite number or null (got ${JSON.stringify(r.costUsd)}).`);
       }
-      return { mustFind, niceToFind: r.niceToFind ?? null, noise: r.noise ?? null, costUsd };
+      return { mustFind, inventoryMustFind, niceToFind: r.niceToFind ?? null, noise: r.noise ?? null, costUsd };
     }),
   };
 }
@@ -217,57 +236,71 @@ function buildBaseline({ cases, provenance }) {
     if (!sameEngine(c.engine, engine)) throw new Error(`Case '${c.summary.case}' pins engine ${JSON.stringify(c.engine)} but '${cases[0].summary.case}' pins ${JSON.stringify(engine)} — a baseline needs one engine.`);
   }
 
-  // One pass over every run of every case, summing the two suite-level facts:
-  //  - POOLED must-find: total finds ÷ total opportunities across all runs — the primary gate's numerator.
-  //    A per-run "1/7" contributes 1 find and 7 opportunities; N repeats × 4 cases makes one large sample.
+  // One pass over every run of every case, summing the suite-level facts:
+  //  - POOLED INVENTORY must-find: total inventory finds ÷ total inventory opportunities across all runs —
+  //    the primary gate's numerator. A per-run "5/9" contributes 5 finds and 9 opportunities; N repeats ×
+  //    the case count makes one large sample.
+  //  - POOLED frozen-round must-find: the same reduction over the frozen-round fractions — the continuity
+  //    diagnostic comparable with pre-inventory baselines.
   //  - COST: every run's cost. A full suite run = one repeat over all cases (there are `repeats` of them),
   //    so the per-full-run figure is what a single gate invocation of the same shape spends. Null
   //    (cost-unavailable) runs are excluded from the sum and counted, so the total is honest.
   let pooledFound = 0;
   let pooledTotal = 0;
+  let pooledInvFound = 0;
+  let pooledInvTotal = 0;
   let totalCostUsd = 0;
   let costedRuns = 0;
   let uncostedRuns = 0;
   for (const c of cases) {
     c.summary.perRun.forEach((r) => {
-      // mustFind is already the typed {found,total} parseCaseSummary produced at the boundary.
+      // mustFind / inventoryMustFind are already the typed {found,total} parseCaseSummary produced at the boundary.
       pooledFound += r.mustFind.found;
       pooledTotal += r.mustFind.total;
+      pooledInvFound += r.inventoryMustFind.found;
+      pooledInvTotal += r.inventoryMustFind.total;
       if (r.costUsd === null) { uncostedRuns++; return; }
       totalCostUsd += r.costUsd;
       costedRuns++;
     });
   }
-  // [LAW:one-source-of-truth] A suite with zero must-find opportunities has no pooled rate and a null gate
-  // floor — it cannot gate, and parseBaseline (the loader) requires opportunities>=1 + a finite floor. Refuse
-  // it at the producer so every baseline buildBaseline emits is one parseBaseline can load back. [LAW:no-silent-failure]
-  if (pooledTotal === 0) {
-    throw new Error('buildBaseline: the suite has zero must-find opportunities — not a gradeable baseline (every case has an empty must-find set). Check the annotations.');
+  // [LAW:one-source-of-truth] A suite with zero inventory must-find opportunities has no pooled rate and a
+  // null gate floor — it cannot gate, and parseBaseline (the loader) requires opportunities>=1 + a finite
+  // floor. Refuse it at the producer so every baseline buildBaseline emits is one parseBaseline can load
+  // back. [LAW:no-silent-failure] (The inventory pool is a superset of the frozen-round pool — enforced at
+  // parseCaseSummary — so this single check covers both.)
+  if (pooledInvTotal === 0) {
+    throw new Error('buildBaseline: the suite has zero inventory must-find opportunities — not a gradeable baseline (every case has an empty must-find set). Check the annotations.');
   }
-  const pooledRate = pooledFound / pooledTotal;
+  const pooledRate = pooledTotal === 0 ? null : pooledFound / pooledTotal;
+  const pooledInvRate = pooledInvFound / pooledInvTotal;
 
   const caseEntries = cases.map(c => ({
     case: c.summary.case,
     mustFindRecall: c.summary.mustFindRecall,
+    inventoryMustFindRecall: c.summary.inventoryMustFindRecall,
     niceToFindRecall: c.summary.niceToFindRecall,
+    inventoryNiceToFindRecall: c.summary.inventoryNiceToFindRecall,
     noiseCount: c.summary.noiseCount,
     costUsd: c.summary.costUsd,
-    // DIAGNOSTIC floor — this case's observed worst must-find recall (min). NOT a gate on its own (per-case
-    // means are too noisy at these denominators; see DEGRADATION_RULE). It localizes which case moved when
-    // the pooled gate trips. null only if the case has zero must-finds (band n===0), which the annotator
-    // should never produce — surfaced, not hidden.
-    diagnosticFloor: c.summary.mustFindRecall.min,
-    // Reconstruct the "found/total" display string from the typed value (identical to what score.js rendered).
+    // DIAGNOSTIC floor — this case's observed worst inventory must-find recall (min). NOT a gate on its own
+    // (per-case means are too noisy at these denominators; see DEGRADATION_RULE). It localizes which case
+    // moved when the pooled gate trips. null only if the case has zero must-finds (band n===0), which the
+    // annotator should never produce — surfaced, not hidden.
+    diagnosticFloor: c.summary.inventoryMustFindRecall.min,
+    // Reconstruct the "found/total" display strings from the typed values (identical to what score.js rendered).
     perRun: c.summary.perRun.map(r => `${r.mustFind.found}/${r.mustFind.total}`),
+    perRunInventory: c.summary.perRun.map(r => `${r.inventoryMustFind.found}/${r.inventoryMustFind.total}`),
   }));
 
-  // Suite headline: the unweighted mean of the per-case mean recalls. Informational only — a summary of the
-  // cases, not the gate (cases have different denominators, so their means don't pool by averaging).
-  const caseMeans = caseEntries.map(c => c.mustFindRecall.mean).filter(v => v !== null);
+  // Suite headline: the unweighted mean of the per-case mean INVENTORY recalls — the same axis the gate
+  // measures. Informational only — a summary of the cases, not the gate (cases have different
+  // denominators, so their means don't pool by averaging).
+  const caseMeans = caseEntries.map(c => c.inventoryMustFindRecall.mean).filter(v => v !== null);
   const suiteMeanRecall = caseMeans.length ? caseMeans.reduce((a, b) => a + b, 0) / caseMeans.length : null;
 
   return {
-    schema: 'copirate-eval-baseline/v1',
+    schema: 'copirate-eval-baseline/v2',
     generatedAt: provenance.date,
     mainSha: provenance.sha,
     engine,
@@ -276,15 +309,23 @@ function buildBaseline({ cases, provenance }) {
     degradationRule: DEGRADATION_RULE,
     suite: {
       cases: caseEntries.length,
-      // THE PRIMARY GATE number: pooled must-find recall + its ~2σ lower-bound floor. A candidate whose
-      // pooled recall (same suite, same N) falls below gateFloor is degraded. [LAW:one-source-of-truth]
+      // THE PRIMARY GATE number: pooled INVENTORY must-find recall + its ~2σ lower-bound floor. A candidate
+      // whose pooled inventory recall (same suite, same N) falls below gateFloor is degraded. [LAW:one-source-of-truth]
+      pooledInventoryMustFind: {
+        found: pooledInvFound,
+        opportunities: pooledInvTotal,
+        rate: round(pooledInvRate, 4),
+        gateFloor: round(pooledFloor(pooledInvFound, pooledInvTotal), 4),
+      },
+      // Continuity DIAGNOSTIC: the same reduction over the frozen-round fractions only — comparable with
+      // pre-inventory (v1) baselines, never a gate.
       pooledMustFind: {
         found: pooledFound,
         opportunities: pooledTotal,
         rate: round(pooledRate, 4),
         gateFloor: round(pooledFloor(pooledFound, pooledTotal), 4),
       },
-      meanMustFindRecall: round(suiteMeanRecall, 4),
+      meanInventoryMustFindRecall: round(suiteMeanRecall, 4),
       totalCostUsd: round(totalCostUsd, 4),
       // Per full suite run = totalCostUsd / repeats — but ONLY well-defined when every run is costed. With
       // any uncosted run, totalCostUsd is a partial sum while `repeats` still counts all full runs, so the
@@ -308,16 +349,16 @@ function buildBaseline({ cases, provenance }) {
 // re-read from baseline.md, never re-rendered from a loaded value.
 function parseBaseline(raw, label) {
   const json = parseJsonObject(raw, label);
-  if (json.schema !== 'copirate-eval-baseline/v1') throw new Error(`${label} is not a v1 baseline (schema=${JSON.stringify(json.schema)}).`);
+  if (json.schema !== 'copirate-eval-baseline/v2') throw new Error(`${label} is not a v2 baseline (schema=${JSON.stringify(json.schema)}). Re-freeze it with eval/baseline.js.`);
   if (typeof json.mainSha !== 'string' || json.mainSha.trim() === '') throw new Error(`${label} has no 'mainSha'.`);
   if (!Number.isInteger(json.repeats) || json.repeats < 1) throw new Error(`${label} 'repeats' must be a positive integer.`);
   if (typeof json.suite !== 'object' || json.suite === null) throw new Error(`${label} has no 'suite'.`);
-  const pooled = json.suite.pooledMustFind;
-  if (typeof pooled !== 'object' || pooled === null) throw new Error(`${label} has no 'suite.pooledMustFind' (the primary gate number).`);
+  const pooled = json.suite.pooledInventoryMustFind;
+  if (typeof pooled !== 'object' || pooled === null) throw new Error(`${label} has no 'suite.pooledInventoryMustFind' (the primary gate number).`);
   if (!Number.isInteger(pooled.found) || !Number.isInteger(pooled.opportunities) || pooled.opportunities < 1) {
-    throw new Error(`${label}.suite.pooledMustFind needs integer found + positive opportunities (got ${JSON.stringify(pooled)}).`);
+    throw new Error(`${label}.suite.pooledInventoryMustFind needs integer found + positive opportunities (got ${JSON.stringify(pooled)}).`);
   }
-  if (typeof pooled.gateFloor !== 'number' || !Number.isFinite(pooled.gateFloor)) throw new Error(`${label}.suite.pooledMustFind.gateFloor must be a finite number.`);
+  if (typeof pooled.gateFloor !== 'number' || !Number.isFinite(pooled.gateFloor)) throw new Error(`${label}.suite.pooledInventoryMustFind.gateFloor must be a finite number.`);
   if (!Array.isArray(json.cases) || json.cases.length === 0) throw new Error(`${label} has no 'cases'.`);
   const cases = json.cases.map((c, i) => {
     const at = `${label}.cases[${i}]`;
@@ -325,15 +366,32 @@ function parseBaseline(raw, label) {
     if (c.diagnosticFloor !== null && (typeof c.diagnosticFloor !== 'number' || !Number.isFinite(c.diagnosticFloor))) {
       throw new Error(`${at}.diagnosticFloor must be a finite number or null (got ${JSON.stringify(c.diagnosticFloor)}).`);
     }
-    return { case: c.case, diagnosticFloor: c.diagnosticFloor, mustFindRecall: parseBand(c.mustFindRecall, `${at}.mustFindRecall`) };
+    return { case: c.case, diagnosticFloor: c.diagnosticFloor, inventoryMustFindRecall: parseBand(c.inventoryMustFindRecall, `${at}.inventoryMustFindRecall`) };
   });
   return {
     schema: json.schema, mainSha: json.mainSha, generatedAt: json.generatedAt ?? null,
     engine: json.engine ?? null, matcher: json.matcher ?? null, repeats: json.repeats,
     degradationRule: json.degradationRule ?? null,
-    pooledMustFind: { found: pooled.found, opportunities: pooled.opportunities, rate: pooled.rate ?? null, gateFloor: pooled.gateFloor },
+    pooledInventoryMustFind: { found: pooled.found, opportunities: pooled.opportunities, rate: pooled.rate ?? null, gateFloor: pooled.gateFloor },
     cases,
   };
+}
+
+// [LAW:single-enforcer] THE gate predicate — the one place DEGRADATION_RULE is applied to a candidate.
+// The compare CLI (2fk.5) wraps this; nothing else re-implements the comparison. PURE: baseline is
+// parseBaseline's typed value, candidate is the candidate suite's pooled inventory must-find counts
+// (found/opportunities across all its N×cases runs), and the verdict is a value. A candidate rate below
+// the frozen gate floor is degradation beyond ~2σ sampling jitter. [LAW:effects-at-boundaries]
+function evaluateGate(baseline, candidate) {
+  if (!Number.isInteger(candidate.found) || !Number.isInteger(candidate.opportunities) || candidate.opportunities < 1) {
+    throw new Error(`evaluateGate: candidate needs integer found + positive opportunities (got ${JSON.stringify(candidate)}).`);
+  }
+  if (candidate.found > candidate.opportunities) {
+    throw new Error(`evaluateGate: candidate found > opportunities (${candidate.found}/${candidate.opportunities}).`);
+  }
+  const rate = candidate.found / candidate.opportunities;
+  const gateFloor = baseline.pooledInventoryMustFind.gateFloor;
+  return { degraded: rate < gateFloor, candidateRate: rate, gateFloor };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -348,7 +406,8 @@ function renderBaselineMarkdown(baseline) {
   const pct = (v) => (v === null || v === undefined ? 'n/a' : `${(v * 100).toFixed(0)}%`);
   const usd = (v) => (v === null || v === undefined ? 'n/a' : `$${v.toFixed(4)}`);
   const eng = baseline.engine;
-  const pooled = baseline.suite.pooledMustFind;
+  const pooled = baseline.suite.pooledInventoryMustFind;
+  const frozenPooled = baseline.suite.pooledMustFind;
   const lines = [
     `# Eval baseline — ${baseline.mainSha.slice(0, 7)} (${baseline.generatedAt})`,
     '',
@@ -358,23 +417,25 @@ function renderBaselineMarkdown(baseline) {
     `- **Engine (pinned):** \`${eng.provider}\` / \`${eng.model}\`${eng.reasoning ? ` / reasoning=${eng.reasoning}` : ''}`,
     `- **Matcher:** \`${baseline.matcher}\``,
     `- **Repeats (N):** ${baseline.repeats} per case`,
-    `- **PRIMARY GATE — pooled must-find recall:** ${pct(pooled.rate)} (${pooled.found}/${pooled.opportunities} across all ${baseline.repeats}×${baseline.suite.cases} runs); gate floor **${pct(pooled.gateFloor)}** (~2σ lower bound). A candidate below the floor is degraded.`,
-    `- **Suite mean of case means:** ${pct(baseline.suite.meanMustFindRecall)} (informational — the gate is the pooled rate above, not this average)`,
+    `- **PRIMARY GATE — pooled inventory must-find recall:** ${pct(pooled.rate)} (${pooled.found}/${pooled.opportunities} across all ${baseline.repeats}×${baseline.suite.cases} runs, against each case's pooled multi-round inventory); gate floor **${pct(pooled.gateFloor)}** (~2σ lower bound). A candidate below the floor is degraded.`,
+    `- **Frozen-round pooled must-find recall:** ${pct(frozenPooled.rate)} (${frozenPooled.found}/${frozenPooled.opportunities}) — continuity diagnostic, comparable with pre-inventory baselines; not a gate.`,
+    `- **Suite mean of per-case inventory recall means:** ${pct(baseline.suite.meanInventoryMustFindRecall)} (informational — the gate is the pooled inventory rate above, not this average)`,
     `- **Cost:** ${usd(baseline.suite.totalCostUsd)} total across ${baseline.suite.costedRuns} costed run(s)` +
       `${baseline.suite.uncostedRuns ? ` (+${baseline.suite.uncostedRuns} run(s) with no cost reported)` : ''}` +
       `, ≈ ${usd(baseline.suite.costPerFullRunUsd)} per full suite run (all cases once).`,
     '',
     '## Per-case must-find recall band (diagnostic)',
     '',
-    'These bands localize *which* case moves a pooled regression; they are not independent gates (per-case means are too noisy at these denominators — see the rule).',
+    'These bands localize *which* case moves a pooled regression; they are not independent gates (per-case means are too noisy at these denominators — see the rule). "inventory" spans every review round of the source PR; "frozen" is the single frozen round.',
     '',
-    '| case | must-find recall (mean / min / max) | diag. floor | per-run must-find | noise (mean) | cost/run (est.) |',
-    '|------|-------------------------------------|-------------|-------------------|--------------|-----------------|',
+    '| case | inventory recall (mean / min / max) | diag. floor | per-run inventory | frozen recall (mean) | per-run frozen | noise (mean) | cost/run (est.) |',
+    '|------|-------------------------------------|-------------|-------------------|----------------------|----------------|--------------|-----------------|',
   ];
   for (const c of baseline.cases) {
+    const inv = c.inventoryMustFindRecall;
     const mf = c.mustFindRecall;
     lines.push(
-      `| \`${c.case}\` | ${pct(mf.mean)} / ${pct(mf.min)} / ${pct(mf.max)} | ${pct(c.diagnosticFloor)} | ${c.perRun.join(' · ')} | ${c.noiseCount.mean === null ? 'n/a' : c.noiseCount.mean.toFixed(1)} | ${usd(c.costUsd.mean)} |`,
+      `| \`${c.case}\` | ${pct(inv.mean)} / ${pct(inv.min)} / ${pct(inv.max)} | ${pct(c.diagnosticFloor)} | ${c.perRunInventory.join(' · ')} | ${pct(mf.mean)} | ${c.perRun.join(' · ')} | ${c.noiseCount.mean === null ? 'n/a' : c.noiseCount.mean.toFixed(1)} | ${usd(c.costUsd.mean)} |`,
     );
   }
   lines.push('');
@@ -382,7 +443,7 @@ function renderBaselineMarkdown(baseline) {
   lines.push('');
   lines.push(baseline.degradationRule.description);
   lines.push('');
-  lines.push(`Mechanically: \`candidate.suite.pooledMustFind.rate < ${pct(pooled.gateFloor)}\` (this baseline's \`suite.pooledMustFind.gateFloor\`) ⇒ the suite is DEGRADED.`);
+  lines.push(`Mechanically: \`candidate.suite.pooledInventoryMustFind.rate < ${pct(pooled.gateFloor)}\` (this baseline's \`suite.pooledInventoryMustFind.gateFloor\`) ⇒ the suite is DEGRADED.`);
   lines.push('');
   return lines.join('\n') + '\n';
 }
@@ -457,6 +518,6 @@ if (require.main === module) {
 
 module.exports = {
   parseArgs, parseBand, parseCaseSummary, parseCaseEngine, parseFraction,
-  sameEngine, pooledFloor, buildBaseline, parseBaseline, renderBaselineMarkdown,
+  sameEngine, pooledFloor, buildBaseline, parseBaseline, evaluateGate, renderBaselineMarkdown,
   DEGRADATION_RULE,
 };
