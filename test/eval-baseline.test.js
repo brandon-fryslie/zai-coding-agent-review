@@ -20,6 +20,7 @@ function summaryFixture(overrides = {}) {
     mustFindRecall: { mean: 0.5, min: 0.3333, max: 0.6667, n: 2 },
     inventoryMustFindRecall: { mean: 0.5, min: 0.3333, max: 0.6667, n: 2 },
     niceToFindRecall: { mean: 0.25, min: 0, max: 0.5, n: 2 },
+    inventoryNiceToFindRecall: { mean: 0.25, min: 0, max: 0.5, n: 2 },
     noiseCount: { mean: 1, min: 0, max: 2, n: 2 },
     costUsd: { mean: 0.2, min: 0.18, max: 0.22, n: 2 },
     perRun: [
@@ -42,6 +43,7 @@ function caseEntry(name, mustFindBand, opts = {}) {
       mustFindRecall: mustFindBand,
       inventoryMustFindRecall: opts.inventoryBand ?? mustFindBand,
       niceToFindRecall: { mean: 0, min: 0, max: 0, n: 2 },
+      inventoryNiceToFindRecall: { mean: 0.5, min: 0.5, max: 0.5, n: 2 },
       noiseCount: { mean: 1, min: 0, max: 2, n: 2 },
       costUsd: { mean: 0.2, min: 0.1, max: 0.3, n: 2 },
       perRun: opts.perRun ?? [
@@ -116,6 +118,7 @@ test('parseCaseSummary keeps the reduced fields and rejects malformed summaries'
   // A pre-inventory (v1-era) summary is rejected loudly — re-score with the current scorer, never pool a
   // missing inventory as zero.
   assert.throws(() => parseCaseSummary(summaryFixture({ inventoryMustFindRecall: undefined }), 'x'), /inventoryMustFindRecall/);
+  assert.throws(() => parseCaseSummary(summaryFixture({ inventoryNiceToFindRecall: undefined }), 'x'), /inventoryNiceToFindRecall/);
   // perRun length must agree with `runs` — a desync would silently pool the wrong total.
   assert.throws(() => parseCaseSummary(summaryFixture({ runs: 3 }), 'x'), /2 perRun entries but claims runs=3/);
   // A perRun entry with an absent or non-string fraction is rejected at the boundary (never leaks a null
@@ -177,6 +180,8 @@ test('buildBaseline freezes diagnostic bands, the pooled gate, suite cost, and t
   assert.equal(b.cases[1].diagnosticFloor, 1);
   assert.deepEqual(b.cases[0].perRun, ['1/3', '2/3']);
   assert.deepEqual(b.cases[0].perRunInventory, ['3/9', '4/9']);
+  // The inventory nice-to-find band is carried per-case (json-only, like the frozen-round nice band).
+  assert.deepEqual(b.cases[0].inventoryNiceToFindRecall, { mean: 0.5, min: 0.5, max: 0.5, n: 2 });
   // PRIMARY GATE: pooled INVENTORY recall across every run of every case. Both cases run perRunInventory
   // ['3/9','4/9'] ⇒ each pools 7 found / 18 opportunities; two cases ⇒ 14/36, with a ~2σ lower bound floor.
   assert.equal(b.suite.pooledInventoryMustFind.found, 14);

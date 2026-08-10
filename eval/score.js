@@ -343,12 +343,14 @@ function aggregateRuns(caseName, scorecards) {
     mustFindRecall: band(scorecards.map(s => s.mustFind.recall)),
     inventoryMustFindRecall: band(scorecards.map(s => s.inventoryMustFind.recall)),
     niceToFindRecall: band(scorecards.map(s => s.niceToFind.recall)),
+    inventoryNiceToFindRecall: band(scorecards.map(s => s.inventoryNiceToFind.recall)),
     noiseCount: band(scorecards.map(s => s.noise.count)),
     costUsd: band(scorecards.map(s => costUsd(s.usage))),
     perRun: scorecards.map(s => ({
       mustFind: `${s.mustFind.found}/${s.mustFind.total}`,
       inventoryMustFind: `${s.inventoryMustFind.found}/${s.inventoryMustFind.total}`,
       niceToFind: `${s.niceToFind.found}/${s.niceToFind.total}`,
+      inventoryNiceToFind: `${s.inventoryNiceToFind.found}/${s.inventoryNiceToFind.total}`,
       noise: s.noise.count,
       costUsd: costUsd(s.usage),
     })),
@@ -364,11 +366,13 @@ function renderTable(summary) {
   const mf = summary.mustFindRecall;
   const inv = summary.inventoryMustFindRecall;
   const nf = summary.niceToFindRecall;
+  const invNf = summary.inventoryNiceToFindRecall;
   const lines = [
     `Case: ${summary.case}   (matcher: ${summary.matcher}, ${summary.runs} run${summary.runs === 1 ? '' : 's'})`,
     `  must-find recall (frozen round):  mean ${pct(mf.mean)}  min ${pct(mf.min)}  max ${pct(mf.max)}`,
     `  inventory recall (all rounds):    mean ${pct(inv.mean)}  min ${pct(inv.min)}  max ${pct(inv.max)}   [PRIMARY]`,
-    `  nice-to-find recall:              mean ${pct(nf.mean)}  min ${pct(nf.min)}  max ${pct(nf.max)}`,
+    `  nice-to-find recall (frozen):     mean ${pct(nf.mean)}  min ${pct(nf.min)}  max ${pct(nf.max)}`,
+    `  nice-to-find recall (inventory):  mean ${pct(invNf.mean)}  min ${pct(invNf.min)}  max ${pct(invNf.max)}`,
     `  noise / run:                      mean ${num(summary.noiseCount.mean)}  min ${num(summary.noiseCount.min)}  max ${num(summary.noiseCount.max)}`,
     `  cost / run (est.):                mean ${usd(summary.costUsd.mean)}`,
     `  per run (must·inv·nice): ${summary.perRun.map(r => `${r.mustFind}·${r.inventoryMustFind}·${r.niceToFind}`).join('   ')}`,

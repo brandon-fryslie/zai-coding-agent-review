@@ -56,6 +56,12 @@
         "max": 0.5,
         "n": 5
       },
+      "inventoryNiceToFindRecall": {
+        "mean": 0.14666666666666667,
+        "min": 0,
+        "max": 0.3333333333333333,
+        "n": 5
+      },
       "noiseCount": {
         "mean": 2.2,
         "min": 0,
@@ -102,6 +108,12 @@
         "mean": 0.05,
         "min": 0,
         "max": 0.25,
+        "n": 5
+      },
+      "inventoryNiceToFindRecall": {
+        "mean": 0.04,
+        "min": 0,
+        "max": 0.2,
         "n": 5
       },
       "noiseCount": {
@@ -152,6 +164,12 @@
         "max": 0.6666666666666666,
         "n": 5
       },
+      "inventoryNiceToFindRecall": {
+        "mean": 0.19999999999999998,
+        "min": 0.16666666666666666,
+        "max": 0.25,
+        "n": 5
+      },
       "noiseCount": {
         "mean": 2.8,
         "min": 2,
@@ -198,6 +216,12 @@
         "mean": 0,
         "min": 0,
         "max": 0,
+        "n": 5
+      },
+      "inventoryNiceToFindRecall": {
+        "mean": 0.04444444444444444,
+        "min": 0,
+        "max": 0.2222222222222222,
         "n": 5
       },
       "noiseCount": {

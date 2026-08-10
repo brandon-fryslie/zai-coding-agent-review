@@ -148,6 +148,7 @@ function parseCaseSummary(raw, label) {
     mustFindRecall: parseBand(json.mustFindRecall, `${label}.mustFindRecall`),
     inventoryMustFindRecall: parseBand(json.inventoryMustFindRecall, `${label}.inventoryMustFindRecall`),
     niceToFindRecall: parseBand(json.niceToFindRecall, `${label}.niceToFindRecall`),
+    inventoryNiceToFindRecall: parseBand(json.inventoryNiceToFindRecall, `${label}.inventoryNiceToFindRecall`),
     noiseCount: parseBand(json.noiseCount, `${label}.noiseCount`),
     costUsd: parseBand(json.costUsd, `${label}.costUsd`),
     perRun: json.perRun.map((r, i) => {
@@ -279,6 +280,7 @@ function buildBaseline({ cases, provenance }) {
     mustFindRecall: c.summary.mustFindRecall,
     inventoryMustFindRecall: c.summary.inventoryMustFindRecall,
     niceToFindRecall: c.summary.niceToFindRecall,
+    inventoryNiceToFindRecall: c.summary.inventoryNiceToFindRecall,
     noiseCount: c.summary.noiseCount,
     costUsd: c.summary.costUsd,
     // DIAGNOSTIC floor — this case's observed worst inventory must-find recall (min). NOT a gate on its own

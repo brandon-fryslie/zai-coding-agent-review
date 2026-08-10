@@ -238,6 +238,7 @@ test('aggregateRuns forms a mean/min/max band and skips null recalls', () => {
     mustFind: { found, total, recall: total ? found / total : null },
     inventoryMustFind: { found: invFound, total: invTotal, recall: invTotal ? invFound / invTotal : null },
     niceToFind: { found: 0, total: 0, recall: null },
+    inventoryNiceToFind: { found: 1, total: 2, recall: 0.5 },
     noise: { count: noise },
     usage: { cost: { available: true, usd } },
   });
@@ -252,6 +253,9 @@ test('aggregateRuns forms a mean/min/max band and skips null recalls', () => {
   assert.deepEqual(s.perRun.map(r => r.inventoryMustFind), ['8/9', '5/9', '6/9']);
   assert.equal(s.niceToFindRecall.n, 0); // all null → skipped, band is empty
   assert.equal(s.niceToFindRecall.mean, null);
+  // The inventory nice-to-find band is aggregated too (not dead per-run storage), with a perRun fraction.
+  assert.equal(s.inventoryNiceToFindRecall.mean, 0.5);
+  assert.deepEqual(s.perRun.map(r => r.inventoryNiceToFind), ['1/2', '1/2', '1/2']);
   assert.equal(s.noiseCount.mean, 3);
   assert.ok(Math.abs(s.costUsd.mean - 0.02) < 1e-9);
   assert.ok(renderTable(s).includes('must-find recall'));
