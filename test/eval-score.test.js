@@ -56,16 +56,33 @@ const EXPECTED = JSON.stringify({
 
 test('parseExpected keeps the scoring fields and rejects bad ones', () => {
   const e = parseExpected(EXPECTED, 'expected.json');
-  assert.equal(e.length, 3);
-  assert.deepEqual(e[0], { commentId: 1, path: 'a.ts', line: 10, annotation: 'must-find', body: 'null deref on close' });
-  assert.throws(() => parseExpected('{}', 'x'), /no 'findings' array/);
-  assert.throws(() => parseExpected(JSON.stringify({ findings: [{ path: 'a', line: 1, body: 'b', annotation: 'UNREVIEWED' }] }), 'x'), /still UNREVIEWED/);
-  assert.throws(() => parseExpected(JSON.stringify({ findings: [{ path: 'a', line: 1, body: 'b', annotation: 'maybe' }] }), 'x'), /invalid annotation/);
-  assert.throws(() => parseExpected(JSON.stringify({ findings: [{ path: 'a', line: 0, body: 'b', annotation: 'noise' }] }), 'x'), /invalid line/);
-  assert.throws(() => parseExpected(JSON.stringify({ findings: [{ path: '', line: 1, body: 'b', annotation: 'noise' }] }), 'x'), /invalid path/);
+  assert.equal(e.reviewId, 1);
+  assert.equal(e.findings.length, 3);
+  // A finding with no reviewId of its own belongs to the frozen round — resolved at the boundary.
+  assert.deepEqual(e.findings[0], { commentId: 1, path: 'a.ts', line: 10, annotation: 'must-find', body: 'null deref on close', reviewId: 1 });
+  assert.throws(() => parseExpected(JSON.stringify({ reviewId: 1 }), 'x'), /no 'findings' array/);
+  assert.throws(() => parseExpected(JSON.stringify({ findings: [] }), 'x'), /no integer top-level 'reviewId'/);
+  const one = (f) => JSON.stringify({ reviewId: 1, findings: [f] });
+  assert.throws(() => parseExpected(one({ path: 'a', line: 1, body: 'b', annotation: 'UNREVIEWED' }), 'x'), /still UNREVIEWED/);
+  assert.throws(() => parseExpected(one({ path: 'a', line: 1, body: 'b', annotation: 'maybe' }), 'x'), /invalid annotation/);
+  assert.throws(() => parseExpected(one({ path: 'a', line: 0, body: 'b', annotation: 'noise' }), 'x'), /invalid line/);
+  assert.throws(() => parseExpected(one({ path: '', line: 1, body: 'b', annotation: 'noise' }), 'x'), /invalid path/);
+  assert.throws(() => parseExpected(one({ path: 'a', line: 1, body: 'b', annotation: 'noise', reviewId: 'r2' }), 'x'), /non-integer reviewId/);
   // Valid-but-wrong-typed JSON is rejected at the shared object boundary, not with a cryptic field-access crash.
   assert.throws(() => parseExpected('123', 'x'), /not a JSON object/);
   assert.throws(() => parseExpected('null', 'x'), /not a JSON object/);
+});
+
+test('parseExpected carries an inventory finding\'s own source round', () => {
+  const e = parseExpected(JSON.stringify({
+    reviewId: 10, headSha: 'abc',
+    findings: [
+      { commentId: 1, path: 'a.ts', line: 5, annotation: 'must-find', body: 'frozen-round defect' },
+      { commentId: 2, path: 'b.ts', line: 9, annotation: 'must-find', body: 'later-round defect', reviewId: 30 },
+    ],
+  }), 'expected.json');
+  assert.equal(e.findings[0].reviewId, 10);
+  assert.equal(e.findings[1].reviewId, 30);
 });
 
 test('parseProduced accepts the raw merged-findings shape and rejects malformed', () => {
@@ -103,7 +120,7 @@ test('pairCandidates pairs only same-path findings within the line window', () =
     { path: 'a.ts', line: 50, body: 'x', severity: null }, // exact match to line 50
     { path: 'c.ts', line: 10, body: 'x', severity: null }, // different file → no pair
   ];
-  const pairs = pairCandidates(EXPECTED_V, produced, 10);
+  const pairs = pairCandidates(EXPECTED_V.findings, produced, 10);
   // expected[0] (a.ts:10) pairs with produced[0]; expected[1] (a.ts:50) pairs with produced[2].
   assert.deepEqual(pairs.map(p => p.key).sort(), ['0:0', '1:2']);
   const p00 = pairs.find(p => p.key === '0:0');
@@ -135,30 +152,63 @@ test('computeMetrics buckets by annotation and counts noise', async () => {
     { path: 'a.ts', line: 50, body: 'perf concern reading file', severity: 'advisory' }, // matches nice-to-find (kw "perf")
     { path: 'z.ts', line: 99, body: 'totally novel finding', severity: 'advisory' }, // matches nothing → noise
   ];
-  const pairs = pairCandidates(EXPECTED_V, produced, 10);
-  const decisions = await keywordJudge(pairs.map(p => ({ key: p.key, expectedBody: EXPECTED_V[p.expectedIdx].body, producedBody: produced[p.producedIdx].body })));
+  const pairs = pairCandidates(EXPECTED_V.findings, produced, 10);
+  const decisions = await keywordJudge(pairs.map(p => ({ key: p.key, expectedBody: EXPECTED_V.findings[p.expectedIdx].body, producedBody: produced[p.producedIdx].body })));
   const m = computeMetrics(EXPECTED_V, produced, pairs, decisions);
   assert.deepEqual(m.mustFind, { total: 1, found: 1, recall: 1, foundIds: [1], missedIds: [] });
   assert.deepEqual(m.niceToFind, { total: 1, found: 1, recall: 1, foundIds: [2], missedIds: [] });
   assert.equal(m.knownNoise.total, 1); // the 'noise'-annotated expected was never produced
   assert.equal(m.knownNoise.found, 0);
+  // With no inventory rounds, the inventory view equals the frozen-round view.
+  assert.deepEqual(m.inventoryMustFind, m.mustFind);
+  assert.deepEqual(m.inventoryNiceToFind, m.niceToFind);
   assert.equal(m.noise.count, 1); // the novel z.ts finding matched nothing
   assert.equal(m.noise.items[0].path, 'z.ts');
 });
 
 test('computeMetrics: a missed must-find drops recall and is listed', async () => {
   const produced = [{ path: 'a.ts', line: 50, body: 'perf concern reading file', severity: 'advisory' }]; // only the nice-to-find
-  const pairs = pairCandidates(EXPECTED_V, produced, 10);
-  const decisions = await keywordJudge(pairs.map(p => ({ key: p.key, expectedBody: EXPECTED_V[p.expectedIdx].body, producedBody: produced[p.producedIdx].body })));
+  const pairs = pairCandidates(EXPECTED_V.findings, produced, 10);
+  const decisions = await keywordJudge(pairs.map(p => ({ key: p.key, expectedBody: EXPECTED_V.findings[p.expectedIdx].body, producedBody: produced[p.producedIdx].body })));
   const m = computeMetrics(EXPECTED_V, produced, pairs, decisions);
   assert.equal(m.mustFind.recall, 0);
   assert.deepEqual(m.mustFind.missedIds, [1]);
   assert.equal(m.noise.count, 0); // the produced finding matched the nice-to-find, so it is not noise
 });
 
+// The inventory view: a case whose expected set pools findings from several review rounds. The frozen-round
+// buckets stay scoped to the frozen review (their numbers can't move when an inventory is added), while
+// inventoryMustFind spans every round — and a produced finding that matches only a later-round defect is an
+// early find, never noise. [LAW:verifiable-goals] This is the ticket's core metric.
+test('computeMetrics scores inventory recall across rounds without moving frozen-round buckets', async () => {
+  const expected = parseExpected(JSON.stringify({
+    reviewId: 100, headSha: 'abc',
+    findings: [
+      { commentId: 1, path: 'a.ts', line: 10, annotation: 'must-find', body: 'null deref on close' },
+      { commentId: 2, path: 'b.ts', line: 40, annotation: 'must-find', body: 'race on refold counter', reviewId: 300 },
+      { commentId: 3, path: 'c.ts', line: 7, annotation: 'must-find', body: 'leak of watcher handle', reviewId: 500 },
+    ],
+  }), 'e');
+  const produced = [
+    { path: 'a.ts', line: 10, body: 'null pointer at close()', severity: 'blocking' },   // frozen-round must-find
+    { path: 'b.ts', line: 42, body: 'race condition double-counts refold', severity: 'blocking' }, // round-300 must-find
+  ];
+  const pairs = pairCandidates(expected.findings, produced, 10);
+  const decisions = await keywordJudge(pairs.map(p => ({ key: p.key, expectedBody: expected.findings[p.expectedIdx].body, producedBody: produced[p.producedIdx].body })));
+  const m = computeMetrics(expected, produced, pairs, decisions);
+  // Frozen-round view: only commentId 1 is in scope, and it was found.
+  assert.deepEqual(m.mustFind, { total: 1, found: 1, recall: 1, foundIds: [1], missedIds: [] });
+  // Inventory view: all three rounds' must-finds; 2 of 3 found, the round-500 leak missed.
+  assert.deepEqual(m.inventoryMustFind, { total: 3, found: 2, recall: 2 / 3, foundIds: [1, 2], missedIds: [3] });
+  // The early find of the round-300 defect is a find, not noise.
+  assert.equal(m.noise.count, 0);
+  // The pair detail names the source round of each expected finding.
+  assert.ok(m.pairs.every(p => [100, 300].includes(p.expectedReviewId)));
+});
+
 test('computeMetrics aborts loudly if a candidate pair has no decision', () => {
   const produced = [{ path: 'a.ts', line: 10, body: 'x', severity: null }];
-  const pairs = pairCandidates(EXPECTED_V, produced, 10);
+  const pairs = pairCandidates(EXPECTED_V.findings, produced, 10);
   assert.throws(() => computeMetrics(EXPECTED_V, produced, pairs, new Map()), /no decision for candidate pair/);
 });
 
@@ -175,28 +225,37 @@ test('scoreRun produces a timestamp-free, re-runnable scorecard', async () => {
   assert.deepEqual(a, b); // deterministic given the same judge
   assert.equal(a.case, 'demo');
   assert.equal(a.mustFind.recall, 1);
+  // The scorecard reports the inventory view alongside the frozen-round buckets.
+  assert.equal(a.inventoryMustFind.recall, 1);
   assert.equal(a.noise.count, 1);
   assert.equal(a.usage.cost.usd, 0.5);
 });
 
 test('aggregateRuns forms a mean/min/max band and skips null recalls', () => {
-  const mk = (found, total, noise, usd) => ({
+  // Each fixture run found `found` of the 7 frozen-round must-finds and invFound of the 9 inventory-wide ones.
+  const mk = (found, total, invFound, invTotal, noise, usd) => ({
     matcher: 'fake',
     mustFind: { found, total, recall: total ? found / total : null },
+    inventoryMustFind: { found: invFound, total: invTotal, recall: invTotal ? invFound / invTotal : null },
     niceToFind: { found: 0, total: 0, recall: null },
     noise: { count: noise },
     usage: { cost: { available: true, usd } },
   });
-  const s = aggregateRuns('demo', [mk(7, 7, 2, 0.01), mk(5, 7, 4, 0.02), mk(6, 7, 3, 0.03)]);
+  const s = aggregateRuns('demo', [mk(7, 7, 8, 9, 2, 0.01), mk(5, 7, 5, 9, 4, 0.02), mk(6, 7, 6, 9, 3, 0.03)]);
   assert.equal(s.runs, 3);
   assert.equal(s.mustFindRecall.max, 1);
   assert.equal(s.mustFindRecall.min, 5 / 7);
   assert.ok(Math.abs(s.mustFindRecall.mean - (1 + 5 / 7 + 6 / 7) / 3) < 1e-9);
+  // The inventory band aggregates the inventory-wide recalls, and perRun carries both fractions.
+  assert.equal(s.inventoryMustFindRecall.max, 8 / 9);
+  assert.equal(s.inventoryMustFindRecall.min, 5 / 9);
+  assert.deepEqual(s.perRun.map(r => r.inventoryMustFind), ['8/9', '5/9', '6/9']);
   assert.equal(s.niceToFindRecall.n, 0); // all null → skipped, band is empty
   assert.equal(s.niceToFindRecall.mean, null);
   assert.equal(s.noiseCount.mean, 3);
   assert.ok(Math.abs(s.costUsd.mean - 0.02) < 1e-9);
   assert.ok(renderTable(s).includes('must-find recall'));
+  assert.ok(renderTable(s).includes('inventory recall'));
 });
 
 // ── lexical judge (the offline fallback) ─────────────────────────────────────────────────────────────
