@@ -310,6 +310,25 @@ test('parseJudgeResponse accepts a bare single object for a one-pair batch', () 
   assert.throws(() => parseJudgeResponse('{"i":2,"match":true}', 1), /omitted a decision for pair 1/);
 });
 
+// The judge sometimes emits a STREAM of bare objects separated by blank lines for a multi-pair batch —
+// observed live (deepseek-v4-flash, cc-candybar scoring, 2026-08-10) and deterministic for some batches,
+// so it must read as the same one-object-per-pair contract, not abort the case's whole scorecard.
+test('parseJudgeResponse accepts concatenated bare objects for a multi-pair batch', () => {
+  const stream = '{"i": 1, "match": true, "reason": "same defect"}\n\n{"i": 2, "match": false, "reason": "different"}\n\n{"i": 3, "match": true, "reason": "brace {inside} a string"}';
+  assert.deepEqual(parseJudgeResponse(stream, 3), [
+    { match: true, reason: 'same defect' },
+    { match: false, reason: 'different' },
+    { match: true, reason: 'brace {inside} a string' },
+  ]);
+  // The array form stays preferred: an array response whose reasons contain braces is read as the array.
+  const arr = parseJudgeResponse('[{"i":1,"match":true,"reason":"a {b}"},{"i":2,"match":true,"reason":"c"}]', 2);
+  assert.equal(arr.length, 2);
+  // A stream that omits a pair still aborts loudly — completeness stays enforced downstream.
+  assert.throws(() => parseJudgeResponse('{"i":1,"match":true}\n\n{"i":3,"match":true}', 3), /omitted a decision for pair 2/);
+  // An unparseable object in the stream aborts the extraction rather than dropping rulings.
+  assert.throws(() => parseJudgeResponse('{"i":1,"match":true}\n\n{"i":2 match:false}', 2), /not valid JSON/);
+});
+
 test('buildJudgePrompt numbers pairs and states the JSON contract', () => {
   const prompt = buildJudgePrompt([{ expectedBody: 'E1', producedBody: 'P1' }, { expectedBody: 'E2', producedBody: 'P2' }]);
   assert.ok(prompt.includes('Pair 1:'));

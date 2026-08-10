@@ -467,22 +467,50 @@ function extractText(envelope) {
 }
 
 // Extract the judge's decision list from its raw text. The output contract is "one decision object per
-// pair"; the model honors it as a JSON array for a multi-pair batch but drops the brackets and emits a
-// BARE OBJECT for a single-pair batch (`{"i":1,...}` not `[{"i":1,...}]`) — a valid instance of the same
-// contract. [LAW:one-type-per-behavior] Both are read to ONE shape (a list of decision objects) here, so
-// parseJudgeResponse validates a single path. Array is preferred, so a well-formed array whose text also
-// contains braces is never mis-read as an object. [LAW:no-silent-failure] Neither shape present ⇒ throw.
+// pair"; the model honors it in more than one concrete shape — a JSON array for a multi-pair batch, a
+// BARE OBJECT for a single-pair batch (`{"i":1,...}` not `[{"i":1,...}]`), and sometimes a STREAM of
+// bare objects separated by blank lines (`{"i":1,...}\n\n{"i":2,...}`) — all valid instances of the same
+// contract. [LAW:one-type-per-behavior] Every shape is read to ONE list of decision objects here, so
+// parseJudgeResponse validates a single path: the array is preferred (a well-formed array whose text also
+// contains braces is never mis-read as objects), and otherwise a balanced-brace scan collects every
+// top-level object — which subsumes the single-bare-object case as a stream of length 1, one mechanism
+// instead of two. [LAW:no-silent-failure] No shape present, or an unparseable object, ⇒ throw; complete-
+// ness against the batch (every pair ruled) stays parseJudgeResponse's job.
 function extractDecisionList(text) {
-  const tryParse = (open, close) => {
-    const start = text.indexOf(open);
-    const end = text.lastIndexOf(close);
+  const tryArray = () => {
+    const start = text.indexOf('[');
+    const end = text.lastIndexOf(']');
     if (start === -1 || end === -1 || end < start) return undefined;
     try { return JSON.parse(text.slice(start, end + 1)); } catch { return undefined; }
   };
-  const arr = tryParse('[', ']');
+  const arr = tryArray();
   if (Array.isArray(arr)) return arr;
-  const obj = tryParse('{', '}');
-  if (obj && typeof obj === 'object' && !Array.isArray(obj)) return [obj];
+
+  // Balanced-brace scan: each top-level {...} span (string-aware, so a brace inside a "reason" cannot
+  // split an object) parses as one decision. A span that is not valid JSON fails the whole extraction
+  // loudly — a half-readable response must never silently drop rulings.
+  const objs = [];
+  let depth = 0, start = -1, inString = false, escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"' && depth > 0) inString = true;
+    else if (c === '{') { if (depth === 0) start = i; depth++; }
+    else if (c === '}' && depth > 0) {
+      depth--;
+      if (depth === 0) {
+        try { objs.push(JSON.parse(text.slice(start, i + 1))); } catch {
+          throw new Error(`Judge response object is not valid JSON: ${text.slice(start, i + 1).slice(0, 300)}`);
+        }
+      }
+    }
+  }
+  if (objs.length > 0) return objs;
   throw new Error(`Judge response is not a JSON array or object: ${text.slice(0, 300)}`);
 }
 
