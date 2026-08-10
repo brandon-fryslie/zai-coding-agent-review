@@ -71,6 +71,76 @@
       "justification": "Correct supply-chain finding with the correct fix: after the telemetry goroutine was deleted, eventsapi_schema is still a direct `require` with no importing source \u2014 go.mod no longer matches actual imports; `go mod tidy` moves it to // indirect. This is the case's headline catch (the telemetry removal left dependency drift).",
       "diffHunk": "@@ -0,0 +1,172 @@\n+module github.com/dolthub/driver\n+\n+go 1.25.6\n+\n+require (\n+\tgithub.com/cenkalti/backoff/v4 v4.2.1\n+\tgithub.com/dolthub/dolt/go v0.40.5-0.20260313234613-4069302e7692\n+\tgithub.com/dolthub/eventsapi_schema v0.0.0-20260310172945-37a9265ade69",
       "body": "**Advisory (non-blocking):** [LAW:one-source-of-truth] `eventsapi_schema` is still listed as a direct `require` (no `// indirect` suffix), but the patch removed all source code that directly imports it (the `emitUsageEvent` goroutine and its imports were deleted from connector.go and driver.go). The go.mod no longer accurately reflects actual imports. The module still needs this dependency transitively through `dolthub/dolt/go`, so `go mod tidy` inside the vendored directory would move it to the `// indirect` block. This creates drift between the go.mod and the source code. Fix: run `go mod tidy` inside `internal/vendor/dolthub-driver/` to let the tool update the go.mod/go.sum to match actual imports."
+    },
+    {
+      "commentId": 3655777817,
+      "reviewId": 4785367888,
+      "path": "internal/vendor/dolthub-driver/result.go",
+      "line": 55,
+      "side": "RIGHT",
+      "annotation": "must-find",
+      "justification": "Real bug, distinct from frozen must-find 3655492243 (which is close-error MASKING the iteration error): here the closeErr is stored without translateError, so a go-mysql-server close error never becomes *mysql.MySQLError and caller type-assertions miss. Different defect, different fix (wrap with translateError). Present at the frozen head (the untranslated rowItr.Close at line 55). Round-3 finding, re-anchored from :63@67f679d.",
+      "body": "Bug: the `closeErr` from `rowItr.Close()` is returned as-is without translation through `translateError`, while the iteration error at line 42 IS translated. If `Close()` returns a go-mysql-server error, callers (or database/sql wrappers) that type-assert to `*mysql.MySQLError` will not match on the close error, even though the same underlying error from the iteration path would have been translated. Fix: wrap `closeErr` with `translateError` before storing it in the result, matching the pattern used for the iteration error."
+    },
+    {
+      "commentId": 3655777820,
+      "reviewId": 4785367888,
+      "path": "internal/vendor/dolthub-driver/errors.go",
+      "line": 29,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real advisory: translateError always constructs a MySQLError even when CastSQLError extracted nothing (a filesystem error or context cancellation becomes Num=0, Message=\"\"), silently discarding the original diagnostic. Present verbatim at the frozen head (lines 29-30). Round-3 finding at :29@67f679d.",
+      "body": "**Advisory (non-blocking):** [LAW:no-silent-failure] `translateError` always constructs a `*mysql.MySQLError` regardless of whether `sql.CastSQLError` succeeded in extracting meaningful fields. If the input error is not a recognized SQL error (e.g., a filesystem error, a context cancellation), `CastSQLError` may return a zero-value (Num=0, Message=\"\"), silently discarding the original error's diagnostic content. Fix: check whether the cast produced a non-zero error number before constructing the MySQL error; if not, return the original error unchanged so it is not silently discarded."
+    },
+    {
+      "commentId": 3655777822,
+      "reviewId": 4785367888,
+      "path": "internal/vendor/dolthub-driver/query_splitter.go",
+      "line": 68,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real dead code: QuerySplitter/parseNext are never called from production (conn.go uses gms.NewMysqlParser), duplicating statement-splitting with divergent edge semantics. Re-reported in round 5 (3655899924, deduped into this entry). Present at the frozen head (type at line 68). Round-3 finding at :68@67f679d.",
+      "body": "**Advisory (non-blocking):** [LAW:decomposition] Dead code: the entire `QuerySplitter` type and `parseNext` function are never called from production code. The actual multi-statement statement splitting is done by `gms.NewMysqlParser()` in `conn.go:73`. The `QuerySplitter` duplicates statement-parsing logic (with different, likely incorrect semantics for edge cases like double-escaped quotes), adds maintenance burden, and has its own test that exercises dead paths. Fix: remove the unused code, or if it serves as a simpler fallback for a future path, document that intent explicitly."
+    },
+    {
+      "commentId": 3655838468,
+      "reviewId": 4785449878,
+      "path": "internal/vendor/dolthub-driver/go.mod",
+      "line": 3,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real one-source-of-truth drift: the go directive is independently owned in two go.mod files with two values (top-level 1.25.7 vs vendor 1.25.6) and no tool keeps them in sync. Present at the frozen head (line 3). Supersedes round-2's 3655777831, whose 'exceeds current stable Go' premise was internally inconsistent with the top-level pin. Round-4 finding, re-anchored from @0fb334f.",
+      "body": "**Advisory (non-blocking):** [LAW:one-source-of-truth] The `go` directive version is independently owned in two go.mod files with two different values: `go 1.25.7` in the top-level go.mod (line 3) and `go 1.25.6` in the vendor go.mod. When the top-level module bumps its Go version requirement, the vendor module will silently remain at the old minimum unless updated by hand. While the main module's version governs at build time, the vendor's go.mod claims a minimum that no automated tool keeps in sync. Concretely, this means a `go mod tidy` or test run inside the vendor directory could expose the wrong Go version floor. Fix: pin these to the same version (1.25.7) or add a note in README.lit-patch.md that the `go` line must be bumped alongside the top-level one when refreshing."
+    },
+    {
+      "commentId": 3655838491,
+      "reviewId": 4785449878,
+      "path": "internal/vendor/dolthub-driver/query_splitter_test.go",
+      "line": 80,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real dead code, distinct from the query_splitter.go finding: the split helper (lines 80-89) is defined and never called in the file or package. Present verbatim at the frozen head. Round-4 finding at :80@0fb334f.",
+      "body": "**Advisory (non-blocking):** Dead code: the `split` function (lines 80-89) is defined but never called anywhere in this file or the package. It splits a string on newlines and trims a trailing empty element \u2014 a helper that appears to have been written for a test case that was either removed or rewritten to use `strings.Join` instead. Remove it to avoid misleading future maintainers."
+    },
+    {
+      "commentId": 3655899904,
+      "reviewId": 4785523761,
+      "path": "internal/vendor/dolthub-driver/go.mod",
+      "line": 172,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real advisory with correct Go semantics: replace directives in a transitive module's go.mod are ignored by the main-module build, so the vendored driver's flatbuffers replace is inert \u2014 either dead (misleading) or a silently unmet need. Present at the frozen head (line 172). Round-5 finding, re-anchored from :162@35427b2.",
+      "body": "**Advisory (non-blocking):** [LAW:one-source-of-truth] The vendored driver's `replace` for `github.com/google/flatbuffers` is silently ignored when building from the root module \u2014 Go only applies `replace` directives from the main module's `go.mod`, not from transitive dependencies. The root `go.mod` uses `github.com/dolthub/flatbuffers/v23` (a different module path entirely), so this `replace` has no effect. If the driver genuinely needs the dolthub flatbuffers fork (v1.13.0-dh.1), the build may silently pick up the wrong flatbuffers and fail at runtime or produce incorrect behavior. If it doesn't need it, the directive is dead code that misleads maintainers about what actually gets used. Fix: either move this `replace` into the root `go.mod` (if needed), or remove it (if not needed)."
+    },
+    {
+      "commentId": 3655899918,
+      "reviewId": 4785523761,
+      "path": "internal/vendor/dolthub-driver/conn.go",
+      "line": 113,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real advisory edge: BeginTx accepts ctx but executes BEGIN with the connection-level d.gmsCtx, so caller deadlines/cancellation are ignored. Present at the frozen head (BeginTx at line 113). Round-5 finding at :113@35427b2.",
+      "body": "**Advisory (non-blocking):** Edge case \u2014 BeginTx accepts `ctx context.Context` but never uses it; the BEGIN query on line 118 is executed with `d.gmsCtx` (the connection-level context, created once during Connect). This means a caller-provided context with a deadline or cancellation is ignored \u2014 `d.se.Query(d.gmsCtx, \"BEGIN;\")` will not be interrupted if the caller's ctx expires. If the embedded engine is slow to respond, the operation runs unbounded regardless of the caller's intent. Fix: pass `ctx` through to the Query call (or a gms.Context derived from it) to respect context propagation."
     }
   ]
 }

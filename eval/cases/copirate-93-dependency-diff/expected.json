@@ -71,6 +71,26 @@
       "justification": "Real [no-silent-failure] doc gap: README documents the 8-module cap but omits MAX_COMMITS/MAX_FILES truncation, so a user can't know upstream context is capped. Documentation-level.",
       "diffHunk": "@@ -173,6 +174,28 @@ jobs:\n           DIFFICULTY_SCALING: \"true\"\n ```\n \n+## Dependency diff context\n+\n+Set `DEPENDENCY_DIFF: \"true\"` to give the reviewer more than a version string when a PR bumps a `go.mod` requirement (for example, a Dependabot PR). When the diff changes a `go.mod` requirement line, the action resolves the bumped module to its GitHub repository and fetches the upstream commits and changed files between the old and new version via GitHub's compare API \u2014 then hands that as read-only context to the reviewer, which is instructed to check whether anything this repo actually calls into changed, broke, or was deprecated upstream, not just that a version moved.\n+\n+This runs entirely in the **host action** \u2014 the reviewing engine is never granted `Bash`, `WebFetch`, or any other network-capable tool; only the trusted Node process fetches the upstream diff, exactly as it already fetches the PR's own diff.\n+\n+Module resolution covers direct `github.com/...` module paths, the `golang.org/x/*` modules (mirrored 1:1 to `github.com/golang/*`), and falls back to the standard Go vanity-import discovery protocol for anything else. A module that can't be resolved to a GitHub repo (or whose compare call fails) is reported as such in the review context rather than silently omitted \u2014 the review still runs on the manifest diff alone. To bound both cost and prompt size, at most 8 bumped modules per PR get their upstream context fetched; any beyond that are named in the note as skipped, not silently dropped.",
       "body": "**Advisory (non-blocking):** [LAW:no-silent-failure] Documentation gap: the README documents the 8-module cap but omits the per-bump commit and file truncation caps (MAX_COMMITS=30, MAX_FILES=50 in src/dependency-diff.js:176-177). A user whose dependency bump spans 200 commits will see only the most recent 30 in the reviewer's context, potentially missing important changes (including breaking changes) from earlier in the range. The render template does flag truncation to the reviewer (\"most recent N shown\"), but the user reading these docs has no way to know this cap exists. The description should note both caps so users can decide whether to supplement with manual review."
+    },
+    {
+      "commentId": 3655496705,
+      "reviewId": 4785034774,
+      "path": "src/dependency-diff.js",
+      "line": 93,
+      "side": "RIGHT",
+      "annotation": "must-find",
+      "justification": "Real security gap, confirmed and fixed in acd22cc: isPublicAddress covers RFC1918/loopback/link-local but omits RFC 6598 CGNAT space (100.64.0.0/10), which some cloud providers use for internal infrastructure \u2014 a bypass of the new SSRF guard. Present at the frozen head (the IPv4 range checks at line 93; isSafeHost landed in the frozen commit itself). Round-5 finding, re-anchored from :97@1641861.",
+      "body": "**Advisory (non-blocking):** Security: `isPublicAddress` omits the RFC 6598 shared address space `100.64.0.0/10` (Carrier-Grade NAT). A diff-controlled module path whose hostname resolves to a CGNAT address \u2014 a range some cloud providers use for internal infrastructure \u2014 would pass the check and allow the discovery fetch to reach an internal service. The existing guards cover RFC 1918 and link-local correctly but miss this reserved range. Add `if (a === 100 && b >= 64 && b <= 127) return false;` after the `a === 10 || a === 127` check."
+    },
+    {
+      "commentId": 3655496713,
+      "reviewId": 4785034774,
+      "path": "test/dependency-diff.test.js",
+      "line": 284,
+      "side": "RIGHT",
+      "annotation": "nice-to-find",
+      "justification": "Real coverage gap, confirmed and fixed in acd22cc: no test asserts the truncation indicators ('most recent N shown' / 'first N shown') that renderDependencyDiffNote emits \u2014 at the frozen head the render fixture incidentally renders one but nothing pins the text, so a regression is invisible. Round-5 finding, re-anchored from :324@1641861 to the render test fixture.",
+      "body": "**Advisory (non-blocking):** Missing test: `renderDependencyDiffNote` truncation indicators are untested. The README documents that truncation is surfaced explicitly (\"N total, most recent 30 shown\" and \"N total, first 50 shown\"), and the implementation renders these at dependency-diff.js:240-241 when `totalCommits > commits.length` or `totalFiles > files.length`. The existing render test uses `totalCommits: 2` with 1 commit and `totalFiles: 1` with 1 file \u2014 matching counts, so truncation is never exercised. Add a test case with e.g. `totalCommits: 35, commits: (30 items)` to assert the rendered output includes `\"most recent 30 shown\"`. [LAW:behavior-not-structure]"
     }
   ]
 }
