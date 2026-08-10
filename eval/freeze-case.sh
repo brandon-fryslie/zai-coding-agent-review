@@ -17,6 +17,11 @@
 # hand afterward — this script writes them as "UNREVIEWED" so an un-annotated case
 # is loud, never silently treated as scored. [LAW:no-silent-failure]
 #
+# This script freezes ONE round. The case's POOLED INVENTORY — eligible findings from
+# the PR's other review rounds, tagged with their source reviewId — is likewise a
+# hand-curation step done afterward; see eval/README.md ("The pooled inventory, and
+# its eligibility rule") for the procedure and the eligibility bar.
+#
 # Usage:
 #   eval/freeze-case.sh <case-name> <owner/repo> <pr-number> <review-id> [exclude-patterns]
 #
