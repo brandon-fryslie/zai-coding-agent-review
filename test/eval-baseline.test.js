@@ -199,8 +199,8 @@ test('buildBaseline freezes diagnostic bands, the pooled gate, suite cost, and t
   assert.equal(b.suite.costPerFullRunUsd, 0.4);
   assert.equal(b.suite.costedRuns, 4);
   assert.equal(b.suite.uncostedRuns, 0);
-  // Informational headline recall = unweighted mean of case means.
-  assert.equal(b.suite.meanMustFindRecall, 0.75);
+  // Informational headline recall = unweighted mean of the per-case INVENTORY means (the gate's axis).
+  assert.equal(b.suite.meanInventoryMustFindRecall, 0.75);
 });
 
 test('parseFraction reads found/total and rejects non-fractions', () => {

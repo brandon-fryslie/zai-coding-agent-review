@@ -293,9 +293,10 @@ function buildBaseline({ cases, provenance }) {
     perRunInventory: c.summary.perRun.map(r => `${r.inventoryMustFind.found}/${r.inventoryMustFind.total}`),
   }));
 
-  // Suite headline: the unweighted mean of the per-case mean recalls. Informational only — a summary of the
-  // cases, not the gate (cases have different denominators, so their means don't pool by averaging).
-  const caseMeans = caseEntries.map(c => c.mustFindRecall.mean).filter(v => v !== null);
+  // Suite headline: the unweighted mean of the per-case mean INVENTORY recalls — the same axis the gate
+  // measures. Informational only — a summary of the cases, not the gate (cases have different
+  // denominators, so their means don't pool by averaging).
+  const caseMeans = caseEntries.map(c => c.inventoryMustFindRecall.mean).filter(v => v !== null);
   const suiteMeanRecall = caseMeans.length ? caseMeans.reduce((a, b) => a + b, 0) / caseMeans.length : null;
 
   return {
@@ -324,7 +325,7 @@ function buildBaseline({ cases, provenance }) {
         rate: round(pooledRate, 4),
         gateFloor: round(pooledFloor(pooledFound, pooledTotal), 4),
       },
-      meanMustFindRecall: round(suiteMeanRecall, 4),
+      meanInventoryMustFindRecall: round(suiteMeanRecall, 4),
       totalCostUsd: round(totalCostUsd, 4),
       // Per full suite run = totalCostUsd / repeats — but ONLY well-defined when every run is costed. With
       // any uncosted run, totalCostUsd is a partial sum while `repeats` still counts all full runs, so the
@@ -418,7 +419,7 @@ function renderBaselineMarkdown(baseline) {
     `- **Repeats (N):** ${baseline.repeats} per case`,
     `- **PRIMARY GATE — pooled inventory must-find recall:** ${pct(pooled.rate)} (${pooled.found}/${pooled.opportunities} across all ${baseline.repeats}×${baseline.suite.cases} runs, against each case's pooled multi-round inventory); gate floor **${pct(pooled.gateFloor)}** (~2σ lower bound). A candidate below the floor is degraded.`,
     `- **Frozen-round pooled must-find recall:** ${pct(frozenPooled.rate)} (${frozenPooled.found}/${frozenPooled.opportunities}) — continuity diagnostic, comparable with pre-inventory baselines; not a gate.`,
-    `- **Suite mean of case means:** ${pct(baseline.suite.meanMustFindRecall)} (informational — the gate is the pooled inventory rate above, not this average)`,
+    `- **Suite mean of per-case inventory recall means:** ${pct(baseline.suite.meanInventoryMustFindRecall)} (informational — the gate is the pooled inventory rate above, not this average)`,
     `- **Cost:** ${usd(baseline.suite.totalCostUsd)} total across ${baseline.suite.costedRuns} costed run(s)` +
       `${baseline.suite.uncostedRuns ? ` (+${baseline.suite.uncostedRuns} run(s) with no cost reported)` : ''}` +
       `, ≈ ${usd(baseline.suite.costPerFullRunUsd)} per full suite run (all cases once).`,

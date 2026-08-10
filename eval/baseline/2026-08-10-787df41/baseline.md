@@ -8,7 +8,7 @@ This is the reference the compare gate (`copirate-eval-harness-2fk.5`) measures 
 - **Repeats (N):** 5 per case
 - **PRIMARY GATE — pooled inventory must-find recall:** 22% (22/100 across all 5×4 runs, against each case's pooled multi-round inventory); gate floor **14%** (~2σ lower bound). A candidate below the floor is degraded.
 - **Frozen-round pooled must-find recall:** 21% (16/75) — continuity diagnostic, comparable with pre-inventory baselines; not a gate.
-- **Suite mean of case means:** 25% (informational — the gate is the pooled inventory rate above, not this average)
+- **Suite mean of per-case inventory recall means:** 24% (informational — the gate is the pooled inventory rate above, not this average)
 - **Cost:** $3.4121 total across 20 costed run(s), ≈ $0.6824 per full suite run (all cases once).
 
 ## Per-case must-find recall band (diagnostic)

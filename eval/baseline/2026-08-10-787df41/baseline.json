@@ -29,7 +29,7 @@
       "rate": 0.2133,
       "gateFloor": 0.1206
     },
-    "meanMustFindRecall": 0.2464,
+    "meanInventoryMustFindRecall": 0.2425,
     "totalCostUsd": 3.4121,
     "costPerFullRunUsd": 0.6824,
     "costedRuns": 20,
