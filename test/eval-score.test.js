@@ -162,6 +162,7 @@ test('computeMetrics buckets by annotation and counts noise', async () => {
   // With no inventory rounds, the inventory view equals the frozen-round view.
   assert.deepEqual(m.inventoryMustFind, m.mustFind);
   assert.deepEqual(m.inventoryNiceToFind, m.niceToFind);
+  assert.deepEqual(m.inventoryKnownNoise, m.knownNoise);
   assert.equal(m.noise.count, 1); // the novel z.ts finding matched nothing
   assert.equal(m.noise.items[0].path, 'z.ts');
 });

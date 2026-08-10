@@ -279,6 +279,7 @@ function computeMetrics(expected, produced, candidatePairs, decisions) {
     knownNoise: bucket('noise', frozenRound),
     inventoryMustFind: bucket('must-find', anyRound),
     inventoryNiceToFind: bucket('nice-to-find', anyRound),
+    inventoryKnownNoise: bucket('noise', anyRound),
     noise: {
       count: noiseIdxs.length,
       items: noiseIdxs.map(i => ({ path: produced[i].path, line: produced[i].line, severity: produced[i].severity, bodyPreview: bodyPreview(produced[i].body) })),
@@ -316,6 +317,7 @@ async function scoreRun({ expected, produced, usage, meta, judge, matcherLabel }
     knownNoise: metrics.knownNoise,
     inventoryMustFind: metrics.inventoryMustFind,
     inventoryNiceToFind: metrics.inventoryNiceToFind,
+    inventoryKnownNoise: metrics.inventoryKnownNoise,
     noise: metrics.noise,
     usage,
     pairs: metrics.pairs,
@@ -375,7 +377,7 @@ function renderTable(summary) {
     `  nice-to-find recall (inventory):  mean ${pct(invNf.mean)}  min ${pct(invNf.min)}  max ${pct(invNf.max)}`,
     `  noise / run:                      mean ${num(summary.noiseCount.mean)}  min ${num(summary.noiseCount.min)}  max ${num(summary.noiseCount.max)}`,
     `  cost / run (est.):                mean ${usd(summary.costUsd.mean)}`,
-    `  per run (must·inv·nice): ${summary.perRun.map(r => `${r.mustFind}·${r.inventoryMustFind}·${r.niceToFind}`).join('   ')}`,
+    `  per run (must·invMust·nice·invNice): ${summary.perRun.map(r => `${r.mustFind}·${r.inventoryMustFind}·${r.niceToFind}·${r.inventoryNiceToFind}`).join('   ')}`,
   ];
   return lines.join('\n');
 }
