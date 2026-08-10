@@ -962,6 +962,12 @@ describe('buildReviewInput / buildRepoReviewInput convergence-sweep prior findin
     assert.doesNotMatch(repo, /CONVERGENCE SWEEP/);
   });
 
+  test('a multi-line finding body renders as exactly one bullet line (no unprefixed continuation)', () => {
+    const multi = [{ path: 'src/a.js', line: 3, body: 'Bug: first line\n  second line\n\nthird line', severity: 'blocking' }];
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorFindings: multi });
+    assert.match(prompt, /• \[src\/a\.js:3\] \(blocking\) Bug: first line second line third line/);
+  });
+
   test('renders every prior finding with location, severity, and body — in both builders', () => {
     for (const prompt of [
       buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorFindings: PRIOR }).prompt,
