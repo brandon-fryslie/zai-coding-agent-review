@@ -330,6 +330,19 @@ margin, so the floor is a meaningful line rather than noise. The per-case bands 
 as **diagnostics** — they localize *which* case moved a pooled regression; they do not gate
 on their own.
 
+### The current baseline (v2, inventory-gated)
+
+The gate reference is
+[`eval/baseline/2026-08-10-787df41/`](baseline/2026-08-10-787df41/baseline.md) — the engine
+of `main` at `787df41`, `deepseek-v4-pro`, N=5, schema v2. Headline: **pooled inventory
+must-find recall 22 % (22 of 100 opportunities), gate floor 14 %.** The frozen-round pooled
+rate measured 21 % (16/75) — statistically consistent with the v1 baseline's 19 % on the same
+engine, so the instrument is stable; the inventory gate simply measures against the fuller
+ground truth (100 opportunities vs 75). A full suite run still costs ≈ $0.68; the whole N=5
+baseline cost $3.41. The headline result carries over: the engine surfaces roughly **one in
+five** of the pooled inventory's must-finds in a single round — that is the number the recall
+epic (`zai-recall-upr`) exists to raise, and the floor the efficiency work must not sink.
+
 ### The first baseline, and the variance that shaped the rule
 
 The first frozen baseline is
