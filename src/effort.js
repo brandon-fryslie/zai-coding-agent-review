@@ -12,7 +12,8 @@
 // nothing derives from would be a false theorem — a knob the profile claims to own while its real
 // source is still an input or a per-config value elsewhere. So the profile owns `scopeConcurrency`
 // (its consumer, the worker pool, reads it here), `roundCap` (its consumer, the pre-spawn round
-// gate in run.js, reads it here), and now `reasoningTier` (its consumer is the reasoning fold at the
+// gate in run.js, reads it here), `sweepCap` (its consumer, the convergence-sweep loop in
+// runMultiScopePass, reads it here), and `reasoningTier` (its consumer is the reasoning fold at the
 // runMultiScope seam — the one place the chain and the effort profile meet — which reconciles the
 // profile's proposed tier with each config's own reasoning via `maxTier` before the adapter clamps it
 // to the engine's range). It GROWS a field as each remaining knob's consumer is migrated off its
@@ -41,6 +42,16 @@
 // multiscope.js; it is the profile's value now, and the worker pool reads it FROM the profile.
 const DEFAULT_SCOPE_CONCURRENCY = 4;
 
+// [LAW:one-source-of-truth] The default convergence-sweep bound: after the initial worker pass, up to
+// this many further sweep passes re-review the same material hunting only for findings NOT yet
+// recorded, stopping early when a sweep adds nothing new (zai-recall-upr.2). The push-round dribble
+// this replaces converged in ~5-8 rounds WITHOUT showing each round the prior findings; a sweep IS
+// shown them, so convergence is expected in fewer passes — 2 bounds the worst case at 3 worker layers
+// per round. 0 = no sweeps, the pre-convergence single-pass behavior. Unlike roundCap there is NO
+// "unlimited" sentinel: termination inside one action run must be guaranteed by the bound, so the cap
+// is always finite. [LAW:types-are-the-program]
+const DEFAULT_SWEEP_CAP = 2;
+
 // [LAW:dataflow-not-control-flow] The abstract reasoning-tier ladder, low→high, keyed to an ordinal
 // RANK. It is the union of every engine's declared reasoning-effort vocabulary: claude-code exposes
 // low..max, codex minimal..xhigh, opencode none. `xhigh` (codex's ceiling) and `max` (claude-code's
@@ -50,12 +61,12 @@ const TIER_RANK = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
 
 // The single representation of review effort. Produced at one seam (a default in simple mode,
 // overridable via the config file later) and consumed uniformly by the engine.
-// @typedef {{ scopeConcurrency: number, roundCap: number, reasoningTier: (string|null) }} EffortProfile
+// @typedef {{ scopeConcurrency: number, roundCap: number, sweepCap: number, reasoningTier: (string|null) }} EffortProfile
 
-// [LAW:effects-at-boundaries] Pure. The default profile — its values ARE today's behavior, so a
-// default-profile run is byte-identical to the pre-profile engine. An OPTIONS object (not positional
-// args) because the profile GROWS axes: each future knob is a new named key, so no call site is
-// re-threaded when the shape widens. [LAW:carrying-cost]
+// [LAW:effects-at-boundaries] Pure. The default profile — its values ARE the engine's default
+// behavior (which, since zai-recall-upr.2, includes convergence sweeps: sweepCap > 0). An OPTIONS
+// object (not positional args) because the profile GROWS axes: each future knob is a new named key,
+// so no call site is re-threaded when the shape widens. [LAW:carrying-cost]
 //
 // `roundCap` is SOURCED, not owned: its production default (action.yml's MAX_REVIEW_ROUNDS = "5")
 // lives at the action boundary and flows in through run()'s parsed input, so it is not duplicated
@@ -66,8 +77,13 @@ const TIER_RANK = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
 // `reasoningTier` defaults to `null` = "propose no raise". It is the difficulty-proposed RAISE, not an
 // absolute tier (see the header): a null profile leaves each config's own `config.reasoning` untouched
 // at the fold, so a default profile is byte-identical. Only difficultyCandidates ever sets it non-null.
-function defaultEffortProfile({ roundCap = 0, reasoningTier = null } = {}) {
-  return { scopeConcurrency: DEFAULT_SCOPE_CONCURRENCY, roundCap, reasoningTier };
+// `sweepCap` is a further cost-bearing axis (zai-recall-upr.2, after roundCap and reasoningTier): its consumer is the
+// convergence-sweep loop in runMultiScopePass, its price the sweep multiplicand in budget.js's
+// estimatedCostUsd — both land together with the axis, per this module's header. It is OWNED here
+// (DEFAULT_SWEEP_CAP), not sourced from an action input: the sweep bound is engine policy, like
+// scope concurrency, not a consumer knob. [LAW:no-mode-explosion]
+function defaultEffortProfile({ roundCap = 0, sweepCap = DEFAULT_SWEEP_CAP, reasoningTier = null } = {}) {
+  return { scopeConcurrency: DEFAULT_SCOPE_CONCURRENCY, roundCap, sweepCap, reasoningTier };
 }
 
 // [LAW:effects-at-boundaries] Pure. The higher of two abstract reasoning tiers by TIER_RANK — the
@@ -146,6 +162,7 @@ function resolveReasoningTier(tier, engineEfforts) {
 
 module.exports = {
   DEFAULT_SCOPE_CONCURRENCY,
+  DEFAULT_SWEEP_CAP,
   TIER_RANK,
   defaultEffortProfile,
   resolveReasoningTier,

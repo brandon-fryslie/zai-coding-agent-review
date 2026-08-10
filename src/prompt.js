@@ -87,10 +87,30 @@ function reviewCharter(toolNames) {
 // or the DEPENDENCY_DIFF input off) renders nothing; a non-empty note (src/dependency-diff.js)
 // appends the fetched upstream-change context after the diff, same placement as the unshowable-
 // files note below. [LAW:dataflow-not-control-flow]
+// [LAW:one-source-of-truth] The convergence-sweep block, rendered once here for BOTH materials (PR and
+// repo workers): the findings this round has already recorded, injected so a sweep pass hunts only for
+// what is NOT yet on the list (zai-recall-upr.2). It follows the pushback block's pattern exactly —
+// [] (the initial pass) renders '', so a non-sweep prompt is byte-identical. [LAW:dataflow-not-control-flow]
+// The framing legitimizes the EMPTY outcome explicitly: a sweep that records nothing is the round's
+// convergence signal, and without that permission a model biased toward producing output would manufacture
+// findings to fill the silence — trading the precision the eval gate holds for fake recall. [LAW:no-silent-failure]
+function renderPriorFindingsBlock(priorFindings, toolNames) {
+  if (priorFindings.length === 0) return '';
+  // A finding body is free text and routinely multi-line; collapse internal newlines (with their
+  // surrounding indentation) so each finding renders as exactly ONE bullet — an unprefixed continuation
+  // line at prompt indentation could read as a stray instruction rather than part of the listed finding.
+  const oneLine = (body) => body.replace(/\s*\n\s*/g, ' ');
+  return `\n    THIS IS A CONVERGENCE SWEEP. A previous pass of this same review already examined this material and recorded the findings below. They are ALREADY collected and will be posted — do not re-record, rephrase, re-argue, or re-verify any of them; a re-record is pure noise.\n`
+    + priorFindings.map(f => `      • [${f.path}:${f.line}] (${f.severity}) ${oneLine(f.body)}`).join('\n')
+    + `\n    Your job in this sweep is ONLY what that list misses: read the material fresh and hunt for real issues NOT already listed — parts of the change no listed finding touches, failure classes the list has none of (edge cases, broken callers, concurrency, security), or a deeper problem behind a listed symptom. Record each genuinely new issue with ${toolNames.requestChange} as usual. If your fresh read surfaces nothing real that is missing, record NOTHING and call ${toolNames.finishReview} with a one-line summary saying the sweep found nothing new — an empty sweep is this review converging, which is a correct and expected outcome, not a failure. Never pad the sweep with speculative or trivial findings to avoid coming back empty.\n`;
+}
+
 // priorPushbacks is a value carrying this PR's earlier RA findings that the author replied to
 // (fetchPriorPushbacks, src/transport.js): each is {path, line, finding, replies[]}. [] — a first round,
 // or a PR with no author replies — renders nothing, so a cold review is byte-identical. [LAW:dataflow-not-control-flow]
-function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = [], dependencyDiffNote = '', dependencyBumps = [], priorPushbacks = [] }) {
+// priorFindings is the convergence-sweep value (see renderPriorFindingsBlock): the findings already
+// recorded by this round's earlier passes. [] — the initial pass — renders nothing. [LAW:dataflow-not-control-flow]
+function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = [], dependencyDiffNote = '', dependencyBumps = [], priorPushbacks = [], priorFindings = [] }) {
   const patchableFiles = files.filter(f => f.patch);
   const includedDiffs = [];
   const includedFiles = [];
@@ -155,6 +175,8 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
       }).join('\n')
       + `\n    If a reply soundly shows the finding was wrong or already handled, do NOT record that same point again this round — the fix, if any, is already in the diff below, which you review fresh. If a reply is itself mistaken and the bug is still real in the current code, you MAY record it again, but state a direct, specific counter to the author's reasoning rather than repeating your original words. These are prior context, not part of the current diff; they never limit what you review, and you must still flag every NEW issue.\n`
     : '';
+
+  const priorFindingsBlock = renderPriorFindingsBlock(priorFindings, toolNames);
 
   // [LAW:dataflow-not-control-flow] A value again: no upstream note means no instruction block.
   // When present, tell the worker WHAT to do with the fetched upstream context — cross-check it
@@ -224,7 +246,7 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
     prompt: `
 Review this pull request. The repository under review is checked out at ${reviewedRepoRoot}.
     Your working directory is intentionally outside the repository; reach it by that absolute path with your Read tool.
-${focusBlock}${pushbackBlock}${dependencyInstructionBlock}${dependencyAssessBlock}
+${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}${dependencyAssessBlock}
     BEFORE judging anything, ${readTargets} The diff shows only the changed hunks; most bugs are only
     visible in the full surrounding context of the function and module — a missing guard, a caller you'd
     break, a value that can't be what this line assumes. Do not form or report any judgment until you
@@ -278,19 +300,22 @@ ${focusBlock}${pushbackBlock}${dependencyInstructionBlock}${dependencyAssessBloc
 // reviewedRepoRoot is the absolute path of the checked-out repo, named explicitly because the
 // engine's working directory is OUTSIDE the tree (so no repo-committed AGENTS.md/CLAUDE.md loads
 // as reviewer instructions); the agent explores the repo by that absolute path. [LAW:effects-at-boundaries]
-function buildRepoReviewInput({ scope, excludePatterns, toolNames, reviewedRepoRoot }) {
+// priorFindings is the same convergence-sweep value the PR builder takes (renderPriorFindingsBlock):
+// [] — the initial pass — renders nothing, so a non-sweep repo review is byte-identical. [LAW:dataflow-not-control-flow]
+function buildRepoReviewInput({ scope, excludePatterns, toolNames, reviewedRepoRoot, priorFindings = [] }) {
   const focus = scope
     ? `Focus this review on the following scope, named by the maintainer: ${scope}. Start from the files and modules that scope points to, and follow the code from there.`
     : `Give a broad review across the whole repository. Start from the entry points and the modules most central to the project, and read the actual source before judging it.`;
   const exclude = excludePatterns.length > 0
     ? `\n\n    Do NOT review files matching these excluded patterns: ${excludePatterns.join(', ')}.`
     : '';
+  const priorFindingsBlock = renderPriorFindingsBlock(priorFindings, toolNames);
 
   return {
     prompt: `
 Review this repository for what would hurt if it shipped. There is no diff — the repository under review is checked out
     at ${reviewedRepoRoot}; explore it yourself using your Read, Grep, and Glob tools against that absolute path (your
-    working directory is intentionally outside the repository) and judge the code you find. ${focus}${exclude}
+    working directory is intentionally outside the repository) and judge the code you find. ${focus}${exclude}${priorFindingsBlock}
 
     Call ${toolNames.requestChange} for each issue you find, with path, line (any real line in that file —
     there is no diff grid here, so any line is valid), a body, and a severity ('blocking' if it must change

@@ -14,7 +14,7 @@ const {
   buildRepoMaterial,
 } = require('../src/multiscope');
 const { defaultEffortProfile } = require('../src/effort');
-const { buildReviewInput, buildPrScoutInput, buildRepoScoutInput } = require('../src/prompt');
+const { buildReviewInput, buildRepoReviewInput, buildPrScoutInput, buildRepoScoutInput } = require('../src/prompt');
 const { parseScopeValue, dedupeFindings } = require('../src/review');
 const { TransientError } = require('../src/failover');
 
@@ -249,7 +249,7 @@ describe('runMultiScopePass — spawn-level transient resilience', () => {
   };
   const config = { engine: 'fake', name: 'c1' };
   const passArgs = (registry) => ({
-    config, material, registry, instructionsPath: 'x', maxConcurrent: 4, log: () => {}, sleepFn: async () => {},
+    config, material, registry, instructionsPath: 'x', maxConcurrent: 4, sweepCap: 0, log: () => {}, sleepFn: async () => {},
   });
 
   // A fake engine adapter: the scout returns SCOPES; each worker returns one finding tagged with its
@@ -524,7 +524,7 @@ describe('runMultiScopePass — scout coverage sweep', () => {
     runMultiScopePass({
       config,
       material: { changedPaths, buildScoutPrompt: () => 'SCOUT', buildWorkerPrompt: (f) => f },
-      registry, instructionsPath: 'x', maxConcurrent: 4, log, sleepFn: async () => {},
+      registry, instructionsPath: 'x', maxConcurrent: 4, sweepCap: 0, log, sleepFn: async () => {},
     });
 
   test('an unassigned changed file gets its own worker (the synthetic scope) and a warning', async () => {
@@ -563,6 +563,127 @@ describe('runMultiScopePass — scout coverage sweep', () => {
 });
 
 // ── materials — closures that build the real engine prompts ──────────────────────────────────────
+
+// ── runMultiScopePass — convergence sweeps (zai-recall-upr.2) ──────────────────────────────────────
+// The worker layer re-runs over the SAME scopes, each sweep shown the cumulative deduped findings and
+// hunting only for what is missing; the loop stops when a sweep adds nothing new (by the dedupeFindings
+// key — the one sameness definition) or at the effort profile's sweepCap.
+describe('runMultiScopePass — convergence sweeps', () => {
+  const SCOPES = [{ name: 'a', focus: 'fa' }, { name: 'b', focus: 'fb' }];
+  // The material ENCODES the priorFindings value into the worker prompt, so the tests can assert the
+  // per-pass threading (pass 0 gets none; a sweep gets the cumulative list).
+  const material = {
+    changedPaths: [],
+    buildScoutPrompt: () => 'SCOUT',
+    buildWorkerPrompt: (focusText, _toolNames, _scopeFiles, priorFindings) =>
+      `${focusText}||prior:${priorFindings.map(f => f.body).join(',')}`,
+  };
+  const config = { engine: 'fake', name: 'c1' };
+  const args = (registry, sweepCap, log = () => {}) => ({
+    config, material, registry, instructionsPath: 'x', maxConcurrent: 4, sweepCap, log, sleepFn: async () => {},
+  });
+
+  // A fake adapter: the scout plans SCOPES; each worker spawn returns findingsFor(scopeName, pass),
+  // where `pass` counts that scope's own spawns (0 = the initial layer, 1 = sweep 1, …).
+  function sweepRegistry(findingsFor, usagePerSpawn = null) {
+    const seenPrompts = [];
+    const perScopeCalls = {};
+    const adapter = {
+      async produceReview({ buildPromptFor }) {
+        const prompt = buildPromptFor({});
+        if (prompt === 'SCOUT') return { summary: 'ctx', findings: [], scopes: SCOPES, assessments: [], usage: usagePerSpawn };
+        seenPrompts.push(prompt);
+        const scope = SCOPES.find(s => prompt.includes(`${s.name} — ${s.focus}`));
+        const pass = perScopeCalls[scope.name] ?? 0;
+        perScopeCalls[scope.name] = pass + 1;
+        return { summary: `sum-${scope.name}-p${pass}`, findings: findingsFor(scope.name, pass), assessments: [], usage: usagePerSpawn };
+      },
+    };
+    return { registry: { get: () => adapter }, seenPrompts, perScopeCalls };
+  }
+  const oneBug = (name) => [{ path: `${name}.js`, line: 1, body: `bug in ${name}`, severity: 'advisory' }];
+
+  test('a sweep that adds nothing new terminates the loop before the cap', async () => {
+    // Every pass re-records the same finding: sweep 1 merges to no growth → converged, sweep 2 never runs.
+    const logs = [];
+    const { registry, perScopeCalls } = sweepRegistry((name) => oneBug(name));
+    const review = await runMultiScopePass(args(registry, 3, (m) => logs.push(m)));
+    assert.deepEqual(perScopeCalls, { a: 2, b: 2 }); // initial layer + exactly one sweep
+    assert.deepEqual(review.findings.map(f => f.path).sort(), ['a.js', 'b.js']); // dedupe kept one per scope
+    assert.ok(logs.some(m => m.includes('convergence sweep 1: 0 new finding(s) — converged')), `logs: ${logs}`);
+  });
+
+  test('the sweep bound caps a loop that keeps adding new findings, and says so', async () => {
+    const logs = [];
+    const { registry, perScopeCalls } = sweepRegistry(
+      (name, pass) => [{ path: `${name}.js`, line: pass + 1, body: `bug-${name}-p${pass}`, severity: 'advisory' }],
+    );
+    const review = await runMultiScopePass(args(registry, 2, (m) => logs.push(m)));
+    assert.deepEqual(perScopeCalls, { a: 3, b: 3 }); // initial layer + the 2 capped sweeps
+    assert.equal(review.findings.length, 6); // every pass's findings merged, none dropped
+    assert.ok(logs.some(m => m.includes('convergence sweep 2: 2 new finding(s) — sweep cap reached')), `logs: ${logs}`);
+  });
+
+  test('sweep workers receive the cumulative prior findings; the initial pass receives none', async () => {
+    const { registry, seenPrompts } = sweepRegistry((name) => oneBug(name));
+    await runMultiScopePass(args(registry, 3));
+    const initial = seenPrompts.filter(p => p.endsWith('||prior:'));
+    const sweeps = seenPrompts.filter(p => !p.endsWith('||prior:'));
+    assert.equal(initial.length, 2); // both scopes' initial prompts carry no prior list
+    assert.equal(sweeps.length, 2);
+    for (const p of sweeps) { // every sweep prompt carries BOTH scopes' cumulative findings
+      assert.match(p, /bug in a/);
+      assert.match(p, /bug in b/);
+    }
+  });
+
+  test('a clean initial pass converges immediately — no sweep spawns, no sweep log', async () => {
+    const logs = [];
+    const { registry, perScopeCalls } = sweepRegistry(() => []);
+    const review = await runMultiScopePass(args(registry, 3, (m) => logs.push(m)));
+    assert.deepEqual(perScopeCalls, { a: 1, b: 1 });
+    assert.deepEqual(review.findings, []);
+    assert.ok(!logs.some(m => m.includes('convergence sweep')), `logs: ${logs}`);
+  });
+
+  test('a sweep mixing one re-record and one genuinely new finding adds exactly the new one', async () => {
+    const { registry } = sweepRegistry(
+      (name, pass) => (name === 'a' && pass === 1)
+        ? [...oneBug('a'), { path: 'a.js', line: 9, body: 'deeper bug behind it', severity: 'blocking' }]
+        : oneBug(name),
+    );
+    const logs = [];
+    const review = await runMultiScopePass(args(registry, 3, (m) => logs.push(m)));
+    assert.equal(review.findings.length, 3); // a.js, b.js, + the one genuinely new
+    assert.ok(logs.some(m => m.includes('convergence sweep 1: 1 new finding(s)')), `logs: ${logs}`);
+    assert.ok(logs.some(m => m.includes('convergence sweep 2: 0 new finding(s) — converged')), `logs: ${logs}`);
+  });
+
+  test('usage sums across every sweep spawn — the footer covers the whole convergence loop', async () => {
+    const usage = { inputTokens: 10, outputTokens: 1, cost: { available: true, usd: 0.01 } };
+    const { registry } = sweepRegistry((name) => oneBug(name), usage);
+    const review = await runMultiScopePass(args(registry, 3));
+    // 1 scout + 2 scopes × 2 layers (initial + the converging sweep) = 5 spawns.
+    assert.equal(review.usage.inputTokens, 50);
+    assert.ok(Math.abs(review.usage.cost.usd - 0.05) < 1e-9);
+  });
+
+  test('the aggregate summary names each sweep; sweepCap 0 restores the single-pass shape', async () => {
+    const swept = await runMultiScopePass(args(sweepRegistry((name) => oneBug(name)).registry, 3));
+    assert.match(swept.summary, /\*\*convergence sweep 1\*\* — nothing new; the review converged\./);
+    assert.match(swept.summary, /sum-a-p0/); // the initial pass's judgments remain the summaries of record
+    assert.doesNotMatch(swept.summary, /sum-a-p1/); // sweep narration does not bloat the posted summary
+    const single = await runMultiScopePass(args(sweepRegistry((name) => oneBug(name)).registry, 0));
+    assert.doesNotMatch(single.summary, /convergence sweep/);
+  });
+
+  test('a malformed sweepCap fails loud — an undefined bound must not silently run zero workers', async () => {
+    await assert.rejects(
+      runMultiScopePass(args(sweepRegistry(() => []).registry, undefined)),
+      /requires a non-negative integer sweepCap/,
+    );
+  });
+});
 
 describe('buildPrMaterial', () => {
   const files = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
@@ -819,6 +940,53 @@ describe('buildReviewInput prior pushbacks', () => {
     const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorPushbacks: pushbacks });
     assert.match(prompt, /\[src\/a\.js\] your earlier finding: f/);
     assert.doesNotMatch(prompt, /src\/a\.js:/);
+  });
+});
+
+// ── the convergence-sweep block (zai-recall-upr.2) — prior findings injected as a value ────────────
+// One rendering (renderPriorFindingsBlock) serves BOTH materials, so the two builders are asserted
+// against the same contract: [] renders nothing (the initial pass is byte-identical), a non-empty list
+// renders each finding plus the hunt-what-is-missing steer and the explicit permission to come back
+// empty — the guard that keeps a sweep from manufacturing findings (precision) to fill the silence.
+describe('buildReviewInput / buildRepoReviewInput convergence-sweep prior findings', () => {
+  const FILES = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
+  const PRIOR = [
+    { path: 'src/a.js', line: 3, body: 'Bug: leaks the handle', severity: 'blocking' },
+    { path: 'src/b.js', line: 8, body: 'Edge case: empty list crashes', severity: 'advisory' },
+  ];
+
+  test('empty priorFindings renders no sweep block in either builder (byte-identical initial pass)', () => {
+    const pr = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT }).prompt;
+    const repo = buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT }).prompt;
+    assert.doesNotMatch(pr, /CONVERGENCE SWEEP/);
+    assert.doesNotMatch(repo, /CONVERGENCE SWEEP/);
+  });
+
+  test('a multi-line finding body renders as exactly one bullet line (no unprefixed continuation)', () => {
+    const multi = [{ path: 'src/a.js', line: 3, body: 'Bug: first line\n  second line\n\nthird line', severity: 'blocking' }];
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorFindings: multi });
+    assert.match(prompt, /• \[src\/a\.js:3\] \(blocking\) Bug: first line second line third line/);
+  });
+
+  test('renders every prior finding with location, severity, and body — in both builders', () => {
+    for (const prompt of [
+      buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorFindings: PRIOR }).prompt,
+      buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorFindings: PRIOR }).prompt,
+    ]) {
+      assert.match(prompt, /CONVERGENCE SWEEP/);
+      assert.match(prompt, /\[src\/a\.js:3\] \(blocking\) Bug: leaks the handle/);
+      assert.match(prompt, /\[src\/b\.js:8\] \(advisory\) Edge case: empty list crashes/);
+    }
+  });
+
+  test('the steer forbids re-records, directs the hunt at what is missing, and legitimizes an empty sweep', () => {
+    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorFindings: PRIOR });
+    assert.match(prompt, /do not re-record, rephrase, re-argue, or re-verify any of them/);
+    assert.match(prompt, /ONLY what that list misses/);
+    // The empty outcome is named as correct — without this, a model biased toward output would pad
+    // the sweep with speculative findings and trade away the precision the eval gate holds.
+    assert.match(prompt, /an empty sweep is this review converging, which is a correct and expected outcome/);
+    assert.match(prompt, /Never pad the sweep with speculative or trivial findings/);
   });
 });
 
