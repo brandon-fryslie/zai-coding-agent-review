@@ -48,7 +48,9 @@ function makeCliAdapter(spec) {
     // [LAW:no-ambient-temporal-coupling] Nested try/finally owns cleanup ordering (LIFO): cwd and
     // home are created inside the collector's scope and torn down before it, each by its own finally,
     // so cleanup runs even when the engine throws. [LAW:no-silent-failure]
-    async produceReview({ config, buildPromptFor, instructionsPath }) {
+    // `deadline` (epoch ms, null = no budget) flows through untouched to runEngine, the one place
+    // it bounds the spawn's lifetime — the adapter neither reads the clock nor re-decides policy.
+    async produceReview({ config, buildPromptFor, instructionsPath, deadline = null }) {
       const prompt = buildPromptFor(spec.toolNames);
       const collector = createReviewCollector();
       try {
@@ -58,7 +60,7 @@ function makeCliAdapter(spec) {
         try {
           const home = spec.materializeHome({ config, instructionsPath, collector });
           try {
-            const output = await runEngine(spec, config, prompt, home, collector, cwd);
+            const output = await runEngine(spec, config, prompt, home, collector, cwd, deadline);
             const usage = spec.extractUsage(output, config);
             const review = readCollectedReview(collector.recordsPath);
             // [LAW:dataflow-not-control-flow] scopes (a scout run), findings (a worker run), and

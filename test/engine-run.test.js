@@ -176,3 +176,63 @@ describe('runEngine session transcript', () => {
     fresh.forEach(f => fs.rmSync(`${TRANSCRIPT_DIR}/${f}`, { force: true }));
   });
 });
+
+// ── the wall-clock deadline at the spawn boundary (zai-timing-sn1) ────────────────────────────────
+// The deadline and the adapter's own cap are DIFFERENT bounds with different types: the deadline
+// firing is the time budget's planned degradation (DeadlineExceededError, absorbed upstream as an
+// unreviewed scope); the adapter cap firing stays the loud engine failure it always was.
+describe('runEngine under a wall-clock deadline', () => {
+  const { DeadlineExceededError } = require('../src/deadline.js');
+
+  test('a deadline already in the past refuses to spawn at all', async () => {
+    let built = false;
+    const adapter = {
+      name: 'fake',
+      timeoutMs: 30_000,
+      buildCommand: () => { built = true; return { command: process.execPath, args: ['-e', ''], env: { PATH: process.env.PATH } }; },
+      assertSucceeded: () => {},
+      classifyError: err => err,
+    };
+    await assert.rejects(
+      runEngine(adapter, {}, 'p', '/tmp', {}, process.cwd(), Date.now() - 1),
+      (err) => err instanceof DeadlineExceededError && /TIME_BUDGET_MINUTES/.test(err.message),
+    );
+    assert.equal(built, false, 'no command is built for a spawn that can never run');
+  });
+
+  test('a deadline nearer than the adapter cap kills the spawn with the deadline type', async () => {
+    const adapter = {
+      name: 'fake',
+      timeoutMs: 30_000, // the adapter cap is far; the deadline must be the bound that fires
+      buildCommand: () => ({
+        command: process.execPath,
+        args: ['-e', 'setTimeout(() => {}, 10000);'], // outlives the deadline
+        env: { PATH: process.env.PATH },
+      }),
+      assertSucceeded: () => {},
+      classifyError: err => err,
+    };
+    await assert.rejects(
+      runEngine(adapter, {}, 'p', '/tmp', {}, process.cwd(), Date.now() + 300),
+      (err) => err instanceof DeadlineExceededError && /ran out mid-spawn/.test(err.message),
+    );
+  });
+
+  test('the adapter cap firing under a FAR deadline stays the plain timeout error', async () => {
+    const adapter = {
+      name: 'fake',
+      timeoutMs: 300, // the adapter cap is the nearer bound
+      buildCommand: () => ({
+        command: process.execPath,
+        args: ['-e', 'setTimeout(() => {}, 10000);'],
+        env: { PATH: process.env.PATH },
+      }),
+      assertSucceeded: () => {},
+      classifyError: err => err,
+    };
+    await assert.rejects(
+      runEngine(adapter, {}, 'p', '/tmp', {}, process.cwd(), Date.now() + 3_600_000),
+      (err) => !(err instanceof DeadlineExceededError) && /review timed out/.test(err.message),
+    );
+  });
+});

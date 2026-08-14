@@ -1,5 +1,6 @@
 'use strict';
-const { produceReview, retryTransientSpawn, sleep } = require('./failover');
+const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS } = require('./failover');
+const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = require('./deadline');
 const { defaultEffortProfile, maxTier } = require('./effort');
 const { dedupeFindings, dedupeAssessments } = require('./review');
 const { renderDependencyDiffNote } = require('./dependency-diff');
@@ -81,13 +82,31 @@ function sumUsage(usages) {
 // one line stating what it added; its workers' own summaries are mostly "nothing new" narration, so
 // their findings flow to the merged set while the sweep line carries the summary-level story. sweeps
 // is a value: [] (sweepCap 0, or the shape predating sweeps) renders nothing. [LAW:dataflow-not-control-flow]
-function composeSummary(scopes, workerResults, sweeps = []) {
-  const lines = [`Reviewed ${scopes.length} scope(s): ${scopes.map(s => s.name).join(', ')}.`, ''];
+// budget is the time-budget outcome: the default (not exhausted, nothing unreviewed) renders nothing,
+// so a run without a deadline — and a run that fit its deadline — is byte-identical to before.
+// [LAW:no-silent-failure] When the budget DID bite, the summary leads with the truth: the headline
+// count names only the scopes actually reviewed, the unreviewed ones are listed by name, and a
+// curtailed convergence is called out — a partial review must never read like a clean bill.
+function composeSummary(scopes, workerResults, sweeps = [], budget = { exhausted: false, unreviewedScopes: [] }) {
+  const unreviewed = new Set(budget.unreviewedScopes);
+  const reviewed = scopes.filter(s => !unreviewed.has(s.name));
+  const lines = [`Reviewed ${reviewed.length} scope(s): ${reviewed.map(s => s.name).join(', ')}.`, ''];
   for (const r of workerResults) {
     lines.push(`**${r.name}** — ${(r.summary || '(no summary)').trim()}`);
   }
   for (const [i, s] of sweeps.entries()) {
-    lines.push(`**convergence sweep ${i + 1}** — ${s.added === 0 ? 'nothing new; the review converged.' : `${s.added} new finding(s).`}`);
+    // [FRAMING:representation] A curtailed sweep must never render as convergence: "added nothing
+    // because it was killed" and "searched and found nothing" are different facts.
+    lines.push(`**convergence sweep ${i + 1}** — ${s.curtailed
+      ? `cut short by the time budget after ${s.added} new finding(s).`
+      : s.added === 0 ? 'nothing new; the review converged.' : `${s.added} new finding(s).`}`);
+  }
+  if (budget.exhausted) {
+    lines.push(budget.unreviewedScopes.length > 0
+      ? `⏳ **Time budget exhausted** — ${reviewed.length} of ${scopes.length} scope(s) were reviewed; `
+        + `NOT reviewed: ${budget.unreviewedScopes.join(', ')}. The findings above cover only the reviewed scopes.`
+      : '⏳ **Time budget exhausted** — every scope was reviewed, but convergence sweeps were cut short; '
+        + 'late-round findings may be missing.');
   }
   return lines.join('\n');
 }
@@ -96,17 +115,34 @@ function composeSummary(scopes, workerResults, sweeps = []) {
 // stops new work and is rethrown after in-flight workers settle, preserving its type (a TransientError
 // stays a TransientError so failover can classify it). [LAW:no-silent-failure] this is the deliberate
 // inverse of swallowing a failed scope into an empty-finding result — an unreviewed scope must never
-// pass as a clean one. results are returned in scope order.
-async function runScopeWorkers({ scopes, runOne, maxConcurrent }) {
-  const results = new Array(scopes.length);
+// pass as a clean one.
+//
+// [LAW:types-are-the-program] The pool returns one OUTCOME per scope, in scope order — a discriminated
+// value: { status: 'reviewed', result } | { status: 'unreviewed' }. 'unreviewed' is the time budget's
+// planned degradation, reached two ways that mean the same thing: shouldStart() said no before the
+// spawn (the budget was already spent), or the spawn was killed at the deadline mid-flight
+// (DeadlineExceededError). Both are absorbed HERE, scope by scope, so sibling workers' already-earned
+// results survive — the deadline must never take the fail-loud path that discards the whole batch.
+// Every other error still aborts the batch exactly as before; the caller decides what 'unreviewed'
+// means for its layer (a pass-0 coverage gap vs a merely-curtailed sweep).
+async function runScopeWorkers({ scopes, runOne, maxConcurrent, shouldStart = () => true }) {
+  const outcomes = new Array(scopes.length);
   let next = 0;
   let firstError = null;
   async function lane() {
     while (next < scopes.length && !firstError) {
       const i = next++;
+      if (!shouldStart()) {
+        outcomes[i] = { status: 'unreviewed' };
+        continue;
+      }
       try {
-        results[i] = await runOne(scopes[i]);
+        outcomes[i] = { status: 'reviewed', result: await runOne(scopes[i]) };
       } catch (e) {
+        if (e instanceof DeadlineExceededError) {
+          outcomes[i] = { status: 'unreviewed' };
+          continue;
+        }
         firstError = firstError || e;
       }
     }
@@ -114,7 +150,7 @@ async function runScopeWorkers({ scopes, runOne, maxConcurrent }) {
   const laneCount = Math.min(Math.max(1, maxConcurrent), scopes.length);
   await Promise.all(Array.from({ length: laneCount }, lane));
   if (firstError) throw firstError;
-  return results;
+  return outcomes;
 }
 
 // One scope worker: a single review spawn on this config, focused on one scope. [LAW:composability]
@@ -189,7 +225,12 @@ function planScopes(scopes, changedPaths) {
 // failover.produceReview drives, so the whole pass is one attempt and retry/failover wraps it as a
 // unit. Returns the same {summary, findings, usage} shape a single engine spawn used to return, so
 // every downstream sink stays unchanged. [LAW:decomposition]
-async function runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, sweepCap, log, sleepFn = sleep }) {
+// `deadline` (epoch ms, null = no budget) and `now` (the injected clock, matching the sleepFn
+// convention) are the wall-clock budget: the pass stops STARTING work — scope workers and sweeps —
+// once the budget is spent, delivers everything already collected, and reports the coverage gap as
+// data (unreviewedScopes, budgetExhausted). [LAW:no-ambient-temporal-coupling] the deadline is a
+// value minted once at the run boundary, never a clock read scattered through callers.
+async function runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, sweepCap, log, sleepFn = sleep, deadline = null, now = Date.now }) {
   // [LAW:no-silent-failure] A missing/malformed sweep bound must not decide anything by accident: an
   // undefined cap would make the convergence loop's `pass <= sweepCap` false on pass 0 and the review
   // would "succeed" having run NO workers at all. The bound comes from the effort profile (its one
@@ -205,7 +246,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // still propagates, so config-level failover (produceReview) is unchanged. [LAW:one-source-of-truth]
   const spawn = (buildPromptFor, label) =>
     retryTransientSpawn(
-      () => adapter.produceReview({ config, buildPromptFor, instructionsPath }),
+      () => adapter.produceReview({ config, buildPromptFor, instructionsPath, deadline }),
       {
         sleepFn,
         onRetry: ({ attempt, limit, delay, err }) =>
@@ -254,29 +295,59 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   const initialResults = [];
   const allResults = [];
   const sweeps = [];
+  const unreviewedScopes = [];
+  let budgetExhausted = false;
   let findings = [];
   for (let pass = 0; pass <= sweepCap; pass++) {
+    // The sweep gate: a further pass only starts inside the budget. Pass 0 is never gated here —
+    // its coverage is what the run exists to deliver, and its own workers degrade scope-by-scope
+    // through the pool below. [LAW:no-silent-failure] a gate trip is announced, never a quiet
+    // shortfall that reads as convergence.
+    if (pass > 0 && remainingMs(deadline, now()) <= 0) {
+      budgetExhausted = true;
+      log(`convergence sweeps stopped before sweep ${pass} — time budget exhausted`);
+      break;
+    }
     const labelPrefix = pass === 0 ? '' : `sweep ${pass} `;
     const priorFindings = findings;
-    const results = await runScopeWorkers({
+    const outcomes = await runScopeWorkers({
       scopes,
       maxConcurrent,
+      shouldStart: () => remainingMs(deadline, now()) > 0,
       runOne: (scope) => runScopeWorker({ scope, context, material, spawn, log, priorFindings, labelPrefix }),
     });
+    const results = outcomes.filter(o => o.status === 'reviewed').map(o => o.result);
+    const skipped = scopes.filter((s, i) => outcomes[i].status === 'unreviewed');
+    for (const s of skipped) log(`${labelPrefix}scope '${s.name}' not reviewed — time budget exhausted`);
+    if (skipped.length > 0) budgetExhausted = true;
+    if (pass === 0) {
+      // An unreviewed scope at pass 0 is a COVERAGE gap, carried as data to the summary and the
+      // verdict; at a sweep it merely curtails convergence — pass 0's judgments of record stand.
+      unreviewedScopes.push(...skipped.map(s => s.name));
+      // [LAW:no-silent-failure] The budget expired before ANY scope completed: there is no review
+      // to deliver, and "delivering" an empty one would approve a change nobody looked at. Fail
+      // fast with the knob named — the diagnosable error the empty-handed workflow cancel never was.
+      if (results.length === 0) {
+        throw new DeadlineExceededError(
+          `The review's time budget expired before any scope completed — no review to deliver. ${BUDGET_REMEDY}`,
+        );
+      }
+      initialResults.push(...results);
+    }
     allResults.push(...results);
-    if (pass === 0) initialResults.push(...results);
     const merged = dedupeFindings([...findings, ...results.flatMap(r => r.findings)]);
     const added = merged.length - findings.length;
     findings = merged;
     if (pass > 0) {
-      sweeps.push({ added });
-      log(`convergence sweep ${pass}: ${added} new finding(s)${added === 0 ? ' — converged' : pass === sweepCap ? ' — sweep cap reached' : ''}`);
+      const curtailed = skipped.length > 0;
+      sweeps.push({ added, curtailed });
+      log(`convergence sweep ${pass}: ${added} new finding(s)${curtailed ? ' — cut short (time budget)' : added === 0 ? ' — converged' : pass === sweepCap ? ' — sweep cap reached' : ''}`);
     }
     if (added === 0) break;
   }
 
   return {
-    summary: composeSummary(scopes, initialResults, sweeps),
+    summary: composeSummary(scopes, initialResults, sweeps, { exhausted: budgetExhausted, unreviewedScopes }),
     findings,
     // [LAW:dataflow-not-control-flow] Dependency assessments aggregate exactly like findings — a flatMap
     // over the workers plus one dedup — and with the SAME shape: no `|| []` fallback, because every worker
@@ -288,6 +359,12 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     // re-assessments, which collapse by the same module key. Non-dependency PR → [].
     assessments: dedupeAssessments(allResults.flatMap(r => r.assessments)),
     usage: sumUsage([scoutResult.usage, ...allResults.map(r => r.usage)]),
+    // [LAW:one-source-of-truth] The coverage gap as DATA, for the sinks: the PR sink withholds
+    // approval when unreviewedScopes is non-empty (transport.submitReview), and run.js warns when
+    // the budget bit at all. The summary text above derives from these same values, never the
+    // other way around. Both are their defaults ([]/false) on every run the budget didn't touch.
+    unreviewedScopes,
+    budgetExhausted,
   };
 }
 
@@ -304,18 +381,24 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
 // engine clamps it per its range (resolveReasoningTier) and `configUsed` (hence the attribution footer)
 // automatically reports the raised tier. [LAW:dataflow-not-control-flow] a null proposed tier folds to
 // each config's own reasoning (byte-identical), so an omitted/default `effort` leaves the chain untouched.
-function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), log = () => {}, sleepFn = sleep }) {
+function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), log = () => {}, sleepFn = sleep, deadline = null, now = Date.now }) {
   const maxConcurrent = effort.scopeConcurrency;
   const sweepCap = effort.sweepCap;
   const effectiveChain = chain.map(config => ({
     ...config,
     reasoning: maxTier(config.reasoning ?? null, effort.reasoningTier ?? null),
   }));
-  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, sweepCap, log, sleepFn });
+  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, sweepCap, log, sleepFn, deadline, now });
   // [LAW:no-ambient-temporal-coupling] Forward the injected clock to produceReview too, so ONE sleepFn
   // owns the whole pass's retry timing — spawn-level (inside the pass) AND config-level failover here.
   // Defaults to the real sleep, so production is unchanged; a test injects a stub to drive failover fast.
-  return produceReview(effectiveChain, null, null, produceOnce, sleepFn);
+  // [LAW:single-enforcer] The wall-clock budget also bounds failover's retry horizon: produceReview
+  // already clamps every backoff sleep to its budget, so handing it the time remaining makes retry
+  // timing deadline-respecting with no second clamp — a Retry-After longer than the budget can no
+  // longer sleep the run past its own deadline. min() with the default keeps the no-deadline path
+  // byte-identical (remainingMs is Infinity there).
+  const budgetMs = Math.min(TRANSIENT_RETRY_BUDGET_MS, remainingMs(deadline, now()));
+  return produceReview(effectiveChain, null, null, produceOnce, sleepFn, budgetMs);
 }
 
 // [LAW:decomposition] The two MATERIALS, built once each. A material knows how to build the scout

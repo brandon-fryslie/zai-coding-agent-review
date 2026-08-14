@@ -2,6 +2,7 @@
 const { spawn } = require('child_process');
 const core = require('@actions/core');
 const { emitTranscript } = require('../debug');
+const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = require('../deadline');
 
 // [LAW:no-ambient-temporal-coupling] An engine may legitimately emit an arbitrarily large
 // stream — codex `exec --json` streams every reasoning delta and tool call as a JSONL line,
@@ -61,10 +62,28 @@ function formatOutputTail(label, value) {
 // [LAW:effects-at-boundaries] This is the only place that spawns a child process.
 // cwd is the engine's working directory — an isolated scratch dir outside the reviewed repo tree
 // (see cli.js) so no repo-committed project-instruction file is auto-loaded as reviewer directives.
-function runEngine(adapter, config, prompt, home, collector, cwd) {
+//
+// [LAW:single-enforcer] `deadline` (epoch ms, null = no budget) is the review's wall-clock budget,
+// and this is the ONE place it bounds a spawn's lifetime: the effective timeout is the smaller of
+// the adapter's own sanity cap and the time remaining. The two bounds mean different things and
+// throw different types [LAW:types-are-the-program] — the adapter cap firing is an engine failure
+// (plain Error, as before), the deadline firing is planned degradation (DeadlineExceededError, which
+// the scope-worker pool absorbs as "scope unreviewed" instead of failing the pass). A deadline
+// already in the past refuses to spawn at all — the one enforcer of "no engine starts past the
+// budget", so callers never race a doomed spawn.
+function runEngine(adapter, config, prompt, home, collector, cwd, deadline = null) {
   return new Promise((resolve, reject) => {
+    const remaining = remainingMs(deadline, Date.now());
+    if (remaining <= 0) {
+      reject(new DeadlineExceededError(
+        `${adapter.name} spawn refused: the review's time budget is exhausted. ${BUDGET_REMEDY}`,
+      ));
+      return;
+    }
     const { command, args, env } = adapter.buildCommand({ config, collector, home });
-    const timeoutMs = adapter.timeoutMs ?? 3_000_000;
+    const adapterCapMs = adapter.timeoutMs ?? 3_000_000;
+    const deadlineBound = remaining < adapterCapMs;
+    const timeoutMs = deadlineBound ? remaining : adapterCapMs;
     // [LAW:dataflow-not-control-flow] The retention window is the adapter's value (default 8 MiB),
     // mirroring the timeoutMs seam above — so a test can exercise the clip/announce path at a small cap.
     const maxRetained = adapter.maxRetainedOutput ?? MAX_RETAINED_OUTPUT;
@@ -99,7 +118,14 @@ function runEngine(adapter, config, prompt, home, collector, cwd) {
     const timeout = setTimeout(() => {
       finish(() => {
         child.kill('SIGTERM');
-        reject(new Error(`${adapter.name} review timed out.`));
+        // [LAW:types-are-the-program] Which bound fired decides the type: the deadline kill is the
+        // budget working as designed (absorbed upstream as an unreviewed scope); the adapter-cap
+        // kill is an engine that outlived any sane review and stays the loud failure it always was.
+        reject(deadlineBound
+          ? new DeadlineExceededError(
+            `${adapter.name} spawn killed: the review's time budget ran out mid-spawn. ${BUDGET_REMEDY}`,
+          )
+          : new Error(`${adapter.name} review timed out.`));
       });
     }, timeoutMs);
 

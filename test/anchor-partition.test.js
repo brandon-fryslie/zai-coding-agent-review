@@ -145,6 +145,7 @@ describe('submitReview — unanchored findings', () => {
       summary: 'Summary text.',
       findings: [],
       unanchored: [{ path: 's.astro', line: 79, body: 'stale doc comment', severity: 'blocking' }],
+      unreviewedScopes: [],
     };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
     const arg = octokit.calls[0];
@@ -162,6 +163,7 @@ describe('submitReview — unanchored findings', () => {
       summary: 'Summary.',
       findings: [{ path: 'a.js', line: 10, body: 'fix', severity: 'blocking' }],
       unanchored: [],
+      unreviewedScopes: [],
     };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
     const arg = octokit.calls[0];
@@ -173,7 +175,7 @@ describe('submitReview — unanchored findings', () => {
 
   test('no findings at all approves (canApprove) and posts no comments', async () => {
     const octokit = fakeOctokit();
-    const review = { summary: 'Clean.', findings: [], unanchored: [] };
+    const review = { summary: 'Clean.', findings: [], unanchored: [], unreviewedScopes: [] };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
     const arg = octokit.calls[0];
     assert.equal(arg.event, 'APPROVE');
@@ -183,7 +185,7 @@ describe('submitReview — unanchored findings', () => {
 
   test('review without an unanchored field behaves as before (back-compat)', async () => {
     const octokit = fakeOctokit();
-    const review = { summary: 'Clean.', findings: [] }; // no `unanchored` key
+    const review = { summary: 'Clean.', findings: [], unreviewedScopes: [] }; // no `unanchored` key
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, false, gitHubTransport([]));
     const arg = octokit.calls[0];
     assert.equal(arg.event, 'COMMENT'); // not approvable, no findings
@@ -198,6 +200,7 @@ describe('submitReview — dependency section placement', () => {
       summary: 'The prose summary.',
       findings: [],
       unanchored: [],
+      unreviewedScopes: [],
       dependencySection: '**Dependency review** — 1 module(s): 1 ✅ safe\n\n<details>...</details>',
     };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
@@ -209,7 +212,7 @@ describe('submitReview — dependency section placement', () => {
   test('no dependencySection leaves the body byte-identical to a plain review', async () => {
     const withField = fakeOctokit();
     const without = fakeOctokit();
-    const base = { summary: 'S.', findings: [], unanchored: [] };
+    const base = { summary: 'S.', findings: [], unanchored: [], unreviewedScopes: [] };
     await submitReview(withField, 'o', 'r', 1, 'sha', 'Reviewer', { ...base, dependencySection: '' }, true, gitHubTransport([]));
     await submitReview(without, 'o', 'r', 1, 'sha', 'Reviewer', base, true, gitHubTransport([]));
     assert.equal(withField.calls[0].body, without.calls[0].body);
@@ -278,20 +281,20 @@ describe('dedupeAssessments', () => {
 describe('submitReview — approve event spelling is host-specific (home-copirate-review-9uj.12)', () => {
   test('gitHubTransport approves with GitHub\'s imperative spelling', async () => {
     const octokit = fakeOctokit();
-    const review = { summary: 'Clean.', findings: [], unanchored: [] };
+    const review = { summary: 'Clean.', findings: [], unanchored: [], unreviewedScopes: [] };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
     assert.equal(octokit.calls[0].event, 'APPROVE');
   });
 
   test('giteaTransport approves with Gitea\'s ReviewStateType spelling, not GitHub\'s', async () => {
     const octokit = fakeOctokit();
-    const review = { summary: 'Clean.', findings: [], unanchored: [] };
+    const review = { summary: 'Clean.', findings: [], unanchored: [], unreviewedScopes: [] };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, giteaTransport([]));
     assert.equal(octokit.calls[0].event, 'APPROVED');
   });
 
   test('REQUEST_CHANGES is spelled identically across transports (no host-specific mapping needed)', async () => {
-    const review = { summary: 'Bad.', findings: [{ path: 'a.js', line: 1, body: 'x', severity: 'blocking' }], unanchored: [] };
+    const review = { summary: 'Bad.', findings: [{ path: 'a.js', line: 1, body: 'x', severity: 'blocking' }], unanchored: [], unreviewedScopes: [] };
     const gh = fakeOctokit();
     await submitReview(gh, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
     const gt = fakeOctokit();
@@ -447,6 +450,7 @@ describe('submitReview — severity drives the verdict, never whether a finding 
         { path: 'b.js', line: 20, body: 'could be faster', severity: 'advisory' },
       ],
       unanchored: [],
+      unreviewedScopes: [],
     };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
     const arg = octokit.calls[0];
@@ -458,7 +462,7 @@ describe('submitReview — severity drives the verdict, never whether a finding 
 
   test('all-advisory findings post as COMMENT when the token cannot approve', async () => {
     const octokit = fakeOctokit();
-    const review = { summary: 's', findings: [{ path: 'a.js', line: 1, body: 'nit', severity: 'advisory' }], unanchored: [] };
+    const review = { summary: 's', findings: [{ path: 'a.js', line: 1, body: 'nit', severity: 'advisory' }], unanchored: [], unreviewedScopes: [] };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, false, gitHubTransport([]));
     assert.equal(octokit.calls[0].event, 'COMMENT');
   });
@@ -472,6 +476,7 @@ describe('submitReview — severity drives the verdict, never whether a finding 
         { path: 'b.js', line: 20, body: 'real bug', severity: 'blocking' },
       ],
       unanchored: [],
+      unreviewedScopes: [],
     };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
     assert.equal(octokit.calls[0].event, 'REQUEST_CHANGES');
@@ -483,6 +488,7 @@ describe('submitReview — severity drives the verdict, never whether a finding 
       summary: 's',
       findings: [{ path: 'a.js', line: 10, body: 'nit', severity: 'advisory' }],
       unanchored: [{ path: 'b.js', line: 999, body: 'real bug off-grid', severity: 'blocking' }],
+      unreviewedScopes: [],
     };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
     const arg = octokit.calls[0];
@@ -496,10 +502,51 @@ describe('submitReview — severity drives the verdict, never whether a finding 
       summary: 's',
       findings: [],
       unanchored: [{ path: 'b.js', line: 999, body: 'perf note off-grid', severity: 'advisory' }],
+      unreviewedScopes: [],
     };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
     const arg = octokit.calls[0];
     assert.equal(arg.event, 'APPROVE'); // advisory-only, even unanchored, does not block
     assert.match(arg.body, /\*\*Advisory \(non-blocking\):\*\* perf note off-grid/);
+  });
+});
+
+// ── partial coverage withholds approval (zai-timing-sn1) ──────────────────────────────────────────
+// A review whose time budget expired before every scope was reviewed has no standing to approve:
+// approval asserts the whole diff was judged. Blocking findings outrank the partial state.
+describe('submitReview — partial coverage (unreviewedScopes)', () => {
+  test('clean-but-partial posts as COMMENT with the partial verdict, never Approved — even with an approve-capable token', async () => {
+    const octokit = fakeOctokit();
+    const review = { summary: 'S.', findings: [], unanchored: [], unreviewedScopes: ['store', 'docs'] };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    const arg = octokit.calls[0];
+    assert.equal(arg.event, 'COMMENT');
+    assert.match(arg.body, /⏳ Partial review/);
+    assert.doesNotMatch(arg.body, /✅ Approved/);
+  });
+
+  test('a blocking finding in a partial review still REQUEST_CHANGES — a blocker found in a half-reviewed diff is still a blocker', async () => {
+    const octokit = fakeOctokit();
+    const review = {
+      summary: 'S.',
+      findings: [{ path: 'a.js', line: 1, body: 'bug', severity: 'blocking' }],
+      unanchored: [],
+      unreviewedScopes: ['docs'],
+    };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    const arg = octokit.calls[0];
+    assert.equal(arg.event, 'REQUEST_CHANGES');
+    assert.match(arg.body, /❌ Request Changes/);
+  });
+
+  test('a review that omits unreviewedScopes crashes loud — coverage is a required part of the review value', async () => {
+    const octokit = fakeOctokit();
+    const review = { summary: 'S.', findings: [], unanchored: [] };
+    delete review.unreviewedScopes;
+    await assert.rejects(
+      submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([])),
+      TypeError,
+    );
+    assert.equal(octokit.calls.length, 0, 'nothing was posted for an out-of-contract review value');
   });
 });

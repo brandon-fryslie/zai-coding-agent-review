@@ -30672,6 +30672,71 @@ module.exports = { loadConfig, validateFile, resolveChain, resolveSecrets, peekC
 
 /***/ }),
 
+/***/ 6757:
+/***/ ((module) => {
+
+"use strict";
+
+
+// [FRAMING:parts-and-seams] The review's wall-clock budget. A hosted run lives under a hard outer
+// cap (the workflow's timeout-minutes) whose only tool is cancellation — which discards every
+// finding the run has collected but not yet submitted. This module makes the deadline OWNED state
+// instead of ambient luck [LAW:no-ambient-temporal-coupling]: the run boundary mints one absolute
+// deadline from the TIME_BUDGET_MINUTES input, and every scheduling decision downstream (start a
+// scope worker? run another sweep? how long may this spawn live?) reads the SAME value — so the
+// review finishes and submits BEFORE the outer kill, shedding coverage loudly instead of dying
+// with a full pocket of findings. [LAW:one-source-of-truth] the deadline is minted exactly once;
+// nothing downstream re-reads the input or re-decides the budget.
+
+// [LAW:types-are-the-program] "The time budget expired" is a distinct fact from "this engine hung
+// past its own sanity cap" — the first is planned degradation the scheduler absorbs scope-by-scope,
+// the second is an engine failure that reds the attempt. Two meanings, two types: the deadline kill
+// carries this class so the worker pool can absorb it as "scope unreviewed" without touching the
+// fail-loud path that protects sibling findings. It is NOT retryable and NOT transient by
+// construction: retryTransientSpawn passes it through (isRetryableSpawnError is false) and
+// produceReview's `instanceof TransientError` gate rethrows it immediately — no failover restart
+// can fit in a budget that has already run out.
+class DeadlineExceededError extends Error {}
+
+// [LAW:one-source-of-truth] The operator remedy, stated once: every deadline-exhaustion message —
+// the spawn refusal, the mid-spawn kill, the nothing-completed failure — names the same two knobs
+// the same way, so the fix is never phrased three drifting ways.
+const BUDGET_REMEDY = 'Raise TIME_BUDGET_MINUTES (and the workflow job\'s timeout-minutes above it) or split the change.';
+
+// [LAW:no-silent-failure] Parse the budget strictly, mirroring parseMaxRounds: a typo like "25m"
+// or "twenty" must red the run, never silently disable the budget (the failure mode that would
+// resurrect the empty-handed cancel this module exists to prevent). The domain is a non-negative
+// integer of minutes; 0 = disabled, matching MAX_REVIEW_ROUNDS' 0-sentinel convention. Empty (an
+// explicitly cleared input) is disabled; unset gets action.yml's default from the runner.
+function parseTimeBudgetMinutes(raw) {
+  const s = String(raw).trim();
+  if (s === '') return 0;
+  if (!/^\d+$/.test(s)) {
+    throw new Error(`TIME_BUDGET_MINUTES must be a non-negative integer of minutes (0 = no budget); got "${raw}".`);
+  }
+  return parseInt(s, 10);
+}
+
+// [LAW:effects-at-boundaries] Pure: the run boundary passes its own clock reading. A positive
+// budget yields an absolute epoch-ms deadline; 0 yields null — "no budget", the value that makes
+// every downstream bound resolve to the adapter's own cap (see remainingMs).
+function mintDeadline(nowMs, budgetMinutes) {
+  return budgetMinutes > 0 ? nowMs + budgetMinutes * 60_000 : null;
+}
+
+// [LAW:dataflow-not-control-flow] Time remaining as a value every consumer can use uniformly: a
+// null deadline reads as Infinity, so `Math.min(cap, remainingMs(...))` is the adapter cap and
+// `remainingMs(...) > 0` is always true — the no-budget path is the same code path with a
+// different value, never a branch per consumer.
+function remainingMs(deadline, nowMs) {
+  return deadline === null || deadline === undefined ? Infinity : deadline - nowMs;
+}
+
+module.exports = { DeadlineExceededError, BUDGET_REMEDY, parseTimeBudgetMinutes, mintDeadline, remainingMs };
+
+
+/***/ }),
+
 /***/ 9806:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -32166,7 +32231,9 @@ function makeCliAdapter(spec) {
     // [LAW:no-ambient-temporal-coupling] Nested try/finally owns cleanup ordering (LIFO): cwd and
     // home are created inside the collector's scope and torn down before it, each by its own finally,
     // so cleanup runs even when the engine throws. [LAW:no-silent-failure]
-    async produceReview({ config, buildPromptFor, instructionsPath }) {
+    // `deadline` (epoch ms, null = no budget) flows through untouched to runEngine, the one place
+    // it bounds the spawn's lifetime — the adapter neither reads the clock nor re-decides policy.
+    async produceReview({ config, buildPromptFor, instructionsPath, deadline = null }) {
       const prompt = buildPromptFor(spec.toolNames);
       const collector = createReviewCollector();
       try {
@@ -32176,7 +32243,7 @@ function makeCliAdapter(spec) {
         try {
           const home = spec.materializeHome({ config, instructionsPath, collector });
           try {
-            const output = await runEngine(spec, config, prompt, home, collector, cwd);
+            const output = await runEngine(spec, config, prompt, home, collector, cwd, deadline);
             const usage = spec.extractUsage(output, config);
             const review = readCollectedReview(collector.recordsPath);
             // [LAW:dataflow-not-control-flow] scopes (a scout run), findings (a worker run), and
@@ -32767,6 +32834,7 @@ module.exports = { get };
 const { spawn } = __nccwpck_require__(5317);
 const core = __nccwpck_require__(7484);
 const { emitTranscript } = __nccwpck_require__(9806);
+const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = __nccwpck_require__(6757);
 
 // [LAW:no-ambient-temporal-coupling] An engine may legitimately emit an arbitrarily large
 // stream — codex `exec --json` streams every reasoning delta and tool call as a JSONL line,
@@ -32826,10 +32894,28 @@ function formatOutputTail(label, value) {
 // [LAW:effects-at-boundaries] This is the only place that spawns a child process.
 // cwd is the engine's working directory — an isolated scratch dir outside the reviewed repo tree
 // (see cli.js) so no repo-committed project-instruction file is auto-loaded as reviewer directives.
-function runEngine(adapter, config, prompt, home, collector, cwd) {
+//
+// [LAW:single-enforcer] `deadline` (epoch ms, null = no budget) is the review's wall-clock budget,
+// and this is the ONE place it bounds a spawn's lifetime: the effective timeout is the smaller of
+// the adapter's own sanity cap and the time remaining. The two bounds mean different things and
+// throw different types [LAW:types-are-the-program] — the adapter cap firing is an engine failure
+// (plain Error, as before), the deadline firing is planned degradation (DeadlineExceededError, which
+// the scope-worker pool absorbs as "scope unreviewed" instead of failing the pass). A deadline
+// already in the past refuses to spawn at all — the one enforcer of "no engine starts past the
+// budget", so callers never race a doomed spawn.
+function runEngine(adapter, config, prompt, home, collector, cwd, deadline = null) {
   return new Promise((resolve, reject) => {
+    const remaining = remainingMs(deadline, Date.now());
+    if (remaining <= 0) {
+      reject(new DeadlineExceededError(
+        `${adapter.name} spawn refused: the review's time budget is exhausted. ${BUDGET_REMEDY}`,
+      ));
+      return;
+    }
     const { command, args, env } = adapter.buildCommand({ config, collector, home });
-    const timeoutMs = adapter.timeoutMs ?? 3_000_000;
+    const adapterCapMs = adapter.timeoutMs ?? 3_000_000;
+    const deadlineBound = remaining < adapterCapMs;
+    const timeoutMs = deadlineBound ? remaining : adapterCapMs;
     // [LAW:dataflow-not-control-flow] The retention window is the adapter's value (default 8 MiB),
     // mirroring the timeoutMs seam above — so a test can exercise the clip/announce path at a small cap.
     const maxRetained = adapter.maxRetainedOutput ?? MAX_RETAINED_OUTPUT;
@@ -32864,7 +32950,14 @@ function runEngine(adapter, config, prompt, home, collector, cwd) {
     const timeout = setTimeout(() => {
       finish(() => {
         child.kill('SIGTERM');
-        reject(new Error(`${adapter.name} review timed out.`));
+        // [LAW:types-are-the-program] Which bound fired decides the type: the deadline kill is the
+        // budget working as designed (absorbed upstream as an unreviewed scope); the adapter-cap
+        // kill is an engine that outlived any sane review and stays the loud failure it always was.
+        reject(deadlineBound
+          ? new DeadlineExceededError(
+            `${adapter.name} spawn killed: the review's time budget ran out mid-spawn. ${BUDGET_REMEDY}`,
+          )
+          : new Error(`${adapter.name} review timed out.`));
       });
     }, timeoutMs);
 
@@ -33365,7 +33458,8 @@ module.exports = {
 
 "use strict";
 
-const { produceReview, retryTransientSpawn, sleep } = __nccwpck_require__(2887);
+const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS } = __nccwpck_require__(2887);
+const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = __nccwpck_require__(6757);
 const { defaultEffortProfile, maxTier } = __nccwpck_require__(4652);
 const { dedupeFindings, dedupeAssessments } = __nccwpck_require__(1565);
 const { renderDependencyDiffNote } = __nccwpck_require__(9838);
@@ -33447,13 +33541,31 @@ function sumUsage(usages) {
 // one line stating what it added; its workers' own summaries are mostly "nothing new" narration, so
 // their findings flow to the merged set while the sweep line carries the summary-level story. sweeps
 // is a value: [] (sweepCap 0, or the shape predating sweeps) renders nothing. [LAW:dataflow-not-control-flow]
-function composeSummary(scopes, workerResults, sweeps = []) {
-  const lines = [`Reviewed ${scopes.length} scope(s): ${scopes.map(s => s.name).join(', ')}.`, ''];
+// budget is the time-budget outcome: the default (not exhausted, nothing unreviewed) renders nothing,
+// so a run without a deadline — and a run that fit its deadline — is byte-identical to before.
+// [LAW:no-silent-failure] When the budget DID bite, the summary leads with the truth: the headline
+// count names only the scopes actually reviewed, the unreviewed ones are listed by name, and a
+// curtailed convergence is called out — a partial review must never read like a clean bill.
+function composeSummary(scopes, workerResults, sweeps = [], budget = { exhausted: false, unreviewedScopes: [] }) {
+  const unreviewed = new Set(budget.unreviewedScopes);
+  const reviewed = scopes.filter(s => !unreviewed.has(s.name));
+  const lines = [`Reviewed ${reviewed.length} scope(s): ${reviewed.map(s => s.name).join(', ')}.`, ''];
   for (const r of workerResults) {
     lines.push(`**${r.name}** — ${(r.summary || '(no summary)').trim()}`);
   }
   for (const [i, s] of sweeps.entries()) {
-    lines.push(`**convergence sweep ${i + 1}** — ${s.added === 0 ? 'nothing new; the review converged.' : `${s.added} new finding(s).`}`);
+    // [FRAMING:representation] A curtailed sweep must never render as convergence: "added nothing
+    // because it was killed" and "searched and found nothing" are different facts.
+    lines.push(`**convergence sweep ${i + 1}** — ${s.curtailed
+      ? `cut short by the time budget after ${s.added} new finding(s).`
+      : s.added === 0 ? 'nothing new; the review converged.' : `${s.added} new finding(s).`}`);
+  }
+  if (budget.exhausted) {
+    lines.push(budget.unreviewedScopes.length > 0
+      ? `⏳ **Time budget exhausted** — ${reviewed.length} of ${scopes.length} scope(s) were reviewed; `
+        + `NOT reviewed: ${budget.unreviewedScopes.join(', ')}. The findings above cover only the reviewed scopes.`
+      : '⏳ **Time budget exhausted** — every scope was reviewed, but convergence sweeps were cut short; '
+        + 'late-round findings may be missing.');
   }
   return lines.join('\n');
 }
@@ -33462,17 +33574,34 @@ function composeSummary(scopes, workerResults, sweeps = []) {
 // stops new work and is rethrown after in-flight workers settle, preserving its type (a TransientError
 // stays a TransientError so failover can classify it). [LAW:no-silent-failure] this is the deliberate
 // inverse of swallowing a failed scope into an empty-finding result — an unreviewed scope must never
-// pass as a clean one. results are returned in scope order.
-async function runScopeWorkers({ scopes, runOne, maxConcurrent }) {
-  const results = new Array(scopes.length);
+// pass as a clean one.
+//
+// [LAW:types-are-the-program] The pool returns one OUTCOME per scope, in scope order — a discriminated
+// value: { status: 'reviewed', result } | { status: 'unreviewed' }. 'unreviewed' is the time budget's
+// planned degradation, reached two ways that mean the same thing: shouldStart() said no before the
+// spawn (the budget was already spent), or the spawn was killed at the deadline mid-flight
+// (DeadlineExceededError). Both are absorbed HERE, scope by scope, so sibling workers' already-earned
+// results survive — the deadline must never take the fail-loud path that discards the whole batch.
+// Every other error still aborts the batch exactly as before; the caller decides what 'unreviewed'
+// means for its layer (a pass-0 coverage gap vs a merely-curtailed sweep).
+async function runScopeWorkers({ scopes, runOne, maxConcurrent, shouldStart = () => true }) {
+  const outcomes = new Array(scopes.length);
   let next = 0;
   let firstError = null;
   async function lane() {
     while (next < scopes.length && !firstError) {
       const i = next++;
+      if (!shouldStart()) {
+        outcomes[i] = { status: 'unreviewed' };
+        continue;
+      }
       try {
-        results[i] = await runOne(scopes[i]);
+        outcomes[i] = { status: 'reviewed', result: await runOne(scopes[i]) };
       } catch (e) {
+        if (e instanceof DeadlineExceededError) {
+          outcomes[i] = { status: 'unreviewed' };
+          continue;
+        }
         firstError = firstError || e;
       }
     }
@@ -33480,7 +33609,7 @@ async function runScopeWorkers({ scopes, runOne, maxConcurrent }) {
   const laneCount = Math.min(Math.max(1, maxConcurrent), scopes.length);
   await Promise.all(Array.from({ length: laneCount }, lane));
   if (firstError) throw firstError;
-  return results;
+  return outcomes;
 }
 
 // One scope worker: a single review spawn on this config, focused on one scope. [LAW:composability]
@@ -33555,7 +33684,12 @@ function planScopes(scopes, changedPaths) {
 // failover.produceReview drives, so the whole pass is one attempt and retry/failover wraps it as a
 // unit. Returns the same {summary, findings, usage} shape a single engine spawn used to return, so
 // every downstream sink stays unchanged. [LAW:decomposition]
-async function runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, sweepCap, log, sleepFn = sleep }) {
+// `deadline` (epoch ms, null = no budget) and `now` (the injected clock, matching the sleepFn
+// convention) are the wall-clock budget: the pass stops STARTING work — scope workers and sweeps —
+// once the budget is spent, delivers everything already collected, and reports the coverage gap as
+// data (unreviewedScopes, budgetExhausted). [LAW:no-ambient-temporal-coupling] the deadline is a
+// value minted once at the run boundary, never a clock read scattered through callers.
+async function runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, sweepCap, log, sleepFn = sleep, deadline = null, now = Date.now }) {
   // [LAW:no-silent-failure] A missing/malformed sweep bound must not decide anything by accident: an
   // undefined cap would make the convergence loop's `pass <= sweepCap` false on pass 0 and the review
   // would "succeed" having run NO workers at all. The bound comes from the effort profile (its one
@@ -33571,7 +33705,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // still propagates, so config-level failover (produceReview) is unchanged. [LAW:one-source-of-truth]
   const spawn = (buildPromptFor, label) =>
     retryTransientSpawn(
-      () => adapter.produceReview({ config, buildPromptFor, instructionsPath }),
+      () => adapter.produceReview({ config, buildPromptFor, instructionsPath, deadline }),
       {
         sleepFn,
         onRetry: ({ attempt, limit, delay, err }) =>
@@ -33620,29 +33754,59 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   const initialResults = [];
   const allResults = [];
   const sweeps = [];
+  const unreviewedScopes = [];
+  let budgetExhausted = false;
   let findings = [];
   for (let pass = 0; pass <= sweepCap; pass++) {
+    // The sweep gate: a further pass only starts inside the budget. Pass 0 is never gated here —
+    // its coverage is what the run exists to deliver, and its own workers degrade scope-by-scope
+    // through the pool below. [LAW:no-silent-failure] a gate trip is announced, never a quiet
+    // shortfall that reads as convergence.
+    if (pass > 0 && remainingMs(deadline, now()) <= 0) {
+      budgetExhausted = true;
+      log(`convergence sweeps stopped before sweep ${pass} — time budget exhausted`);
+      break;
+    }
     const labelPrefix = pass === 0 ? '' : `sweep ${pass} `;
     const priorFindings = findings;
-    const results = await runScopeWorkers({
+    const outcomes = await runScopeWorkers({
       scopes,
       maxConcurrent,
+      shouldStart: () => remainingMs(deadline, now()) > 0,
       runOne: (scope) => runScopeWorker({ scope, context, material, spawn, log, priorFindings, labelPrefix }),
     });
+    const results = outcomes.filter(o => o.status === 'reviewed').map(o => o.result);
+    const skipped = scopes.filter((s, i) => outcomes[i].status === 'unreviewed');
+    for (const s of skipped) log(`${labelPrefix}scope '${s.name}' not reviewed — time budget exhausted`);
+    if (skipped.length > 0) budgetExhausted = true;
+    if (pass === 0) {
+      // An unreviewed scope at pass 0 is a COVERAGE gap, carried as data to the summary and the
+      // verdict; at a sweep it merely curtails convergence — pass 0's judgments of record stand.
+      unreviewedScopes.push(...skipped.map(s => s.name));
+      // [LAW:no-silent-failure] The budget expired before ANY scope completed: there is no review
+      // to deliver, and "delivering" an empty one would approve a change nobody looked at. Fail
+      // fast with the knob named — the diagnosable error the empty-handed workflow cancel never was.
+      if (results.length === 0) {
+        throw new DeadlineExceededError(
+          `The review's time budget expired before any scope completed — no review to deliver. ${BUDGET_REMEDY}`,
+        );
+      }
+      initialResults.push(...results);
+    }
     allResults.push(...results);
-    if (pass === 0) initialResults.push(...results);
     const merged = dedupeFindings([...findings, ...results.flatMap(r => r.findings)]);
     const added = merged.length - findings.length;
     findings = merged;
     if (pass > 0) {
-      sweeps.push({ added });
-      log(`convergence sweep ${pass}: ${added} new finding(s)${added === 0 ? ' — converged' : pass === sweepCap ? ' — sweep cap reached' : ''}`);
+      const curtailed = skipped.length > 0;
+      sweeps.push({ added, curtailed });
+      log(`convergence sweep ${pass}: ${added} new finding(s)${curtailed ? ' — cut short (time budget)' : added === 0 ? ' — converged' : pass === sweepCap ? ' — sweep cap reached' : ''}`);
     }
     if (added === 0) break;
   }
 
   return {
-    summary: composeSummary(scopes, initialResults, sweeps),
+    summary: composeSummary(scopes, initialResults, sweeps, { exhausted: budgetExhausted, unreviewedScopes }),
     findings,
     // [LAW:dataflow-not-control-flow] Dependency assessments aggregate exactly like findings — a flatMap
     // over the workers plus one dedup — and with the SAME shape: no `|| []` fallback, because every worker
@@ -33654,6 +33818,12 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     // re-assessments, which collapse by the same module key. Non-dependency PR → [].
     assessments: dedupeAssessments(allResults.flatMap(r => r.assessments)),
     usage: sumUsage([scoutResult.usage, ...allResults.map(r => r.usage)]),
+    // [LAW:one-source-of-truth] The coverage gap as DATA, for the sinks: the PR sink withholds
+    // approval when unreviewedScopes is non-empty (transport.submitReview), and run.js warns when
+    // the budget bit at all. The summary text above derives from these same values, never the
+    // other way around. Both are their defaults ([]/false) on every run the budget didn't touch.
+    unreviewedScopes,
+    budgetExhausted,
   };
 }
 
@@ -33670,18 +33840,24 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
 // engine clamps it per its range (resolveReasoningTier) and `configUsed` (hence the attribution footer)
 // automatically reports the raised tier. [LAW:dataflow-not-control-flow] a null proposed tier folds to
 // each config's own reasoning (byte-identical), so an omitted/default `effort` leaves the chain untouched.
-function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), log = () => {}, sleepFn = sleep }) {
+function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), log = () => {}, sleepFn = sleep, deadline = null, now = Date.now }) {
   const maxConcurrent = effort.scopeConcurrency;
   const sweepCap = effort.sweepCap;
   const effectiveChain = chain.map(config => ({
     ...config,
     reasoning: maxTier(config.reasoning ?? null, effort.reasoningTier ?? null),
   }));
-  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, sweepCap, log, sleepFn });
+  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, sweepCap, log, sleepFn, deadline, now });
   // [LAW:no-ambient-temporal-coupling] Forward the injected clock to produceReview too, so ONE sleepFn
   // owns the whole pass's retry timing — spawn-level (inside the pass) AND config-level failover here.
   // Defaults to the real sleep, so production is unchanged; a test injects a stub to drive failover fast.
-  return produceReview(effectiveChain, null, null, produceOnce, sleepFn);
+  // [LAW:single-enforcer] The wall-clock budget also bounds failover's retry horizon: produceReview
+  // already clamps every backoff sleep to its budget, so handing it the time remaining makes retry
+  // timing deadline-respecting with no second clamp — a Retry-After longer than the budget can no
+  // longer sleep the run past its own deadline. min() with the default keeps the no-deadline path
+  // byte-identical (remainingMs is Infinity there).
+  const budgetMs = Math.min(TRANSIENT_RETRY_BUDGET_MS, remainingMs(deadline, now()));
+  return produceReview(effectiveChain, null, null, produceOnce, sleepFn, budgetMs);
 }
 
 // [LAW:decomposition] The two MATERIALS, built once each. A material knows how to build the scout
@@ -34838,6 +35014,7 @@ const { renderCostLine, costWarning, costMarker } = __nccwpck_require__(9614);
 const { renderRepoReport } = __nccwpck_require__(8959);
 const registry = __nccwpck_require__(25);
 const { loadConfig, peekConfigNames } = __nccwpck_require__(1283);
+const { parseTimeBudgetMinutes, mintDeadline } = __nccwpck_require__(6757);
 const { synthesizeProviderConfig } = __nccwpck_require__(3676);
 const { selectConfig } = __nccwpck_require__(675);
 const { preflight } = __nccwpck_require__(9866);
@@ -35084,8 +35261,10 @@ async function resolveDependencySummaries(octokit, filteredFiles, dependencyDiff
 }
 
 // PR-diff review: fetch the PR, gate forks, build the diff material + anchors, run the engine
-// chain, and submit an inline GitHub review.
-async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
+// chain, and submit an inline GitHub review. `deadline` (epoch ms, null = no budget) is the run's
+// wall-clock budget, minted once in run(); the pre-review phases here (PR fetch, preflight,
+// dependency fetch) spend from it implicitly because it is absolute.
+async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadline) {
   const maxDiffChars = parseInt(core.getInput('MAX_DIFF_CHARS'), 10) || 0;
   const token = core.getInput('GITHUB_TOKEN');
   core.setSecret(token);
@@ -35292,6 +35471,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
     await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, {
       summary: 'No patchable changes found after filtering.',
       findings: [],
+      unreviewedScopes: [],
     }, Boolean(reviewToken), transport);
     return;
   }
@@ -35331,8 +35511,18 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
   const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info,
+    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline,
   });
+  // [LAW:no-silent-failure] The budget biting is operator news, not just review-body prose: the
+  // warning makes a curtailed review visible in the run's annotations, naming the knobs to turn.
+  if (review.budgetExhausted) {
+    core.warning(
+      `Review time budget exhausted: ${review.unreviewedScopes.length} scope(s) went unreviewed`
+      + `${review.unreviewedScopes.length > 0 ? ` (${review.unreviewedScopes.join(', ')})` : ''}. `
+      + 'The collected findings were still submitted. Raise TIME_BUDGET_MINUTES (and the job\'s '
+      + 'timeout-minutes above it) for full coverage.',
+    );
+  }
 
   // [LAW:single-enforcer] The PR sink reconciles the MERGED findings with the diff anchors exactly
   // once, here at the boundary: anchored (incl. snapped) post inline; unanchored surface in the
@@ -35351,7 +35541,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
   const footer = buildReviewFooter(review.usage, configUsed, prior.cost);
   await submitReview(
     reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
-    { summary: review.summary, findings: anchored, unanchored, dependencySection },
+    { summary: review.summary, findings: anchored, unanchored, dependencySection, unreviewedScopes: review.unreviewedScopes },
     Boolean(reviewToken), transport, footer,
   );
 
@@ -35373,7 +35563,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
 
 // Whole-repo review: no PR, no fork gate, no host transport. Build a repo-exploration prompt
 // (optionally scoped), run the same engine chain, and print the report to the Step Summary + logs.
-async function runRepoReview(reviewerName, excludePatterns, effort) {
+async function runRepoReview(reviewerName, excludePatterns, effort, deadline) {
   const scope = core.getInput('SCOPE').trim();
 
   let chain;
@@ -35397,8 +35587,18 @@ async function runRepoReview(reviewerName, excludePatterns, effort) {
     + `${scope ? ` (scope: ${scope})` : ' (whole repository)'}...`,
   );
   const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info,
+    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline,
   });
+  // Same operator-facing signal as the PR sink; the report body already carries the coverage gap
+  // in its summary (composeSummary renders it from the same values). [LAW:one-source-of-truth]
+  if (review.budgetExhausted) {
+    core.warning(
+      `Review time budget exhausted: ${review.unreviewedScopes.length} scope(s) went unreviewed`
+      + `${review.unreviewedScopes.length > 0 ? ` (${review.unreviewedScopes.join(', ')})` : ''}. `
+      + 'The collected findings were still reported. Raise TIME_BUDGET_MINUTES (and the job\'s '
+      + 'timeout-minutes above it) for full coverage.',
+    );
+  }
 
   const footer = buildReviewFooter(review.usage, configUsed);
   const report = renderRepoReport({ reviewerName, scope, review, footer });
@@ -35441,18 +35641,27 @@ async function run() {
   // (the pre-spawn gate in runPrReview) reads a trusted value off the profile and never re-parses or
   // guards. A malformed input reds the run loud rather than silently disabling the cap.
   let roundCap;
+  let budgetMinutes;
   try {
     roundCap = parseMaxRounds(core.getInput('MAX_REVIEW_ROUNDS'));
+    budgetMinutes = parseTimeBudgetMinutes(core.getInput('TIME_BUDGET_MINUTES'));
   } catch (e) {
     core.setFailed(e.message);
     return;
   }
   const effort = defaultEffortProfile({ roundCap });
+  // [LAW:no-ambient-temporal-coupling] The review's wall-clock deadline, minted exactly ONCE at the
+  // run boundary (the same boundary that owns `new Date()` for the budget ledger) and threaded down
+  // as an absolute value — so every phase, pre-review included, spends from the same clock. It exists
+  // so the run finishes and SUBMITS before the workflow's timeout-minutes cancel, which can only
+  // discard collected findings. null (TIME_BUDGET_MINUTES: 0) disables it — bit-for-bit the
+  // pre-budget behavior. [LAW:one-source-of-truth]
+  const deadline = mintDeadline(Date.now(), budgetMinutes);
 
   if (mode === 'pr') {
-    await runPrReview(reviewerName, excludePatterns, effort);
+    await runPrReview(reviewerName, excludePatterns, effort, deadline);
   } else if (mode === 'repo') {
-    await runRepoReview(reviewerName, excludePatterns, effort);
+    await runRepoReview(reviewerName, excludePatterns, effort, deadline);
   } else {
     core.setFailed(`Invalid MODE '${mode}'. Valid values: 'pr' (review a pull request) or 'repo' (whole-repo review).`);
   }
@@ -35543,6 +35752,10 @@ const { parseCostMarker } = __nccwpck_require__(9614);
 const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
 const APPROVED_MESSAGE = '✅ Approved';
 const REQUEST_CHANGES_MESSAGE = '❌ Request Changes';
+// The time-budget verdict: scopes went unreviewed and nothing blocking surfaced in the ones that
+// were. Deliberately NOT the approve message — approval asserts the whole diff was judged, and a
+// partial review has no standing to assert it. [LAW:no-silent-failure]
+const PARTIAL_MESSAGE = '⏳ Partial review — the time budget expired before every scope was reviewed; no blocking findings in the scopes that were';
 
 async function listAllFiles(octokit, owner, repo, pullNumber) {
   const files = [];
@@ -35788,8 +36001,15 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   const unanchored = review.unanchored || [];
   const isBlocking = f => f.severity === 'blocking';
   const requestsChanges = review.findings.some(isBlocking) || unanchored.some(isBlocking);
-  const event = reviewEvent(requestsChanges, canApprove, transport);
-  const verdict = requestsChanges ? REQUEST_CHANGES_MESSAGE : APPROVED_MESSAGE;
+  // [LAW:types-are-the-program] unreviewedScopes is a REQUIRED field of the review value, exactly
+  // like findings — every producer states its coverage ([] = complete), and a caller that omits it
+  // crashes loud here rather than approving a partial review by accident. Approvability is the
+  // conjunction of the token's capability and full coverage: a review that did not see every scope
+  // may report and request changes, but it may never approve. Blocking findings outrank the
+  // partial state — a blocker found in a half-reviewed diff is still a blocker.
+  const complete = review.unreviewedScopes.length === 0;
+  const event = reviewEvent(requestsChanges, canApprove && complete, transport);
+  const verdict = requestsChanges ? REQUEST_CHANGES_MESSAGE : (complete ? APPROVED_MESSAGE : PARTIAL_MESSAGE);
   const footer = attributionFooter ? `\n\n${attributionFooter}` : '';
   // [LAW:dataflow-not-control-flow] The dependency section is a VALUE prepended to the summary: a
   // dependency-bump PR leads with its scannable roll-up + per-module breakdown; every other PR carries

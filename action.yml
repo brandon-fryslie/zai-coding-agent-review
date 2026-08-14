@@ -76,6 +76,10 @@ inputs:
     description: "Max times this action reviews one PR; further pushes skip cleanly, no engine spawned (0 = unlimited). Bounds cost on PRs that are pushed many times."
     required: false
     default: "5"
+  TIME_BUDGET_MINUTES:
+    description: "Wall-clock budget for the whole review run, in minutes. When it expires the review stops starting new scope workers and convergence sweeps and SUBMITS what it has collected — unreviewed scopes are named in the summary and the verdict withholds approval — instead of holding every finding until the job's timeout-minutes cancels the run empty-handed. Set it a few minutes below the job's timeout-minutes so submission always beats the kill. 0 = no budget."
+    required: false
+    default: "25"
   DAILY_BUDGET_USD:
     description: "Daily spend ceiling (USD) honored as a GRADIENT, not a hard cutoff: as the day's budget depletes, each review deliberately de-rates (fewer review rounds) so the budget lasts the day. Unset or 0 = off (today's default effort, no ledger IO). PR mode only. Requires LEDGER_ISSUE and 'permissions: issues: write'."
     required: false
