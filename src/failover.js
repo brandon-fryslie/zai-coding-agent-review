@@ -166,10 +166,13 @@ async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sl
 // count, restart from chain[0], until the 60-min budget is spent.
 // [LAW:effects-at-boundaries] budgetMs is injectable so tests can set a zero/tiny budget
 // to cover the 'deadline exceeded mid-retry' throw path without real 60-min waits.
-async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepFn = sleep, budgetMs = TRANSIENT_RETRY_BUDGET_MS) {
+// [LAW:no-ambient-temporal-coupling] `now` is the injected clock, the SAME seam the multi-scope
+// pass and the spawn-level retry clamp use — so a caller measuring its budget on a fake clock has
+// this layer spend it on that same clock, never on ambient wall time.
+async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepFn = sleep, budgetMs = TRANSIENT_RETRY_BUDGET_MS, now = Date.now) {
   // [LAW:no-silent-failure] An empty chain never assigns lastErr; throw undefined is opaque.
   if (!chain.length) throw new Error('produceReview: chain must not be empty');
-  const deadline = Date.now() + budgetMs;
+  const deadline = now() + budgetMs;
   let totalAttempts = 0;
   let lastErr;
   const PER_CONFIG_LIMIT = 3;
@@ -184,7 +187,7 @@ async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepF
         } catch (err) {
           if (!(err instanceof TransientError)) throw err; // non-transient: surface immediately
           lastErr = err;
-          const budgetLeft = Math.max(0, deadline - Date.now());
+          const budgetLeft = Math.max(0, deadline - now());
           if (budgetLeft === 0) throw lastErr;
 
           if (attempt < PER_CONFIG_LIMIT) {
@@ -213,7 +216,7 @@ async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepF
     // Honor lastErr.retryAfterMs if the last failure carried a Retry-After hint —
     // the per-config path does the same; omitting it here would make the sweep
     // restart immediately when the provider said to wait. [LAW:one-source-of-truth]
-    const budgetLeft = Math.max(0, deadline - Date.now());
+    const budgetLeft = Math.max(0, deadline - now());
     if (budgetLeft === 0) throw lastErr;
     const hintOrBackoff = lastErr.retryAfterMs ?? transientBackoffMs(sweep);
     const delay = Math.min(hintOrBackoff, budgetLeft);

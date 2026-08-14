@@ -417,16 +417,18 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
     reasoning: maxTier(config.reasoning ?? null, effort.reasoningTier ?? null),
   }));
   const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, sweepCap, log, sleepFn, deadline, now });
-  // [LAW:no-ambient-temporal-coupling] Forward the injected clock to produceReview too, so ONE sleepFn
-  // owns the whole pass's retry timing — spawn-level (inside the pass) AND config-level failover here.
-  // Defaults to the real sleep, so production is unchanged; a test injects a stub to drive failover fast.
+  // [LAW:no-ambient-temporal-coupling] ONE sleepFn and ONE clock own the whole pass's retry timing:
+  // both are forwarded to produceReview, so the pass-level gates, the spawn-level retry clamp, and
+  // config-level failover all measure the budget on the same injected `now` — a fake clock in a test
+  // can never leave failover spending wall time the rest of the pass isn't. Defaults keep
+  // production unchanged.
   // [LAW:single-enforcer] The wall-clock budget also bounds failover's retry horizon: produceReview
   // already clamps every backoff sleep to its budget, so handing it the time remaining makes retry
   // timing deadline-respecting with no second clamp — a Retry-After longer than the budget can no
   // longer sleep the run past its own deadline. min() with the default keeps the no-deadline path
   // byte-identical (remainingMs is Infinity there).
   const budgetMs = Math.min(TRANSIENT_RETRY_BUDGET_MS, remainingMs(deadline, now()));
-  return produceReview(effectiveChain, null, null, produceOnce, sleepFn, budgetMs);
+  return produceReview(effectiveChain, null, null, produceOnce, sleepFn, budgetMs, now);
 }
 
 // [LAW:decomposition] The two MATERIALS, built once each. A material knows how to build the scout

@@ -1,6 +1,6 @@
 # CoPirate Code Review
 
-A GitHub Action that runs an AI coding agent as a **read-only** code reviewer. It reviews a pull request diff and submits an inline GitHub review — `REQUEST_CHANGES` when it finds blocking issues, otherwise `APPROVE`. It can also do an on-demand whole-repo review (`MODE: repo`).
+A GitHub Action that runs an AI coding agent as a **read-only** code reviewer. It reviews a pull request diff and submits an inline GitHub review — `REQUEST_CHANGES` when it finds blocking issues, otherwise `APPROVE` (or a "⏳ Partial review" `COMMENT` when the [time budget](#inputs) ran out before every scope was reviewed — a partial review never approves). It can also do an on-demand whole-repo review (`MODE: repo`).
 
 The review engine is chosen by `PROVIDER`, which defaults to `auto` (today: Claude Code against DeepSeek). You can also run Claude Code against Z.ai, or Codex against OpenAI. The engine reviews read-only — it cannot push to GitHub itself; findings flow through a private collector and are submitted by the action.
 
@@ -95,7 +95,7 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | `EXCLUDE_PATTERNS` | `*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml` | Comma-separated file patterns to exclude. |
 | `MAX_DIFF_CHARS` | `0` (unlimited) | Max characters of diff sent to the engine. |
 | `MAX_REVIEW_ROUNDS` | `5` | Max times the action reviews one PR; further pushes skip cleanly with no engine spawned (`0` = unlimited). Bounds cost on PRs pushed many times. |
-| `TIME_BUDGET_MINUTES` | `25` | Wall-clock budget for the whole review run. When it expires, the review stops starting new scope workers and sweeps and **submits what it has** — unreviewed scopes are named in the summary and the verdict withholds approval — instead of the job's `timeout-minutes` cancelling the run with every finding undelivered. Set it a few minutes below the job's `timeout-minutes`. `0` = no budget. |
+| `TIME_BUDGET_MINUTES` | `25` | Wall-clock budget for the whole review run. When it expires, the review stops starting new scope workers and sweeps and **submits what it has** — unreviewed scopes are named in the summary and the verdict withholds approval — instead of the job's `timeout-minutes` cancelling the run with every finding undelivered. A budget that expires before **any** scope completes instead fails the run loudly, naming this input — there is no review to deliver. Set it a few minutes below the job's `timeout-minutes`. `0` = no budget. |
 | `DAILY_BUDGET_USD` | `0` (off) | Daily spend ceiling honored as a **gradient** — see [Daily budget](#daily-budget). `0`/unset = off (today's default effort, no ledger I/O). PR mode only; requires `LEDGER_ISSUE` and `issues: write`. |
 | `LEDGER_ISSUE` | — | Issue number of the append-only daily cost ledger the budget gradient reads and writes (typically `${{ vars.LEDGER_ISSUE }}`). Required when `DAILY_BUDGET_USD` is set. |
 | `DIFFICULTY_SCALING` | `false` (off) | Scale review effort to change difficulty — see [Difficulty scaling](#difficulty-scaling). An easy diff draws fewer review rounds; a complex diff reasons harder each round. PR mode only. |

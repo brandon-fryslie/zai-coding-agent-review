@@ -482,3 +482,31 @@ describe('retryTransientSpawn — deadline-clamped sleeps', () => {
     assert.deepEqual(slept, [0]);
   });
 });
+
+// ── produceReview measures its budget on the injected clock (zai-timing-sn1 review round 2) ───────
+// The `now` seam exists for deterministic deadline tests: the budget must be SPENT on the same
+// clock it was measured on, never on ambient wall time.
+describe('produceReview — injected clock', () => {
+  it('a fake clock that advances past the budget between attempts ends the run instead of sleeping on', async () => {
+    let clock = 0;
+    const slept = [];
+    let attempts = 0;
+    await assert.rejects(
+      produceReview(
+        [cfg('only')],
+        null, null,
+        async () => {
+          attempts++;
+          clock += 10_000; // each attempt burns 10s of fake time; the 5s budget is gone after one
+          throw new TransientError('rate-limited');
+        },
+        async ms => { slept.push(ms); },
+        5_000,
+        () => clock,
+      ),
+      /rate-limited/,
+    );
+    assert.equal(attempts, 1); // budgetLeft hit 0 on the fake clock — no second attempt, no sleep
+    assert.deepEqual(slept, []);
+  });
+});

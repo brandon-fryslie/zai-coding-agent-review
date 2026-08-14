@@ -30711,10 +30711,16 @@ const BUDGET_REMEDY = 'Raise TIME_BUDGET_MINUTES (and the workflow job\'s timeou
 function parseTimeBudgetMinutes(raw) {
   const s = String(raw).trim();
   if (s === '') return 0;
-  if (!/^\d+$/.test(s)) {
+  const minutes = parseInt(s, 10);
+  // The safe-integer gate closes the overflow hole in the digits regex: a long-enough digit string
+  // parses to Infinity (or loses precision), mintDeadline yields a never-arriving deadline, and the
+  // budget is silently DISABLED by the exact kind of garbage the strict parse exists to refuse.
+  // Soundness of the arithmetic is the bound — no invented policy cap beyond it: a safe-but-absurd
+  // value is the operator's visible choice.
+  if (!/^\d+$/.test(s) || !Number.isSafeInteger(minutes)) {
     throw new Error(`TIME_BUDGET_MINUTES must be a non-negative integer of minutes (0 = no budget); got "${raw}".`);
   }
-  return parseInt(s, 10);
+  return minutes;
 }
 
 // [LAW:effects-at-boundaries] Pure: the run boundary passes its own clock reading. A positive
@@ -33194,10 +33200,13 @@ async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sl
 // count, restart from chain[0], until the 60-min budget is spent.
 // [LAW:effects-at-boundaries] budgetMs is injectable so tests can set a zero/tiny budget
 // to cover the 'deadline exceeded mid-retry' throw path without real 60-min waits.
-async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepFn = sleep, budgetMs = TRANSIENT_RETRY_BUDGET_MS) {
+// [LAW:no-ambient-temporal-coupling] `now` is the injected clock, the SAME seam the multi-scope
+// pass and the spawn-level retry clamp use — so a caller measuring its budget on a fake clock has
+// this layer spend it on that same clock, never on ambient wall time.
+async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepFn = sleep, budgetMs = TRANSIENT_RETRY_BUDGET_MS, now = Date.now) {
   // [LAW:no-silent-failure] An empty chain never assigns lastErr; throw undefined is opaque.
   if (!chain.length) throw new Error('produceReview: chain must not be empty');
-  const deadline = Date.now() + budgetMs;
+  const deadline = now() + budgetMs;
   let totalAttempts = 0;
   let lastErr;
   const PER_CONFIG_LIMIT = 3;
@@ -33212,7 +33221,7 @@ async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepF
         } catch (err) {
           if (!(err instanceof TransientError)) throw err; // non-transient: surface immediately
           lastErr = err;
-          const budgetLeft = Math.max(0, deadline - Date.now());
+          const budgetLeft = Math.max(0, deadline - now());
           if (budgetLeft === 0) throw lastErr;
 
           if (attempt < PER_CONFIG_LIMIT) {
@@ -33241,7 +33250,7 @@ async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepF
     // Honor lastErr.retryAfterMs if the last failure carried a Retry-After hint —
     // the per-config path does the same; omitting it here would make the sweep
     // restart immediately when the provider said to wait. [LAW:one-source-of-truth]
-    const budgetLeft = Math.max(0, deadline - Date.now());
+    const budgetLeft = Math.max(0, deadline - now());
     if (budgetLeft === 0) throw lastErr;
     const hintOrBackoff = lastErr.retryAfterMs ?? transientBackoffMs(sweep);
     const delay = Math.min(hintOrBackoff, budgetLeft);
@@ -33885,16 +33894,18 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
     reasoning: maxTier(config.reasoning ?? null, effort.reasoningTier ?? null),
   }));
   const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, sweepCap, log, sleepFn, deadline, now });
-  // [LAW:no-ambient-temporal-coupling] Forward the injected clock to produceReview too, so ONE sleepFn
-  // owns the whole pass's retry timing — spawn-level (inside the pass) AND config-level failover here.
-  // Defaults to the real sleep, so production is unchanged; a test injects a stub to drive failover fast.
+  // [LAW:no-ambient-temporal-coupling] ONE sleepFn and ONE clock own the whole pass's retry timing:
+  // both are forwarded to produceReview, so the pass-level gates, the spawn-level retry clamp, and
+  // config-level failover all measure the budget on the same injected `now` — a fake clock in a test
+  // can never leave failover spending wall time the rest of the pass isn't. Defaults keep
+  // production unchanged.
   // [LAW:single-enforcer] The wall-clock budget also bounds failover's retry horizon: produceReview
   // already clamps every backoff sleep to its budget, so handing it the time remaining makes retry
   // timing deadline-respecting with no second clamp — a Retry-After longer than the budget can no
   // longer sleep the run past its own deadline. min() with the default keeps the no-deadline path
   // byte-identical (remainingMs is Infinity there).
   const budgetMs = Math.min(TRANSIENT_RETRY_BUDGET_MS, remainingMs(deadline, now()));
-  return produceReview(effectiveChain, null, null, produceOnce, sleepFn, budgetMs);
+  return produceReview(effectiveChain, null, null, produceOnce, sleepFn, budgetMs, now);
 }
 
 // [LAW:decomposition] The two MATERIALS, built once each. A material knows how to build the scout
@@ -35163,11 +35174,13 @@ function buildReviewFooter(usage, configUsed, priorCost = null) {
 // review-body prose: the warning makes a curtailed review visible in the run's annotations.
 function warnBudgetExhausted(review) {
   if (!review.budgetExhausted) return;
-  core.warning(
-    `Review time budget exhausted: ${review.unreviewedScopes.length} scope(s) went unreviewed`
-    + `${review.unreviewedScopes.length > 0 ? ` (${review.unreviewedScopes.join(', ')})` : ''}. `
-    + `The collected findings were still delivered. ${BUDGET_REMEDY}`,
-  );
+  // The same two budget states composeSummary distinguishes, distinguished here too: a coverage
+  // gap names the unreviewed scopes; curtailed-only means every scope WAS reviewed and only the
+  // convergence sweeps were cut short — "0 scope(s) went unreviewed" would contradict itself.
+  const state = review.unreviewedScopes.length > 0
+    ? `${review.unreviewedScopes.length} scope(s) went unreviewed (${review.unreviewedScopes.join(', ')})`
+    : 'every scope was reviewed, but convergence sweeps were cut short';
+  core.warning(`Review time budget exhausted: ${state}. The collected findings were still delivered. ${BUDGET_REMEDY}`);
 }
 
 // [LAW:decomposition] The one fetch site for the reviewed diff: select the host transport, pull the
@@ -35700,7 +35713,7 @@ async function run() {
   }
 }
 
-module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, MAX_DEPENDENCY_BUMPS_FETCHED };
+module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, MAX_DEPENDENCY_BUMPS_FETCHED };
 
 
 /***/ }),

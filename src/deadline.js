@@ -33,10 +33,16 @@ const BUDGET_REMEDY = 'Raise TIME_BUDGET_MINUTES (and the workflow job\'s timeou
 function parseTimeBudgetMinutes(raw) {
   const s = String(raw).trim();
   if (s === '') return 0;
-  if (!/^\d+$/.test(s)) {
+  const minutes = parseInt(s, 10);
+  // The safe-integer gate closes the overflow hole in the digits regex: a long-enough digit string
+  // parses to Infinity (or loses precision), mintDeadline yields a never-arriving deadline, and the
+  // budget is silently DISABLED by the exact kind of garbage the strict parse exists to refuse.
+  // Soundness of the arithmetic is the bound — no invented policy cap beyond it: a safe-but-absurd
+  // value is the operator's visible choice.
+  if (!/^\d+$/.test(s) || !Number.isSafeInteger(minutes)) {
     throw new Error(`TIME_BUDGET_MINUTES must be a non-negative integer of minutes (0 = no budget); got "${raw}".`);
   }
-  return parseInt(s, 10);
+  return minutes;
 }
 
 // [LAW:effects-at-boundaries] Pure: the run boundary passes its own clock reading. A positive

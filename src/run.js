@@ -132,11 +132,13 @@ function buildReviewFooter(usage, configUsed, priorCost = null) {
 // review-body prose: the warning makes a curtailed review visible in the run's annotations.
 function warnBudgetExhausted(review) {
   if (!review.budgetExhausted) return;
-  core.warning(
-    `Review time budget exhausted: ${review.unreviewedScopes.length} scope(s) went unreviewed`
-    + `${review.unreviewedScopes.length > 0 ? ` (${review.unreviewedScopes.join(', ')})` : ''}. `
-    + `The collected findings were still delivered. ${BUDGET_REMEDY}`,
-  );
+  // The same two budget states composeSummary distinguishes, distinguished here too: a coverage
+  // gap names the unreviewed scopes; curtailed-only means every scope WAS reviewed and only the
+  // convergence sweeps were cut short — "0 scope(s) went unreviewed" would contradict itself.
+  const state = review.unreviewedScopes.length > 0
+    ? `${review.unreviewedScopes.length} scope(s) went unreviewed (${review.unreviewedScopes.join(', ')})`
+    : 'every scope was reviewed, but convergence sweeps were cut short';
+  core.warning(`Review time budget exhausted: ${state}. The collected findings were still delivered. ${BUDGET_REMEDY}`);
 }
 
 // [LAW:decomposition] The one fetch site for the reviewed diff: select the host transport, pull the
@@ -669,4 +671,4 @@ async function run() {
   }
 }
 
-module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, MAX_DEPENDENCY_BUMPS_FETCHED };
+module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, MAX_DEPENDENCY_BUMPS_FETCHED };

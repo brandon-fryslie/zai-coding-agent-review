@@ -52,3 +52,13 @@ describe('DeadlineExceededError retry policy', () => {
     assert.equal(new DeadlineExceededError('x') instanceof TransientError, false);
   });
 });
+
+// ── the overflow hole in the digits regex (zai-timing-sn1 review round 2) ─────────────────────────
+describe('parseTimeBudgetMinutes — overflow safety', () => {
+  test('a digit string past the safe-integer range is rejected, never a silently-disabled budget', () => {
+    // '9'.repeat(400) parses to Infinity; mintDeadline would yield a never-arriving deadline and
+    // every downstream gate would take the no-budget path — garbage silently disabling the exact
+    // protection this module exists to provide.
+    assert.throws(() => parseTimeBudgetMinutes('9'.repeat(400)), /TIME_BUDGET_MINUTES must be a non-negative integer/);
+  });
+});
