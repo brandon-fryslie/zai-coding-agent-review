@@ -62,3 +62,17 @@ describe('parseTimeBudgetMinutes — overflow safety', () => {
     assert.throws(() => parseTimeBudgetMinutes('9'.repeat(400)), /TIME_BUDGET_MINUTES must be a non-negative integer/);
   });
 });
+
+// ── round 4: the DERIVED milliseconds are what must stay safe ─────────────────────────────────────
+describe('parseTimeBudgetMinutes — derived-product safety', () => {
+  test('a safe-integer minutes value whose millisecond product overflows is rejected', () => {
+    // 1e14 is a safe integer, but * 60_000 is ~6e18 — past MAX_SAFE_INTEGER, minting an imprecise
+    // never-arriving deadline that silently disables the budget.
+    assert.throws(() => parseTimeBudgetMinutes('100000000000000'), /TIME_BUDGET_MINUTES must be a non-negative integer/);
+  });
+  test('the error type serializes distinguishably', () => {
+    const e = new DeadlineExceededError('budget spent');
+    assert.equal(e.name, 'DeadlineExceededError');
+    assert.match(String(e), /^DeadlineExceededError: budget spent/);
+  });
+});

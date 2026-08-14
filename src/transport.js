@@ -10,7 +10,7 @@ const REQUEST_CHANGES_MESSAGE = '❌ Request Changes';
 // The time-budget verdict: scopes went unreviewed and nothing blocking surfaced in the ones that
 // were. Deliberately NOT the approve message — approval asserts the whole diff was judged, and a
 // partial review has no standing to assert it. [LAW:no-silent-failure]
-const PARTIAL_MESSAGE = '⏳ Partial review — the time budget expired before every scope was reviewed; no blocking findings in the scopes that were';
+const PARTIAL_MESSAGE = '⏳ Partial review — the time budget expired before every scope was reviewed; no blocking findings in the scopes that were reviewed.';
 
 async function listAllFiles(octokit, owner, repo, pullNumber) {
   const files = [];

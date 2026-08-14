@@ -1295,3 +1295,43 @@ describe('planScopes — unique scope names', () => {
     assert.match(summary, /1 of 2 scope\(s\) were reviewed; NOT reviewed: sync \(2\)/);
   });
 });
+
+// ── round 4: the failover-budget clamp is mutation-visible ────────────────────────────────────────
+// runMultiScope derives produceReview's retry budget from the wall-clock deadline. Without this
+// test, deleting that min() line silently restores the 60-minute failover horizon: sleeps take the
+// uncapped Retry-After and spawn counts grow unbounded by the deadline.
+describe('runMultiScope — failover budget bounded by the deadline', () => {
+  test('a transient storm under a finite deadline ends promptly with every sleep inside the remaining budget', async () => {
+    let clock = 0;
+    const slept = [];
+    let spawns = 0;
+    const material = {
+      changedPaths: [],
+      buildScoutPrompt: () => 'SCOUT',
+      buildWorkerPrompt: (t) => t,
+    };
+    const adapter = {
+      async produceReview() {
+        spawns++;
+        clock += 600; // each attempt burns fake time toward the 1s deadline
+        throw new TransientError('rate-limited', 999_999); // uncapped server Retry-After
+      },
+    };
+    await assert.rejects(
+      runMultiScope({
+        chain: [{ engine: 'fake', name: 'c1' }],
+        material,
+        registry: { get: () => adapter },
+        instructionsPath: 'x',
+        log: () => {},
+        sleepFn: async ms => { slept.push(ms); },
+        deadline: 1_000,
+        now: () => clock,
+      }),
+      TransientError,
+    );
+    assert.ok(slept.length > 0, 'the retry path actually slept');
+    assert.ok(slept.every(ms => ms <= 1_000), `every sleep clamped to the remaining budget, got: ${slept}`);
+    assert.ok(spawns <= 6, `attempts bounded by the deadline, not the 60m default horizon: ${spawns}`);
+  });
+});

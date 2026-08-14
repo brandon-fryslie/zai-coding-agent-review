@@ -18,7 +18,15 @@
 // construction: retryTransientSpawn passes it through (isRetryableSpawnError is false) and
 // produceReview's `instanceof TransientError` gate rethrows it immediately — no failover restart
 // can fit in a budget that has already run out.
-class DeadlineExceededError extends Error {}
+class DeadlineExceededError extends Error {
+  constructor(message) {
+    super(message);
+    // The whole point of the type is being distinguishable — including in serialized form:
+    // without this, err.name/String(err) report a generic "Error" and every log or triage
+    // surface collapses planned degradation back into an engine failure.
+    this.name = 'DeadlineExceededError';
+  }
+}
 
 // [LAW:one-source-of-truth] The operator remedy, stated once: every deadline-exhaustion message —
 // the spawn refusal, the mid-spawn kill, the nothing-completed failure — names the same two knobs
@@ -34,12 +42,13 @@ function parseTimeBudgetMinutes(raw) {
   const s = String(raw).trim();
   if (s === '') return 0;
   const minutes = parseInt(s, 10);
-  // The safe-integer gate closes the overflow hole in the digits regex: a long-enough digit string
-  // parses to Infinity (or loses precision), mintDeadline yields a never-arriving deadline, and the
-  // budget is silently DISABLED by the exact kind of garbage the strict parse exists to refuse.
-  // Soundness of the arithmetic is the bound — no invented policy cap beyond it: a safe-but-absurd
-  // value is the operator's visible choice.
-  if (!/^\d+$/.test(s) || !Number.isSafeInteger(minutes)) {
+  // The safe-integer gate closes the overflow hole in the digits regex — applied to the DERIVED
+  // milliseconds, because that product is what the deadline arithmetic actually uses: a minutes
+  // value can itself be a safe integer while minutes * 60_000 is not, minting an imprecise
+  // never-arriving deadline, and either way the budget is silently DISABLED by the exact kind of
+  // garbage the strict parse exists to refuse. Soundness of the arithmetic is the bound — no
+  // invented policy cap beyond it: a safe-but-absurd value is the operator's visible choice.
+  if (!/^\d+$/.test(s) || !Number.isSafeInteger(minutes * 60_000)) {
     throw new Error(`TIME_BUDGET_MINUTES must be a non-negative integer of minutes (0 = no budget); got "${raw}".`);
   }
   return minutes;
