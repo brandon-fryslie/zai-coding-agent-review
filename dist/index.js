@@ -33029,6 +33029,7 @@ module.exports = { parseJsonEnvelope, formatOutputTail, runEngine, appendBounded
 
 
 const core = __nccwpck_require__(7484);
+const { remainingMs } = __nccwpck_require__(6757);
 
 const TRANSIENT_RETRY_BUDGET_MS = 60 * 60 * 1000;
 const TRANSIENT_BACKOFF_BASE_MS = 2_000;
@@ -33137,7 +33138,15 @@ const TRANSIENT_SPAWN_ATTEMPTS = 3;
 // run with its precise cause — a persistent model protocol slip is a broken engine, not a provider blip.
 // onRetry is the injected progress effect; sleepFn is injectable so tests drive the retry path with no
 // real waits. [LAW:effects-at-boundaries]
-async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sleepFn = sleep, onRetry = () => {} } = {}) {
+// `deadline` (epoch ms, null = no budget) clamps every retry sleep to the time remaining — the same
+// clamp produceReview applies to its own budget's sleeps, applied here to the spawn-level axis. An
+// uncapped server Retry-After near the deadline would otherwise sleep the run past its own budget
+// and into the workflow's timeout-minutes kill, the exact empty-handed cancellation the budget
+// exists to prevent. A wake-up at (or past) the deadline is harmless by construction: the next
+// attempt's spawn is refused at runEngine's deadline gate and degrades scope-by-scope as designed.
+// [LAW:single-enforcer] retry timing stays owned HERE — callers thread the deadline value, never a
+// pre-clamped sleep of their own.
+async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sleepFn = sleep, onRetry = () => {}, deadline = null, now = Date.now } = {}) {
   // [LAW:no-silent-failure] A limit < 1 would run zero iterations and fall through to `throw lastErr`
   // with lastErr still undefined — an opaque `throw undefined` crash. Reject it loud with a diagnostic.
   // The destructuring default fires only on `undefined`, so an explicit 0/negative reaches here; a
@@ -33156,7 +33165,7 @@ async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sl
       // survives every attempt reaches produceReview's `!instanceof TransientError` gate and reds the run
       // with its precise cause — a genuinely broken engine is not laundered into config-level failover.
       if (attempt === limit) throw lastErr;
-      const delay = err.retryAfterMs ?? transientBackoffMs(attempt);
+      const delay = Math.min(err.retryAfterMs ?? transientBackoffMs(attempt), Math.max(0, remainingMs(deadline, now())));
       onRetry({ attempt, limit, delay, err });
       await sleepFn(delay);
     }
@@ -33671,13 +33680,36 @@ function planScopes(scopes, changedPaths) {
     }
     seen.add(p);
   }
-  if (sweptPaths.length === 0) return { scopes, sweptPaths, duplicatePaths };
+  if (sweptPaths.length === 0) return { scopes: uniquelyNamed(scopes), sweptPaths, duplicatePaths };
   const catchAll = {
     name: 'unassigned files',
     focus: `These changed files were not covered by the planned scopes: ${sweptPaths.join(', ')}. Review their changes fully.`,
     files: sweptPaths,
   };
-  return { scopes: [...scopes, catchAll], sweptPaths, duplicatePaths };
+  return { scopes: uniquelyNamed([...scopes, catchAll]), sweptPaths, duplicatePaths };
+}
+
+// [LAW:parse-dont-validate] A scope's name is its IDENTIFIER downstream — log lines, sweep labels,
+// and the time budget's coverage bookkeeping (unreviewedScopes vs reviewed) all key on it — but the
+// scout contract only promises non-empty, not unique. Stamp uniqueness once here at the plan
+// boundary, so every name-keyed consumer inland is sound by construction: a repeated name (scout
+// dupes, or a scout scope colliding with the 'unassigned files' catch-all) gets a deterministic
+// ' (2)', ' (3)' suffix; the suffixed name is itself checked against the used set, so a scout that
+// literally planned 'x' and 'x (2)' still comes out collision-free.
+function uniquelyNamed(scopes) {
+  const used = new Set();
+  let renamed = false;
+  const out = scopes.map(s => {
+    let name = s.name;
+    for (let n = 2; used.has(name); n++) name = `${s.name} (${n})`;
+    used.add(name);
+    if (name === s.name) return s;
+    renamed = true;
+    return { ...s, name };
+  });
+  // The collision-free case returns the INPUT array itself — the common path is a provable no-op,
+  // not a fresh copy that merely looks like one.
+  return renamed ? out : scopes;
 }
 
 // One full multi-scope pass for ONE config: scout → workers → aggregate. This is the produceOnce that
@@ -33708,6 +33740,11 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
       () => adapter.produceReview({ config, buildPromptFor, instructionsPath, deadline }),
       {
         sleepFn,
+        // The same deadline bounds the spawn AND its retry sleeps: an uncapped Retry-After near
+        // the budget's edge must not sleep the run past its own deadline. [LAW:single-enforcer]
+        // the clamp lives in retryTransientSpawn; this seam only threads the value.
+        deadline,
+        now,
         onRetry: ({ attempt, limit, delay, err }) =>
           log(`${label}: transient error (attempt ${attempt}/${limit}), retrying in ${Math.round(delay / 1000)}s: ${err.message}`),
       },
@@ -35014,7 +35051,7 @@ const { renderCostLine, costWarning, costMarker } = __nccwpck_require__(9614);
 const { renderRepoReport } = __nccwpck_require__(8959);
 const registry = __nccwpck_require__(25);
 const { loadConfig, peekConfigNames } = __nccwpck_require__(1283);
-const { parseTimeBudgetMinutes, mintDeadline } = __nccwpck_require__(6757);
+const { parseTimeBudgetMinutes, mintDeadline, BUDGET_REMEDY } = __nccwpck_require__(6757);
 const { synthesizeProviderConfig } = __nccwpck_require__(3676);
 const { selectConfig } = __nccwpck_require__(675);
 const { preflight } = __nccwpck_require__(9866);
@@ -35117,6 +35154,20 @@ function buildReviewFooter(usage, configUsed, priorCost = null) {
   if (costLine) core.info(costLine.replace(/^_|_$/g, ''));
   const marker = costMarker(usage && usage.cost);
   return [buildAttributionFooter(configUsed), costLine, marker].filter(Boolean).join('\n\n');
+}
+
+// [LAW:one-source-of-truth] The budget-exhaustion warning, composed ONCE for both review modes from
+// the review's coverage data plus the one remedy sentence (BUDGET_REMEDY, src/deadline.js) — never
+// re-authored per sink, so the operator remedy cannot drift between modes or from the error
+// messages that share it. [LAW:no-silent-failure] the budget biting is operator news, not just
+// review-body prose: the warning makes a curtailed review visible in the run's annotations.
+function warnBudgetExhausted(review) {
+  if (!review.budgetExhausted) return;
+  core.warning(
+    `Review time budget exhausted: ${review.unreviewedScopes.length} scope(s) went unreviewed`
+    + `${review.unreviewedScopes.length > 0 ? ` (${review.unreviewedScopes.join(', ')})` : ''}. `
+    + `The collected findings were still delivered. ${BUDGET_REMEDY}`,
+  );
 }
 
 // [LAW:decomposition] The one fetch site for the reviewed diff: select the host transport, pull the
@@ -35513,16 +35564,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   const { review, configUsed } = await runMultiScope({
     chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline,
   });
-  // [LAW:no-silent-failure] The budget biting is operator news, not just review-body prose: the
-  // warning makes a curtailed review visible in the run's annotations, naming the knobs to turn.
-  if (review.budgetExhausted) {
-    core.warning(
-      `Review time budget exhausted: ${review.unreviewedScopes.length} scope(s) went unreviewed`
-      + `${review.unreviewedScopes.length > 0 ? ` (${review.unreviewedScopes.join(', ')})` : ''}. `
-      + 'The collected findings were still submitted. Raise TIME_BUDGET_MINUTES (and the job\'s '
-      + 'timeout-minutes above it) for full coverage.',
-    );
-  }
+  warnBudgetExhausted(review);
 
   // [LAW:single-enforcer] The PR sink reconciles the MERGED findings with the diff anchors exactly
   // once, here at the boundary: anchored (incl. snapped) post inline; unanchored surface in the
@@ -35589,16 +35631,7 @@ async function runRepoReview(reviewerName, excludePatterns, effort, deadline) {
   const { review, configUsed } = await runMultiScope({
     chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline,
   });
-  // Same operator-facing signal as the PR sink; the report body already carries the coverage gap
-  // in its summary (composeSummary renders it from the same values). [LAW:one-source-of-truth]
-  if (review.budgetExhausted) {
-    core.warning(
-      `Review time budget exhausted: ${review.unreviewedScopes.length} scope(s) went unreviewed`
-      + `${review.unreviewedScopes.length > 0 ? ` (${review.unreviewedScopes.join(', ')})` : ''}. `
-      + 'The collected findings were still reported. Raise TIME_BUDGET_MINUTES (and the job\'s '
-      + 'timeout-minutes above it) for full coverage.',
-    );
-  }
+  warnBudgetExhausted(review);
 
   const footer = buildReviewFooter(review.usage, configUsed);
   const report = renderRepoReport({ reviewerName, scope, review, footer });

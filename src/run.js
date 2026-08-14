@@ -20,7 +20,7 @@ const { renderCostLine, costWarning, costMarker } = require('./usage');
 const { renderRepoReport } = require('./report');
 const registry = require('./engine/registry');
 const { loadConfig, peekConfigNames } = require('./config');
-const { parseTimeBudgetMinutes, mintDeadline } = require('./deadline');
+const { parseTimeBudgetMinutes, mintDeadline, BUDGET_REMEDY } = require('./deadline');
 const { synthesizeProviderConfig } = require('./provider');
 const { selectConfig } = require('./selection');
 const { preflight } = require('./preflight');
@@ -123,6 +123,20 @@ function buildReviewFooter(usage, configUsed, priorCost = null) {
   if (costLine) core.info(costLine.replace(/^_|_$/g, ''));
   const marker = costMarker(usage && usage.cost);
   return [buildAttributionFooter(configUsed), costLine, marker].filter(Boolean).join('\n\n');
+}
+
+// [LAW:one-source-of-truth] The budget-exhaustion warning, composed ONCE for both review modes from
+// the review's coverage data plus the one remedy sentence (BUDGET_REMEDY, src/deadline.js) — never
+// re-authored per sink, so the operator remedy cannot drift between modes or from the error
+// messages that share it. [LAW:no-silent-failure] the budget biting is operator news, not just
+// review-body prose: the warning makes a curtailed review visible in the run's annotations.
+function warnBudgetExhausted(review) {
+  if (!review.budgetExhausted) return;
+  core.warning(
+    `Review time budget exhausted: ${review.unreviewedScopes.length} scope(s) went unreviewed`
+    + `${review.unreviewedScopes.length > 0 ? ` (${review.unreviewedScopes.join(', ')})` : ''}. `
+    + `The collected findings were still delivered. ${BUDGET_REMEDY}`,
+  );
 }
 
 // [LAW:decomposition] The one fetch site for the reviewed diff: select the host transport, pull the
@@ -519,16 +533,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   const { review, configUsed } = await runMultiScope({
     chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline,
   });
-  // [LAW:no-silent-failure] The budget biting is operator news, not just review-body prose: the
-  // warning makes a curtailed review visible in the run's annotations, naming the knobs to turn.
-  if (review.budgetExhausted) {
-    core.warning(
-      `Review time budget exhausted: ${review.unreviewedScopes.length} scope(s) went unreviewed`
-      + `${review.unreviewedScopes.length > 0 ? ` (${review.unreviewedScopes.join(', ')})` : ''}. `
-      + 'The collected findings were still submitted. Raise TIME_BUDGET_MINUTES (and the job\'s '
-      + 'timeout-minutes above it) for full coverage.',
-    );
-  }
+  warnBudgetExhausted(review);
 
   // [LAW:single-enforcer] The PR sink reconciles the MERGED findings with the diff anchors exactly
   // once, here at the boundary: anchored (incl. snapped) post inline; unanchored surface in the
@@ -595,16 +600,7 @@ async function runRepoReview(reviewerName, excludePatterns, effort, deadline) {
   const { review, configUsed } = await runMultiScope({
     chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline,
   });
-  // Same operator-facing signal as the PR sink; the report body already carries the coverage gap
-  // in its summary (composeSummary renders it from the same values). [LAW:one-source-of-truth]
-  if (review.budgetExhausted) {
-    core.warning(
-      `Review time budget exhausted: ${review.unreviewedScopes.length} scope(s) went unreviewed`
-      + `${review.unreviewedScopes.length > 0 ? ` (${review.unreviewedScopes.join(', ')})` : ''}. `
-      + 'The collected findings were still reported. Raise TIME_BUDGET_MINUTES (and the job\'s '
-      + 'timeout-minutes above it) for full coverage.',
-    );
-  }
+  warnBudgetExhausted(review);
 
   const footer = buildReviewFooter(review.usage, configUsed);
   const report = renderRepoReport({ reviewerName, scope, review, footer });

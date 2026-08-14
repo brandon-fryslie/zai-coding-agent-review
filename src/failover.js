@@ -1,6 +1,7 @@
 'use strict';
 
 const core = require('@actions/core');
+const { remainingMs } = require('./deadline');
 
 const TRANSIENT_RETRY_BUDGET_MS = 60 * 60 * 1000;
 const TRANSIENT_BACKOFF_BASE_MS = 2_000;
@@ -109,7 +110,15 @@ const TRANSIENT_SPAWN_ATTEMPTS = 3;
 // run with its precise cause — a persistent model protocol slip is a broken engine, not a provider blip.
 // onRetry is the injected progress effect; sleepFn is injectable so tests drive the retry path with no
 // real waits. [LAW:effects-at-boundaries]
-async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sleepFn = sleep, onRetry = () => {} } = {}) {
+// `deadline` (epoch ms, null = no budget) clamps every retry sleep to the time remaining — the same
+// clamp produceReview applies to its own budget's sleeps, applied here to the spawn-level axis. An
+// uncapped server Retry-After near the deadline would otherwise sleep the run past its own budget
+// and into the workflow's timeout-minutes kill, the exact empty-handed cancellation the budget
+// exists to prevent. A wake-up at (or past) the deadline is harmless by construction: the next
+// attempt's spawn is refused at runEngine's deadline gate and degrades scope-by-scope as designed.
+// [LAW:single-enforcer] retry timing stays owned HERE — callers thread the deadline value, never a
+// pre-clamped sleep of their own.
+async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sleepFn = sleep, onRetry = () => {}, deadline = null, now = Date.now } = {}) {
   // [LAW:no-silent-failure] A limit < 1 would run zero iterations and fall through to `throw lastErr`
   // with lastErr still undefined — an opaque `throw undefined` crash. Reject it loud with a diagnostic.
   // The destructuring default fires only on `undefined`, so an explicit 0/negative reaches here; a
@@ -128,7 +137,7 @@ async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sl
       // survives every attempt reaches produceReview's `!instanceof TransientError` gate and reds the run
       // with its precise cause — a genuinely broken engine is not laundered into config-level failover.
       if (attempt === limit) throw lastErr;
-      const delay = err.retryAfterMs ?? transientBackoffMs(attempt);
+      const delay = Math.min(err.retryAfterMs ?? transientBackoffMs(attempt), Math.max(0, remainingMs(deadline, now())));
       onRetry({ attempt, limit, delay, err });
       await sleepFn(delay);
     }

@@ -435,3 +435,50 @@ describe('produceReview — configUsed', () => {
     assert.equal(result.attempts, 7); // 3+3+1
   });
 });
+
+// ── the wall-clock deadline clamps spawn-level retry sleeps (zai-timing-sn1 review round) ─────────
+// An uncapped server Retry-After near the deadline must not sleep the run past its own budget and
+// into the workflow's timeout-minutes kill — the exact empty-handed cancel the budget prevents.
+describe('retryTransientSpawn — deadline-clamped sleeps', () => {
+  it('a Retry-After far larger than the remaining budget sleeps only the remainder', async () => {
+    const slept = [];
+    let calls = 0;
+    await retryTransientSpawn(
+      async () => {
+        calls++;
+        if (calls === 1) throw new TransientError('rate-limited', 120_000); // server says 2 minutes
+        return 'ok';
+      },
+      { sleepFn: async ms => { slept.push(ms); }, deadline: 5_000, now: () => 0 }, // 5s remain
+    );
+    assert.deepEqual(slept, [5_000]);
+  });
+
+  it('no deadline leaves the sleep at the full Retry-After (byte-identical to before)', async () => {
+    const slept = [];
+    let calls = 0;
+    await retryTransientSpawn(
+      async () => {
+        calls++;
+        if (calls === 1) throw new TransientError('rate-limited', 120_000);
+        return 'ok';
+      },
+      { sleepFn: async ms => { slept.push(ms); } },
+    );
+    assert.deepEqual(slept, [120_000]);
+  });
+
+  it('a deadline already past clamps the sleep to zero (the next attempt is refused at the spawn gate, not slept toward)', async () => {
+    const slept = [];
+    let calls = 0;
+    await retryTransientSpawn(
+      async () => {
+        calls++;
+        if (calls === 1) throw new TransientError('rate-limited', 120_000);
+        return 'ok';
+      },
+      { sleepFn: async ms => { slept.push(ms); }, deadline: 0, now: () => 10 },
+    );
+    assert.deepEqual(slept, [0]);
+  });
+});

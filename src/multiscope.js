@@ -212,13 +212,36 @@ function planScopes(scopes, changedPaths) {
     }
     seen.add(p);
   }
-  if (sweptPaths.length === 0) return { scopes, sweptPaths, duplicatePaths };
+  if (sweptPaths.length === 0) return { scopes: uniquelyNamed(scopes), sweptPaths, duplicatePaths };
   const catchAll = {
     name: 'unassigned files',
     focus: `These changed files were not covered by the planned scopes: ${sweptPaths.join(', ')}. Review their changes fully.`,
     files: sweptPaths,
   };
-  return { scopes: [...scopes, catchAll], sweptPaths, duplicatePaths };
+  return { scopes: uniquelyNamed([...scopes, catchAll]), sweptPaths, duplicatePaths };
+}
+
+// [LAW:parse-dont-validate] A scope's name is its IDENTIFIER downstream — log lines, sweep labels,
+// and the time budget's coverage bookkeeping (unreviewedScopes vs reviewed) all key on it — but the
+// scout contract only promises non-empty, not unique. Stamp uniqueness once here at the plan
+// boundary, so every name-keyed consumer inland is sound by construction: a repeated name (scout
+// dupes, or a scout scope colliding with the 'unassigned files' catch-all) gets a deterministic
+// ' (2)', ' (3)' suffix; the suffixed name is itself checked against the used set, so a scout that
+// literally planned 'x' and 'x (2)' still comes out collision-free.
+function uniquelyNamed(scopes) {
+  const used = new Set();
+  let renamed = false;
+  const out = scopes.map(s => {
+    let name = s.name;
+    for (let n = 2; used.has(name); n++) name = `${s.name} (${n})`;
+    used.add(name);
+    if (name === s.name) return s;
+    renamed = true;
+    return { ...s, name };
+  });
+  // The collision-free case returns the INPUT array itself — the common path is a provable no-op,
+  // not a fresh copy that merely looks like one.
+  return renamed ? out : scopes;
 }
 
 // One full multi-scope pass for ONE config: scout → workers → aggregate. This is the produceOnce that
@@ -249,6 +272,11 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
       () => adapter.produceReview({ config, buildPromptFor, instructionsPath, deadline }),
       {
         sleepFn,
+        // The same deadline bounds the spawn AND its retry sleeps: an uncapped Retry-After near
+        // the budget's edge must not sleep the run past its own deadline. [LAW:single-enforcer]
+        // the clamp lives in retryTransientSpawn; this seam only threads the value.
+        deadline,
+        now,
         onRetry: ({ attempt, limit, delay, err }) =>
           log(`${label}: transient error (attempt ${attempt}/${limit}), retrying in ${Math.round(delay / 1000)}s: ${err.message}`),
       },

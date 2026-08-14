@@ -1249,3 +1249,49 @@ describe('runMultiScopePass — wall-clock time budget', () => {
     assert.doesNotMatch(review.summary, /Time budget/);
   });
 });
+
+// ── planScopes stamps unique names (zai-timing-sn1 review round) ──────────────────────────────────
+// Scope names are identifiers downstream — logs, sweep labels, and the time budget's coverage
+// bookkeeping key on them — but the scout contract only promises non-empty. planScopes is the one
+// boundary that makes them unique, so name-keyed consumers are sound by construction.
+describe('planScopes — unique scope names', () => {
+  test('a repeated name gets a deterministic suffix; distinct names pass through untouched', () => {
+    const { scopes } = planScopes([
+      { name: 'sync', focus: 'f1', files: ['a.js'] },
+      { name: 'sync', focus: 'f2', files: ['b.js'] },
+      { name: 'docs', focus: 'f3', files: ['c.js'] },
+    ], ['a.js', 'b.js', 'c.js']);
+    assert.deepEqual(scopes.map(s => s.name), ['sync', 'sync (2)', 'docs']);
+  });
+
+  test('a suffixed name colliding with a literally-planned one keeps bumping until free', () => {
+    const { scopes } = planScopes([
+      { name: 'x', focus: 'f1', files: ['a.js'] },
+      { name: 'x (2)', focus: 'f2', files: ['b.js'] },
+      { name: 'x', focus: 'f3', files: ['c.js'] },
+    ], ['a.js', 'b.js', 'c.js']);
+    assert.deepEqual(scopes.map(s => s.name), ['x', 'x (2)', 'x (3)']);
+  });
+
+  test("a scout scope named 'unassigned files' cannot collide with the catch-all", () => {
+    const { scopes } = planScopes(
+      [{ name: 'unassigned files', focus: 'f1', files: ['a.js'] }],
+      ['a.js', 'stray.js'],
+    );
+    assert.deepEqual(scopes.map(s => s.name), ['unassigned files', 'unassigned files (2)']);
+    assert.deepEqual(scopes[1].files, ['stray.js']);
+  });
+
+  test('coverage bookkeeping stays consistent under formerly-duplicate names (the reporting bug this fixes)', () => {
+    // Two same-named scopes, one deadline-killed: the summary must count the reviewed one as
+    // reviewed, not subtract both via the shared name.
+    const summary = composeSummary(
+      [{ name: 'sync', focus: 'f1' }, { name: 'sync (2)', focus: 'f2' }],
+      [{ name: 'sync', summary: 'ok' }],
+      [],
+      { exhausted: true, unreviewedScopes: ['sync (2)'] },
+    );
+    assert.match(summary, /Reviewed 1 scope\(s\): sync\./);
+    assert.match(summary, /1 of 2 scope\(s\) were reviewed; NOT reviewed: sync \(2\)/);
+  });
+});

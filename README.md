@@ -308,7 +308,7 @@ To make a `review:gpt-5.5` label "just work", name a config `gpt-5.5`. Selection
 
 ### Failover
 
-When `fallback` is set, the selected config plus the rest of that list form the failover chain. A **transient** error (429 / rate-limit / quota / 529) retries the same config up to 3× (honoring `Retry-After`), then advances to the next config immediately; an exhausted chain backs off and sweeps again until a 60-minute budget is spent. A **non-transient** error (bad output, validation failure, spawn error) throws immediately with no failover. The submitted review's footer names the config that actually produced it, so a failover is always visible.
+When `fallback` is set, the selected config plus the rest of that list form the failover chain. A **transient** error (429 / rate-limit / quota / 529) retries the same config up to 3× (honoring `Retry-After`), then advances to the next config immediately; an exhausted chain backs off and sweeps again until the retry budget is spent — the smaller of 60 minutes and the time remaining in `TIME_BUDGET_MINUTES` (retry sleeps, including a server's `Retry-After`, are clamped to that remainder too, so a rate-limited run can never sleep past its own deadline). A **non-transient** error (bad output, validation failure, spawn error) throws immediately with no failover. The submitted review's footer names the config that actually produced it, so a failover is always visible.
 
 ## Preflight diagnostic
 
