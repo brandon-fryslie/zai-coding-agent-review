@@ -644,23 +644,24 @@ async function run() {
   // input is parsed strictly here and the integer folded into the profile, so the round-cap consumer
   // (the pre-spawn gate in runPrReview) reads a trusted value off the profile and never re-parses or
   // guards. A malformed input reds the run loud rather than silently disabling the cap.
-  let roundCap;
-  let budgetMinutes;
-  try {
-    roundCap = parseMaxRounds(core.getInput('MAX_REVIEW_ROUNDS'));
-    budgetMinutes = parseTimeBudgetMinutes(core.getInput('TIME_BUDGET_MINUTES'));
-  } catch (e) {
-    core.setFailed(e.message);
-    return;
-  }
-  const effort = defaultEffortProfile({ roundCap });
   // [LAW:no-ambient-temporal-coupling] The review's wall-clock deadline, minted exactly ONCE at the
   // run boundary (the same boundary that owns `new Date()` for the budget ledger) and threaded down
   // as an absolute value — so every phase, pre-review included, spends from the same clock. It exists
   // so the run finishes and SUBMITS before the workflow's timeout-minutes cancel, which can only
   // discard collected findings. null (TIME_BUDGET_MINUTES: 0) disables it — bit-for-bit the
-  // pre-budget behavior. [LAW:one-source-of-truth]
-  const deadline = mintDeadline(Date.now(), budgetMinutes);
+  // pre-budget behavior. [LAW:one-source-of-truth] The mint shares the parses' failure path: it is
+  // the boundary that proves the deadline SUM sound (deadline.js), and its refusal is the same
+  // misconfiguration class as a malformed input.
+  let roundCap;
+  let deadline;
+  try {
+    roundCap = parseMaxRounds(core.getInput('MAX_REVIEW_ROUNDS'));
+    deadline = mintDeadline(Date.now(), parseTimeBudgetMinutes(core.getInput('TIME_BUDGET_MINUTES')));
+  } catch (e) {
+    core.setFailed(e.message);
+    return;
+  }
+  const effort = defaultEffortProfile({ roundCap });
 
   if (mode === 'pr') {
     await runPrReview(reviewerName, excludePatterns, effort, deadline);

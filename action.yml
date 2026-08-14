@@ -77,7 +77,7 @@ inputs:
     required: false
     default: "5"
   TIME_BUDGET_MINUTES:
-    description: "Wall-clock budget for the whole review run, in minutes. When it expires the review stops starting new scope workers and convergence sweeps and SUBMITS what it has collected — unreviewed scopes are named in the summary and the verdict withholds approval — instead of holding every finding until the job's timeout-minutes cancels the run empty-handed. A budget that expires before ANY scope completes instead fails the run loudly, naming this input — there is no review to deliver. Set it a few minutes below the job's timeout-minutes so submission always beats the kill. 0 = no budget."
+    description: "Wall-clock budget for the whole review run, in minutes, in both review modes. When it expires the review stops starting new scope workers and convergence sweeps and DELIVERS what it has collected instead of holding every finding until the job's timeout-minutes cancels the run empty-handed: in pr mode the review is submitted with unreviewed scopes named in the summary and the verdict withholding approval; in repo mode the Step Summary report still renders, carrying the same partial-coverage note (there is no verdict to withhold). A budget that expires before ANY scope completes instead fails the run loudly, naming this input — there is no review to deliver. Set it a few minutes below the job's timeout-minutes so delivery always beats the kill. 0 = no budget."
     required: false
     default: "25"
   DAILY_BUDGET_USD:

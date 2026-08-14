@@ -82,7 +82,10 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
     }
     const { command, args, env } = adapter.buildCommand({ config, collector, home });
     const adapterCapMs = adapter.timeoutMs ?? 3_000_000;
-    const deadlineBound = remaining < adapterCapMs;
+    // <= : at the exact tie both bounds fire at the same instant, and the deadline reading wins —
+    // it is true (the budget did expire then) and it is the safe side (absorbed upstream as an
+    // unreviewed scope; the adapter-cap reading would take the batch-aborting plain-Error path).
+    const deadlineBound = remaining <= adapterCapMs;
     const timeoutMs = deadlineBound ? remaining : adapterCapMs;
     // [LAW:dataflow-not-control-flow] The retention window is the adapter's value (default 8 MiB),
     // mirroring the timeoutMs seam above — so a test can exercise the clip/announce path at a small cap.

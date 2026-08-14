@@ -57,8 +57,18 @@ function parseTimeBudgetMinutes(raw) {
 // [LAW:effects-at-boundaries] Pure: the run boundary passes its own clock reading. A positive
 // budget yields an absolute epoch-ms deadline; 0 yields null — "no budget", the value that makes
 // every downstream bound resolve to the adapter's own cap (see remainingMs).
+// [LAW:parse-dont-validate] Each boundary proves what it can see: the parse keeps the millisecond
+// PRODUCT safe, but only here do both operands exist — a product that is safe alone can leave the
+// safe range once the epoch nowMs is added, minting an imprecise never-arriving deadline that
+// silently disables the budget. The SUM is what every remainingMs comparison uses, so the sum is
+// what this boundary refuses to mint unsound.
 function mintDeadline(nowMs, budgetMinutes) {
-  return budgetMinutes > 0 ? nowMs + budgetMinutes * 60_000 : null;
+  if (budgetMinutes <= 0) return null;
+  const deadline = nowMs + budgetMinutes * 60_000;
+  if (!Number.isSafeInteger(deadline)) {
+    throw new Error(`TIME_BUDGET_MINUTES is too large to mint a sound deadline (${budgetMinutes} minutes from now overflows safe integer arithmetic).`);
+  }
+  return deadline;
 }
 
 // [LAW:dataflow-not-control-flow] Time remaining as a value every consumer can use uniformly: a

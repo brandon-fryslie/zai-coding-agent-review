@@ -510,3 +510,22 @@ describe('produceReview — injected clock', () => {
     assert.deepEqual(slept, []);
   });
 });
+
+// ── round 5: the clamp binds the BACKOFF branch too, not only Retry-After ─────────────────────────
+describe('retryTransientSpawn — backoff branch clamped by the deadline', () => {
+  it('with no Retry-After, the exponential backoff is clamped to the remaining budget', async () => {
+    const slept = [];
+    let calls = 0;
+    await retryTransientSpawn(
+      async () => {
+        calls++;
+        if (calls === 1) throw new TransientError('connection error'); // retryAfterMs null → backoff
+        return 'ok';
+      },
+      // attempt-1 backoff is jittered in [1000, 2000); a 500ms remainder is below its floor, so the
+      // recorded sleep proves the clamp bound the backoff branch — deterministic despite the jitter.
+      { sleepFn: async ms => { slept.push(ms); }, deadline: 500, now: () => 0 },
+    );
+    assert.deepEqual(slept, [500]);
+  });
+});

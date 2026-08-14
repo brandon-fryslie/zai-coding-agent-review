@@ -76,3 +76,16 @@ describe('parseTimeBudgetMinutes — derived-product safety', () => {
     assert.match(String(e), /^DeadlineExceededError: budget spent/);
   });
 });
+
+// ── round 5: the SUM is what the arithmetic uses — mint refuses an unsound one ────────────────────
+describe('mintDeadline — sum safety', () => {
+  test('a product-safe budget whose epoch sum overflows is refused at the mint', () => {
+    // 150119987579 minutes: * 60_000 = 9007199254740000 (safe), + a real epoch nowMs → past
+    // MAX_SAFE_INTEGER — an imprecise never-arriving deadline that would silently disable the budget.
+    const minutes = parseTimeBudgetMinutes('150119987579'); // passes the parse gate
+    assert.throws(() => mintDeadline(1_755_000_000_000, minutes), /too large to mint a sound deadline/);
+  });
+  test('an ordinary budget mints exactly', () => {
+    assert.equal(mintDeadline(1_755_000_000_000, 25), 1_755_000_000_000 + 25 * 60_000);
+  });
+});

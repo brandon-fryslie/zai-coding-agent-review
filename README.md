@@ -118,6 +118,8 @@ The default `GITHUB_TOKEN` cannot approve PRs. With no `GITHUB_REVIEW_TOKEN`:
 
 Set `GITHUB_REVIEW_TOKEN` to an approval-capable user or GitHub App token to have non-blocking reviews submit a formal `APPROVE`. When a blocking finding exists the action requests changes — resolve the threads and dismiss the review to proceed.
 
+**The partial exception:** a review whose [time budget](#inputs) expired before every scope was reviewed never approves, however clean — with or without `GITHUB_REVIEW_TOKEN` it posts a `COMMENT` review whose verdict reads `⏳ Partial review`, naming the unreviewed scopes in the summary. Approval asserts the whole diff was judged, and a partial review has no standing to assert it.
+
 ## Fork PRs are never reviewed
 
 PRs opened from a fork (head repo ≠ base repo) are skipped cleanly — logged, exit 0, no engine spawned, no review posted — *before any credential is read*. This is unconditional with no opt-in, so an outside contributor's PR can never spend the host's AI credits or meet a secret. Your own branches (head and base in the same repo) review normally.

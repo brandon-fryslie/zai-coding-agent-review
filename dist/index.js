@@ -30735,8 +30735,18 @@ function parseTimeBudgetMinutes(raw) {
 // [LAW:effects-at-boundaries] Pure: the run boundary passes its own clock reading. A positive
 // budget yields an absolute epoch-ms deadline; 0 yields null — "no budget", the value that makes
 // every downstream bound resolve to the adapter's own cap (see remainingMs).
+// [LAW:parse-dont-validate] Each boundary proves what it can see: the parse keeps the millisecond
+// PRODUCT safe, but only here do both operands exist — a product that is safe alone can leave the
+// safe range once the epoch nowMs is added, minting an imprecise never-arriving deadline that
+// silently disables the budget. The SUM is what every remainingMs comparison uses, so the sum is
+// what this boundary refuses to mint unsound.
 function mintDeadline(nowMs, budgetMinutes) {
-  return budgetMinutes > 0 ? nowMs + budgetMinutes * 60_000 : null;
+  if (budgetMinutes <= 0) return null;
+  const deadline = nowMs + budgetMinutes * 60_000;
+  if (!Number.isSafeInteger(deadline)) {
+    throw new Error(`TIME_BUDGET_MINUTES is too large to mint a sound deadline (${budgetMinutes} minutes from now overflows safe integer arithmetic).`);
+  }
+  return deadline;
 }
 
 // [LAW:dataflow-not-control-flow] Time remaining as a value every consumer can use uniformly: a
@@ -32946,7 +32956,10 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
     }
     const { command, args, env } = adapter.buildCommand({ config, collector, home });
     const adapterCapMs = adapter.timeoutMs ?? 3_000_000;
-    const deadlineBound = remaining < adapterCapMs;
+    // <= : at the exact tie both bounds fire at the same instant, and the deadline reading wins —
+    // it is true (the budget did expire then) and it is the safe side (absorbed upstream as an
+    // unreviewed scope; the adapter-cap reading would take the batch-aborting plain-Error path).
+    const deadlineBound = remaining <= adapterCapMs;
     const timeoutMs = deadlineBound ? remaining : adapterCapMs;
     // [LAW:dataflow-not-control-flow] The retention window is the adapter's value (default 8 MiB),
     // mirroring the timeoutMs seam above — so a test can exercise the clip/announce path at a small cap.
@@ -35746,23 +35759,24 @@ async function run() {
   // input is parsed strictly here and the integer folded into the profile, so the round-cap consumer
   // (the pre-spawn gate in runPrReview) reads a trusted value off the profile and never re-parses or
   // guards. A malformed input reds the run loud rather than silently disabling the cap.
-  let roundCap;
-  let budgetMinutes;
-  try {
-    roundCap = parseMaxRounds(core.getInput('MAX_REVIEW_ROUNDS'));
-    budgetMinutes = parseTimeBudgetMinutes(core.getInput('TIME_BUDGET_MINUTES'));
-  } catch (e) {
-    core.setFailed(e.message);
-    return;
-  }
-  const effort = defaultEffortProfile({ roundCap });
   // [LAW:no-ambient-temporal-coupling] The review's wall-clock deadline, minted exactly ONCE at the
   // run boundary (the same boundary that owns `new Date()` for the budget ledger) and threaded down
   // as an absolute value — so every phase, pre-review included, spends from the same clock. It exists
   // so the run finishes and SUBMITS before the workflow's timeout-minutes cancel, which can only
   // discard collected findings. null (TIME_BUDGET_MINUTES: 0) disables it — bit-for-bit the
-  // pre-budget behavior. [LAW:one-source-of-truth]
-  const deadline = mintDeadline(Date.now(), budgetMinutes);
+  // pre-budget behavior. [LAW:one-source-of-truth] The mint shares the parses' failure path: it is
+  // the boundary that proves the deadline SUM sound (deadline.js), and its refusal is the same
+  // misconfiguration class as a malformed input.
+  let roundCap;
+  let deadline;
+  try {
+    roundCap = parseMaxRounds(core.getInput('MAX_REVIEW_ROUNDS'));
+    deadline = mintDeadline(Date.now(), parseTimeBudgetMinutes(core.getInput('TIME_BUDGET_MINUTES')));
+  } catch (e) {
+    core.setFailed(e.message);
+    return;
+  }
+  const effort = defaultEffortProfile({ roundCap });
 
   if (mode === 'pr') {
     await runPrReview(reviewerName, excludePatterns, effort, deadline);
