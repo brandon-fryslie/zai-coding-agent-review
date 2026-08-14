@@ -236,3 +236,84 @@ describe('runEngine under a wall-clock deadline', () => {
     );
   });
 });
+
+// ── a kill means the TREE is gone (zai-timing-sn1 round 3: the live ENOTEMPTY crash) ──────────────
+// The engines are npx launchers whose real work happens in a grandchild. Signalling only the direct
+// child left the engine alive — writing its temp HOME during cleanup (ENOTEMPTY, findings
+// discarded), holding stdio so the action lingered past its own deadline, and burning credits as an
+// orphan. The kill signals the process GROUP and settles only on 'close' — when the tree has
+// actually exited and released the pipes.
+describe('runEngine kill semantics', () => {
+  const { DeadlineExceededError } = require('../src/deadline.js');
+  const fs = require('fs');
+  const os = require('os');
+  const pathmod = require('path');
+
+  test('a deadline kill takes down the whole process tree — a grandchild cannot outlive the settle', async () => {
+    const pidFile = pathmod.join(os.tmpdir(), `engine-run-gpid-${process.pid}-${Date.now()}`);
+    const script =
+      `const { spawn } = require('child_process');` +
+      `const g = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000);'], { stdio: 'ignore' });` +
+      `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(g.pid));` +
+      `setTimeout(() => {}, 30000);`;
+    const adapter = {
+      name: 'fake',
+      timeoutMs: 30_000,
+      buildCommand: () => ({ command: process.execPath, args: ['-e', script], env: { PATH: process.env.PATH } }),
+      assertSucceeded: () => {},
+      classifyError: err => err,
+    };
+    await assert.rejects(
+      runEngine(adapter, {}, 'p', '/tmp', {}, process.cwd(), Date.now() + 500),
+      DeadlineExceededError,
+    );
+    // The settle happens on 'close', i.e. after the group signal — the grandchild must already be
+    // dead (or die within the SIGKILL grace at most; poll briefly to absorb signal delivery time).
+    const gpid = parseInt(fs.readFileSync(pidFile, 'utf8'), 10);
+    fs.rmSync(pidFile, { force: true });
+    assert.ok(Number.isInteger(gpid) && gpid > 0, `grandchild pid recorded (${gpid})`);
+    let dead = false;
+    for (let i = 0; i < 40 && !dead; i++) {
+      try {
+        process.kill(gpid, 0);
+        await new Promise(r => setTimeout(r, 50));
+      } catch (e) {
+        dead = e.code === 'ESRCH';
+        break;
+      }
+    }
+    assert.ok(dead, `grandchild ${gpid} is dead after the deadline kill settled`);
+  });
+
+  test('an engine that ignores SIGTERM is SIGKILLed after the grace and still settles with the deadline type', async () => {
+    const adapter = {
+      name: 'fake',
+      timeoutMs: 30_000,
+      killGraceMs: 300,
+      buildCommand: () => ({
+        command: process.execPath,
+        args: ['-e', 'process.on("SIGTERM", () => {}); setTimeout(() => {}, 30000);'],
+        env: { PATH: process.env.PATH },
+      }),
+      assertSucceeded: () => {},
+      classifyError: err => err,
+    };
+    const started = Date.now();
+    await assert.rejects(
+      runEngine(adapter, {}, 'p', '/tmp', {}, process.cwd(), Date.now() + 300),
+      DeadlineExceededError,
+    );
+    // deadline (~300ms) + grace (300ms) + SIGKILL delivery — well under 5s, never the 30s the
+    // SIGTERM-ignoring engine wanted.
+    assert.ok(Date.now() - started < 5_000, 'the escalation ended the spawn promptly');
+  });
+
+  test('removeQuietly surfaces a failed cleanup as a warning, never a throw that outranks the result', async () => {
+    const { removeQuietly } = require('../src/engine/cli.js');
+    const warnings = await captureWarnings(async () => {
+      removeQuietly(pathmod.join(os.tmpdir(), `engine-run-nonexistent-${Date.now()}`), 'temp HOME');
+    });
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /Could not remove the engine's temp HOME/);
+  });
+});

@@ -87,7 +87,25 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
     // [LAW:dataflow-not-control-flow] The retention window is the adapter's value (default 8 MiB),
     // mirroring the timeoutMs seam above — so a test can exercise the clip/announce path at a small cap.
     const maxRetained = adapter.maxRetainedOutput ?? MAX_RETAINED_OUTPUT;
-    const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'], cwd });
+    // detached puts the child in its OWN process group (POSIX), so a kill can signal the whole tree.
+    // The engines here are npx/CLI launchers whose real work happens in a GRANDCHILD: signalling only
+    // the direct child leaves the engine alive — writing its temp HOME while the caller's cleanup
+    // deletes it (the live ENOTEMPTY crash that red a run and discarded its findings), holding the
+    // stdio pipes so the action lingered 15 minutes past its own deadline, and burning provider
+    // credits as an orphan. Group delivery is what makes a kill mean the TREE is gone.
+    const posix = process.platform !== 'win32';
+    const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'], cwd, detached: posix });
+    // Signal the whole group on POSIX (the negative-pid form), the lone child elsewhere. ESRCH means
+    // the tree is already gone — the goal state, not an error; anything else is announced, never
+    // thrown into the engine lifecycle. [LAW:no-silent-failure]
+    const killTree = signal => {
+      try {
+        if (posix) process.kill(-child.pid, signal);
+        else child.kill(signal);
+      } catch (e) {
+        if (e.code !== 'ESRCH') core.warning(`${adapter.name}: failed to ${signal} the engine process tree: ${e.message}`);
+      }
+    };
     let stdout = '';
     let stderr = '';
     let truncated = false;
@@ -104,6 +122,7 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      clearTimeout(escalation);
       emitTranscript({
         engine: adapter.name,
         model: config.model,
@@ -115,18 +134,21 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
       result();
     };
 
+    // [LAW:no-ambient-temporal-coupling] A kill SETTLES NOTHING here: the timeout only signals the
+    // tree (SIGTERM, then SIGKILL after the grace for an engine that ignores the polite form) and
+    // remembers that it fired; the one settle path for a killed spawn is the 'close' handler below,
+    // which the OS fires only when the process tree has actually exited and released the stdio
+    // pipes. That ordering is the fix for the ENOTEMPTY race: control returns to the caller — whose
+    // finally deletes the engine's temp HOME — only when nothing is left alive to write into it.
+    // The escalation timer must OUTLIVE finish-from-timeout (there is none anymore) and is cleared
+    // in finish, i.e. when close/error actually settles: a SIGTERM that worked needs no SIGKILL.
+    let timedOut = false;
+    let escalation = null;
+    const killGraceMs = adapter.killGraceMs ?? 2_000;
     const timeout = setTimeout(() => {
-      finish(() => {
-        child.kill('SIGTERM');
-        // [LAW:types-are-the-program] Which bound fired decides the type: the deadline kill is the
-        // budget working as designed (absorbed upstream as an unreviewed scope); the adapter-cap
-        // kill is an engine that outlived any sane review and stays the loud failure it always was.
-        reject(deadlineBound
-          ? new DeadlineExceededError(
-            `${adapter.name} spawn killed: the review's time budget ran out mid-spawn. ${BUDGET_REMEDY}`,
-          )
-          : new Error(`${adapter.name} review timed out.`));
-      });
+      timedOut = true;
+      killTree('SIGTERM');
+      escalation = setTimeout(() => killTree('SIGKILL'), killGraceMs);
     }, timeoutMs);
 
     // [LAW:no-silent-failure] A verbose-but-complete review must finish and be parsed, not be
@@ -148,6 +170,18 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
 
     child.on('close', code => {
       finish(() => {
+        // [LAW:types-are-the-program] A close after a kill is the KILL settling, not an engine exit
+        // to classify: which bound fired decides the type — the deadline kill is the budget working
+        // as designed (absorbed upstream as an unreviewed scope); the adapter-cap kill is an engine
+        // that outlived any sane review and stays the loud failure it always was.
+        if (timedOut) {
+          reject(deadlineBound
+            ? new DeadlineExceededError(
+              `${adapter.name} spawn killed: the review's time budget ran out mid-spawn. ${BUDGET_REMEDY}`,
+            )
+            : new Error(`${adapter.name} review timed out.`));
+          return;
+        }
         if (code !== 0) {
           const msg = [
             `${adapter.name} exited with status ${code}.`,
