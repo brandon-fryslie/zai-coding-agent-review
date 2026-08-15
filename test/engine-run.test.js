@@ -317,3 +317,68 @@ describe('runEngine kill semantics', () => {
     assert.match(warnings[0], /Could not remove the engine's temp HOME/);
   });
 });
+
+// ── round 6: the two orphan holes the group-kill left open ────────────────────────────────────────
+describe('runEngine orphan reaping', () => {
+  const { DeadlineExceededError } = require('../src/deadline.js');
+  const { reapLiveEngineGroups } = require('../src/engine/run.js');
+  const fs = require('fs');
+  const os = require('os');
+  const pathmod = require('path');
+
+  async function pollDead(pid) {
+    for (let i = 0; i < 40; i++) {
+      try {
+        process.kill(pid, 0);
+        await new Promise(r => setTimeout(r, 50));
+      } catch (e) {
+        return e.code === 'ESRCH';
+      }
+    }
+    return false;
+  }
+
+  test("a pipe-less SIGTERM-ignoring grandchild dies at the settle's SIGKILL sweep, not from the pipes closing", async () => {
+    const pidFile = pathmod.join(os.tmpdir(), `engine-run-straggler-${process.pid}-${Date.now()}`);
+    // The direct child dies politely on SIGTERM; its stdio-ignore grandchild ignores SIGTERM — the
+    // exact shape where an early 'close' used to cancel the escalation and spare the straggler.
+    const script =
+      `const { spawn } = require('child_process');` +
+      `const g = spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => {}); setTimeout(() => {}, 30000);'], { stdio: 'ignore' });` +
+      `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(g.pid));` +
+      `setTimeout(() => {}, 30000);`;
+    const adapter = {
+      name: 'fake',
+      timeoutMs: 30_000,
+      killGraceMs: 10_000, // the escalation timer alone would fire far too late to explain a dead straggler
+      buildCommand: () => ({ command: process.execPath, args: ['-e', script], env: { PATH: process.env.PATH } }),
+      assertSucceeded: () => {},
+      classifyError: err => err,
+    };
+    await assert.rejects(
+      runEngine(adapter, {}, 'p', '/tmp', {}, process.cwd(), Date.now() + 500),
+      DeadlineExceededError,
+    );
+    const gpid = parseInt(fs.readFileSync(pidFile, 'utf8'), 10);
+    fs.rmSync(pidFile, { force: true });
+    assert.ok(await pollDead(gpid), `SIGTERM-ignoring pipe-less grandchild ${gpid} is dead after the settle`);
+  });
+
+  test('reapLiveEngineGroups kills an in-flight engine group — the shutdown path for an action dying first', async () => {
+    const adapter = {
+      name: 'fake',
+      timeoutMs: 30_000,
+      buildCommand: () => ({
+        command: process.execPath,
+        args: ['-e', 'setTimeout(() => {}, 30000);'],
+        env: { PATH: process.env.PATH },
+      }),
+      assertSucceeded: () => {},
+      classifyError: err => err,
+    };
+    const inFlight = runEngine(adapter, {}, 'p', '/tmp', {}, process.cwd(), null);
+    await new Promise(r => setTimeout(r, 200)); // let the spawn register its group
+    reapLiveEngineGroups();
+    await assert.rejects(inFlight); // SIGKILLed → nonzero close → the loud engine-failure path
+  });
+});

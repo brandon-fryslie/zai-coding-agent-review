@@ -32903,6 +32903,37 @@ function appendBounded(buffer, chunk, max = MAX_RETAINED_OUTPUT) {
   return { text: next, clipped: false };
 }
 
+// [LAW:no-shared-mutable-globals] The live-engine-group registry, owned by THIS module with one
+// invariant: a pid is present exactly while its detached spawn is unsettled (added at spawn,
+// removed in finish). It exists for one consumer — the shutdown reaper — because detaching an
+// engine into its own process group (so a deadline kill can signal the whole tree) also removes it
+// from the ACTION's group: if the action dies first (workflow cancel, TIME_BUDGET_MINUTES 0, a
+// budget above the job's timeout-minutes), a group-based job kill no longer reaches the engine and
+// it can orphan on a persistent self-hosted/act_runner host, burning provider credits. The reaper
+// SIGKILLs every live group on process 'exit' and on SIGINT/SIGTERM (re-exiting with the
+// conventional code), so the engine dies with the action on every path the action can observe.
+// GitHub-hosted runners additionally evaporate the VM at job end — the reaper is what closes the
+// self-hosted gap. ESRCH is the goal state, never an error.
+const liveEngineGroups = new Set();
+function reapLiveEngineGroups() {
+  for (const pid of liveEngineGroups) {
+    try { process.kill(-pid, 'SIGKILL'); } catch { /* ESRCH: already gone — the goal state */ }
+  }
+  liveEngineGroups.clear();
+}
+let reaperInstalled = false;
+function installShutdownReaper() {
+  if (reaperInstalled) return;
+  reaperInstalled = true;
+  process.on('exit', reapLiveEngineGroups);
+  for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+    process.on(signal, () => {
+      reapLiveEngineGroups();
+      process.exit(code);
+    });
+  }
+}
+
 function parseJsonEnvelope(stdout) {
   try {
     return JSON.parse(stdout);
@@ -32969,9 +33000,16 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
     // the direct child leaves the engine alive — writing its temp HOME while the caller's cleanup
     // deletes it (the live ENOTEMPTY crash that red a run and discarded its findings), holding the
     // stdio pipes so the action lingered 15 minutes past its own deadline, and burning provider
-    // credits as an orphan. Group delivery is what makes a kill mean the TREE is gone.
+    // credits as an orphan. Group delivery is what makes a kill mean the TREE is gone. The TRADEOFF
+    // — a detached group escapes the action's own group and would outlive an action killed first —
+    // is owned by the live-group registry + shutdown reaper above, so the engine dies with the
+    // action on cancel/signal paths too.
     const posix = process.platform !== 'win32';
     const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'], cwd, detached: posix });
+    if (posix) {
+      installShutdownReaper();
+      liveEngineGroups.add(child.pid);
+    }
     // Signal the whole group on POSIX (the negative-pid form), the lone child elsewhere. ESRCH means
     // the tree is already gone — the goal state, not an error; anything else is announced, never
     // thrown into the engine lifecycle. [LAW:no-silent-failure]
@@ -33000,6 +33038,7 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
       settled = true;
       clearTimeout(timeout);
       clearTimeout(escalation);
+      liveEngineGroups.delete(child.pid);
       emitTranscript({
         engine: adapter.name,
         model: config.model,
@@ -33052,6 +33091,12 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
         // as designed (absorbed upstream as an unreviewed scope); the adapter-cap kill is an engine
         // that outlived any sane review and stays the loud failure it always was.
         if (timedOut) {
+          // One unconditional SIGKILL sweep before settling: 'close' proves the direct child and
+          // every PIPE HOLDER are gone — not the whole group. A pipe-less grandchild that ignored
+          // SIGTERM (stdio 'ignore'/re-detached) would otherwise be spared exactly here, when the
+          // early close cancels the pending escalation, and outlive the settle into the cleanup —
+          // the ENOTEMPTY/credit-burn hole again. Idempotent: ESRCH is the goal state.
+          killTree('SIGKILL');
           reject(deadlineBound
             ? new DeadlineExceededError(
               `${adapter.name} spawn killed: the review's time budget ran out mid-spawn. ${BUDGET_REMEDY}`,
@@ -33096,7 +33141,7 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
   });
 }
 
-module.exports = { parseJsonEnvelope, formatOutputTail, runEngine, appendBounded, MAX_RETAINED_OUTPUT };
+module.exports = { parseJsonEnvelope, formatOutputTail, runEngine, appendBounded, reapLiveEngineGroups, MAX_RETAINED_OUTPUT };
 
 
 /***/ }),
