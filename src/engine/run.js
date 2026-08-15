@@ -2,6 +2,7 @@
 const { spawn } = require('child_process');
 const core = require('@actions/core');
 const { emitTranscript } = require('../debug');
+const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = require('../deadline');
 
 // [LAW:no-ambient-temporal-coupling] An engine may legitimately emit an arbitrarily large
 // stream — codex `exec --json` streams every reasoning delta and tool call as a JSONL line,
@@ -26,6 +27,37 @@ function appendBounded(buffer, chunk, max = MAX_RETAINED_OUTPUT) {
   const next = buffer + chunk;
   if (next.length > max) return { text: next.slice(-max), clipped: true };
   return { text: next, clipped: false };
+}
+
+// [LAW:no-shared-mutable-globals] The live-engine-group registry, owned by THIS module with one
+// invariant: a pid is present exactly while its detached spawn is unsettled (added at spawn,
+// removed in finish). It exists for one consumer — the shutdown reaper — because detaching an
+// engine into its own process group (so a deadline kill can signal the whole tree) also removes it
+// from the ACTION's group: if the action dies first (workflow cancel, TIME_BUDGET_MINUTES 0, a
+// budget above the job's timeout-minutes), a group-based job kill no longer reaches the engine and
+// it can orphan on a persistent self-hosted/act_runner host, burning provider credits. The reaper
+// SIGKILLs every live group on process 'exit' and on SIGINT/SIGTERM (re-exiting with the
+// conventional code), so the engine dies with the action on every path the action can observe.
+// GitHub-hosted runners additionally evaporate the VM at job end — the reaper is what closes the
+// self-hosted gap. ESRCH is the goal state, never an error.
+const liveEngineGroups = new Set();
+function reapLiveEngineGroups() {
+  for (const pid of liveEngineGroups) {
+    try { process.kill(-pid, 'SIGKILL'); } catch { /* ESRCH: already gone — the goal state */ }
+  }
+  liveEngineGroups.clear();
+}
+let reaperInstalled = false;
+function installShutdownReaper() {
+  if (reaperInstalled) return;
+  reaperInstalled = true;
+  process.on('exit', reapLiveEngineGroups);
+  for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+    process.on(signal, () => {
+      reapLiveEngineGroups();
+      process.exit(code);
+    });
+  }
 }
 
 function parseJsonEnvelope(stdout) {
@@ -61,14 +93,60 @@ function formatOutputTail(label, value) {
 // [LAW:effects-at-boundaries] This is the only place that spawns a child process.
 // cwd is the engine's working directory — an isolated scratch dir outside the reviewed repo tree
 // (see cli.js) so no repo-committed project-instruction file is auto-loaded as reviewer directives.
-function runEngine(adapter, config, prompt, home, collector, cwd) {
+//
+// [LAW:single-enforcer] `deadline` (epoch ms, null = no budget) is the review's wall-clock budget,
+// and this is the ONE place it bounds a spawn's lifetime: the effective timeout is the smaller of
+// the adapter's own sanity cap and the time remaining. The two bounds mean different things and
+// throw different types [LAW:types-are-the-program] — the adapter cap firing is an engine failure
+// (plain Error, as before), the deadline firing is planned degradation (DeadlineExceededError, which
+// the scope-worker pool absorbs as "scope unreviewed" instead of failing the pass). A deadline
+// already in the past refuses to spawn at all — the one enforcer of "no engine starts past the
+// budget", so callers never race a doomed spawn.
+function runEngine(adapter, config, prompt, home, collector, cwd, deadline = null) {
   return new Promise((resolve, reject) => {
+    const remaining = remainingMs(deadline, Date.now());
+    if (remaining <= 0) {
+      reject(new DeadlineExceededError(
+        `${adapter.name} spawn refused: the review's time budget is exhausted. ${BUDGET_REMEDY}`,
+      ));
+      return;
+    }
     const { command, args, env } = adapter.buildCommand({ config, collector, home });
-    const timeoutMs = adapter.timeoutMs ?? 3_000_000;
+    const adapterCapMs = adapter.timeoutMs ?? 3_000_000;
+    // <= : at the exact tie both bounds fire at the same instant, and the deadline reading wins —
+    // it is true (the budget did expire then) and it is the safe side (absorbed upstream as an
+    // unreviewed scope; the adapter-cap reading would take the batch-aborting plain-Error path).
+    const deadlineBound = remaining <= adapterCapMs;
+    const timeoutMs = deadlineBound ? remaining : adapterCapMs;
     // [LAW:dataflow-not-control-flow] The retention window is the adapter's value (default 8 MiB),
     // mirroring the timeoutMs seam above — so a test can exercise the clip/announce path at a small cap.
     const maxRetained = adapter.maxRetainedOutput ?? MAX_RETAINED_OUTPUT;
-    const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'], cwd });
+    // detached puts the child in its OWN process group (POSIX), so a kill can signal the whole tree.
+    // The engines here are npx/CLI launchers whose real work happens in a GRANDCHILD: signalling only
+    // the direct child leaves the engine alive — writing its temp HOME while the caller's cleanup
+    // deletes it (the live ENOTEMPTY crash that red a run and discarded its findings), holding the
+    // stdio pipes so the action lingered 15 minutes past its own deadline, and burning provider
+    // credits as an orphan. Group delivery is what makes a kill mean the TREE is gone. The TRADEOFF
+    // — a detached group escapes the action's own group and would outlive an action killed first —
+    // is owned by the live-group registry + shutdown reaper above, so the engine dies with the
+    // action on cancel/signal paths too.
+    const posix = process.platform !== 'win32';
+    const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'], cwd, detached: posix });
+    if (posix) {
+      installShutdownReaper();
+      liveEngineGroups.add(child.pid);
+    }
+    // Signal the whole group on POSIX (the negative-pid form), the lone child elsewhere. ESRCH means
+    // the tree is already gone — the goal state, not an error; anything else is announced, never
+    // thrown into the engine lifecycle. [LAW:no-silent-failure]
+    const killTree = signal => {
+      try {
+        if (posix) process.kill(-child.pid, signal);
+        else child.kill(signal);
+      } catch (e) {
+        if (e.code !== 'ESRCH') core.warning(`${adapter.name}: failed to ${signal} the engine process tree: ${e.message}`);
+      }
+    };
     let stdout = '';
     let stderr = '';
     let truncated = false;
@@ -85,6 +163,8 @@ function runEngine(adapter, config, prompt, home, collector, cwd) {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      clearTimeout(escalation);
+      liveEngineGroups.delete(child.pid);
       emitTranscript({
         engine: adapter.name,
         model: config.model,
@@ -96,11 +176,21 @@ function runEngine(adapter, config, prompt, home, collector, cwd) {
       result();
     };
 
+    // [LAW:no-ambient-temporal-coupling] A kill SETTLES NOTHING here: the timeout only signals the
+    // tree (SIGTERM, then SIGKILL after the grace for an engine that ignores the polite form) and
+    // remembers that it fired; the one settle path for a killed spawn is the 'close' handler below,
+    // which the OS fires only when the process tree has actually exited and released the stdio
+    // pipes. That ordering is the fix for the ENOTEMPTY race: control returns to the caller — whose
+    // finally deletes the engine's temp HOME — only when nothing is left alive to write into it.
+    // The escalation timer must OUTLIVE finish-from-timeout (there is none anymore) and is cleared
+    // in finish, i.e. when close/error actually settles: a SIGTERM that worked needs no SIGKILL.
+    let timedOut = false;
+    let escalation = null;
+    const killGraceMs = adapter.killGraceMs ?? 2_000;
     const timeout = setTimeout(() => {
-      finish(() => {
-        child.kill('SIGTERM');
-        reject(new Error(`${adapter.name} review timed out.`));
-      });
+      timedOut = true;
+      killTree('SIGTERM');
+      escalation = setTimeout(() => killTree('SIGKILL'), killGraceMs);
     }, timeoutMs);
 
     // [LAW:no-silent-failure] A verbose-but-complete review must finish and be parsed, not be
@@ -122,6 +212,24 @@ function runEngine(adapter, config, prompt, home, collector, cwd) {
 
     child.on('close', code => {
       finish(() => {
+        // [LAW:types-are-the-program] A close after a kill is the KILL settling, not an engine exit
+        // to classify: which bound fired decides the type — the deadline kill is the budget working
+        // as designed (absorbed upstream as an unreviewed scope); the adapter-cap kill is an engine
+        // that outlived any sane review and stays the loud failure it always was.
+        if (timedOut) {
+          // One unconditional SIGKILL sweep before settling: 'close' proves the direct child and
+          // every PIPE HOLDER are gone — not the whole group. A pipe-less grandchild that ignored
+          // SIGTERM (stdio 'ignore'/re-detached) would otherwise be spared exactly here, when the
+          // early close cancels the pending escalation, and outlive the settle into the cleanup —
+          // the ENOTEMPTY/credit-burn hole again. Idempotent: ESRCH is the goal state.
+          killTree('SIGKILL');
+          reject(deadlineBound
+            ? new DeadlineExceededError(
+              `${adapter.name} spawn killed: the review's time budget ran out mid-spawn. ${BUDGET_REMEDY}`,
+            )
+            : new Error(`${adapter.name} review timed out.`));
+          return;
+        }
         if (code !== 0) {
           const msg = [
             `${adapter.name} exited with status ${code}.`,
@@ -159,4 +267,4 @@ function runEngine(adapter, config, prompt, home, collector, cwd) {
   });
 }
 
-module.exports = { parseJsonEnvelope, formatOutputTail, runEngine, appendBounded, MAX_RETAINED_OUTPUT };
+module.exports = { parseJsonEnvelope, formatOutputTail, runEngine, appendBounded, reapLiveEngineGroups, MAX_RETAINED_OUTPUT };

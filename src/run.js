@@ -20,6 +20,7 @@ const { renderCostLine, costWarning, costMarker } = require('./usage');
 const { renderRepoReport } = require('./report');
 const registry = require('./engine/registry');
 const { loadConfig, peekConfigNames } = require('./config');
+const { parseTimeBudgetMinutes, mintDeadline, BUDGET_REMEDY } = require('./deadline');
 const { synthesizeProviderConfig } = require('./provider');
 const { selectConfig } = require('./selection');
 const { preflight } = require('./preflight');
@@ -122,6 +123,22 @@ function buildReviewFooter(usage, configUsed, priorCost = null) {
   if (costLine) core.info(costLine.replace(/^_|_$/g, ''));
   const marker = costMarker(usage && usage.cost);
   return [buildAttributionFooter(configUsed), costLine, marker].filter(Boolean).join('\n\n');
+}
+
+// [LAW:one-source-of-truth] The budget-exhaustion warning, composed ONCE for both review modes from
+// the review's coverage data plus the one remedy sentence (BUDGET_REMEDY, src/deadline.js) — never
+// re-authored per sink, so the operator remedy cannot drift between modes or from the error
+// messages that share it. [LAW:no-silent-failure] the budget biting is operator news, not just
+// review-body prose: the warning makes a curtailed review visible in the run's annotations.
+function warnBudgetExhausted(review) {
+  if (!review.budgetExhausted) return;
+  // The same two budget states composeSummary distinguishes, distinguished here too: a coverage
+  // gap names the unreviewed scopes; curtailed-only means every scope WAS reviewed and only the
+  // convergence sweeps were cut short — "0 scope(s) went unreviewed" would contradict itself.
+  const state = review.unreviewedScopes.length > 0
+    ? `${review.unreviewedScopes.length} scope(s) went unreviewed (${review.unreviewedScopes.join(', ')})`
+    : 'every scope was reviewed, but convergence sweeps were cut short';
+  core.warning(`Review time budget exhausted: ${state}. The collected findings were still delivered. ${BUDGET_REMEDY}`);
 }
 
 // [LAW:decomposition] The one fetch site for the reviewed diff: select the host transport, pull the
@@ -266,8 +283,10 @@ async function resolveDependencySummaries(octokit, filteredFiles, dependencyDiff
 }
 
 // PR-diff review: fetch the PR, gate forks, build the diff material + anchors, run the engine
-// chain, and submit an inline GitHub review.
-async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
+// chain, and submit an inline GitHub review. `deadline` (epoch ms, null = no budget) is the run's
+// wall-clock budget, minted once in run(); the pre-review phases here (PR fetch, preflight,
+// dependency fetch) spend from it implicitly because it is absolute.
+async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadline) {
   const maxDiffChars = parseInt(core.getInput('MAX_DIFF_CHARS'), 10) || 0;
   const token = core.getInput('GITHUB_TOKEN');
   core.setSecret(token);
@@ -474,6 +493,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
     await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, {
       summary: 'No patchable changes found after filtering.',
       findings: [],
+      unreviewedScopes: [],
     }, Boolean(reviewToken), transport);
     return;
   }
@@ -513,8 +533,9 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
   const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info,
+    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline,
   });
+  warnBudgetExhausted(review);
 
   // [LAW:single-enforcer] The PR sink reconciles the MERGED findings with the diff anchors exactly
   // once, here at the boundary: anchored (incl. snapped) post inline; unanchored surface in the
@@ -533,7 +554,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
   const footer = buildReviewFooter(review.usage, configUsed, prior.cost);
   await submitReview(
     reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
-    { summary: review.summary, findings: anchored, unanchored, dependencySection },
+    { summary: review.summary, findings: anchored, unanchored, dependencySection, unreviewedScopes: review.unreviewedScopes },
     Boolean(reviewToken), transport, footer,
   );
 
@@ -555,7 +576,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
 
 // Whole-repo review: no PR, no fork gate, no host transport. Build a repo-exploration prompt
 // (optionally scoped), run the same engine chain, and print the report to the Step Summary + logs.
-async function runRepoReview(reviewerName, excludePatterns, effort) {
+async function runRepoReview(reviewerName, excludePatterns, effort, deadline) {
   const scope = core.getInput('SCOPE').trim();
 
   let chain;
@@ -579,8 +600,9 @@ async function runRepoReview(reviewerName, excludePatterns, effort) {
     + `${scope ? ` (scope: ${scope})` : ' (whole repository)'}...`,
   );
   const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info,
+    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline,
   });
+  warnBudgetExhausted(review);
 
   const footer = buildReviewFooter(review.usage, configUsed);
   const report = renderRepoReport({ reviewerName, scope, review, footer });
@@ -622,9 +644,19 @@ async function run() {
   // input is parsed strictly here and the integer folded into the profile, so the round-cap consumer
   // (the pre-spawn gate in runPrReview) reads a trusted value off the profile and never re-parses or
   // guards. A malformed input reds the run loud rather than silently disabling the cap.
+  // [LAW:no-ambient-temporal-coupling] The review's wall-clock deadline, minted exactly ONCE at the
+  // run boundary (the same boundary that owns `new Date()` for the budget ledger) and threaded down
+  // as an absolute value — so every phase, pre-review included, spends from the same clock. It exists
+  // so the run finishes and SUBMITS before the workflow's timeout-minutes cancel, which can only
+  // discard collected findings. null (TIME_BUDGET_MINUTES: 0) disables it — bit-for-bit the
+  // pre-budget behavior. [LAW:one-source-of-truth] The mint shares the parses' failure path: it is
+  // the boundary that proves the deadline SUM sound (deadline.js), and its refusal is the same
+  // misconfiguration class as a malformed input.
   let roundCap;
+  let deadline;
   try {
     roundCap = parseMaxRounds(core.getInput('MAX_REVIEW_ROUNDS'));
+    deadline = mintDeadline(Date.now(), parseTimeBudgetMinutes(core.getInput('TIME_BUDGET_MINUTES')));
   } catch (e) {
     core.setFailed(e.message);
     return;
@@ -632,12 +664,12 @@ async function run() {
   const effort = defaultEffortProfile({ roundCap });
 
   if (mode === 'pr') {
-    await runPrReview(reviewerName, excludePatterns, effort);
+    await runPrReview(reviewerName, excludePatterns, effort, deadline);
   } else if (mode === 'repo') {
-    await runRepoReview(reviewerName, excludePatterns, effort);
+    await runRepoReview(reviewerName, excludePatterns, effort, deadline);
   } else {
     core.setFailed(`Invalid MODE '${mode}'. Valid values: 'pr' (review a pull request) or 'repo' (whole-repo review).`);
   }
 }
 
-module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, MAX_DEPENDENCY_BUMPS_FETCHED };
+module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, MAX_DEPENDENCY_BUMPS_FETCHED };

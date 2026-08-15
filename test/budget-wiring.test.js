@@ -185,3 +185,31 @@ describe('resolveBudgetedEffort', () => {
     assert.equal(profile.roundCap, 5);
   });
 });
+
+// ── warnBudgetExhausted distinguishes a coverage gap from curtailed sweeps (zai-timing-sn1 r2) ────
+describe('warnBudgetExhausted', () => {
+  const { warnBudgetExhausted } = require('../src/run');
+  const core = require('@actions/core');
+  function captured(review) {
+    const original = core.warning;
+    const warnings = [];
+    core.warning = m => warnings.push(m);
+    try { warnBudgetExhausted(review); } finally { core.warning = original; }
+    return warnings;
+  }
+  test('a coverage gap names the unreviewed scopes', () => {
+    const w = captured({ budgetExhausted: true, unreviewedScopes: ['store', 'docs'] });
+    assert.equal(w.length, 1);
+    assert.match(w[0], /2 scope\(s\) went unreviewed \(store, docs\)/);
+    assert.match(w[0], /TIME_BUDGET_MINUTES/);
+  });
+  test('curtailed-only says every scope was reviewed — never a contradictory zero-unreviewed line', () => {
+    const w = captured({ budgetExhausted: true, unreviewedScopes: [] });
+    assert.equal(w.length, 1);
+    assert.match(w[0], /every scope was reviewed, but convergence sweeps were cut short/);
+    assert.doesNotMatch(w[0], /0 scope\(s\)/);
+  });
+  test('a budget that never bit warns nothing', () => {
+    assert.deepEqual(captured({ budgetExhausted: false, unreviewedScopes: [] }), []);
+  });
+});

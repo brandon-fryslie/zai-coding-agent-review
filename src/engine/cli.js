@@ -2,8 +2,25 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const core = require('@actions/core');
 const { createReviewCollector, readCollectedReview } = require('../collector');
 const { runEngine } = require('./run');
+
+// [LAW:no-silent-failure] Scratch-dir cleanup must never OUTRANK the review: these are throwaway
+// dirs under the runner's ephemeral tmp, and a removal failure is a few leaked megabytes on a VM
+// that evaporates at job end — worth a loud warning, never worth destroying the operative result.
+// A throw from a finally REPLACES the in-flight value or error, which is exactly how a deadline
+// kill's ENOTEMPTY (a just-killed engine's last write racing the recursive rm) once turned a
+// deliverable partial review into a red run with every finding discarded. The failure still
+// surfaces — as a warning naming the path — matching debug.js's stance that plumbing must not
+// break the review it serves.
+function removeQuietly(dir, label) {
+  try {
+    fs.rmSync(dir, { recursive: true });
+  } catch (e) {
+    core.warning(`Could not remove the engine's ${label} (${dir}) — left for the runner to reap: ${e.message}`);
+  }
+}
 
 // [LAW:one-type-per-behavior] claude-code and codex are ONE behavior — a CLI agent spawned as a
 // subprocess that returns findings out-of-band through the MCP collector. They differ only in
@@ -48,7 +65,9 @@ function makeCliAdapter(spec) {
     // [LAW:no-ambient-temporal-coupling] Nested try/finally owns cleanup ordering (LIFO): cwd and
     // home are created inside the collector's scope and torn down before it, each by its own finally,
     // so cleanup runs even when the engine throws. [LAW:no-silent-failure]
-    async produceReview({ config, buildPromptFor, instructionsPath }) {
+    // `deadline` (epoch ms, null = no budget) flows through untouched to runEngine, the one place
+    // it bounds the spawn's lifetime — the adapter neither reads the clock nor re-decides policy.
+    async produceReview({ config, buildPromptFor, instructionsPath, deadline = null }) {
       const prompt = buildPromptFor(spec.toolNames);
       const collector = createReviewCollector();
       try {
@@ -58,7 +77,7 @@ function makeCliAdapter(spec) {
         try {
           const home = spec.materializeHome({ config, instructionsPath, collector });
           try {
-            const output = await runEngine(spec, config, prompt, home, collector, cwd);
+            const output = await runEngine(spec, config, prompt, home, collector, cwd, deadline);
             const usage = spec.extractUsage(output, config);
             const review = readCollectedReview(collector.recordsPath);
             // [LAW:dataflow-not-control-flow] scopes (a scout run), findings (a worker run), and
@@ -66,16 +85,16 @@ function makeCliAdapter(spec) {
             // values; the caller uses whichever its pass produced, an empty list otherwise.
             return { summary: review.summary, findings: review.findings, scopes: review.scopes, assessments: review.assessments, usage };
           } finally {
-            fs.rmSync(home, { recursive: true });
+            removeQuietly(home, 'temp HOME');
           }
         } finally {
-          fs.rmSync(cwd, { recursive: true });
+          removeQuietly(cwd, 'scratch cwd');
         }
       } finally {
-        fs.rmSync(collector.dir, { recursive: true });
+        removeQuietly(collector.dir, 'collector dir');
       }
     },
   };
 }
 
-module.exports = { makeCliAdapter };
+module.exports = { makeCliAdapter, removeQuietly };

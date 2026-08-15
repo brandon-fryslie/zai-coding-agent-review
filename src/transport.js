@@ -7,6 +7,10 @@ const { parseCostMarker } = require('./usage');
 const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
 const APPROVED_MESSAGE = '✅ Approved';
 const REQUEST_CHANGES_MESSAGE = '❌ Request Changes';
+// The time-budget verdict: scopes went unreviewed and nothing blocking surfaced in the ones that
+// were. Deliberately NOT the approve message — approval asserts the whole diff was judged, and a
+// partial review has no standing to assert it. [LAW:no-silent-failure]
+const PARTIAL_MESSAGE = '⏳ Partial review — the time budget expired before every scope was reviewed; no blocking findings in the scopes that were reviewed.';
 
 async function listAllFiles(octokit, owner, repo, pullNumber) {
   const files = [];
@@ -252,8 +256,15 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   const unanchored = review.unanchored || [];
   const isBlocking = f => f.severity === 'blocking';
   const requestsChanges = review.findings.some(isBlocking) || unanchored.some(isBlocking);
-  const event = reviewEvent(requestsChanges, canApprove, transport);
-  const verdict = requestsChanges ? REQUEST_CHANGES_MESSAGE : APPROVED_MESSAGE;
+  // [LAW:types-are-the-program] unreviewedScopes is a REQUIRED field of the review value, exactly
+  // like findings — every producer states its coverage ([] = complete), and a caller that omits it
+  // crashes loud here rather than approving a partial review by accident. Approvability is the
+  // conjunction of the token's capability and full coverage: a review that did not see every scope
+  // may report and request changes, but it may never approve. Blocking findings outrank the
+  // partial state — a blocker found in a half-reviewed diff is still a blocker.
+  const complete = review.unreviewedScopes.length === 0;
+  const event = reviewEvent(requestsChanges, canApprove && complete, transport);
+  const verdict = requestsChanges ? REQUEST_CHANGES_MESSAGE : (complete ? APPROVED_MESSAGE : PARTIAL_MESSAGE);
   const footer = attributionFooter ? `\n\n${attributionFooter}` : '';
   // [LAW:dataflow-not-control-flow] The dependency section is a VALUE prepended to the summary: a
   // dependency-bump PR leads with its scannable roll-up + per-module breakdown; every other PR carries

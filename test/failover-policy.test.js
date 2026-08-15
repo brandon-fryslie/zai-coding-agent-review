@@ -435,3 +435,97 @@ describe('produceReview — configUsed', () => {
     assert.equal(result.attempts, 7); // 3+3+1
   });
 });
+
+// ── the wall-clock deadline clamps spawn-level retry sleeps (zai-timing-sn1 review round) ─────────
+// An uncapped server Retry-After near the deadline must not sleep the run past its own budget and
+// into the workflow's timeout-minutes kill — the exact empty-handed cancel the budget prevents.
+describe('retryTransientSpawn — deadline-clamped sleeps', () => {
+  it('a Retry-After far larger than the remaining budget sleeps only the remainder', async () => {
+    const slept = [];
+    let calls = 0;
+    await retryTransientSpawn(
+      async () => {
+        calls++;
+        if (calls === 1) throw new TransientError('rate-limited', 120_000); // server says 2 minutes
+        return 'ok';
+      },
+      { sleepFn: async ms => { slept.push(ms); }, deadline: 5_000, now: () => 0 }, // 5s remain
+    );
+    assert.deepEqual(slept, [5_000]);
+  });
+
+  it('no deadline leaves the sleep at the full Retry-After (byte-identical to before)', async () => {
+    const slept = [];
+    let calls = 0;
+    await retryTransientSpawn(
+      async () => {
+        calls++;
+        if (calls === 1) throw new TransientError('rate-limited', 120_000);
+        return 'ok';
+      },
+      { sleepFn: async ms => { slept.push(ms); } },
+    );
+    assert.deepEqual(slept, [120_000]);
+  });
+
+  it('a deadline already past clamps the sleep to zero (the next attempt is refused at the spawn gate, not slept toward)', async () => {
+    const slept = [];
+    let calls = 0;
+    await retryTransientSpawn(
+      async () => {
+        calls++;
+        if (calls === 1) throw new TransientError('rate-limited', 120_000);
+        return 'ok';
+      },
+      { sleepFn: async ms => { slept.push(ms); }, deadline: 0, now: () => 10 },
+    );
+    assert.deepEqual(slept, [0]);
+  });
+});
+
+// ── produceReview measures its budget on the injected clock (zai-timing-sn1 review round 2) ───────
+// The `now` seam exists for deterministic deadline tests: the budget must be SPENT on the same
+// clock it was measured on, never on ambient wall time.
+describe('produceReview — injected clock', () => {
+  it('a fake clock that advances past the budget between attempts ends the run instead of sleeping on', async () => {
+    let clock = 0;
+    const slept = [];
+    let attempts = 0;
+    await assert.rejects(
+      produceReview(
+        [cfg('only')],
+        null, null,
+        async () => {
+          attempts++;
+          clock += 10_000; // each attempt burns 10s of fake time; the 5s budget is gone after one
+          throw new TransientError('rate-limited');
+        },
+        async ms => { slept.push(ms); },
+        5_000,
+        () => clock,
+      ),
+      /rate-limited/,
+    );
+    assert.equal(attempts, 1); // budgetLeft hit 0 on the fake clock — no second attempt, no sleep
+    assert.deepEqual(slept, []);
+  });
+});
+
+// ── round 5: the clamp binds the BACKOFF branch too, not only Retry-After ─────────────────────────
+describe('retryTransientSpawn — backoff branch clamped by the deadline', () => {
+  it('with no Retry-After, the exponential backoff is clamped to the remaining budget', async () => {
+    const slept = [];
+    let calls = 0;
+    await retryTransientSpawn(
+      async () => {
+        calls++;
+        if (calls === 1) throw new TransientError('connection error'); // retryAfterMs null → backoff
+        return 'ok';
+      },
+      // attempt-1 backoff is jittered in [1000, 2000); a 500ms remainder is below its floor, so the
+      // recorded sleep proves the clamp bound the backoff branch — deterministic despite the jitter.
+      { sleepFn: async ms => { slept.push(ms); }, deadline: 500, now: () => 0 },
+    );
+    assert.deepEqual(slept, [500]);
+  });
+});

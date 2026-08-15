@@ -1,0 +1,91 @@
+'use strict';
+const { test, describe } = require('node:test');
+const assert = require('node:assert/strict');
+
+const { DeadlineExceededError, parseTimeBudgetMinutes, mintDeadline, remainingMs } = require('../src/deadline');
+const { isRetryableSpawnError, TransientError } = require('../src/failover');
+
+// ── the time-budget input, parsed strictly (mirrors parseMaxRounds) ───────────────────────────────
+describe('parseTimeBudgetMinutes', () => {
+  test('accepts a run of digits', () => {
+    assert.equal(parseTimeBudgetMinutes('25'), 25);
+    assert.equal(parseTimeBudgetMinutes(' 40 '), 40);
+  });
+  test('0 and empty are the disabled sentinel', () => {
+    assert.equal(parseTimeBudgetMinutes('0'), 0);
+    assert.equal(parseTimeBudgetMinutes(''), 0);
+  });
+  test('rejects anything else loudly — a typo must never silently disable the budget', () => {
+    // [LAW:no-silent-failure] `parseInt("25m")` would yield 25 and "twenty" would yield NaN→0
+    // (= budget off); both are misconfigurations that must red the run, not decide policy.
+    for (const bad of ['25m', 'twenty', '-1', '2.5', '25 minutes']) {
+      assert.throws(() => parseTimeBudgetMinutes(bad), /TIME_BUDGET_MINUTES must be a non-negative integer/);
+    }
+  });
+});
+
+describe('mintDeadline / remainingMs', () => {
+  test('a positive budget mints an absolute epoch deadline', () => {
+    assert.equal(mintDeadline(1_000, 25), 1_000 + 25 * 60_000);
+  });
+  test('a zero budget mints null — no deadline', () => {
+    assert.equal(mintDeadline(1_000, 0), null);
+  });
+  test('remainingMs counts down and goes negative past the deadline', () => {
+    assert.equal(remainingMs(5_000, 2_000), 3_000);
+    assert.equal(remainingMs(5_000, 6_000), -1_000);
+  });
+  test('a null deadline reads as Infinity, so every bound resolves to the adapter cap and every gate stays open', () => {
+    // [LAW:dataflow-not-control-flow] the no-budget path is the same code path with a different
+    // value: Math.min(cap, Infinity) === cap and Infinity > 0 is always true.
+    assert.equal(remainingMs(null, 999_999), Infinity);
+    assert.equal(Math.min(3_000_000, remainingMs(null, 0)), 3_000_000);
+  });
+});
+
+// ── the deadline kill's place in the error vocabulary ─────────────────────────────────────────────
+describe('DeadlineExceededError retry policy', () => {
+  test('is not retryable in place — a fresh spawn cannot fit in a spent budget', () => {
+    assert.equal(isRetryableSpawnError(new DeadlineExceededError('x')), false);
+  });
+  test('is not transient — config-level failover must not restart the pass at the deadline', () => {
+    assert.equal(new DeadlineExceededError('x') instanceof TransientError, false);
+  });
+});
+
+// ── the overflow hole in the digits regex (zai-timing-sn1 review round 2) ─────────────────────────
+describe('parseTimeBudgetMinutes — overflow safety', () => {
+  test('a digit string past the safe-integer range is rejected, never a silently-disabled budget', () => {
+    // '9'.repeat(400) parses to Infinity; mintDeadline would yield a never-arriving deadline and
+    // every downstream gate would take the no-budget path — garbage silently disabling the exact
+    // protection this module exists to provide.
+    assert.throws(() => parseTimeBudgetMinutes('9'.repeat(400)), /TIME_BUDGET_MINUTES must be a non-negative integer/);
+  });
+});
+
+// ── round 4: the DERIVED milliseconds are what must stay safe ─────────────────────────────────────
+describe('parseTimeBudgetMinutes — derived-product safety', () => {
+  test('a safe-integer minutes value whose millisecond product overflows is rejected', () => {
+    // 1e14 is a safe integer, but * 60_000 is ~6e18 — past MAX_SAFE_INTEGER, minting an imprecise
+    // never-arriving deadline that silently disables the budget.
+    assert.throws(() => parseTimeBudgetMinutes('100000000000000'), /TIME_BUDGET_MINUTES must be a non-negative integer/);
+  });
+  test('the error type serializes distinguishably', () => {
+    const e = new DeadlineExceededError('budget spent');
+    assert.equal(e.name, 'DeadlineExceededError');
+    assert.match(String(e), /^DeadlineExceededError: budget spent/);
+  });
+});
+
+// ── round 5: the SUM is what the arithmetic uses — mint refuses an unsound one ────────────────────
+describe('mintDeadline — sum safety', () => {
+  test('a product-safe budget whose epoch sum overflows is refused at the mint', () => {
+    // 150119987579 minutes: * 60_000 = 9007199254740000 (safe), + a real epoch nowMs → past
+    // MAX_SAFE_INTEGER — an imprecise never-arriving deadline that would silently disable the budget.
+    const minutes = parseTimeBudgetMinutes('150119987579'); // passes the parse gate
+    assert.throws(() => mintDeadline(1_755_000_000_000, minutes), /too large to mint a sound deadline/);
+  });
+  test('an ordinary budget mints exactly', () => {
+    assert.equal(mintDeadline(1_755_000_000_000, 25), 1_755_000_000_000 + 25 * 60_000);
+  });
+});

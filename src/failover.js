@@ -1,6 +1,7 @@
 'use strict';
 
 const core = require('@actions/core');
+const { remainingMs } = require('./deadline');
 
 const TRANSIENT_RETRY_BUDGET_MS = 60 * 60 * 1000;
 const TRANSIENT_BACKOFF_BASE_MS = 2_000;
@@ -109,7 +110,15 @@ const TRANSIENT_SPAWN_ATTEMPTS = 3;
 // run with its precise cause — a persistent model protocol slip is a broken engine, not a provider blip.
 // onRetry is the injected progress effect; sleepFn is injectable so tests drive the retry path with no
 // real waits. [LAW:effects-at-boundaries]
-async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sleepFn = sleep, onRetry = () => {} } = {}) {
+// `deadline` (epoch ms, null = no budget) clamps every retry sleep to the time remaining — the same
+// clamp produceReview applies to its own budget's sleeps, applied here to the spawn-level axis. An
+// uncapped server Retry-After near the deadline would otherwise sleep the run past its own budget
+// and into the workflow's timeout-minutes kill, the exact empty-handed cancellation the budget
+// exists to prevent. A wake-up at (or past) the deadline is harmless by construction: the next
+// attempt's spawn is refused at runEngine's deadline gate and degrades scope-by-scope as designed.
+// [LAW:single-enforcer] retry timing stays owned HERE — callers thread the deadline value, never a
+// pre-clamped sleep of their own.
+async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sleepFn = sleep, onRetry = () => {}, deadline = null, now = Date.now } = {}) {
   // [LAW:no-silent-failure] A limit < 1 would run zero iterations and fall through to `throw lastErr`
   // with lastErr still undefined — an opaque `throw undefined` crash. Reject it loud with a diagnostic.
   // The destructuring default fires only on `undefined`, so an explicit 0/negative reaches here; a
@@ -128,7 +137,7 @@ async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sl
       // survives every attempt reaches produceReview's `!instanceof TransientError` gate and reds the run
       // with its precise cause — a genuinely broken engine is not laundered into config-level failover.
       if (attempt === limit) throw lastErr;
-      const delay = err.retryAfterMs ?? transientBackoffMs(attempt);
+      const delay = Math.min(err.retryAfterMs ?? transientBackoffMs(attempt), Math.max(0, remainingMs(deadline, now())));
       onRetry({ attempt, limit, delay, err });
       await sleepFn(delay);
     }
@@ -157,10 +166,13 @@ async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sl
 // count, restart from chain[0], until the 60-min budget is spent.
 // [LAW:effects-at-boundaries] budgetMs is injectable so tests can set a zero/tiny budget
 // to cover the 'deadline exceeded mid-retry' throw path without real 60-min waits.
-async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepFn = sleep, budgetMs = TRANSIENT_RETRY_BUDGET_MS) {
+// [LAW:no-ambient-temporal-coupling] `now` is the injected clock, the SAME seam the multi-scope
+// pass and the spawn-level retry clamp use — so a caller measuring its budget on a fake clock has
+// this layer spend it on that same clock, never on ambient wall time.
+async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepFn = sleep, budgetMs = TRANSIENT_RETRY_BUDGET_MS, now = Date.now) {
   // [LAW:no-silent-failure] An empty chain never assigns lastErr; throw undefined is opaque.
   if (!chain.length) throw new Error('produceReview: chain must not be empty');
-  const deadline = Date.now() + budgetMs;
+  const deadline = now() + budgetMs;
   let totalAttempts = 0;
   let lastErr;
   const PER_CONFIG_LIMIT = 3;
@@ -175,7 +187,7 @@ async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepF
         } catch (err) {
           if (!(err instanceof TransientError)) throw err; // non-transient: surface immediately
           lastErr = err;
-          const budgetLeft = Math.max(0, deadline - Date.now());
+          const budgetLeft = Math.max(0, deadline - now());
           if (budgetLeft === 0) throw lastErr;
 
           if (attempt < PER_CONFIG_LIMIT) {
@@ -204,7 +216,7 @@ async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepF
     // Honor lastErr.retryAfterMs if the last failure carried a Retry-After hint —
     // the per-config path does the same; omitting it here would make the sweep
     // restart immediately when the provider said to wait. [LAW:one-source-of-truth]
-    const budgetLeft = Math.max(0, deadline - Date.now());
+    const budgetLeft = Math.max(0, deadline - now());
     if (budgetLeft === 0) throw lastErr;
     const hintOrBackoff = lastErr.retryAfterMs ?? transientBackoffMs(sweep);
     const delay = Math.min(hintOrBackoff, budgetLeft);

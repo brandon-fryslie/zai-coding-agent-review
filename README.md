@@ -1,6 +1,6 @@
 # CoPirate Code Review
 
-A GitHub Action that runs an AI coding agent as a **read-only** code reviewer. It reviews a pull request diff and submits an inline GitHub review — `REQUEST_CHANGES` when it finds blocking issues, otherwise `APPROVE`. It can also do an on-demand whole-repo review (`MODE: repo`).
+A GitHub Action that runs an AI coding agent as a **read-only** code reviewer. It reviews a pull request diff and submits an inline GitHub review — `REQUEST_CHANGES` when it finds blocking issues, otherwise `APPROVE` (or a "⏳ Partial review" `COMMENT` when the [time budget](#inputs) ran out before every scope was reviewed — a partial review never approves). It can also do an on-demand whole-repo review (`MODE: repo`).
 
 The review engine is chosen by `PROVIDER`, which defaults to `auto` (today: Claude Code against DeepSeek). You can also run Claude Code against Z.ai, or Codex against OpenAI. The engine reviews read-only — it cannot push to GitHub itself; findings flow through a private collector and are submitted by the action.
 
@@ -95,6 +95,7 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | `EXCLUDE_PATTERNS` | `*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml` | Comma-separated file patterns to exclude. |
 | `MAX_DIFF_CHARS` | `0` (unlimited) | Max characters of diff sent to the engine. |
 | `MAX_REVIEW_ROUNDS` | `5` | Max times the action reviews one PR; further pushes skip cleanly with no engine spawned (`0` = unlimited). Bounds cost on PRs pushed many times. |
+| `TIME_BUDGET_MINUTES` | `25` | Wall-clock budget for the whole review run, in both modes. When it expires, the review stops starting new scope workers and sweeps and **delivers what it has** instead of the job's `timeout-minutes` cancelling the run with every finding undelivered: in `pr` mode the review is submitted with unreviewed scopes named in the summary and the verdict withholding approval; in `repo` mode the Step Summary report still renders, carrying the same partial-coverage note (there is no verdict to withhold). A budget that expires before **any** scope completes instead fails the run loudly, naming this input — there is no review to deliver. Set it a few minutes below the job's `timeout-minutes`. `0` = no budget. |
 | `DAILY_BUDGET_USD` | `0` (off) | Daily spend ceiling honored as a **gradient** — see [Daily budget](#daily-budget). `0`/unset = off (today's default effort, no ledger I/O). PR mode only; requires `LEDGER_ISSUE` and `issues: write`. |
 | `LEDGER_ISSUE` | — | Issue number of the append-only daily cost ledger the budget gradient reads and writes (typically `${{ vars.LEDGER_ISSUE }}`). Required when `DAILY_BUDGET_USD` is set. |
 | `DIFFICULTY_SCALING` | `false` (off) | Scale review effort to change difficulty — see [Difficulty scaling](#difficulty-scaling). An easy diff draws fewer review rounds; a complex diff reasons harder each round. PR mode only. |
@@ -116,6 +117,8 @@ The default `GITHUB_TOKEN` cannot approve PRs. With no `GITHUB_REVIEW_TOKEN`:
 - A review with no blocking findings (clean, or advisory-only) just logs `✅ Approved` — advisory findings still post as inline comments — with no formal approval submitted.
 
 Set `GITHUB_REVIEW_TOKEN` to an approval-capable user or GitHub App token to have non-blocking reviews submit a formal `APPROVE`. When a blocking finding exists the action requests changes — resolve the threads and dismiss the review to proceed.
+
+**The partial exception:** a review whose [time budget](#inputs) expired before every scope was reviewed never approves, however clean — with or without `GITHUB_REVIEW_TOKEN` it posts a `COMMENT` review whose verdict reads `⏳ Partial review`, naming the unreviewed scopes in the summary. Approval asserts the whole diff was judged, and a partial review has no standing to assert it.
 
 ## Fork PRs are never reviewed
 
@@ -307,7 +310,7 @@ To make a `review:gpt-5.5` label "just work", name a config `gpt-5.5`. Selection
 
 ### Failover
 
-When `fallback` is set, the selected config plus the rest of that list form the failover chain. A **transient** error (429 / rate-limit / quota / 529) retries the same config up to 3× (honoring `Retry-After`), then advances to the next config immediately; an exhausted chain backs off and sweeps again until a 60-minute budget is spent. A **non-transient** error (bad output, validation failure, spawn error) throws immediately with no failover. The submitted review's footer names the config that actually produced it, so a failover is always visible.
+When `fallback` is set, the selected config plus the rest of that list form the failover chain. A **transient** error (429 / rate-limit / quota / 529) retries the same config up to 3× (honoring `Retry-After`), then advances to the next config immediately; an exhausted chain backs off and sweeps again until the retry budget is spent — the smaller of 60 minutes and the time remaining in `TIME_BUDGET_MINUTES` (retry sleeps, including a server's `Retry-After`, are clamped to that remainder too, so a rate-limited run can never sleep past its own deadline). A **non-transient** error (bad output, validation failure, spawn error) throws immediately with no failover. The submitted review's footer names the config that actually produced it, so a failover is always visible.
 
 ## Preflight diagnostic
 

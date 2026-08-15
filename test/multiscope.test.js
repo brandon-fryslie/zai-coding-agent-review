@@ -17,6 +17,7 @@ const { defaultEffortProfile } = require('../src/effort');
 const { buildReviewInput, buildRepoReviewInput, buildPrScoutInput, buildRepoScoutInput } = require('../src/prompt');
 const { parseScopeValue, dedupeFindings } = require('../src/review');
 const { TransientError } = require('../src/failover');
+const { DeadlineExceededError } = require('../src/deadline');
 
 const TOOL_NAMES = {
   requestChange: 'mcp__review_collector__request_change',
@@ -206,14 +207,15 @@ describe('composeSummary', () => {
 // ── runScopeWorkers — fail-loud bounded pool ─────────────────────────────────────────────────────
 
 describe('runScopeWorkers', () => {
-  test('returns results in scope order regardless of completion order', async () => {
+  test('returns one outcome per scope, in scope order regardless of completion order', async () => {
     const scopes = [{ name: 'a' }, { name: 'b' }, { name: 'c' }];
     const runOne = async (s) => {
       await new Promise(r => setTimeout(r, s.name === 'a' ? 5 : 0)); // a finishes last
       return { name: s.name };
     };
-    const results = await runScopeWorkers({ scopes, runOne, maxConcurrent: 3 });
-    assert.deepEqual(results.map(r => r.name), ['a', 'b', 'c']);
+    const outcomes = await runScopeWorkers({ scopes, runOne, maxConcurrent: 3 });
+    assert.deepEqual(outcomes.map(o => o.status), ['reviewed', 'reviewed', 'reviewed']);
+    assert.deepEqual(outcomes.map(o => o.result.name), ['a', 'b', 'c']);
   });
 
   test('rethrows the first error, preserving its type, so failover can classify it', async () => {
@@ -229,6 +231,31 @@ describe('runScopeWorkers', () => {
     const scopes = [{ name: 'a' }];
     const runOne = async () => { throw new Error('engine produced garbage'); };
     await assert.rejects(runScopeWorkers({ scopes, runOne, maxConcurrent: 2 }), /engine produced garbage/);
+  });
+
+  test('a deadline-killed worker becomes an unreviewed outcome; siblings keep their results', async () => {
+    const scopes = [{ name: 'a' }, { name: 'b' }, { name: 'c' }];
+    const runOne = async (s) => {
+      if (s.name === 'b') throw new DeadlineExceededError('killed at the deadline');
+      return { name: s.name };
+    };
+    const outcomes = await runScopeWorkers({ scopes, runOne, maxConcurrent: 3 });
+    assert.deepEqual(outcomes.map(o => o.status), ['reviewed', 'unreviewed', 'reviewed']);
+    assert.deepEqual(outcomes.filter(o => o.status === 'reviewed').map(o => o.result.name), ['a', 'c']);
+  });
+
+  test('once shouldStart says no, remaining scopes are unreviewed without spawning', async () => {
+    const scopes = [{ name: 'a' }, { name: 'b' }, { name: 'c' }];
+    const started = [];
+    let budget = 1; // one start allowed, then the budget is spent
+    const outcomes = await runScopeWorkers({
+      scopes,
+      maxConcurrent: 1,
+      shouldStart: () => budget-- > 0,
+      runOne: async (s) => { started.push(s.name); return { name: s.name }; },
+    });
+    assert.deepEqual(started, ['a']);
+    assert.deepEqual(outcomes.map(o => o.status), ['reviewed', 'unreviewed', 'unreviewed']);
   });
 });
 
@@ -1097,5 +1124,214 @@ describe('shipped prompts carry no reviewed-repo layout', () => {
     assert.match(prScout, /line-anchor parsing and a change to report rendering/);
     assert.match(repoScout, /a price table and the function that reads that table/);
     assert.match(repoScout, /line-anchor parsing and report rendering/);
+  });
+});
+
+// ── the wall-clock time budget (zai-timing-sn1) ───────────────────────────────────────────────────
+// The budget's contract: completed scopes' findings are DELIVERED with the gap named as data; a
+// deadline kill degrades scope-by-scope (pass 0 = coverage gap, sweep = curtailed convergence) and
+// never takes the fail-loud path that discards sibling findings — except when NOTHING completed,
+// which fails fast with the knob named.
+describe('runMultiScopePass — wall-clock time budget', () => {
+  const SCOPES = [
+    { name: 'a', focus: 'fa' },
+    { name: 'b', focus: 'fb' },
+    { name: 'c', focus: 'fc' },
+  ];
+  const material = {
+    changedPaths: [],
+    buildScoutPrompt: () => 'SCOUT',
+    // priorFindings discriminates the phase in the prompt, so a fake worker can behave differently
+    // on the initial pass vs a convergence sweep — exactly the value the real prompt varies on.
+    buildWorkerPrompt: (focusText, _tools, _files, priorFindings) => `${priorFindings.length > 0 ? 'SWEEP ' : ''}${focusText}`,
+  };
+  const config = { engine: 'fake', name: 'c1' };
+
+  function makeRegistry({ workerBehavior }) {
+    const calls = { scout: 0, workers: {}, deadlines: [] };
+    const adapter = {
+      async produceReview({ buildPromptFor, deadline }) {
+        calls.deadlines.push(deadline);
+        const prompt = buildPromptFor({});
+        if (prompt === 'SCOUT') {
+          calls.scout++;
+          return { summary: 'ctx', findings: [], scopes: SCOPES, assessments: [], usage: null };
+        }
+        const sweep = prompt.startsWith('SWEEP ');
+        const scope = SCOPES.find(s => prompt.includes(`${s.name} — ${s.focus}`));
+        calls.workers[scope.name] = (calls.workers[scope.name] ?? 0) + 1;
+        return workerBehavior({ scope, sweep });
+      },
+    };
+    return { registry: { get: () => adapter }, calls };
+  }
+  const okResult = (scope, tag = '') => ({
+    summary: `sum-${scope.name}`,
+    findings: [{ path: `${tag}${scope.name}.js`, line: 1, body: `bug in ${tag}${scope.name}`, severity: 'blocking' }],
+    assessments: [],
+    usage: null,
+  });
+  const passArgs = (registry, extra = {}) => ({
+    config, material, registry, instructionsPath: 'x', maxConcurrent: 4, sweepCap: 0, log: () => {}, sleepFn: async () => {}, ...extra,
+  });
+
+  test("a deadline-killed pass-0 worker yields a PARTIAL review: siblings' findings delivered, the gap carried as data, no in-place retry", async () => {
+    const { registry, calls } = makeRegistry({
+      workerBehavior: ({ scope }) => {
+        if (scope.name === 'b') throw new DeadlineExceededError('killed at the deadline');
+        return okResult(scope);
+      },
+    });
+    const review = await runMultiScopePass(passArgs(registry, { deadline: Date.now() + 3_600_000 }));
+    assert.deepEqual(review.findings.map(f => f.path).sort(), ['a.js', 'c.js']);
+    assert.deepEqual(review.unreviewedScopes, ['b']);
+    assert.equal(review.budgetExhausted, true);
+    assert.equal(calls.workers.b, 1); // a spent budget is not retried in place
+    assert.match(review.summary, /Reviewed 2 scope\(s\): a, c\./);
+    assert.match(review.summary, /Time budget exhausted.*2 of 3 scope\(s\).*NOT reviewed: b/);
+  });
+
+  test('the budget expiring before ANY scope completes fails fast, naming the knob', async () => {
+    const { registry } = makeRegistry({
+      workerBehavior: () => { throw new DeadlineExceededError('killed'); },
+    });
+    await assert.rejects(
+      runMultiScopePass(passArgs(registry, { deadline: Date.now() + 3_600_000 })),
+      (err) => err instanceof DeadlineExceededError && /before any scope completed/.test(err.message) && /TIME_BUDGET_MINUTES/.test(err.message),
+    );
+  });
+
+  test('deadline-killed SWEEP workers curtail convergence without touching pass-0 coverage', async () => {
+    const { registry } = makeRegistry({
+      workerBehavior: ({ scope, sweep }) => {
+        if (sweep) throw new DeadlineExceededError('killed in the sweep');
+        return okResult(scope);
+      },
+    });
+    const review = await runMultiScopePass(passArgs(registry, { sweepCap: 2, deadline: Date.now() + 3_600_000 }));
+    assert.deepEqual(review.findings.map(f => f.path).sort(), ['a.js', 'b.js', 'c.js']);
+    assert.deepEqual(review.unreviewedScopes, []); // pass 0's judgments of record stand
+    assert.equal(review.budgetExhausted, true);
+    assert.match(review.summary, /every scope was reviewed, but convergence sweeps were cut short/);
+  });
+
+  test('a deadline that passes between pass 0 and the first sweep trips the sweep gate — no sweep spawns', async () => {
+    let clock = 0;
+    const { registry, calls } = makeRegistry({ workerBehavior: ({ scope }) => okResult(scope) });
+    const logs = [];
+    let doneCount = 0;
+    const log = (msg) => {
+      logs.push(msg);
+      // The deterministic clock: the budget runs out the moment the last pass-0 worker reports done.
+      if (/ done — /.test(msg) && ++doneCount === SCOPES.length) clock = 200;
+    };
+    const review = await runMultiScopePass(passArgs(registry, { sweepCap: 2, deadline: 100, now: () => clock, log }));
+    assert.deepEqual(review.findings.map(f => f.path).sort(), ['a.js', 'b.js', 'c.js']);
+    assert.equal(review.budgetExhausted, true);
+    assert.equal(Object.values(calls.workers).reduce((a, b) => a + b, 0), SCOPES.length); // pass 0 only — no sweep spawned
+    assert.ok(logs.some(m => /convergence sweeps stopped before sweep 1 — time budget exhausted/.test(m)));
+    assert.match(review.summary, /convergence sweeps were cut short/);
+  });
+
+  test('the deadline value reaches every engine spawn (scout and workers alike)', async () => {
+    const { registry, calls } = makeRegistry({ workerBehavior: ({ scope }) => okResult(scope) });
+    const deadline = Date.now() + 12_345_678;
+    await runMultiScopePass(passArgs(registry, { deadline }));
+    assert.ok(calls.deadlines.length >= 4); // 1 scout + 3 workers
+    assert.ok(calls.deadlines.every(d => d === deadline));
+  });
+
+  test('no deadline (null) leaves the result fields at their defaults — the budget-off run carries no budget state', async () => {
+    const { registry } = makeRegistry({ workerBehavior: ({ scope }) => okResult(scope) });
+    const review = await runMultiScopePass(passArgs(registry));
+    assert.deepEqual(review.unreviewedScopes, []);
+    assert.equal(review.budgetExhausted, false);
+    assert.doesNotMatch(review.summary, /Time budget/);
+  });
+});
+
+// ── planScopes stamps unique names (zai-timing-sn1 review round) ──────────────────────────────────
+// Scope names are identifiers downstream — logs, sweep labels, and the time budget's coverage
+// bookkeeping key on them — but the scout contract only promises non-empty. planScopes is the one
+// boundary that makes them unique, so name-keyed consumers are sound by construction.
+describe('planScopes — unique scope names', () => {
+  test('a repeated name gets a deterministic suffix; distinct names pass through untouched', () => {
+    const { scopes } = planScopes([
+      { name: 'sync', focus: 'f1', files: ['a.js'] },
+      { name: 'sync', focus: 'f2', files: ['b.js'] },
+      { name: 'docs', focus: 'f3', files: ['c.js'] },
+    ], ['a.js', 'b.js', 'c.js']);
+    assert.deepEqual(scopes.map(s => s.name), ['sync', 'sync (2)', 'docs']);
+  });
+
+  test('a suffixed name colliding with a literally-planned one keeps bumping until free', () => {
+    const { scopes } = planScopes([
+      { name: 'x', focus: 'f1', files: ['a.js'] },
+      { name: 'x (2)', focus: 'f2', files: ['b.js'] },
+      { name: 'x', focus: 'f3', files: ['c.js'] },
+    ], ['a.js', 'b.js', 'c.js']);
+    assert.deepEqual(scopes.map(s => s.name), ['x', 'x (2)', 'x (3)']);
+  });
+
+  test("a scout scope named 'unassigned files' cannot collide with the catch-all", () => {
+    const { scopes } = planScopes(
+      [{ name: 'unassigned files', focus: 'f1', files: ['a.js'] }],
+      ['a.js', 'stray.js'],
+    );
+    assert.deepEqual(scopes.map(s => s.name), ['unassigned files', 'unassigned files (2)']);
+    assert.deepEqual(scopes[1].files, ['stray.js']);
+  });
+
+  test('coverage bookkeeping stays consistent under formerly-duplicate names (the reporting bug this fixes)', () => {
+    // Two same-named scopes, one deadline-killed: the summary must count the reviewed one as
+    // reviewed, not subtract both via the shared name.
+    const summary = composeSummary(
+      [{ name: 'sync', focus: 'f1' }, { name: 'sync (2)', focus: 'f2' }],
+      [{ name: 'sync', summary: 'ok' }],
+      [],
+      { exhausted: true, unreviewedScopes: ['sync (2)'] },
+    );
+    assert.match(summary, /Reviewed 1 scope\(s\): sync\./);
+    assert.match(summary, /1 of 2 scope\(s\) were reviewed; NOT reviewed: sync \(2\)/);
+  });
+});
+
+// ── round 4: the failover-budget clamp is mutation-visible ────────────────────────────────────────
+// runMultiScope derives produceReview's retry budget from the wall-clock deadline. Without this
+// test, deleting that min() line silently restores the 60-minute failover horizon: sleeps take the
+// uncapped Retry-After and spawn counts grow unbounded by the deadline.
+describe('runMultiScope — failover budget bounded by the deadline', () => {
+  test('a transient storm under a finite deadline ends promptly with every sleep inside the remaining budget', async () => {
+    let clock = 0;
+    const slept = [];
+    let spawns = 0;
+    const material = {
+      changedPaths: [],
+      buildScoutPrompt: () => 'SCOUT',
+      buildWorkerPrompt: (t) => t,
+    };
+    const adapter = {
+      async produceReview() {
+        spawns++;
+        clock += 600; // each attempt burns fake time toward the 1s deadline
+        throw new TransientError('rate-limited', 999_999); // uncapped server Retry-After
+      },
+    };
+    await assert.rejects(
+      runMultiScope({
+        chain: [{ engine: 'fake', name: 'c1' }],
+        material,
+        registry: { get: () => adapter },
+        instructionsPath: 'x',
+        log: () => {},
+        sleepFn: async ms => { slept.push(ms); },
+        deadline: 1_000,
+        now: () => clock,
+      }),
+      TransientError,
+    );
+    assert.ok(slept.length > 0, 'the retry path actually slept');
+    assert.ok(slept.every(ms => ms <= 1_000), `every sleep clamped to the remaining budget, got: ${slept}`);
+    assert.ok(spawns <= 6, `attempts bounded by the deadline, not the 60m default horizon: ${spawns}`);
   });
 });
