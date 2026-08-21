@@ -56,7 +56,7 @@ function workerFocusText(scope, context) {
 // [LAW:one-source-of-truth] "Same finding" is decided by dedupeFindings in src/review.js — one dedup
 // over the MERGED findings (not per worker), since two adjacent scopes can both touch a shared file.
 // It is imported, never re-implemented, so the pre-anchor merge here and the post-anchor snap-collapse
-// in partitionFindings share one key and one severity-merge rule. [LAW:single-enforcer]
+// in partitionFindings share one key. [LAW:single-enforcer]
 
 // [LAW:effects-at-boundaries] Pure: sum the per-spawn Usage values into one. Token counts always add.
 // Cost is uniform by construction — every spawn in a pass runs on ONE config, so all costs share the

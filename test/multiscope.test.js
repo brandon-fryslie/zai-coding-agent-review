@@ -80,9 +80,9 @@ describe('workerFocusText', () => {
 describe('dedupeFindings', () => {
   test('drops exact-duplicate findings by path:line:body, preserving order', () => {
     const findings = [
-      { path: 'a.js', line: 1, body: '[LAW:x] foo', severity: 'blocking' },
-      { path: 'b.js', line: 2, body: '[LAW:y] bar', severity: 'blocking' },
-      { path: 'a.js', line: 1, body: '[LAW:x] foo', severity: 'blocking' },
+      { path: 'a.js', line: 1, body: '[LAW:x] foo' },
+      { path: 'b.js', line: 2, body: '[LAW:y] bar' },
+      { path: 'a.js', line: 1, body: '[LAW:x] foo' },
     ];
     const out = dedupeFindings(findings);
     assert.equal(out.length, 2);
@@ -91,8 +91,8 @@ describe('dedupeFindings', () => {
 
   test('keeps two findings on the same line with different bodies', () => {
     const out = dedupeFindings([
-      { path: 'a.js', line: 1, body: 'first distinct issue here', severity: 'blocking' },
-      { path: 'a.js', line: 1, body: 'second different issue here', severity: 'advisory' },
+      { path: 'a.js', line: 1, body: 'first distinct issue here' },
+      { path: 'a.js', line: 1, body: 'second different issue here' },
     ]);
     assert.equal(out.length, 2);
   });
@@ -103,8 +103,8 @@ describe('dedupeFindings', () => {
   test('keeps two same-line findings that share a >60-char prefix but differ later', () => {
     const shared = 'Bug: this comparison on the id field looks wrong and needs a closer look here '; // 77 chars
     const out = dedupeFindings([
-      { path: 'a.js', line: 1, body: `${shared}because it uses = instead of ===`, severity: 'blocking' },
-      { path: 'a.js', line: 1, body: `${shared}because it runs before the guard`, severity: 'advisory' },
+      { path: 'a.js', line: 1, body: `${shared}because it uses = instead of ===` },
+      { path: 'a.js', line: 1, body: `${shared}because it runs before the guard` },
     ]);
     assert.equal(out.length, 2);
   });
@@ -112,39 +112,19 @@ describe('dedupeFindings', () => {
   // Byte-identical bodies modulo whitespace/case are the real double-record case: they still collapse.
   test('dedupes bodies that differ only in whitespace and case', () => {
     const out = dedupeFindings([
-      { path: 'a.js', line: 1, body: 'Bug:  the   guard is missing', severity: 'blocking' },
-      { path: 'a.js', line: 1, body: 'bug: the guard is missing', severity: 'blocking' },
+      { path: 'a.js', line: 1, body: 'Bug:  the   guard is missing' },
+      { path: 'a.js', line: 1, body: 'bug: the guard is missing' },
     ]);
     assert.equal(out.length, 1);
-  });
-
-  // [LAW:no-silent-failure] severity decides the merge gate, so a duplicate must not lose it to order.
-  test('a blocking duplicate wins over an advisory that arrived first (upward merge)', () => {
-    const out = dedupeFindings([
-      { path: 'a.js', line: 1, body: 'same issue', severity: 'advisory' },
-      { path: 'a.js', line: 1, body: 'same issue', severity: 'blocking' },
-    ]);
-    assert.equal(out.length, 1);
-    assert.equal(out[0].severity, 'blocking'); // advisory-first never downgrades the merged finding
-  });
-
-  test('a blocking finding is not downgraded by a later advisory duplicate', () => {
-    const out = dedupeFindings([
-      { path: 'a.js', line: 1, body: 'same issue', severity: 'blocking' },
-      { path: 'a.js', line: 1, body: 'same issue', severity: 'advisory' },
-    ]);
-    assert.equal(out.length, 1);
-    assert.equal(out[0].severity, 'blocking');
   });
 
   test('merging preserves first-seen order across keys', () => {
     const out = dedupeFindings([
-      { path: 'a.js', line: 1, body: 'x', severity: 'advisory' },
-      { path: 'b.js', line: 2, body: 'y', severity: 'blocking' },
-      { path: 'a.js', line: 1, body: 'x', severity: 'blocking' }, // upgrades a.js in place
+      { path: 'a.js', line: 1, body: 'x' },
+      { path: 'b.js', line: 2, body: 'y' },
+      { path: 'a.js', line: 1, body: 'x' },
     ]);
     assert.deepEqual(out.map(f => f.path), ['a.js', 'b.js']); // a.js keeps its original position
-    assert.equal(out[0].severity, 'blocking');
   });
 });
 
@@ -628,7 +608,7 @@ describe('runMultiScopePass — convergence sweeps', () => {
     };
     return { registry: { get: () => adapter }, seenPrompts, perScopeCalls };
   }
-  const oneBug = (name) => [{ path: `${name}.js`, line: 1, body: `bug in ${name}`, severity: 'advisory' }];
+  const oneBug = (name) => [{ path: `${name}.js`, line: 1, body: `bug in ${name}` }];
 
   test('a sweep that adds nothing new terminates the loop before the cap', async () => {
     // Every pass re-records the same finding: sweep 1 merges to no growth → converged, sweep 2 never runs.
@@ -643,7 +623,7 @@ describe('runMultiScopePass — convergence sweeps', () => {
   test('the sweep bound caps a loop that keeps adding new findings, and says so', async () => {
     const logs = [];
     const { registry, perScopeCalls } = sweepRegistry(
-      (name, pass) => [{ path: `${name}.js`, line: pass + 1, body: `bug-${name}-p${pass}`, severity: 'advisory' }],
+      (name, pass) => [{ path: `${name}.js`, line: pass + 1, body: `bug-${name}-p${pass}` }],
     );
     const review = await runMultiScopePass(args(registry, 2, (m) => logs.push(m)));
     assert.deepEqual(perScopeCalls, { a: 3, b: 3 }); // initial layer + the 2 capped sweeps
@@ -676,7 +656,7 @@ describe('runMultiScopePass — convergence sweeps', () => {
   test('a sweep mixing one re-record and one genuinely new finding adds exactly the new one', async () => {
     const { registry } = sweepRegistry(
       (name, pass) => (name === 'a' && pass === 1)
-        ? [...oneBug('a'), { path: 'a.js', line: 9, body: 'deeper bug behind it', severity: 'blocking' }]
+        ? [...oneBug('a'), { path: 'a.js', line: 9, body: 'deeper bug behind it' }]
         : oneBug(name),
     );
     const logs = [];
@@ -772,11 +752,11 @@ describe('buildPrMaterial', () => {
 
   // copirate-review-loop-5pw.3 — fewer false positives via verification: the SAME call-site reading .2
   // added for recall is turned the opposite way for precision. Before recording, the worker confirms a
-  // suspected fault against that fuller context, drops one the context refutes, and downgrades an
-  // inconclusive one to advisory rather than withholding it (recall preserved). This is woven INTO the .2
-  // passage as one lever, two directions — not a second "read more context" instruction — so it is present
-  // whether or not the scope carries assigned files, right alongside the .2 assertions above.
-  test('the review prompt directs verifying a suspicion against fuller context before recording, refuted findings dropped and inconclusive ones kept as advisory', () => {
+  // suspected fault against that fuller context, drops one the context refutes, and records an
+  // inconclusive one with its uncertainty stated rather than withholding it (recall preserved). This is
+  // woven INTO the .2 passage as one lever, two directions — not a second "read more context" instruction
+  // — so it is present whether or not the scope carries assigned files, right alongside the .2 assertions above.
+  test('the review prompt directs verifying a suspicion against fuller context before recording, refuted findings dropped and inconclusive ones recorded with stated uncertainty', () => {
     for (const scopeFiles of [[], ['src/usage.js']]) {
       const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, scopeFiles);
       // the same call-site reading runs both directions (recall + precision), not a new context-read
@@ -785,8 +765,8 @@ describe('buildPrMaterial', () => {
       assert.match(prompt, /before you record any finding, confirm\s+the suspected fault against that fuller context/);
       // fuller context refutes -> the finding is dropped (precision, no false positive)
       assert.match(prompt, /if that context shows the code is actually correct, do not record it/);
-      // inconclusive -> advisory, never silently withheld (recall preserved)
-      assert.match(prompt, /if the check is\s+genuinely inconclusive, record the issue as advisory rather than withholding it/);
+      // inconclusive -> recorded with stated uncertainty, never silently withheld (recall preserved)
+      assert.match(prompt, /if the check is\s+genuinely inconclusive, record the issue anyway, stating what remains unverified/);
     }
   });
 
@@ -978,8 +958,8 @@ describe('buildReviewInput prior pushbacks', () => {
 describe('buildReviewInput / buildRepoReviewInput convergence-sweep prior findings', () => {
   const FILES = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
   const PRIOR = [
-    { path: 'src/a.js', line: 3, body: 'Bug: leaks the handle', severity: 'blocking' },
-    { path: 'src/b.js', line: 8, body: 'Edge case: empty list crashes', severity: 'advisory' },
+    { path: 'src/a.js', line: 3, body: 'Bug: leaks the handle' },
+    { path: 'src/b.js', line: 8, body: 'Edge case: empty list crashes' },
   ];
 
   test('empty priorFindings renders no sweep block in either builder (byte-identical initial pass)', () => {
@@ -990,19 +970,19 @@ describe('buildReviewInput / buildRepoReviewInput convergence-sweep prior findin
   });
 
   test('a multi-line finding body renders as exactly one bullet line (no unprefixed continuation)', () => {
-    const multi = [{ path: 'src/a.js', line: 3, body: 'Bug: first line\n  second line\n\nthird line', severity: 'blocking' }];
+    const multi = [{ path: 'src/a.js', line: 3, body: 'Bug: first line\n  second line\n\nthird line' }];
     const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorFindings: multi });
-    assert.match(prompt, /• \[src\/a\.js:3\] \(blocking\) Bug: first line second line third line/);
+    assert.match(prompt, /• \[src\/a\.js:3\] Bug: first line second line third line/);
   });
 
-  test('renders every prior finding with location, severity, and body — in both builders', () => {
+  test('renders every prior finding with location and body — in both builders', () => {
     for (const prompt of [
       buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorFindings: PRIOR }).prompt,
       buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorFindings: PRIOR }).prompt,
     ]) {
       assert.match(prompt, /CONVERGENCE SWEEP/);
-      assert.match(prompt, /\[src\/a\.js:3\] \(blocking\) Bug: leaks the handle/);
-      assert.match(prompt, /\[src\/b\.js:8\] \(advisory\) Edge case: empty list crashes/);
+      assert.match(prompt, /\[src\/a\.js:3\] Bug: leaks the handle/);
+      assert.match(prompt, /\[src\/b\.js:8\] Edge case: empty list crashes/);
     }
   });
 
@@ -1167,7 +1147,7 @@ describe('runMultiScopePass — wall-clock time budget', () => {
   }
   const okResult = (scope, tag = '') => ({
     summary: `sum-${scope.name}`,
-    findings: [{ path: `${tag}${scope.name}.js`, line: 1, body: `bug in ${tag}${scope.name}`, severity: 'blocking' }],
+    findings: [{ path: `${tag}${scope.name}.js`, line: 1, body: `bug in ${tag}${scope.name}` }],
     assessments: [],
     usage: null,
   });

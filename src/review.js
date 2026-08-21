@@ -21,15 +21,10 @@ function parseOneFinding(finding, label) {
   if (typeof body !== 'string' || body.trim().length === 0) {
     throw new Error(`${label} has an invalid body.`);
   }
-  // [LAW:types-are-the-program] severity is the discriminator that separates "worth surfacing" from
-  // "worth blocking a merge". Without it those two facts collapse into the model's private judgment and
-  // a non-blocking finding is silently withheld; as a required enum value it rides on the record and
-  // flows to the verdict computation instead. [LAW:no-silent-failure]
-  const severity = finding.severity;
-  if (severity !== 'blocking' && severity !== 'advisory') {
-    throw new Error(`${label} has an invalid severity (expected 'blocking' or 'advisory').`);
-  }
-  return { path: pathValue.trim(), line, body: body.trim(), severity };
+  // [LAW:types-are-the-program] A finding carries no severity: every recorded finding blocks the merge.
+  // The blocking/advisory split was deleted deliberately — the model's judgment of "non-blocking" was
+  // not trustworthy, so the distinction is unrepresentable rather than defaulted.
+  return { path: pathValue.trim(), line, body: body.trim() };
 }
 
 function parseReviewValue(parsed, context) {
@@ -97,9 +92,8 @@ function parseScopeValue(scope, index) {
 //     affected is true it SHOULD be named; a missing one degrades to an explicit "(call site not named)"
 //     rather than failing the whole review. [LAW:no-defensive-null-guards]
 //   - verdict: the merge-risk call, a closed enum — it owns its glyph and action string at the one render
-//     site, exactly as a finding's severity owns its tag (severityTaggedBody). The verdict is PRESENTATION;
-//     the actual merge gate stays driven by blocking findings, so a lenient verdict can never silently
-//     downgrade a real blocker. [LAW:single-enforcer]
+//     site. The verdict is PRESENTATION; the actual merge gate stays driven by findings (every finding
+//     blocks), so a lenient verdict can never silently downgrade a real blocker. [LAW:single-enforcer]
 const ASSESSMENT_VERDICTS = ['safe', 'review', 'risky'];
 
 function parseAssessmentValue(assessment, index) {
@@ -134,9 +128,8 @@ function parseAssessmentValue(assessment, index) {
 // worker that owns the bumped go.mod (buildReviewInput), so single authorship is the common case; this is
 // the safety net for the multi-go.mod PR (several workers each own a go.mod) and any model over-eagerness.
 //
-// [LAW:one-type-per-behavior] Conflict resolution mirrors dedupeFindings' severity merge, which is the same
-// behavior on the other record kind: two workers assessing one module with different verdicts must not let
-// arrival order (nondeterministic under concurrency — [LAW:no-ambient-temporal-coupling]) pick the winner.
+// [LAW:no-ambient-temporal-coupling] Conflict resolution: two workers assessing one module with different
+// verdicts must not let arrival order (nondeterministic under concurrency) pick the winner.
 // The MORE CAUTIOUS verdict wins — a masked 'safe' over a real 'risky' would mislead the reader even though
 // the merge gate is findings-driven. ASSESSMENT_VERDICTS is ordered by ascending caution, so its index IS
 // the caution rank — no second table to drift. [LAW:one-source-of-truth] First-seen position is preserved
@@ -173,21 +166,13 @@ function normalizeBody(body) {
 // collapse, while any genuine difference in wording keeps two findings apart. Cross-worker paraphrases
 // of one issue surviving as near-duplicates is noise, not loss — the accepted direction to err.
 //
-// [LAW:no-silent-failure] Severity decides the merge gate, so a duplicate must never lose its severity
-// to arrival order: when two members share a key with different severities, the merged finding is
-// 'blocking' if ANY member is — the stronger severity wins, never the one that happened to arrive first.
-// A blocking finding can never be silently downgraded to the advisory that preceded it. First-seen
-// order is preserved (a Map keeps a key's original position when its value is replaced).
+// First-seen wins: members sharing a key are the same recorded finding (every finding blocks the
+// merge, so there is no severity to reconcile), and first-seen order is preserved by the Map.
 function dedupeFindings(findings) {
   const byKey = new Map();
   for (const f of findings) {
     const key = `${f.path}:${f.line}:${normalizeBody(f.body)}`;
-    const existing = byKey.get(key);
-    if (!existing) {
-      byKey.set(key, f);
-    } else if (f.severity === 'blocking' && existing.severity !== 'blocking') {
-      byKey.set(key, f);
-    }
+    if (!byKey.has(key)) byKey.set(key, f);
   }
   return [...byKey.values()];
 }
@@ -261,17 +246,4 @@ function partitionFindings(findings, anchors) {
   return { anchored, unanchored };
 }
 
-// [LAW:one-source-of-truth] Severity is a value on the finding; a human reader must be able to tell a
-// blocking request from an advisory note in EVERY sink (inline PR comment, the unanchored summary
-// section, the whole-repo report). GitHub has no "advisory" field on a review comment, so the only
-// channel is the body text — this is the one place that string is defined, and all three sinks derive
-// the presented body from here rather than each restating the tag. [LAW:single-enforcer]
-// [LAW:dataflow-not-control-flow] The tag is a rendering of the severity value, not a branch on
-// whether the finding is shown — every finding is shown; only its label varies.
-function severityTaggedBody(finding) {
-  return finding.severity === 'advisory'
-    ? `**Advisory (non-blocking):** ${finding.body}`
-    : finding.body;
-}
-
-module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTaggedBody };
+module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine };

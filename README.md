@@ -1,6 +1,6 @@
 # CoPirate Code Review
 
-A GitHub Action that runs an AI coding agent as a **read-only** code reviewer. It reviews a pull request diff and submits an inline GitHub review — `REQUEST_CHANGES` when it finds blocking issues, otherwise `APPROVE` (or a "⏳ Partial review" `COMMENT` when the [time budget](#inputs) ran out before every scope was reviewed — a partial review never approves). It can also do an on-demand whole-repo review (`MODE: repo`).
+A GitHub Action that runs an AI coding agent as a **read-only** code reviewer. It reviews a pull request diff and submits an inline GitHub review — `REQUEST_CHANGES` when it finds issues, otherwise `APPROVE` (or a "⏳ Partial review" `COMMENT` when the [time budget](#inputs) ran out before every scope was reviewed — a partial review never approves). It can also do an on-demand whole-repo review (`MODE: repo`).
 
 The review engine is chosen by `PROVIDER`, which defaults to `auto` (today: Claude Code against DeepSeek). You can also run Claude Code against Z.ai, or Codex against OpenAI. The engine reviews read-only — it cannot push to GitHub itself; findings flow through a private collector and are submitted by the action.
 
@@ -109,14 +109,14 @@ The action installs its bundled reviewer instructions as the engine's user-globa
 
 ## Approvals
 
-Each finding carries a **severity** — `blocking` (must change before merge) or `advisory` (a genuine issue worth surfacing that need not block the merge, e.g. a missing test, a perf concern, or a maintainability nit). Only a `blocking` finding requests changes; a review whose findings are all advisory is not a merge gate. Advisory findings still post as inline comments, tagged so the author can tell them apart.
+**Every finding blocks.** The reviewer makes no blocking/advisory call — a recorded finding is one the code must address, and any finding submits a `REQUEST_CHANGES` review. There is no non-blocking severity tier.
 
 The default `GITHUB_TOKEN` cannot approve PRs. With no `GITHUB_REVIEW_TOKEN`:
 
-- A `blocking` finding is submitted as a `REQUEST_CHANGES` review with inline threads.
-- A review with no blocking findings (clean, or advisory-only) just logs `✅ Approved` — advisory findings still post as inline comments — with no formal approval submitted.
+- Any finding is submitted as a `REQUEST_CHANGES` review with inline threads.
+- A clean review just logs `✅ Approved`, with no formal approval submitted.
 
-Set `GITHUB_REVIEW_TOKEN` to an approval-capable user or GitHub App token to have non-blocking reviews submit a formal `APPROVE`. When a blocking finding exists the action requests changes — resolve the threads and dismiss the review to proceed.
+Set `GITHUB_REVIEW_TOKEN` to an approval-capable user or GitHub App token to have clean reviews submit a formal `APPROVE`. When a finding exists the action requests changes — resolve the threads and dismiss the review to proceed.
 
 **The partial exception:** a review whose [time budget](#inputs) expired before every scope was reviewed never approves, however clean — with or without `GITHUB_REVIEW_TOKEN` it posts a `COMMENT` review whose verdict reads `⏳ Partial review`, naming the unreviewed scopes in the summary. Approval asserts the whole diff was judged, and a partial review has no standing to assert it.
 

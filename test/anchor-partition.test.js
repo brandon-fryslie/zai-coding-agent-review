@@ -2,7 +2,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { partitionFindings, nearestAnchorableLine, parseFindingValue, parseAssessmentValue, dedupeAssessments, severityTaggedBody } = require('../src/review');
+const { partitionFindings, nearestAnchorableLine, parseFindingValue, parseAssessmentValue, dedupeAssessments } = require('../src/review');
 const { submitReview, gitHubTransport, giteaTransport } = require('../src/transport');
 const { buildReviewAnchors } = require('../src/diff');
 
@@ -144,7 +144,7 @@ describe('submitReview — unanchored findings', () => {
     const review = {
       summary: 'Summary text.',
       findings: [],
-      unanchored: [{ path: 's.astro', line: 79, body: 'stale doc comment', severity: 'blocking' }],
+      unanchored: [{ path: 's.astro', line: 79, body: 'stale doc comment' }],
       unreviewedScopes: [],
     };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
@@ -161,7 +161,7 @@ describe('submitReview — unanchored findings', () => {
     const octokit = fakeOctokit();
     const review = {
       summary: 'Summary.',
-      findings: [{ path: 'a.js', line: 10, body: 'fix', severity: 'blocking' }],
+      findings: [{ path: 'a.js', line: 10, body: 'fix' }],
       unanchored: [],
       unreviewedScopes: [],
     };
@@ -294,7 +294,7 @@ describe('submitReview — approve event spelling is host-specific (home-copirat
   });
 
   test('REQUEST_CHANGES is spelled identically across transports (no host-specific mapping needed)', async () => {
-    const review = { summary: 'Bad.', findings: [{ path: 'a.js', line: 1, body: 'x', severity: 'blocking' }], unanchored: [], unreviewedScopes: [] };
+    const review = { summary: 'Bad.', findings: [{ path: 'a.js', line: 1, body: 'x' }], unanchored: [], unreviewedScopes: [] };
     const gh = fakeOctokit();
     await submitReview(gh, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
     const gt = fakeOctokit();
@@ -304,53 +304,27 @@ describe('submitReview — approve event spelling is host-specific (home-copirat
   });
 });
 
-// ── severity: the discriminator that separates "worth surfacing" from "worth blocking" ────────────
-// [LAW:verifiable-goals] AC: recording a finding no longer forces REQUEST_CHANGES — an advisory
-// finding still posts and still counts, but the verdict blocks only on a 'blocking' finding.
+// ── findings carry no severity: every recorded finding blocks the merge ───────────────────────────
+// [LAW:verifiable-goals] AC: the model makes no blocking/advisory call. A finding is path/line/body;
+// a stray severity key from an older engine is dropped, never carried or validated.
 
-describe('parseFindingValue — severity', () => {
-  test('accepts a blocking finding and carries severity through', () => {
+describe('parseFindingValue — no severity', () => {
+  test('parses a finding as path/line/body only', () => {
     assert.deepEqual(
-      parseFindingValue({ path: 'a.js', line: 3, body: 'bug', severity: 'blocking' }, 0),
-      { path: 'a.js', line: 3, body: 'bug', severity: 'blocking' },
+      parseFindingValue({ path: 'a.js', line: 3, body: 'bug' }, 0),
+      { path: 'a.js', line: 3, body: 'bug' },
     );
   });
-  test('accepts an advisory finding', () => {
-    assert.equal(parseFindingValue({ path: 'a.js', line: 3, body: 'nit', severity: 'advisory' }, 0).severity, 'advisory');
-  });
-  test('rejects a missing severity — the field is required', () => {
-    assert.throws(() => parseFindingValue({ path: 'a.js', line: 3, body: 'x' }, 0), /invalid severity/);
-  });
-  test('rejects an unknown severity value', () => {
-    assert.throws(() => parseFindingValue({ path: 'a.js', line: 3, body: 'x', severity: 'critical' }, 0), /invalid severity/);
+  test('drops a stray severity key — the concept is unrepresentable downstream', () => {
+    assert.deepEqual(
+      parseFindingValue({ path: 'a.js', line: 3, body: 'bug', severity: 'advisory' }, 0),
+      { path: 'a.js', line: 3, body: 'bug' },
+    );
   });
   test('the error names the caller-supplied position, not always "finding 1"', () => {
-    // parseFindingValue(index=5) must report "finding 6" — the record's real position — so a bad
+    // parseFindingValue(index=2) must report "finding 3" — the record's real position — so a bad
     // finding deep in records.jsonl is locatable, not mislabeled as the first. [LAW:decomposition]
-    assert.throws(() => parseFindingValue({ path: 'a.js', line: 3, body: 'x', severity: 'nope' }, 5), /finding 6 has an invalid severity/);
-    assert.throws(() => parseFindingValue({ path: '', line: 3, body: 'x', severity: 'blocking' }, 2), /finding 3 has an invalid path/);
-  });
-});
-
-describe('severityTaggedBody', () => {
-  test('prefixes an advisory finding so a reader can tell it apart', () => {
-    assert.equal(severityTaggedBody({ body: 'missing test', severity: 'advisory' }), '**Advisory (non-blocking):** missing test');
-  });
-  test('leaves a blocking finding body untagged', () => {
-    assert.equal(severityTaggedBody({ body: 'off-by-one', severity: 'blocking' }), 'off-by-one');
-  });
-});
-
-describe('partitionFindings — severity carried through', () => {
-  test('severity survives an exact anchor and a snap', () => {
-    const anchors = anchorsFor([['a.js', 10], ['a.js', 12]]);
-    const findings = [
-      { path: 'a.js', line: 10, body: 'exact', severity: 'advisory' },
-      { path: 'a.js', line: 14, body: 'near', severity: 'blocking' }, // snaps to 12
-    ];
-    const { anchored } = partitionFindings(findings, anchors);
-    assert.equal(anchored[0].severity, 'advisory');
-    assert.equal(anchored[1].severity, 'blocking'); // snapped, severity intact
+    assert.throws(() => parseFindingValue({ path: '', line: 3, body: 'x' }, 2), /finding 3 has an invalid path/);
   });
 });
 
@@ -404,34 +378,6 @@ describe('partitionFindings — collapses near-duplicates that snap onto one lin
     assert.deepEqual(anchored[0], { path: 'a.js', line: 12, body: 'Bug: race on shared map' });
   });
 
-  test('[LAW:no-silent-failure] collapse keeps the stronger severity regardless of arrival order', () => {
-    const anchors = anchorsFor([['a.js', 12]]);
-    const findings = [
-      { path: 'a.js', line: 10, body: 'Bug: same issue', severity: 'advisory' },
-      { path: 'a.js', line: 14, body: 'Bug: same issue', severity: 'blocking' }, // arrives later
-    ];
-    const { anchored } = partitionFindings(findings, anchors);
-    assert.equal(anchored.length, 1);
-    assert.equal(anchored[0].severity, 'blocking');
-  });
-
-  test('[LAW:no-silent-failure] severity-driven replacement swaps which candidate survives — the snapped blocking one wins AND is annotated', () => {
-    // The first-seen survivor is an EXACT-anchored advisory (no snap note); a later SNAPPED blocking
-    // finding with the same normalized body replaces it via blocking-wins. The survivor must flip both
-    // its severity (→ blocking) and its annotation state (→ carries the snap note of the snapped member).
-    const anchors = anchorsFor([['a.js', 12]]);
-    const findings = [
-      { path: 'a.js', line: 12, body: 'Bug: same issue', severity: 'advisory' }, // exact, first-seen
-      { path: 'a.js', line: 14, body: 'Bug: same issue', severity: 'blocking' }, // snaps to 12, replaces
-    ];
-    const { anchored } = partitionFindings(findings, anchors);
-    assert.equal(anchored.length, 1);
-    assert.equal(anchored[0].line, 12);
-    assert.equal(anchored[0].severity, 'blocking');
-    assert.match(anchored[0].body, /Anchored to line 12; the review referenced line 14/);
-    assert.equal('snappedFromLine' in anchored[0], false);
-  });
-
   test('snappedFromLine scaffolding never leaks onto an anchored finding', () => {
     const anchors = anchorsFor([['a.js', 12]]);
     const { anchored } = partitionFindings([{ path: 'a.js', line: 14, body: 'x' }], anchors);
@@ -440,80 +386,45 @@ describe('partitionFindings — collapses near-duplicates that snap onto one lin
   });
 });
 
-describe('submitReview — severity drives the verdict, never whether a finding is recorded', () => {
-  test('all-advisory findings APPROVE (canApprove) yet still post inline, tagged', async () => {
+describe('submitReview — every finding blocks', () => {
+  test('any finding forces REQUEST_CHANGES even with an approve-capable token, and posts verbatim', async () => {
     const octokit = fakeOctokit();
     const review = {
-      summary: 'Two non-blocking notes.',
+      summary: 'Two notes.',
       findings: [
-        { path: 'a.js', line: 10, body: 'add a test', severity: 'advisory' },
-        { path: 'b.js', line: 20, body: 'could be faster', severity: 'advisory' },
+        { path: 'a.js', line: 10, body: 'add a test' },
+        { path: 'b.js', line: 20, body: 'could be faster' },
       ],
       unanchored: [],
       unreviewedScopes: [],
     };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
     const arg = octokit.calls[0];
-    assert.equal(arg.event, 'APPROVE'); // recording advisory findings does NOT block the merge
-    assert.match(arg.body, /✅ Approved/);
-    assert.equal(arg.comments.length, 2); // advisory findings still post inline
-    assert.match(arg.comments[0].body, /^\*\*Advisory \(non-blocking\):\*\* add a test/);
+    assert.equal(arg.event, 'REQUEST_CHANGES'); // no non-blocking tier: a recorded finding is a blocker
+    assert.match(arg.body, /❌ Request Changes/);
+    assert.equal(arg.comments.length, 2);
+    assert.equal(arg.comments[0].body, 'add a test'); // no severity tag prefixes the body
   });
 
-  test('all-advisory findings post as COMMENT when the token cannot approve', async () => {
-    const octokit = fakeOctokit();
-    const review = { summary: 's', findings: [{ path: 'a.js', line: 1, body: 'nit', severity: 'advisory' }], unanchored: [], unreviewedScopes: [] };
-    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, false, gitHubTransport([]));
-    assert.equal(octokit.calls[0].event, 'COMMENT');
-  });
-
-  test('one blocking finding among advisories forces REQUEST_CHANGES', async () => {
+  test('an UNANCHORED finding alone still blocks — a mis-anchored issue cannot downgrade to APPROVE', async () => {
     const octokit = fakeOctokit();
     const review = {
       summary: 's',
-      findings: [
-        { path: 'a.js', line: 10, body: 'nit', severity: 'advisory' },
-        { path: 'b.js', line: 20, body: 'real bug', severity: 'blocking' },
-      ],
-      unanchored: [],
-      unreviewedScopes: [],
-    };
-    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
-    assert.equal(octokit.calls[0].event, 'REQUEST_CHANGES');
-  });
-
-  test('a blocking UNANCHORED finding still blocks — a mis-anchored blocker cannot downgrade to APPROVE', async () => {
-    const octokit = fakeOctokit();
-    const review = {
-      summary: 's',
-      findings: [{ path: 'a.js', line: 10, body: 'nit', severity: 'advisory' }],
-      unanchored: [{ path: 'b.js', line: 999, body: 'real bug off-grid', severity: 'blocking' }],
+      findings: [],
+      unanchored: [{ path: 'b.js', line: 999, body: 'real bug off-grid' }],
       unreviewedScopes: [],
     };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
     const arg = octokit.calls[0];
     assert.equal(arg.event, 'REQUEST_CHANGES');
     assert.match(arg.body, /Findings outside the reviewed diff/);
-  });
-
-  test('an advisory unanchored finding is tagged in the summary section', async () => {
-    const octokit = fakeOctokit();
-    const review = {
-      summary: 's',
-      findings: [],
-      unanchored: [{ path: 'b.js', line: 999, body: 'perf note off-grid', severity: 'advisory' }],
-      unreviewedScopes: [],
-    };
-    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
-    const arg = octokit.calls[0];
-    assert.equal(arg.event, 'APPROVE'); // advisory-only, even unanchored, does not block
-    assert.match(arg.body, /\*\*Advisory \(non-blocking\):\*\* perf note off-grid/);
+    assert.match(arg.body, /real bug off-grid/);
   });
 });
 
 // ── partial coverage withholds approval (zai-timing-sn1) ──────────────────────────────────────────
 // A review whose time budget expired before every scope was reviewed has no standing to approve:
-// approval asserts the whole diff was judged. Blocking findings outrank the partial state.
+// approval asserts the whole diff was judged. Findings outrank the partial state.
 describe('submitReview — partial coverage (unreviewedScopes)', () => {
   test('clean-but-partial posts as COMMENT with the partial verdict, never Approved — even with an approve-capable token', async () => {
     const octokit = fakeOctokit();
@@ -525,11 +436,11 @@ describe('submitReview — partial coverage (unreviewedScopes)', () => {
     assert.doesNotMatch(arg.body, /✅ Approved/);
   });
 
-  test('a blocking finding in a partial review still REQUEST_CHANGES — a blocker found in a half-reviewed diff is still a blocker', async () => {
+  test('a finding in a partial review still REQUEST_CHANGES — an issue found in a half-reviewed diff still blocks', async () => {
     const octokit = fakeOctokit();
     const review = {
       summary: 'S.',
-      findings: [{ path: 'a.js', line: 1, body: 'bug', severity: 'blocking' }],
+      findings: [{ path: 'a.js', line: 1, body: 'bug' }],
       unanchored: [],
       unreviewedScopes: ['docs'],
     };

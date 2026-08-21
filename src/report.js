@@ -1,5 +1,4 @@
 'use strict';
-const { severityTaggedBody } = require('./review');
 
 // The printed sink for full-repo review mode. There is no pull request to comment on, so
 // findings are rendered as a single Markdown report written to the GitHub Step Summary and
@@ -25,7 +24,7 @@ function groupByPath(findings) {
 // One finding rendered as a list item; the body is flattened to a single line so the grouped
 // list stays scannable in the Step Summary.
 function renderFinding(finding) {
-  const body = severityTaggedBody(finding).replace(/\s*\n\s*/g, ' ').trim();
+  const body = finding.body.replace(/\s*\n\s*/g, ' ').trim();
   return `- **line ${finding.line}:** ${body}`;
 }
 

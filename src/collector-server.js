@@ -22,16 +22,15 @@ function collectorTools() {
   return [
     {
       name: 'request_change',
-      description: "Record a code issue anchored to a visible diff line. Set severity 'blocking' if it must change before merge, 'advisory' if it is a genuine issue worth surfacing but need not block the merge (e.g. a missing test, a perf concern, a maintainability problem, or a finding you are only moderately sure of). Record EVERY genuine issue you find at the right severity — do not withhold one because it is non-blocking. Do not use for praise, neutral observations, or pure style/naming preferences.",
+      description: "Record a code issue anchored to a visible diff line. Every recorded issue must change before merge — recording one requests changes on the review. Record EVERY genuine issue you find, including one you are only moderately sure of (state what you are unsure of in the body). Do not use for praise, neutral observations, or pure style/naming preferences.",
       inputSchema: {
         type: 'object',
         properties: {
           path: { type: 'string' },
           line: { type: 'integer' },
           body: { type: 'string' },
-          severity: { type: 'string', enum: ['blocking', 'advisory'] },
         },
-        required: ['path', 'line', 'body', 'severity'],
+        required: ['path', 'line', 'body'],
         additionalProperties: false,
       },
     },

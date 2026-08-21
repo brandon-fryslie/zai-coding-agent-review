@@ -307,10 +307,10 @@ function mdText(str) {
   return escapeHtml(String(str).replace(/[\\`*_[\]()~]/g, m => `\\${m}`));
 }
 
-// [LAW:one-source-of-truth] The verdict enum owns its glyph, label, and action at THIS one site — exactly
-// as a finding's severity owns its tag (severityTaggedBody). Nothing else re-spells a verdict; every render
-// derives from here. The verdict is PRESENTATION — the merge gate is driven by blocking findings, not by
-// this glyph — so a lenient verdict can never silently downgrade a real blocker. [LAW:single-enforcer]
+// [LAW:one-source-of-truth] The verdict enum owns its glyph, label, and action at THIS one site.
+// Nothing else re-spells a verdict; every render derives from here. The verdict is PRESENTATION — the
+// merge gate is driven by findings (every finding blocks), not by this glyph — so a lenient verdict
+// can never silently downgrade a real blocker. [LAW:single-enforcer]
 const VERDICT_PRESENTATION = {
   safe: { glyph: '✅', label: 'Safe', action: 'routine bump; safe to merge.' },
   review: { glyph: '⚠️', label: 'Review', action: 'worth a human glance before merge.' },

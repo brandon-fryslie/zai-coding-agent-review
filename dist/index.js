@@ -30218,16 +30218,15 @@ function collectorTools() {
   return [
     {
       name: 'request_change',
-      description: "Record a code issue anchored to a visible diff line. Set severity 'blocking' if it must change before merge, 'advisory' if it is a genuine issue worth surfacing but need not block the merge (e.g. a missing test, a perf concern, a maintainability problem, or a finding you are only moderately sure of). Record EVERY genuine issue you find at the right severity — do not withhold one because it is non-blocking. Do not use for praise, neutral observations, or pure style/naming preferences.",
+      description: "Record a code issue anchored to a visible diff line. Every recorded issue must change before merge — recording one requests changes on the review. Record EVERY genuine issue you find, including one you are only moderately sure of (state what you are unsure of in the body). Do not use for praise, neutral observations, or pure style/naming preferences.",
       inputSchema: {
         type: 'object',
         properties: {
           path: { type: 'string' },
           line: { type: 'integer' },
           body: { type: 'string' },
-          severity: { type: 'string', enum: ['blocking', 'advisory'] },
         },
-        required: ['path', 'line', 'body', 'severity'],
+        required: ['path', 'line', 'body'],
         additionalProperties: false,
       },
     },
@@ -31144,10 +31143,10 @@ function mdText(str) {
   return escapeHtml(String(str).replace(/[\\`*_[\]()~]/g, m => `\\${m}`));
 }
 
-// [LAW:one-source-of-truth] The verdict enum owns its glyph, label, and action at THIS one site — exactly
-// as a finding's severity owns its tag (severityTaggedBody). Nothing else re-spells a verdict; every render
-// derives from here. The verdict is PRESENTATION — the merge gate is driven by blocking findings, not by
-// this glyph — so a lenient verdict can never silently downgrade a real blocker. [LAW:single-enforcer]
+// [LAW:one-source-of-truth] The verdict enum owns its glyph, label, and action at THIS one site.
+// Nothing else re-spells a verdict; every render derives from here. The verdict is PRESENTATION — the
+// merge gate is driven by findings (every finding blocks), not by this glyph — so a lenient verdict
+// can never silently downgrade a real blocker. [LAW:single-enforcer]
 const VERDICT_PRESENTATION = {
   safe: { glyph: '✅', label: 'Safe', action: 'routine bump; safe to merge.' },
   review: { glyph: '⚠️', label: 'Review', action: 'worth a human glance before merge.' },
@@ -33651,7 +33650,7 @@ function workerFocusText(scope, context) {
 // [LAW:one-source-of-truth] "Same finding" is decided by dedupeFindings in src/review.js — one dedup
 // over the MERGED findings (not per worker), since two adjacent scopes can both touch a shared file.
 // It is imported, never re-implemented, so the pre-anchor merge here and the post-anchor snap-collapse
-// in partitionFindings share one key and one severity-merge rule. [LAW:single-enforcer]
+// in partitionFindings share one key. [LAW:single-enforcer]
 
 // [LAW:effects-at-boundaries] Pure: sum the per-spawn Usage values into one. Token counts always add.
 // Cost is uniform by construction — every spawn in a pass runs on ONE config, so all costs share the
@@ -34231,9 +34230,8 @@ function reviewCharter(toolNames) {
     line you examine, ask "how does this go wrong? what input breaks it? what did the author assume that
     isn't guaranteed?" Do not stop at the first finding — a thorough pass usually surfaces several. A
     miss is far more expensive than a false alarm, so when you are moderately (not fully) sure a line is
-    wrong, still record it — as an 'advisory' finding (see severity below) — and say what you're unsure
-    of. Recording every genuine issue is the goal; the severity field, not silence, is how you mark one
-    non-blocking. For pure style, naming, and formatting, stay silent.
+    wrong, still record it and say exactly what you're unsure of in the body. Recording every genuine
+    issue is the goal. For pure style, naming, and formatting, stay silent.
 
     Hunt in this order — highest cost-of-missing first:
     1. Correctness bugs — the code does not do what it plainly intends. Wrong operator or comparison,
@@ -34263,16 +34261,13 @@ function reviewCharter(toolNames) {
        doing several things, a type that admits illegal states, a fact with two sources of truth that
        can drift, effects tangled through pure logic, a dependency cycle. These map to the [LAW:*] tokens
        in your guidance; cite the token when one fits. These are real, but they rank BELOW "will this
-       ship a bug" — record a clean-architecture nit as 'advisory', never blocking; a correctness bug in
-       ugly-but-working code is always 'blocking'.
+       ship a bug" — spend your attention on the categories above first.
 
-    Set each finding's severity by where it falls in that list. Categories 1–7 (correctness, edge cases,
-    breakage, security, concurrency, silent failure, resource/lifecycle) default to 'blocking' — they
-    must change before merge. Categories 8–10 (missing tests, performance, architecture/maintainability)
-    default to 'advisory' — record them so they are not lost, but they do not block the merge. A finding
-    you are only moderately sure of is 'advisory', not withheld. Never drop a genuine issue because it is
-    non-blocking; give it the right severity and record it — the action blocks the merge only when at
-    least one finding is 'blocking', so an advisory finding is always safe to record.
+    You do NOT decide what blocks the merge. Every recorded finding must change before merge — the
+    action requests changes whenever any finding exists — so record a finding only when the code should
+    actually change, and record EVERY such issue. Categorize each finding by where it falls in that
+    list (its tag, below); never soften or withhold one because it feels minor, and never inflate a
+    style preference into a finding to fill a review.
 
     Each ${toolNames.requestChange} body has three parts, in order: (1) a short tag naming the kind —
     Bug, Edge case, Breaking, Security, Race, Silent failure, Resource leak, Perf, or a [LAW:token] for
@@ -34318,7 +34313,7 @@ function renderPriorFindingsBlock(priorFindings, toolNames) {
   // line at prompt indentation could read as a stray instruction rather than part of the listed finding.
   const oneLine = (body) => body.replace(/\s*\n\s*/g, ' ');
   return `\n    THIS IS A CONVERGENCE SWEEP. A previous pass of this same review already examined this material and recorded the findings below. They are ALREADY collected and will be posted — do not re-record, rephrase, re-argue, or re-verify any of them; a re-record is pure noise.\n`
-    + priorFindings.map(f => `      • [${f.path}:${f.line}] (${f.severity}) ${oneLine(f.body)}`).join('\n')
+    + priorFindings.map(f => `      • [${f.path}:${f.line}] ${oneLine(f.body)}`).join('\n')
     + `\n    Your job in this sweep is ONLY what that list misses: read the material fresh and hunt for real issues NOT already listed — parts of the change no listed finding touches, failure classes the list has none of (edge cases, broken callers, concurrency, security), or a deeper problem behind a listed symptom. Record each genuinely new issue with ${toolNames.requestChange} as usual. If your fresh read surfaces nothing real that is missing, record NOTHING and call ${toolNames.finishReview} with a one-line summary saying the sweep found nothing new — an empty sweep is this review converging, which is a correct and expected outcome, not a failure. Never pad the sweep with speculative or trivial findings to avoid coming back empty.\n`;
 }
 
@@ -34373,7 +34368,7 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // (dedupeFindings), so a finding another worker may also catch costs nothing to report and is never
   // silently withheld. [LAW:no-silent-failure]
   const focusBlock = focus
-    ? `\n    CONCENTRATE THIS REVIEW on one part of the change: ${focus}\n    The whole diff is shown below both for context and because you must not stay silent about a real bug just because it falls outside this part. Read the named part most deeply, but if you notice a genuine issue ANYWHERE in the diff, still record it with ${toolNames.requestChange} (assigning severity as usual). Overlapping findings are de-duplicated downstream, so nothing is lost by reporting an issue another review may also catch.\n`
+    ? `\n    CONCENTRATE THIS REVIEW on one part of the change: ${focus}\n    The whole diff is shown below both for context and because you must not stay silent about a real bug just because it falls outside this part. Read the named part most deeply, but if you notice a genuine issue ANYWHERE in the diff, still record it with ${toolNames.requestChange}. Overlapping findings are de-duplicated downstream, so nothing is lost by reporting an issue another review may also catch.\n`
     : '';
 
   // [LAW:dataflow-not-control-flow] Prior-round pushbacks render as a VALUE: [] yields '' (a cold review,
@@ -34404,8 +34399,8 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
     module, then judge whether anything in the upstream range breaks, deprecates, or changes the behavior of a
     symbol this repo actually uses — a removed export, a changed function signature, a changed default, a
     renamed field. If nothing this repo uses is affected, say so briefly in the ${toolNames.finishReview}
-    summary; if something is, name the exact upstream change and the call site it affects at 'blocking'
-    severity — as ${toolNames.requestChange} on the go.mod version line if that line is shown above (a LINE N
+    summary; if something is, name the exact upstream change and the call site it affects
+    — as ${toolNames.requestChange} on the go.mod version line if that line is shown above (a LINE N
     anchor), or in the ${toolNames.finishReview} summary if go.mod's own diff was too large to show inline
     (see the unshowable-files note above) — never silently drop the finding because the anchor isn't available.\n`
     : '';
@@ -34430,7 +34425,7 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
     change?), 'callSite' (the file or file:line where, when affected — omit when not), and 'verdict' ('safe' =
     routine, merge freely; 'review' = worth a human glance; 'risky' = a breaking change that touches this repo).
     The host renders this into the review's dependency summary. It does NOT replace a finding: if the bump breaks
-    a symbol this repo uses, still record that as a 'blocking' ${toolNames.requestChange} (or in the ${toolNames.finishReview}
+    a symbol this repo uses, still record that as a ${toolNames.requestChange} (or in the ${toolNames.finishReview}
     summary if unanchorable), because the assessment's verdict is presentation — findings drive the merge decision.\n`
     : '';
 
@@ -34445,8 +34440,8 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // depth, not a completeness sweep (copirate-review-loop-5pw.2). That same call-site reading runs both
   // directions: it surfaces a break the hunk hides (recall, .2) AND refutes a false alarm the hunk suggests
   // (precision, copirate-review-loop-5pw.3) — the worker verifies a suspicion against that fuller context
-  // before recording, dropping one the context refutes and downgrading an inconclusive one to advisory
-  // (never withheld — the severity charter owns that valve). One lever, two directions; the record-time
+  // before recording, dropping one the context refutes and recording an inconclusive one with its
+  // uncertainty stated in the body (never withheld). One lever, two directions; the record-time
   // consequence lives in the buildReviewInput passage below, not a second "read more context" instruction.
   const readTargets = scopeFiles.length > 0
     ? `Read the complete content of THESE files — this scope's assigned changed files: ${scopeFiles.join(', ')}. `
@@ -34476,11 +34471,11 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
     the hunk hides, and it clears a false alarm the hunk suggests. So before you record any finding, confirm
     the suspected fault against that fuller context — the definition and callers the change reaches, not the
     hunk alone; if that context shows the code is actually correct, do not record it, and if the check is
-    genuinely inconclusive, record the issue as advisory rather than withholding it.
+    genuinely inconclusive, record the issue anyway, stating what remains unverified, rather than
+    withholding it.
 
     Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} for each issue you
-    find. Every recorded change must use path, line (the displayed LINE value), body, and severity
-    ('blocking' if it must change before merge, 'advisory' otherwise — see the charter below). When the
+    find. Every recorded change must use path, line (the displayed LINE value), and body. When the
     review is complete, call ${toolNames.finishReview} exactly once. The summary is a one-line verdict
     — what the change does and whether it needs fixing — plus any real problem you could not tie to a
     specific changed line (state that problem here rather than drop it). It is NOT a place to praise the
@@ -34535,8 +34530,7 @@ Review this repository for what would hurt if it shipped. There is no diff — t
     working directory is intentionally outside the repository) and judge the code you find. ${focus}${exclude}${priorFindingsBlock}
 
     Call ${toolNames.requestChange} for each issue you find, with path, line (any real line in that file —
-    there is no diff grid here, so any line is valid), a body, and a severity ('blocking' if it must change
-    before merge, 'advisory' otherwise — see the charter below). When the review is complete, call
+    there is no diff grid here, so any line is valid), and a body. When the review is complete, call
     ${toolNames.finishReview} exactly once. The summary is a one-line verdict — what you audited and
     whether it needs fixing — plus any real problem you could not tie to a specific file and line (state
     that problem here rather than drop it). It is NOT a place to praise the code, describe what you read,
@@ -34797,11 +34791,10 @@ module.exports = { synthesizeProviderConfig, PROVIDERS, PROVIDER_ALIASES, PROVID
 /***/ }),
 
 /***/ 8959:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+/***/ ((module) => {
 
 "use strict";
 
-const { severityTaggedBody } = __nccwpck_require__(1565);
 
 // The printed sink for full-repo review mode. There is no pull request to comment on, so
 // findings are rendered as a single Markdown report written to the GitHub Step Summary and
@@ -34827,7 +34820,7 @@ function groupByPath(findings) {
 // One finding rendered as a list item; the body is flattened to a single line so the grouped
 // list stays scannable in the Step Summary.
 function renderFinding(finding) {
-  const body = severityTaggedBody(finding).replace(/\s*\n\s*/g, ' ').trim();
+  const body = finding.body.replace(/\s*\n\s*/g, ' ').trim();
   return `- **line ${finding.line}:** ${body}`;
 }
 
@@ -34896,15 +34889,10 @@ function parseOneFinding(finding, label) {
   if (typeof body !== 'string' || body.trim().length === 0) {
     throw new Error(`${label} has an invalid body.`);
   }
-  // [LAW:types-are-the-program] severity is the discriminator that separates "worth surfacing" from
-  // "worth blocking a merge". Without it those two facts collapse into the model's private judgment and
-  // a non-blocking finding is silently withheld; as a required enum value it rides on the record and
-  // flows to the verdict computation instead. [LAW:no-silent-failure]
-  const severity = finding.severity;
-  if (severity !== 'blocking' && severity !== 'advisory') {
-    throw new Error(`${label} has an invalid severity (expected 'blocking' or 'advisory').`);
-  }
-  return { path: pathValue.trim(), line, body: body.trim(), severity };
+  // [LAW:types-are-the-program] A finding carries no severity: every recorded finding blocks the merge.
+  // The blocking/advisory split was deleted deliberately — the model's judgment of "non-blocking" was
+  // not trustworthy, so the distinction is unrepresentable rather than defaulted.
+  return { path: pathValue.trim(), line, body: body.trim() };
 }
 
 function parseReviewValue(parsed, context) {
@@ -34972,9 +34960,8 @@ function parseScopeValue(scope, index) {
 //     affected is true it SHOULD be named; a missing one degrades to an explicit "(call site not named)"
 //     rather than failing the whole review. [LAW:no-defensive-null-guards]
 //   - verdict: the merge-risk call, a closed enum — it owns its glyph and action string at the one render
-//     site, exactly as a finding's severity owns its tag (severityTaggedBody). The verdict is PRESENTATION;
-//     the actual merge gate stays driven by blocking findings, so a lenient verdict can never silently
-//     downgrade a real blocker. [LAW:single-enforcer]
+//     site. The verdict is PRESENTATION; the actual merge gate stays driven by findings (every finding
+//     blocks), so a lenient verdict can never silently downgrade a real blocker. [LAW:single-enforcer]
 const ASSESSMENT_VERDICTS = ['safe', 'review', 'risky'];
 
 function parseAssessmentValue(assessment, index) {
@@ -35009,9 +34996,8 @@ function parseAssessmentValue(assessment, index) {
 // worker that owns the bumped go.mod (buildReviewInput), so single authorship is the common case; this is
 // the safety net for the multi-go.mod PR (several workers each own a go.mod) and any model over-eagerness.
 //
-// [LAW:one-type-per-behavior] Conflict resolution mirrors dedupeFindings' severity merge, which is the same
-// behavior on the other record kind: two workers assessing one module with different verdicts must not let
-// arrival order (nondeterministic under concurrency — [LAW:no-ambient-temporal-coupling]) pick the winner.
+// [LAW:no-ambient-temporal-coupling] Conflict resolution: two workers assessing one module with different
+// verdicts must not let arrival order (nondeterministic under concurrency) pick the winner.
 // The MORE CAUTIOUS verdict wins — a masked 'safe' over a real 'risky' would mislead the reader even though
 // the merge gate is findings-driven. ASSESSMENT_VERDICTS is ordered by ascending caution, so its index IS
 // the caution rank — no second table to drift. [LAW:one-source-of-truth] First-seen position is preserved
@@ -35048,21 +35034,13 @@ function normalizeBody(body) {
 // collapse, while any genuine difference in wording keeps two findings apart. Cross-worker paraphrases
 // of one issue surviving as near-duplicates is noise, not loss — the accepted direction to err.
 //
-// [LAW:no-silent-failure] Severity decides the merge gate, so a duplicate must never lose its severity
-// to arrival order: when two members share a key with different severities, the merged finding is
-// 'blocking' if ANY member is — the stronger severity wins, never the one that happened to arrive first.
-// A blocking finding can never be silently downgraded to the advisory that preceded it. First-seen
-// order is preserved (a Map keeps a key's original position when its value is replaced).
+// First-seen wins: members sharing a key are the same recorded finding (every finding blocks the
+// merge, so there is no severity to reconcile), and first-seen order is preserved by the Map.
 function dedupeFindings(findings) {
   const byKey = new Map();
   for (const f of findings) {
     const key = `${f.path}:${f.line}:${normalizeBody(f.body)}`;
-    const existing = byKey.get(key);
-    if (!existing) {
-      byKey.set(key, f);
-    } else if (f.severity === 'blocking' && existing.severity !== 'blocking') {
-      byKey.set(key, f);
-    }
+    if (!byKey.has(key)) byKey.set(key, f);
   }
   return [...byKey.values()];
 }
@@ -35136,20 +35114,7 @@ function partitionFindings(findings, anchors) {
   return { anchored, unanchored };
 }
 
-// [LAW:one-source-of-truth] Severity is a value on the finding; a human reader must be able to tell a
-// blocking request from an advisory note in EVERY sink (inline PR comment, the unanchored summary
-// section, the whole-repo report). GitHub has no "advisory" field on a review comment, so the only
-// channel is the body text — this is the one place that string is defined, and all three sinks derive
-// the presented body from here rather than each restating the tag. [LAW:single-enforcer]
-// [LAW:dataflow-not-control-flow] The tag is a rendering of the severity value, not a branch on
-// whether the finding is shown — every finding is shown; only its label varies.
-function severityTaggedBody(finding) {
-  return finding.severity === 'advisory'
-    ? `**Advisory (non-blocking):** ${finding.body}`
-    : finding.body;
-}
-
-module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTaggedBody };
+module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine };
 
 
 /***/ }),
@@ -35911,16 +35876,15 @@ module.exports = { selectConfig, BODY_DIRECTIVE_RE };
 
 const core = __nccwpck_require__(7484);
 const { parseUnifiedDiff } = __nccwpck_require__(9898);
-const { severityTaggedBody } = __nccwpck_require__(1565);
 const { parseCostMarker } = __nccwpck_require__(9614);
 
 const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
 const APPROVED_MESSAGE = '✅ Approved';
 const REQUEST_CHANGES_MESSAGE = '❌ Request Changes';
-// The time-budget verdict: scopes went unreviewed and nothing blocking surfaced in the ones that
+// The time-budget verdict: scopes went unreviewed and no findings surfaced in the ones that
 // were. Deliberately NOT the approve message — approval asserts the whole diff was judged, and a
 // partial review has no standing to assert it. [LAW:no-silent-failure]
-const PARTIAL_MESSAGE = '⏳ Partial review — the time budget expired before every scope was reviewed; no blocking findings in the scopes that were reviewed.';
+const PARTIAL_MESSAGE = '⏳ Partial review — the time budget expired before every scope was reviewed; no findings in the scopes that were reviewed.';
 
 async function listAllFiles(octokit, owner, repo, pullNumber) {
   const files = [];
@@ -36149,7 +36113,7 @@ function reviewEvent(requestsChanges, canApprove, transport) {
 function renderUnanchoredSection(unanchored) {
   if (!unanchored || unanchored.length === 0) return '';
   const items = unanchored
-    .map(f => `- \`${f.path}:${f.line}\` — ${severityTaggedBody(f)}`)
+    .map(f => `- \`${f.path}:${f.line}\` — ${f.body}`)
     .join('\n');
   return `\n\n### Findings outside the reviewed diff\nThese reference lines not present in this PR's diff, so they could not be posted as inline comments:\n\n${items}`;
 }
@@ -36157,21 +36121,17 @@ function renderUnanchoredSection(unanchored) {
 async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review, canApprove, transport, attributionFooter) {
   // [LAW:one-source-of-truth] One boolean drives both the GitHub event and the rendered
   // verdict, so they cannot disagree. The model never states the verdict.
-  // [LAW:dataflow-not-control-flow] The verdict is derived from a value carried on each finding —
-  // its severity — not from whether the finding exists. Only BLOCKING findings force
-  // REQUEST_CHANGES; a review of purely advisory findings is APPROVE/COMMENT. An unanchored
-  // blocking finding still counts, so a mis-anchored real blocker can never silently downgrade the
-  // verdict to APPROVE. [LAW:no-silent-failure] Advisory findings are never dropped — they still
-  // post inline (below) and render in the unanchored section, just tagged and non-blocking.
+  // Every finding blocks: any recorded finding forces REQUEST_CHANGES — the model makes no
+  // blocking/non-blocking call. An unanchored finding still counts, so a mis-anchored real
+  // issue can never silently downgrade the verdict to APPROVE. [LAW:no-silent-failure]
   const unanchored = review.unanchored || [];
-  const isBlocking = f => f.severity === 'blocking';
-  const requestsChanges = review.findings.some(isBlocking) || unanchored.some(isBlocking);
+  const requestsChanges = review.findings.length > 0 || unanchored.length > 0;
   // [LAW:types-are-the-program] unreviewedScopes is a REQUIRED field of the review value, exactly
   // like findings — every producer states its coverage ([] = complete), and a caller that omits it
   // crashes loud here rather than approving a partial review by accident. Approvability is the
   // conjunction of the token's capability and full coverage: a review that did not see every scope
-  // may report and request changes, but it may never approve. Blocking findings outrank the
-  // partial state — a blocker found in a half-reviewed diff is still a blocker.
+  // may report and request changes, but it may never approve. Findings outrank the
+  // partial state — an issue found in a half-reviewed diff still blocks.
   const complete = review.unreviewedScopes.length === 0;
   const event = reviewEvent(requestsChanges, canApprove && complete, transport);
   const verdict = requestsChanges ? REQUEST_CHANGES_MESSAGE : (complete ? APPROVED_MESSAGE : PARTIAL_MESSAGE);
@@ -36182,7 +36142,7 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   // structured summaries + the model's assessments); this sink only places it. [LAW:single-enforcer]
   const dependencySection = review.dependencySection ? `${review.dependencySection}\n\n` : '';
   const body = `## ${reviewerName}\n\n${dependencySection}${review.summary}${renderUnanchoredSection(unanchored)}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
-  const comments = review.findings.map(finding => transport.toComment({ ...finding, body: severityTaggedBody(finding) }));
+  const comments = review.findings.map(finding => transport.toComment(finding));
 
   // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.
   await octokit.rest.pulls.createReview({

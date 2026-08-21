@@ -191,7 +191,8 @@ directory per repeat, so a re-run never clobbers a prior batch's artifacts.
 ```
 eval/out/<case-name>/<timestamp>-run<i>/
   findings.json   — the raw merged findings from runMultiScope, PRE anchor-partition:
-                    an array of { path, line, body, severity }. This is what the scorer
+                    an array of { path, line, body } (runs before 1.41.0 also carry a
+                    severity field, kept readable by the scorer). This is what the scorer
                     (copirate-eval-harness-2fk.3) matches against expected.json.
   summary.txt     — the aggregated multi-scope review summary.
   usage.json      — { inputTokens, outputTokens, cost } (cost is the existing discriminated

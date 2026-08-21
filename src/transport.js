@@ -1,16 +1,15 @@
 'use strict';
 const core = require('@actions/core');
 const { parseUnifiedDiff } = require('./diff');
-const { severityTaggedBody } = require('./review');
 const { parseCostMarker } = require('./usage');
 
 const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
 const APPROVED_MESSAGE = '✅ Approved';
 const REQUEST_CHANGES_MESSAGE = '❌ Request Changes';
-// The time-budget verdict: scopes went unreviewed and nothing blocking surfaced in the ones that
+// The time-budget verdict: scopes went unreviewed and no findings surfaced in the ones that
 // were. Deliberately NOT the approve message — approval asserts the whole diff was judged, and a
 // partial review has no standing to assert it. [LAW:no-silent-failure]
-const PARTIAL_MESSAGE = '⏳ Partial review — the time budget expired before every scope was reviewed; no blocking findings in the scopes that were reviewed.';
+const PARTIAL_MESSAGE = '⏳ Partial review — the time budget expired before every scope was reviewed; no findings in the scopes that were reviewed.';
 
 async function listAllFiles(octokit, owner, repo, pullNumber) {
   const files = [];
@@ -239,7 +238,7 @@ function reviewEvent(requestsChanges, canApprove, transport) {
 function renderUnanchoredSection(unanchored) {
   if (!unanchored || unanchored.length === 0) return '';
   const items = unanchored
-    .map(f => `- \`${f.path}:${f.line}\` — ${severityTaggedBody(f)}`)
+    .map(f => `- \`${f.path}:${f.line}\` — ${f.body}`)
     .join('\n');
   return `\n\n### Findings outside the reviewed diff\nThese reference lines not present in this PR's diff, so they could not be posted as inline comments:\n\n${items}`;
 }
@@ -247,21 +246,17 @@ function renderUnanchoredSection(unanchored) {
 async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review, canApprove, transport, attributionFooter) {
   // [LAW:one-source-of-truth] One boolean drives both the GitHub event and the rendered
   // verdict, so they cannot disagree. The model never states the verdict.
-  // [LAW:dataflow-not-control-flow] The verdict is derived from a value carried on each finding —
-  // its severity — not from whether the finding exists. Only BLOCKING findings force
-  // REQUEST_CHANGES; a review of purely advisory findings is APPROVE/COMMENT. An unanchored
-  // blocking finding still counts, so a mis-anchored real blocker can never silently downgrade the
-  // verdict to APPROVE. [LAW:no-silent-failure] Advisory findings are never dropped — they still
-  // post inline (below) and render in the unanchored section, just tagged and non-blocking.
+  // Every finding blocks: any recorded finding forces REQUEST_CHANGES — the model makes no
+  // blocking/non-blocking call. An unanchored finding still counts, so a mis-anchored real
+  // issue can never silently downgrade the verdict to APPROVE. [LAW:no-silent-failure]
   const unanchored = review.unanchored || [];
-  const isBlocking = f => f.severity === 'blocking';
-  const requestsChanges = review.findings.some(isBlocking) || unanchored.some(isBlocking);
+  const requestsChanges = review.findings.length > 0 || unanchored.length > 0;
   // [LAW:types-are-the-program] unreviewedScopes is a REQUIRED field of the review value, exactly
   // like findings — every producer states its coverage ([] = complete), and a caller that omits it
   // crashes loud here rather than approving a partial review by accident. Approvability is the
   // conjunction of the token's capability and full coverage: a review that did not see every scope
-  // may report and request changes, but it may never approve. Blocking findings outrank the
-  // partial state — a blocker found in a half-reviewed diff is still a blocker.
+  // may report and request changes, but it may never approve. Findings outrank the
+  // partial state — an issue found in a half-reviewed diff still blocks.
   const complete = review.unreviewedScopes.length === 0;
   const event = reviewEvent(requestsChanges, canApprove && complete, transport);
   const verdict = requestsChanges ? REQUEST_CHANGES_MESSAGE : (complete ? APPROVED_MESSAGE : PARTIAL_MESSAGE);
@@ -272,7 +267,7 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   // structured summaries + the model's assessments); this sink only places it. [LAW:single-enforcer]
   const dependencySection = review.dependencySection ? `${review.dependencySection}\n\n` : '';
   const body = `## ${reviewerName}\n\n${dependencySection}${review.summary}${renderUnanchoredSection(unanchored)}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
-  const comments = review.findings.map(finding => transport.toComment({ ...finding, body: severityTaggedBody(finding) }));
+  const comments = review.findings.map(finding => transport.toComment(finding));
 
   // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.
   await octokit.rest.pulls.createReview({
