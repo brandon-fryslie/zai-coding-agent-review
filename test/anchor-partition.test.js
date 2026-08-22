@@ -157,6 +157,20 @@ describe('submitReview — unanchored findings', () => {
     assert.match(arg.body, /❌ Request Changes/);
   });
 
+  test('a backtick in an unanchored path cannot break out of its code span', async () => {
+    // The code-span fence is sized longer than any backtick run in the data, so a crafted or
+    // legal-but-weird filename can never close the span early and inject markdown into the body.
+    const octokit = fakeOctokit();
+    const review = {
+      summary: 's',
+      findings: [],
+      unanchored: [{ path: 'a`b`.js', line: 7, body: 'x', severity: 3 }],
+      unreviewedScopes: [],
+    };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    assert.match(octokit.calls[0].body, /`` a`b`\.js:7 ``/);
+  });
+
   test('anchored findings post inline and add no unanchored section', async () => {
     const octokit = fakeOctokit();
     const review = {

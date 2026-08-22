@@ -1,6 +1,6 @@
 # CoPirate Code Review
 
-A GitHub Action that runs an AI coding agent as a **read-only** code reviewer. It reviews a pull request diff and submits an inline GitHub review — `REQUEST_CHANGES` when it finds issues, otherwise `APPROVE` (or a "⏳ Partial review" `COMMENT` when the [time budget](#inputs) ran out before every scope was reviewed — a partial review never approves). It can also do an on-demand whole-repo review (`MODE: repo`).
+A GitHub Action that runs an AI coding agent as a **read-only** code reviewer. It reviews a pull request diff and submits an inline GitHub review — `REQUEST_CHANGES` when it finds issues, otherwise an approval (a formal `APPROVE` when `GITHUB_REVIEW_TOKEN` is set; logged-only otherwise — see [Approvals](#approvals)) (or a "⏳ Partial review" `COMMENT` when the [time budget](#inputs) ran out before every scope was reviewed — a partial review never approves). It can also do an on-demand whole-repo review (`MODE: repo`).
 
 The review engine is chosen by `PROVIDER`, which defaults to `auto` (today: Claude Code against DeepSeek). You can also run Claude Code against Z.ai, or Codex against OpenAI. The engine reviews read-only — it cannot push to GitHub itself; findings flow through a private collector and are submitted by the action.
 

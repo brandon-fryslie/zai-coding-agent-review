@@ -622,7 +622,7 @@ describe('runMultiScopePass — convergence sweeps', () => {
     };
     return { registry: { get: () => adapter }, seenPrompts, perScopeCalls };
   }
-  const oneBug = (name) => [{ path: `${name}.js`, line: 1, body: `bug in ${name}` }];
+  const oneBug = (name) => [{ path: `${name}.js`, line: 1, body: `bug in ${name}`, severity: 3 }];
 
   test('a sweep that adds nothing new terminates the loop before the cap', async () => {
     // Every pass re-records the same finding: sweep 1 merges to no growth → converged, sweep 2 never runs.
@@ -637,7 +637,7 @@ describe('runMultiScopePass — convergence sweeps', () => {
   test('the sweep bound caps a loop that keeps adding new findings, and says so', async () => {
     const logs = [];
     const { registry, perScopeCalls } = sweepRegistry(
-      (name, pass) => [{ path: `${name}.js`, line: pass + 1, body: `bug-${name}-p${pass}` }],
+      (name, pass) => [{ path: `${name}.js`, line: pass + 1, body: `bug-${name}-p${pass}`, severity: 3 }],
     );
     const review = await runMultiScopePass(args(registry, 2, (m) => logs.push(m)));
     assert.deepEqual(perScopeCalls, { a: 3, b: 3 }); // initial layer + the 2 capped sweeps
@@ -670,7 +670,7 @@ describe('runMultiScopePass — convergence sweeps', () => {
   test('a sweep mixing one re-record and one genuinely new finding adds exactly the new one', async () => {
     const { registry } = sweepRegistry(
       (name, pass) => (name === 'a' && pass === 1)
-        ? [...oneBug('a'), { path: 'a.js', line: 9, body: 'deeper bug behind it' }]
+        ? [...oneBug('a'), { path: 'a.js', line: 9, body: 'deeper bug behind it', severity: 4 }]
         : oneBug(name),
     );
     const logs = [];
@@ -1008,7 +1008,7 @@ describe('buildReviewInput / buildRepoReviewInput convergence-sweep prior findin
   test('a multi-line finding body renders as exactly one bullet line (no unprefixed continuation)', () => {
     const multi = [{ path: 'src/a.js', line: 3, body: 'Bug: first line\n  second line\n\nthird line', severity: 4 }];
     const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorFindings: multi });
-    assert.match(prompt, /• \[src\/a\.js:3\] \(S4\) Bug: first line second line third line/);
+    assert.match(prompt, /• \[src\/a\.js:3\] \*\*\[S4\]\*\* Bug: first line second line third line/);
   });
 
   test('renders every prior finding with location, severity, and body — in both builders', () => {
@@ -1017,8 +1017,8 @@ describe('buildReviewInput / buildRepoReviewInput convergence-sweep prior findin
       buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorFindings: PRIOR }).prompt,
     ]) {
       assert.match(prompt, /CONVERGENCE SWEEP/);
-      assert.match(prompt, /\[src\/a\.js:3\] \(S4\) Bug: leaks the handle/);
-      assert.match(prompt, /\[src\/b\.js:8\] \(S3\) Edge case: empty list crashes/);
+      assert.match(prompt, /\[src\/a\.js:3\] \*\*\[S4\]\*\* Bug: leaks the handle/);
+      assert.match(prompt, /\[src\/b\.js:8\] \*\*\[S3\]\*\* Edge case: empty list crashes/);
     }
   });
 
@@ -1187,7 +1187,7 @@ describe('runMultiScopePass — wall-clock time budget', () => {
   }
   const okResult = (scope, tag = '') => ({
     summary: `sum-${scope.name}`,
-    findings: [{ path: `${tag}${scope.name}.js`, line: 1, body: `bug in ${tag}${scope.name}` }],
+    findings: [{ path: `${tag}${scope.name}.js`, line: 1, body: `bug in ${tag}${scope.name}`, severity: 3 }],
     assessments: [],
     usage: null,
   });

@@ -1,5 +1,6 @@
 'use strict';
 const { annotatePatchWithLines } = require('./diff');
+const { severityTag, flattenBody } = require('./review');
 
 // [LAW:one-source-of-truth] The REVIEW PHILOSOPHY lives here, once, shared by both the PR-diff and
 // whole-repo review builders. It is deliberately NOT a laws-compliance audit: a code review exists to
@@ -79,8 +80,8 @@ function reviewCharter(toolNames) {
 
     Do not invent rules, and do not request changes for style, naming preference, or speculative
     "might one day". Every finding names a concrete way the code misbehaves, breaks a caller, or will
-    bite a maintainer. Do NOT state an overall verdict, approval status, or a finding count — the action
-    derives the verdict from the recorded changes and appends it itself.`;
+    bite a maintainer. Do NOT state an approval decision, a request-changes decision, or a finding
+    count — the host owns the review's disposition, derived from the recorded findings.`;
 }
 
 // toolNames is required; callers supply adapter.toolNames so each engine's actual
@@ -109,12 +110,12 @@ function reviewCharter(toolNames) {
 // findings to fill the silence — trading the precision the eval gate holds for fake recall. [LAW:no-silent-failure]
 function renderPriorFindingsBlock(priorFindings, toolNames) {
   if (priorFindings.length === 0) return '';
-  // A finding body is free text and routinely multi-line; collapse internal newlines (with their
-  // surrounding indentation) so each finding renders as exactly ONE bullet — an unprefixed continuation
-  // line at prompt indentation could read as a stray instruction rather than part of the listed finding.
-  const oneLine = (body) => body.replace(/\s*\n\s*/g, ' ');
+  // A finding body is free text and routinely multi-line; flattenBody (the one flattening rule)
+  // collapses it so each finding renders as exactly ONE bullet — an unprefixed continuation line at
+  // prompt indentation could read as a stray instruction rather than part of the listed finding. The
+  // severity label likewise derives from severityTag, the one spelling. [LAW:single-enforcer]
   return `\n    THIS IS A CONVERGENCE SWEEP. A previous pass of this same review already examined this material and recorded the findings below. They are ALREADY collected and will be posted — do not re-record, rephrase, re-argue, or re-verify any of them; a re-record is pure noise.\n`
-    + priorFindings.map(f => `      • [${f.path}:${f.line}] (S${f.severity}) ${oneLine(f.body)}`).join('\n')
+    + priorFindings.map(f => `      • [${f.path}:${f.line}] ${severityTag(f)} ${flattenBody(f.body)}`).join('\n')
     + `\n    Your job in this sweep is ONLY what that list misses: read the material fresh and hunt for real issues NOT already listed — parts of the change no listed finding touches, failure classes the list has none of (edge cases, broken callers, concurrency, security), or a deeper problem behind a listed symptom. Record each genuinely new issue with ${toolNames.requestChange} as usual. If your fresh read surfaces nothing real that is missing, record NOTHING and call ${toolNames.finishReview} with a one-line summary saying the sweep found nothing new — an empty sweep is this review converging, which is a correct and expected outcome, not a failure. Never pad the sweep with speculative or trivial findings to avoid coming back empty.\n`;
 }
 
@@ -213,7 +214,7 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // per-module assessments (dedupeAssessments collapses the multi-go.mod case downstream). Any other
   // worker — and every non-dependency PR (dependencyBumps === []) — renders nothing. The assessment is the
   // SUMMARY-level judgment the host folds into the review's dependency section; it does NOT replace the
-  // blocking finding a real break still requires (that is what drives the merge verdict). [LAW:no-silent-failure]
+  // request_change finding a real break still requires (findings drive the merge verdict). [LAW:no-silent-failure]
   const ownsBumpedGoMod = dependencyBumps.length > 0
     && scopeFiles.some(f => f === 'go.mod' || f.endsWith('/go.mod'));
   // [FRAMING:representation] List DISTINCT module paths: when two go.mod files bump the same module the raw
@@ -292,8 +293,10 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
 
     Flag any problem this change introduces or is now responsible for — a bug or risk in the code this
     diff adds, or in existing code it now relies on or feeds. Pre-existing problems in code this PR does
-    not touch are not this review's job; note only the significant ones in the ${toolNames.finishReview}
-    summary. You can ONLY attach a comment to a line shown as LINE N — a line this diff added or kept as
+    not touch are NOT findings for this review — never record one with ${toolNames.requestChange}; you
+    may mention a significant one in a single sentence of the ${toolNames.finishReview} summary as
+    context for the maintainer, and that mention carries no verdict weight. You can ONLY attach a
+    comment to a line shown as LINE N — a line this diff added or kept as
     context; the host does not allow comments on unchanged or deleted code. When the change creates a
     problem whose root cause sits in unchanged code (it feeds a bad value into an existing function, or
     relies on an existing loose type), attach the comment to the changed LINE responsible for the new
@@ -339,9 +342,10 @@ Review this repository for what would hurt if it shipped. There is no diff — t
     there is no diff grid here, so any line is valid), a body, and a severity (an integer 1-5 — see the
     charter below). When the review is complete, call
     ${toolNames.finishReview} exactly once. The summary is a one-line verdict — what you audited and
-    whether it needs fixing — plus any real problem you could not tie to a specific file and line (state
-    that problem here rather than drop it). It is NOT a place to praise the code, describe what you read,
-    narrate your review, or restate the inline findings — those are already posted via
+    whether it needs fixing. It is NOT a channel for findings: every real problem has a file and a line
+    here (any real line is valid), so record it with ${toolNames.requestChange}. It is NOT a place to
+    praise the code, describe what you read, narrate your review, or restate the inline findings — those
+    are already posted via
     ${toolNames.requestChange}. Do not write giant blocks of text explaining why well-implemented code is
     good; if nothing needs fixing, the summary is a single short sentence saying so, and nothing more. The
     collector tools are the only review output channel.

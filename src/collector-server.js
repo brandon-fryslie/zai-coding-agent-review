@@ -26,9 +26,9 @@ function collectorTools() {
       inputSchema: {
         type: 'object',
         properties: {
-          path: { type: 'string', minLength: 1 },
+          path: { type: 'string', minLength: 1, pattern: '\\S' },
           line: { type: 'integer', minimum: 1 },
-          body: { type: 'string', minLength: 1 },
+          body: { type: 'string', minLength: 1, pattern: '\\S' },
           severity: { type: 'integer', minimum: 1, maximum: 5 },
         },
         required: ['path', 'line', 'body', 'severity'],
@@ -41,8 +41,8 @@ function collectorTools() {
       inputSchema: {
         type: 'object',
         properties: {
-          name: { type: 'string' },
-          focus: { type: 'string' },
+          name: { type: 'string', minLength: 1, pattern: '\\S' },
+          focus: { type: 'string', minLength: 1, pattern: '\\S' },
           files: { type: 'array', items: { type: 'string' } },
         },
         required: ['name', 'focus'],
@@ -55,8 +55,8 @@ function collectorTools() {
       inputSchema: {
         type: 'object',
         properties: {
-          module: { type: 'string' },
-          impact: { type: 'string' },
+          module: { type: 'string', minLength: 1, pattern: '\\S' },
+          impact: { type: 'string', minLength: 1, pattern: '\\S' },
           affected: { type: 'boolean' },
           callSite: { type: 'string' },
           verdict: { type: 'string', enum: ['safe', 'review', 'risky'] },
@@ -71,7 +71,7 @@ function collectorTools() {
       inputSchema: {
         type: 'object',
         properties: {
-          summary: { type: 'string' },
+          summary: { type: 'string', minLength: 1, pattern: '\\S' },
         },
         required: ['summary'],
         additionalProperties: false,
