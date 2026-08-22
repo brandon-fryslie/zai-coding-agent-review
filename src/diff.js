@@ -190,18 +190,32 @@ function parseUnifiedDiff(diff) {
 // So the path is REFUSED here instead, once, and surfaced as a typed `unreviewable` entry the caller
 // reports. Every file that survives this boundary provably renders on one line, which is why no sink
 // downstream flattens a filename.
+// The accept/reject table this boundary implements — written before the predicate, because a predicate
+// written first rejects the shape its author had in mind and silently ADMITS every shape they did not:
+//   "src/a.js"          -> reviewable
+//   "src/my file.js"    -> reviewable (interior spaces are fine; only VERTICAL separators break a line)
+//   "src/a\nEVIL.js"    -> refused (separator: \n, lone \r, U+2028/U+2029)
+//   ""  /  "   "        -> refused (no path to open or anchor to)
+//   undefined/null/42   -> refused (a non-string has no path at all — it renders as "undefined")
+// The last row is not hypothetical pedantry: hasVerticalSeparator(undefined) coerces to the STRING
+// "undefined", finds no separator, and would wave it through as a reviewable file.
+function reviewablePathRefusal(filename) {
+  if (typeof filename !== 'string') return `path is ${filename === null ? 'null' : typeof filename}, not a string`;
+  if (filename.trim().length === 0) return 'path is blank';
+  if (hasVerticalSeparator(filename)) return 'path contains a line separator, so it cannot be named on a prompt line or anchored to a review comment';
+  return null;
+}
+
 function parseReviewableFiles(files) {
   const reviewable = [];
   const unreviewable = [];
   for (const file of files) {
-    if (hasVerticalSeparator(file.filename)) {
-      unreviewable.push({
-        filename: file.filename,
-        reason: 'path contains a line separator, so it cannot be named on a prompt line or anchored to a review comment',
-      });
+    const refusal = reviewablePathRefusal(file.filename);
+    if (refusal === null) {
+      reviewable.push(file);
       continue;
     }
-    reviewable.push(file);
+    unreviewable.push({ filename: file.filename, reason: refusal });
   }
   return { files: reviewable, unreviewable };
 }

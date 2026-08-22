@@ -358,8 +358,14 @@ function firstLine(text) {
 // [LAW:single-enforcer] The one rule for rendering untrusted text as a Markdown code span: the
 // backtick fence is sized longer than any backtick run inside the content, so the delimiter can never
 // be supplied by the data (a backtick-bearing filename or go.mod token cannot close the span early
-// and inject markdown). Content must already be newline-free — a code span cannot contain a blank
-// line — so callers compose this with flattenBody. [LAW:composability]
+// and inject markdown). Backtick-fencing is ORTHOGONAL to line structure, which is why this is a
+// separate rule and not folded into the stamp.
+//
+// Content must already be newline-free — a code span cannot contain a blank line — but callers no
+// longer arrange that themselves: every value reaching a codeSpan today (a finding's path, a go.mod
+// module/version token) is single-line by the time it gets here, either stamped at its parse boundary
+// or refused at the diff boundary. Do not "restore" a flattenBody call at a call site; if a NEW caller
+// appears whose content is not already single-line, the fix is to stamp it where it is produced.
 function codeSpan(content) {
   const longestRun = (content.match(/`+/g) || []).reduce((max, run) => Math.max(max, run.length), 0);
   const fence = '`'.repeat(longestRun + 1);

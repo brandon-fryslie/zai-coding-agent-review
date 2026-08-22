@@ -15,7 +15,7 @@ const { parseDailyBudgetUsd, defaultBudgetCandidates, chooseProfile, effectiveRo
 const { assessDifficulty } = require('./difficulty');
 const { difficultyCandidates, parseDifficultyScaling } = require('./difficulty-policy');
 const { readSpentToday, appendCost } = require('./ledger');
-const { parseDependencyDiffFlag, parseGoModBumps, fetchUpstreamChangeSummary, renderDependencyReviewSection } = require('./dependency-diff');
+const { parseDependencyDiffFlag, parseGoModBumps, fetchUpstreamChangeSummary, unresolvedSummary, renderDependencyReviewSection } = require('./dependency-diff');
 const { renderCostLine, costWarning, costMarker } = require('./usage');
 const { renderRepoReport } = require('./report');
 const registry = require('./engine/registry');
@@ -267,9 +267,12 @@ async function resolveDependencySummaries(octokit, filteredFiles, dependencyDiff
   const bumps = goMods.flatMap(f => parseGoModBumps(f.patch));
   if (bumps.length === 0) return [];
   const toFetch = bumps.slice(0, MAX_DEPENDENCY_BUMPS_FETCHED);
-  const skipped = bumps.slice(MAX_DEPENDENCY_BUMPS_FETCHED).map(b => ({
-    ...b, resolved: false, reason: `upstream context not fetched — this PR bumps more than ${MAX_DEPENDENCY_BUMPS_FETCHED} modules`,
-  }));
+  // [LAW:single-enforcer] Built through unresolvedSummary like every other unresolved bump, so this is
+  // not a second construction site for the same typed value. Today's reason is host-authored text with
+  // only a number in it and could not carry a separator; routing it through the constructor is what
+  // keeps that true when someone later interpolates the module path or an error message into it.
+  const skipped = bumps.slice(MAX_DEPENDENCY_BUMPS_FETCHED).map(b =>
+    unresolvedSummary(b, `upstream context not fetched — this PR bumps more than ${MAX_DEPENDENCY_BUMPS_FETCHED} modules`));
   core.info(`Dependency diff: fetching upstream context for ${toFetch.length} go.mod bump(s)`
     + `${skipped.length > 0 ? ` (${skipped.length} more skipped — over the ${MAX_DEPENDENCY_BUMPS_FETCHED}-module cap)` : ''}...`);
   const fetched = await Promise.all(toFetch.map(b => fetchUpstreamChangeSummary(octokit, b)));

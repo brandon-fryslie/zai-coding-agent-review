@@ -444,6 +444,7 @@ module.exports = {
   parseGoModBumps,
   resolveModuleRepo,
   fetchUpstreamChangeSummary,
+  unresolvedSummary,
   renderDependencyDiffNote,
   renderDependencyReviewSection,
   semverMagnitude,

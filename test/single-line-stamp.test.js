@@ -104,6 +104,26 @@ describe('parseReviewableFiles — a path is refused, never collapsed', () => {
     assert.match(unreviewable[0].reason, /line separator/);
   });
 
+  it('refuses every non-path shape, not just the one with a separator', () => {
+    // The enumeration gap this closes: hasVerticalSeparator(undefined) coerces to the STRING
+    // "undefined", finds no separator, and admitted the file — so the boundary waved through a record
+    // that renders as `### undefined` and anchors comments to "undefined:N".
+    const { files, unreviewable } = parseReviewableFiles([
+      { filename: undefined }, { filename: null }, { filename: 42 }, { filename: '' }, { filename: '   ' },
+    ]);
+    assert.equal(files.length, 0, 'no non-path shape may be admitted');
+    assert.equal(unreviewable.length, 5);
+    assert.match(unreviewable[0].reason, /not a string/);
+    assert.match(unreviewable[1].reason, /null/);
+    assert.match(unreviewable[3].reason, /blank/);
+  });
+
+  it('admits a path with interior spaces — only VERTICAL separators break a line', () => {
+    const { files, unreviewable } = parseReviewableFiles([{ filename: 'src/my file.js', status: 'modified' }]);
+    assert.equal(files.length, 1);
+    assert.equal(unreviewable.length, 0);
+  });
+
   it('passes an ordinary file list through unchanged, byte for byte', () => {
     // A surviving path must stay EXACT — it is the path a worker opens and the anchor a comment posts
     // to, so any normalization here would be the corruption this boundary exists to prevent.
