@@ -461,6 +461,16 @@ describe('renderDependencyReviewSection', () => {
     assert.match(out, /⚪ `gitlab\.example\/foo\/bar` `v1\.0\.0 → v1\.1\.0` — upstream not fetched \(could not resolve/);
   });
 
+  test('a backtick-bearing unresolved module path cannot close its code span (fence outsizes the data)', () => {
+    // GO_MOD_REQUIRE_LINE captures \S+, so a backtick is a legal module-path character; an unresolved
+    // module keeps that raw untrusted text, and the fence must always be longer than any run inside it.
+    const out = renderDependencyReviewSection([{
+      modulePath: 'evil.example/x`**bold**`y', from: 'v1.0.0', to: 'v1.1.0',
+      resolved: false, reason: 'could not resolve',
+    }], []);
+    assert.match(out, /`` evil\.example\/x`\*\*bold\*\*`y ``/); // double fence, content literal
+  });
+
   test('a resolved module with NO matching assessment still renders host facts, flagged as unassessed', () => {
     const out = renderDependencyReviewSection([resolvedSummary()], []); // no assessments at all
     assert.match(out, /<details>/);

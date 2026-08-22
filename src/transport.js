@@ -1,7 +1,7 @@
 'use strict';
 const core = require('@actions/core');
 const { parseUnifiedDiff } = require('./diff');
-const { severityTag, flattenBody } = require('./review');
+const { severityTag, flattenBody, codeSpan } = require('./review');
 const { parseCostMarker } = require('./usage');
 
 const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
@@ -234,24 +234,15 @@ function reviewEvent(requestsChanges, canApprove, transport) {
   return requestsChanges ? 'REQUEST_CHANGES' : (canApprove ? transport.approveEvent : 'COMMENT');
 }
 
-// A Markdown code span whose backtick fence is always longer than any backtick run inside the
-// content, so the delimiter can never be supplied by the data — a path containing backticks (a legal
-// Git filename, or one relayed from crafted diff content) cannot close the span early and inject
-// markdown into the review body.
-function codeSpan(content) {
-  const longestRun = (content.match(/`+/g) || []).reduce((max, run) => Math.max(max, run.length), 0);
-  const fence = '`'.repeat(longestRun + 1);
-  const pad = longestRun > 0 ? ' ' : '';
-  return `${fence}${pad}${content}${pad}${fence}`;
-}
-
 // [LAW:effects-at-boundaries] Pure: render the findings that could not be posted inline as a
-// summary section. They still carry their path:line so the reader can locate them. Bodies are
-// flattened (flattenBody) so a multi-line body stays one bullet, never a detached paragraph.
+// summary section. They still carry their path:line so the reader can locate them. The path:line is
+// flattened THEN fenced (codeSpan) — a filename can legally embed a newline (unquoteCStylePath
+// reconstructs one from a quoted diff header) or backticks, and neither may split the bullet or
+// close the span; the body is flattened so a multi-line body stays one bullet.
 function renderUnanchoredSection(unanchored) {
   if (!unanchored || unanchored.length === 0) return '';
   const items = unanchored
-    .map(f => `- ${codeSpan(`${f.path}:${f.line}`)} — ${severityTag(f)} ${flattenBody(f.body)}`)
+    .map(f => `- ${codeSpan(flattenBody(`${f.path}:${f.line}`))} — ${severityTag(f)} ${flattenBody(f.body)}`)
     .join('\n');
   return `\n\n### Findings outside the reviewed diff\nThese reference lines not present in this PR's diff, so they could not be posted as inline comments:\n\n${items}`;
 }

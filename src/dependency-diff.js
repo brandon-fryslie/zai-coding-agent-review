@@ -1,7 +1,7 @@
 'use strict';
 
 const dns = require('node:dns').promises;
-const { ASSESSMENT_VERDICTS } = require('./review');
+const { ASSESSMENT_VERDICTS, flattenBody, codeSpan } = require('./review');
 
 // Detect a Go module version bump in a PR's go.mod diff, resolve the module to its GitHub
 // repository, and fetch what actually changed upstream between the two versions — so a reviewer
@@ -360,9 +360,11 @@ function renderDependencyReviewSection(summaries, assessments = []) {
   const blocks = summaries.map((s) => {
     if (!s.resolved) {
       tally.unresolved++;
-      // modulePath/from/to sit inside backtick code spans — GitHub escapes code-span content itself, so
-      // they render literally and safely without manual encoding. reason is markdown running text → mdText it.
-      return `- ${UNRESOLVED_GLYPH} \`${s.modulePath}\` \`${s.from} → ${s.to}\` — upstream not fetched (${mdText(s.reason)}).`;
+      // modulePath/from/to come straight from the PR's go.mod diff (unresolved = never validated
+      // upstream), so they are fenced through codeSpan — a backtick in the token cannot close the
+      // span — and flattened first, since a code span cannot contain a newline. reason is markdown
+      // running text → mdText it.
+      return `- ${UNRESOLVED_GLYPH} ${codeSpan(flattenBody(s.modulePath))} ${codeSpan(flattenBody(`${s.from} → ${s.to}`))} — upstream not fetched (${mdText(s.reason)}).`;
     }
     const magnitude = semverMagnitude(s.from, s.to);
     // URLs are built from host-owned, shape-constrained parts (owner/repoName from the resolved repo, sha

@@ -285,4 +285,16 @@ function flattenBody(body) {
   return body.replace(/\s*\n\s*/g, ' ').trim();
 }
 
-module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, ASSESSMENT_VERDICTS, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTag, flattenBody };
+// [LAW:single-enforcer] The one rule for rendering untrusted text as a Markdown code span: the
+// backtick fence is sized longer than any backtick run inside the content, so the delimiter can never
+// be supplied by the data (a backtick-bearing filename or go.mod token cannot close the span early
+// and inject markdown). Content must already be newline-free — a code span cannot contain a blank
+// line — so callers compose this with flattenBody. [LAW:composability]
+function codeSpan(content) {
+  const longestRun = (content.match(/`+/g) || []).reduce((max, run) => Math.max(max, run.length), 0);
+  const fence = '`'.repeat(longestRun + 1);
+  const pad = longestRun > 0 ? ' ' : '';
+  return `${fence}${pad}${content}${pad}${fence}`;
+}
+
+module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, ASSESSMENT_VERDICTS, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTag, flattenBody, codeSpan };

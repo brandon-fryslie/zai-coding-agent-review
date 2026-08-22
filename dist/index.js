@@ -30838,7 +30838,7 @@ module.exports = { TRANSCRIPT_DIR, buildTranscript, emitTranscript };
 
 
 const dns = (__nccwpck_require__(610).promises);
-const { ASSESSMENT_VERDICTS } = __nccwpck_require__(1565);
+const { ASSESSMENT_VERDICTS, flattenBody, codeSpan } = __nccwpck_require__(1565);
 
 // Detect a Go module version bump in a PR's go.mod diff, resolve the module to its GitHub
 // repository, and fetch what actually changed upstream between the two versions — so a reviewer
@@ -31197,9 +31197,11 @@ function renderDependencyReviewSection(summaries, assessments = []) {
   const blocks = summaries.map((s) => {
     if (!s.resolved) {
       tally.unresolved++;
-      // modulePath/from/to sit inside backtick code spans — GitHub escapes code-span content itself, so
-      // they render literally and safely without manual encoding. reason is markdown running text → mdText it.
-      return `- ${UNRESOLVED_GLYPH} \`${s.modulePath}\` \`${s.from} → ${s.to}\` — upstream not fetched (${mdText(s.reason)}).`;
+      // modulePath/from/to come straight from the PR's go.mod diff (unresolved = never validated
+      // upstream), so they are fenced through codeSpan — a backtick in the token cannot close the
+      // span — and flattened first, since a code span cannot contain a newline. reason is markdown
+      // running text → mdText it.
+      return `- ${UNRESOLVED_GLYPH} ${codeSpan(flattenBody(s.modulePath))} ${codeSpan(flattenBody(`${s.from} → ${s.to}`))} — upstream not fetched (${mdText(s.reason)}).`;
     }
     const magnitude = semverMagnitude(s.from, s.to);
     // URLs are built from host-owned, shape-constrained parts (owner/repoName from the resolved repo, sha
@@ -35194,7 +35196,19 @@ function flattenBody(body) {
   return body.replace(/\s*\n\s*/g, ' ').trim();
 }
 
-module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, ASSESSMENT_VERDICTS, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTag, flattenBody };
+// [LAW:single-enforcer] The one rule for rendering untrusted text as a Markdown code span: the
+// backtick fence is sized longer than any backtick run inside the content, so the delimiter can never
+// be supplied by the data (a backtick-bearing filename or go.mod token cannot close the span early
+// and inject markdown). Content must already be newline-free — a code span cannot contain a blank
+// line — so callers compose this with flattenBody. [LAW:composability]
+function codeSpan(content) {
+  const longestRun = (content.match(/`+/g) || []).reduce((max, run) => Math.max(max, run.length), 0);
+  const fence = '`'.repeat(longestRun + 1);
+  const pad = longestRun > 0 ? ' ' : '';
+  return `${fence}${pad}${content}${pad}${fence}`;
+}
+
+module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, ASSESSMENT_VERDICTS, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTag, flattenBody, codeSpan };
 
 
 /***/ }),
@@ -35956,7 +35970,7 @@ module.exports = { selectConfig, BODY_DIRECTIVE_RE };
 
 const core = __nccwpck_require__(7484);
 const { parseUnifiedDiff } = __nccwpck_require__(9898);
-const { severityTag, flattenBody } = __nccwpck_require__(1565);
+const { severityTag, flattenBody, codeSpan } = __nccwpck_require__(1565);
 const { parseCostMarker } = __nccwpck_require__(9614);
 
 const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
@@ -36189,24 +36203,15 @@ function reviewEvent(requestsChanges, canApprove, transport) {
   return requestsChanges ? 'REQUEST_CHANGES' : (canApprove ? transport.approveEvent : 'COMMENT');
 }
 
-// A Markdown code span whose backtick fence is always longer than any backtick run inside the
-// content, so the delimiter can never be supplied by the data — a path containing backticks (a legal
-// Git filename, or one relayed from crafted diff content) cannot close the span early and inject
-// markdown into the review body.
-function codeSpan(content) {
-  const longestRun = (content.match(/`+/g) || []).reduce((max, run) => Math.max(max, run.length), 0);
-  const fence = '`'.repeat(longestRun + 1);
-  const pad = longestRun > 0 ? ' ' : '';
-  return `${fence}${pad}${content}${pad}${fence}`;
-}
-
 // [LAW:effects-at-boundaries] Pure: render the findings that could not be posted inline as a
-// summary section. They still carry their path:line so the reader can locate them. Bodies are
-// flattened (flattenBody) so a multi-line body stays one bullet, never a detached paragraph.
+// summary section. They still carry their path:line so the reader can locate them. The path:line is
+// flattened THEN fenced (codeSpan) — a filename can legally embed a newline (unquoteCStylePath
+// reconstructs one from a quoted diff header) or backticks, and neither may split the bullet or
+// close the span; the body is flattened so a multi-line body stays one bullet.
 function renderUnanchoredSection(unanchored) {
   if (!unanchored || unanchored.length === 0) return '';
   const items = unanchored
-    .map(f => `- ${codeSpan(`${f.path}:${f.line}`)} — ${severityTag(f)} ${flattenBody(f.body)}`)
+    .map(f => `- ${codeSpan(flattenBody(`${f.path}:${f.line}`))} — ${severityTag(f)} ${flattenBody(f.body)}`)
     .join('\n');
   return `\n\n### Findings outside the reviewed diff\nThese reference lines not present in this PR's diff, so they could not be posted as inline comments:\n\n${items}`;
 }

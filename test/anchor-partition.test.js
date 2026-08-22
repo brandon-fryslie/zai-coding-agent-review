@@ -171,6 +171,21 @@ describe('submitReview — unanchored findings', () => {
     assert.match(octokit.calls[0].body, /`` a`b`\.js:7 ``/);
   });
 
+  test('a newline in an unanchored path cannot split the bullet — the span content is flattened before fencing', async () => {
+    // A filename can legally embed a newline (unquoteCStylePath reconstructs one from a quoted diff
+    // header). Unflattened, `a.js\n\n# Fake heading` would close the list item and inject markdown.
+    const octokit = fakeOctokit();
+    const review = {
+      summary: 's',
+      findings: [],
+      unanchored: [{ path: 'a.js\n\n# Fake heading', line: 7, body: 'x', severity: 3 }],
+      unreviewedScopes: [],
+    };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    assert.match(octokit.calls[0].body, /`a\.js # Fake heading:7`/); // one span, one line
+    assert.doesNotMatch(octokit.calls[0].body, /\n# Fake heading/); // never a raw heading line
+  });
+
   test('anchored findings post inline and add no unanchored section', async () => {
     const octokit = fakeOctokit();
     const review = {
