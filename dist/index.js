@@ -33608,7 +33608,7 @@ module.exports = {
 const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS } = __nccwpck_require__(2887);
 const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = __nccwpck_require__(6757);
 const { defaultEffortProfile, maxTier } = __nccwpck_require__(4652);
-const { dedupeFindings, dedupeAssessments } = __nccwpck_require__(1565);
+const { dedupeFindings, dedupeAssessments, flattenBody } = __nccwpck_require__(1565);
 const { renderDependencyDiffNote } = __nccwpck_require__(9838);
 const {
   buildReviewInput,
@@ -33696,9 +33696,10 @@ function sumUsage(usages) {
 function composeSummary(scopes, workerResults, sweeps = [], budget = { exhausted: false, unreviewedScopes: [] }) {
   const unreviewed = new Set(budget.unreviewedScopes);
   const reviewed = scopes.filter(s => !unreviewed.has(s.name));
-  const lines = [`Reviewed ${reviewed.length} scope(s): ${reviewed.map(s => s.name).join(', ')}.`, ''];
+  // Scope names and file paths are untrusted single-line values in a line-structured summary; flatten. [LAW:single-enforcer]
+  const lines = [`Reviewed ${reviewed.length} scope(s): ${flattenBody(reviewed.map(s => s.name).join(', '))}.`, ''];
   for (const r of workerResults) {
-    lines.push(`**${r.name}** — ${(r.summary || '(no summary)').trim()}`);
+    lines.push(`**${flattenBody(r.name)}** — ${(r.summary || '(no summary)').trim()}`);
   }
   for (const [i, s] of sweeps.entries()) {
     // [FRAMING:representation] A curtailed sweep must never render as convergence: "added nothing
@@ -33710,7 +33711,7 @@ function composeSummary(scopes, workerResults, sweeps = [], budget = { exhausted
   if (budget.exhausted) {
     lines.push(budget.unreviewedScopes.length > 0
       ? `⏳ **Time budget exhausted** — ${reviewed.length} of ${scopes.length} scope(s) were reviewed; `
-        + `NOT reviewed: ${budget.unreviewedScopes.join(', ')}. The findings above cover only the reviewed scopes.`
+        + `NOT reviewed: ${flattenBody(budget.unreviewedScopes.join(', '))}. The findings above cover only the reviewed scopes.`
       : '⏳ **Time budget exhausted** — every scope was reviewed, but convergence sweeps were cut short; '
         + 'late-round findings may be missing.');
   }
@@ -33821,7 +33822,7 @@ function planScopes(scopes, changedPaths) {
   if (sweptPaths.length === 0) return { scopes: uniquelyNamed(scopes), sweptPaths, duplicatePaths };
   const catchAll = {
     name: 'unassigned files',
-    focus: `These changed files were not covered by the planned scopes: ${sweptPaths.join(', ')}. Review their changes fully.`,
+    focus: `These changed files were not covered by the planned scopes: ${flattenBody(sweptPaths.join(', '))}. Review their changes fully.`,
     files: sweptPaths,
   };
   return { scopes: uniquelyNamed([...scopes, catchAll]), sweptPaths, duplicatePaths };
@@ -34368,7 +34369,7 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   let totalChars = 0;
 
   for (const f of patchableFiles) {
-    const entry = `### ${f.filename} (${f.status})\n\`\`\`diff\n${annotatePatchWithLines(f.patch)}\n\`\`\``;
+    const entry = `### ${flattenBody(f.filename)} (${f.status})\n\`\`\`diff\n${annotatePatchWithLines(f.patch)}\n\`\`\``;
     if (maxDiffChars > 0 && totalChars + entry.length > maxDiffChars) {
       unshowableFiles.push(f.filename);
     } else {
@@ -34386,7 +34387,7 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // which counts toward the verdict and renders in the review body — so the riskiest (biggest) changed
   // files stay reviewable, and an issue in them can never bypass the merge gate via summary prose.
   if (unshowableFiles.length > 0) {
-    diffs += `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`). Read each in full at its absolute path and review its changes. Record any issue with ${toolNames.requestChange} using the file's real line number from the full file — the line cannot be anchored inline, so the host will post that finding in the review body's "Findings outside the reviewed diff" section; never put it in the ${toolNames.finishReview} summary:\n${unshowableFiles.map(f => `> - ${reviewedRepoRoot}/${f}`).join('\n')}`;
+    diffs += `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`). Read each in full at its absolute path and review its changes. Record any issue with ${toolNames.requestChange} using the file's real line number from the full file — the line cannot be anchored inline, so the host will post that finding in the review body's "Findings outside the reviewed diff" section; never put it in the ${toolNames.finishReview} summary:\n${unshowableFiles.map(f => `> - ${flattenBody(`${reviewedRepoRoot}/${f}`)}`).join('\n')}`;
   }
 
   if (dependencyDiffNote) {
@@ -34480,7 +34481,7 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // uncertainty stated in the body (never withheld). One lever, two directions; the record-time
   // consequence lives in the buildReviewInput passage below, not a second "read more context" instruction.
   const readTargets = scopeFiles.length > 0
-    ? `Read the complete content of THESE files — this scope's assigned changed files: ${scopeFiles.join(', ')}. `
+    ? `Read the complete content of THESE files — this scope's assigned changed files: ${flattenBody(scopeFiles.join(', '))}. `
       + `Skip any among them that are generated or vendored artifacts (bundled or minified output, lockfiles) or pure documentation. `
       + `Another scope's worker reads the other changed files, so do NOT read them in full — that duplicates their work and their cost. `
       + `You may consult another file when a specific finding needs it — one your assigned files import, or a caller elsewhere that uses a symbol they change: prefer Grep to confirm a symbol, signature, or its call sites `
@@ -34873,7 +34874,9 @@ function renderFindingsSection(findings) {
   }
   const lines = [`### Findings (${findings.length})`];
   for (const [path, list] of groupByPath(findings)) {
-    lines.push('', `#### ${path}`, ...list.map(renderFinding));
+    // The path heads an ATX heading line; flattened so a newline-bearing filename cannot inject
+    // its own heading into the Step Summary. [LAW:single-enforcer]
+    lines.push('', `#### ${flattenBody(path)}`, ...list.map(renderFinding));
   }
   return lines;
 }
@@ -35188,12 +35191,14 @@ function severityTag(finding) {
   return `**[S${finding.severity}]**`;
 }
 
-// [LAW:single-enforcer] The one rule for flattening a multi-line finding body into a single Markdown
-// list line: continuation lines at column 0 would detach from their bullet and render as a new
-// paragraph, so every list-context sink (unanchored section, repo report, prior-findings block)
-// flattens through this, never its own regex.
+// [LAW:single-enforcer] The one rule for flattening untrusted multi-line text into a single Markdown
+// line: continuation lines at column 0 would detach from their bullet/heading and render as injected
+// markup, so every line-structured sink (unanchored section, repo report, prior-findings block, the
+// prompt's file lists) flattens through this, never its own regex. It collapses EVERY vertical
+// separator — \n, a lone \r (a CommonMark line ending, reconstructable in a filename via
+// unquoteCStylePath), and U+2028/U+2029 — not just \n.
 function flattenBody(body) {
-  return body.replace(/\s*\n\s*/g, ' ').trim();
+  return body.replace(/\s*[\n\r\u2028\u2029]\s*/g, ' ').trim();
 }
 
 // [LAW:single-enforcer] The one rule for rendering untrusted text as a Markdown code span: the

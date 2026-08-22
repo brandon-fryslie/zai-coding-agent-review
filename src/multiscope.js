@@ -2,7 +2,7 @@
 const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS } = require('./failover');
 const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = require('./deadline');
 const { defaultEffortProfile, maxTier } = require('./effort');
-const { dedupeFindings, dedupeAssessments } = require('./review');
+const { dedupeFindings, dedupeAssessments, flattenBody } = require('./review');
 const { renderDependencyDiffNote } = require('./dependency-diff');
 const {
   buildReviewInput,
@@ -90,9 +90,10 @@ function sumUsage(usages) {
 function composeSummary(scopes, workerResults, sweeps = [], budget = { exhausted: false, unreviewedScopes: [] }) {
   const unreviewed = new Set(budget.unreviewedScopes);
   const reviewed = scopes.filter(s => !unreviewed.has(s.name));
-  const lines = [`Reviewed ${reviewed.length} scope(s): ${reviewed.map(s => s.name).join(', ')}.`, ''];
+  // Scope names and file paths are untrusted single-line values in a line-structured summary; flatten. [LAW:single-enforcer]
+  const lines = [`Reviewed ${reviewed.length} scope(s): ${flattenBody(reviewed.map(s => s.name).join(', '))}.`, ''];
   for (const r of workerResults) {
-    lines.push(`**${r.name}** — ${(r.summary || '(no summary)').trim()}`);
+    lines.push(`**${flattenBody(r.name)}** — ${(r.summary || '(no summary)').trim()}`);
   }
   for (const [i, s] of sweeps.entries()) {
     // [FRAMING:representation] A curtailed sweep must never render as convergence: "added nothing
@@ -104,7 +105,7 @@ function composeSummary(scopes, workerResults, sweeps = [], budget = { exhausted
   if (budget.exhausted) {
     lines.push(budget.unreviewedScopes.length > 0
       ? `⏳ **Time budget exhausted** — ${reviewed.length} of ${scopes.length} scope(s) were reviewed; `
-        + `NOT reviewed: ${budget.unreviewedScopes.join(', ')}. The findings above cover only the reviewed scopes.`
+        + `NOT reviewed: ${flattenBody(budget.unreviewedScopes.join(', '))}. The findings above cover only the reviewed scopes.`
       : '⏳ **Time budget exhausted** — every scope was reviewed, but convergence sweeps were cut short; '
         + 'late-round findings may be missing.');
   }
@@ -215,7 +216,7 @@ function planScopes(scopes, changedPaths) {
   if (sweptPaths.length === 0) return { scopes: uniquelyNamed(scopes), sweptPaths, duplicatePaths };
   const catchAll = {
     name: 'unassigned files',
-    focus: `These changed files were not covered by the planned scopes: ${sweptPaths.join(', ')}. Review their changes fully.`,
+    focus: `These changed files were not covered by the planned scopes: ${flattenBody(sweptPaths.join(', '))}. Review their changes fully.`,
     files: sweptPaths,
   };
   return { scopes: uniquelyNamed([...scopes, catchAll]), sweptPaths, duplicatePaths };

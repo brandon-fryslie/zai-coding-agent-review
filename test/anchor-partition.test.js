@@ -2,7 +2,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { partitionFindings, nearestAnchorableLine, parseFindingValue, parseAssessmentValue, dedupeAssessments } = require('../src/review');
+const { partitionFindings, nearestAnchorableLine, parseFindingValue, parseAssessmentValue, dedupeAssessments, flattenBody } = require('../src/review');
 const { submitReview, gitHubTransport, giteaTransport } = require('../src/transport');
 const { buildReviewAnchors } = require('../src/diff');
 
@@ -14,6 +14,19 @@ const { buildReviewAnchors } = require('../src/diff');
 function anchorsFor(entries) {
   return new Map(entries.map(([path, line]) => [`${path}:${line}`, { path, line }]));
 }
+
+// [LAW:single-enforcer] flattenBody is the ONE vertical-whitespace rule for line-structured sinks;
+// a lone \r is a CommonMark line ending (and reconstructable in a filename via unquoteCStylePath),
+// so it must collapse exactly as \n does.
+describe('flattenBody', () => {
+  test('collapses every vertical separator to one space, not just \\n', () => {
+    assert.equal(flattenBody('a\nb'), 'a b');
+    assert.equal(flattenBody('a\rb'), 'a b');          // lone CR
+    assert.equal(flattenBody('a\r\nb'), 'a b');
+    assert.equal(flattenBody('a\u2028b\u2029c'), 'a b c');
+    assert.equal(flattenBody('  a\n\n  b  '), 'a b');
+  });
+});
 
 describe('nearestAnchorableLine', () => {
   test('returns null for an empty or missing file-line list', () => {

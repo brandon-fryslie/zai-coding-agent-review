@@ -140,7 +140,7 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   let totalChars = 0;
 
   for (const f of patchableFiles) {
-    const entry = `### ${f.filename} (${f.status})\n\`\`\`diff\n${annotatePatchWithLines(f.patch)}\n\`\`\``;
+    const entry = `### ${flattenBody(f.filename)} (${f.status})\n\`\`\`diff\n${annotatePatchWithLines(f.patch)}\n\`\`\``;
     if (maxDiffChars > 0 && totalChars + entry.length > maxDiffChars) {
       unshowableFiles.push(f.filename);
     } else {
@@ -158,7 +158,7 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // which counts toward the verdict and renders in the review body — so the riskiest (biggest) changed
   // files stay reviewable, and an issue in them can never bypass the merge gate via summary prose.
   if (unshowableFiles.length > 0) {
-    diffs += `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`). Read each in full at its absolute path and review its changes. Record any issue with ${toolNames.requestChange} using the file's real line number from the full file — the line cannot be anchored inline, so the host will post that finding in the review body's "Findings outside the reviewed diff" section; never put it in the ${toolNames.finishReview} summary:\n${unshowableFiles.map(f => `> - ${reviewedRepoRoot}/${f}`).join('\n')}`;
+    diffs += `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`). Read each in full at its absolute path and review its changes. Record any issue with ${toolNames.requestChange} using the file's real line number from the full file — the line cannot be anchored inline, so the host will post that finding in the review body's "Findings outside the reviewed diff" section; never put it in the ${toolNames.finishReview} summary:\n${unshowableFiles.map(f => `> - ${flattenBody(`${reviewedRepoRoot}/${f}`)}`).join('\n')}`;
   }
 
   if (dependencyDiffNote) {
@@ -252,7 +252,7 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // uncertainty stated in the body (never withheld). One lever, two directions; the record-time
   // consequence lives in the buildReviewInput passage below, not a second "read more context" instruction.
   const readTargets = scopeFiles.length > 0
-    ? `Read the complete content of THESE files — this scope's assigned changed files: ${scopeFiles.join(', ')}. `
+    ? `Read the complete content of THESE files — this scope's assigned changed files: ${flattenBody(scopeFiles.join(', '))}. `
       + `Skip any among them that are generated or vendored artifacts (bundled or minified output, lockfiles) or pure documentation. `
       + `Another scope's worker reads the other changed files, so do NOT read them in full — that duplicates their work and their cost. `
       + `You may consult another file when a specific finding needs it — one your assigned files import, or a caller elsewhere that uses a symbol they change: prefer Grep to confirm a symbol, signature, or its call sites `

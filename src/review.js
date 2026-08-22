@@ -277,12 +277,14 @@ function severityTag(finding) {
   return `**[S${finding.severity}]**`;
 }
 
-// [LAW:single-enforcer] The one rule for flattening a multi-line finding body into a single Markdown
-// list line: continuation lines at column 0 would detach from their bullet and render as a new
-// paragraph, so every list-context sink (unanchored section, repo report, prior-findings block)
-// flattens through this, never its own regex.
+// [LAW:single-enforcer] The one rule for flattening untrusted multi-line text into a single Markdown
+// line: continuation lines at column 0 would detach from their bullet/heading and render as injected
+// markup, so every line-structured sink (unanchored section, repo report, prior-findings block, the
+// prompt's file lists) flattens through this, never its own regex. It collapses EVERY vertical
+// separator — \n, a lone \r (a CommonMark line ending, reconstructable in a filename via
+// unquoteCStylePath), and U+2028/U+2029 — not just \n.
 function flattenBody(body) {
-  return body.replace(/\s*\n\s*/g, ' ').trim();
+  return body.replace(/\s*[\n\r\u2028\u2029]\s*/g, ' ').trim();
 }
 
 // [LAW:single-enforcer] The one rule for rendering untrusted text as a Markdown code span: the

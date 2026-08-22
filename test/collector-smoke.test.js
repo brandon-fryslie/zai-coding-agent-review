@@ -80,6 +80,24 @@ test('collector smoke: full MCP handshake produces valid records.jsonl', async (
     assert.ok(toolNames.includes('add_scope'), 'tools must include add_scope');
     assert.ok(toolNames.includes('assess_dependency'), 'tools must include assess_dependency');
 
+    // The ADVERTISED contract must match what the parser enforces — the drift this pins was real:
+    // the schema once permitted line 0 / blank strings the parser rejected. [LAW:single-enforcer]
+    const requestChange = tools.find(t => t.name === 'request_change');
+    assert.deepEqual(requestChange.inputSchema.properties, {
+      path: { type: 'string', minLength: 1, pattern: '\\S' },
+      line: { type: 'integer', minimum: 1 },
+      body: { type: 'string', minLength: 1, pattern: '\\S' },
+      severity: { type: 'integer', minimum: 1, maximum: 5 },
+    });
+    assert.deepEqual(requestChange.inputSchema.required, ['path', 'line', 'body', 'severity']);
+    // Every non-blank string field on every tool advertises the non-blank pattern the parser enforces.
+    for (const [tool, fields] of [['add_scope', ['name', 'focus']], ['assess_dependency', ['module', 'impact']], ['finish_review', ['summary']]]) {
+      const schema = tools.find(t => t.name === tool).inputSchema;
+      for (const field of fields) {
+        assert.equal(schema.properties[field].pattern, '\\S', `${tool}.${field} must advertise the non-blank pattern`);
+      }
+    }
+
     // 3. tools/call request_change
     const changeResp = await rpc(child, 3, 'tools/call', {
       name: 'request_change',

@@ -34,7 +34,9 @@ function renderFindingsSection(findings) {
   }
   const lines = [`### Findings (${findings.length})`];
   for (const [path, list] of groupByPath(findings)) {
-    lines.push('', `#### ${path}`, ...list.map(renderFinding));
+    // The path heads an ATX heading line; flattened so a newline-bearing filename cannot inject
+    // its own heading into the Step Summary. [LAW:single-enforcer]
+    lines.push('', `#### ${flattenBody(path)}`, ...list.map(renderFinding));
   }
   return lines;
 }
