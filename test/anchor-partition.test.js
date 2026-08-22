@@ -144,7 +144,7 @@ describe('submitReview — unanchored findings', () => {
     const review = {
       summary: 'Summary text.',
       findings: [],
-      unanchored: [{ path: 's.astro', line: 79, body: 'stale doc comment' }],
+      unanchored: [{ path: 's.astro', line: 79, body: 'stale doc comment', severity: 3 }],
       unreviewedScopes: [],
     };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
@@ -161,7 +161,7 @@ describe('submitReview — unanchored findings', () => {
     const octokit = fakeOctokit();
     const review = {
       summary: 'Summary.',
-      findings: [{ path: 'a.js', line: 10, body: 'fix' }],
+      findings: [{ path: 'a.js', line: 10, body: 'fix', severity: 4 }],
       unanchored: [],
       unreviewedScopes: [],
     };
@@ -294,7 +294,7 @@ describe('submitReview — approve event spelling is host-specific (home-copirat
   });
 
   test('REQUEST_CHANGES is spelled identically across transports (no host-specific mapping needed)', async () => {
-    const review = { summary: 'Bad.', findings: [{ path: 'a.js', line: 1, body: 'x' }], unanchored: [], unreviewedScopes: [] };
+    const review = { summary: 'Bad.', findings: [{ path: 'a.js', line: 1, body: 'x', severity: 4 }], unanchored: [], unreviewedScopes: [] };
     const gh = fakeOctokit();
     await submitReview(gh, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
     const gt = fakeOctokit();
@@ -304,27 +304,28 @@ describe('submitReview — approve event spelling is host-specific (home-copirat
   });
 });
 
-// ── findings carry no severity: every recorded finding blocks the merge ───────────────────────────
-// [LAW:verifiable-goals] AC: the model makes no blocking/advisory call. A finding is path/line/body;
-// a stray severity key from an older engine is dropped, never carried or validated.
+// ── severity: a 1-5 priority label, never a gate ──────────────────────────────────────────────────
+// [LAW:verifiable-goals] AC: the model makes no blocking/non-blocking call — every finding blocks —
+// but each finding carries a required integer 1-5 priority label for the author.
 
-describe('parseFindingValue — no severity', () => {
-  test('parses a finding as path/line/body only', () => {
+describe('parseFindingValue — severity is a required integer 1-5', () => {
+  test('parses a finding with its numeric severity', () => {
     assert.deepEqual(
-      parseFindingValue({ path: 'a.js', line: 3, body: 'bug' }, 0),
-      { path: 'a.js', line: 3, body: 'bug' },
+      parseFindingValue({ path: 'a.js', line: 3, body: 'bug', severity: 5 }, 0),
+      { path: 'a.js', line: 3, body: 'bug', severity: 5 },
     );
+    assert.equal(parseFindingValue({ path: 'a.js', line: 3, body: 'typo', severity: 1 }, 0).severity, 1);
   });
-  test('drops a stray severity key — the concept is unrepresentable downstream', () => {
-    assert.deepEqual(
-      parseFindingValue({ path: 'a.js', line: 3, body: 'bug', severity: 'advisory' }, 0),
-      { path: 'a.js', line: 3, body: 'bug' },
-    );
+  test('rejects a missing, out-of-range, or non-integer severity', () => {
+    for (const severity of [undefined, 0, 6, -1, 2.5, '3', 'blocking']) {
+      assert.throws(() => parseFindingValue({ path: 'a.js', line: 3, body: 'x', severity }, 0), /invalid severity/);
+    }
   });
   test('the error names the caller-supplied position, not always "finding 1"', () => {
     // parseFindingValue(index=2) must report "finding 3" — the record's real position — so a bad
     // finding deep in records.jsonl is locatable, not mislabeled as the first. [LAW:decomposition]
-    assert.throws(() => parseFindingValue({ path: '', line: 3, body: 'x' }, 2), /finding 3 has an invalid path/);
+    assert.throws(() => parseFindingValue({ path: '', line: 3, body: 'x', severity: 3 }, 2), /finding 3 has an invalid path/);
+    assert.throws(() => parseFindingValue({ path: 'a.js', line: 3, body: 'x', severity: 9 }, 5), /finding 6 has an invalid severity/);
   });
 });
 
@@ -336,8 +337,8 @@ describe('partitionFindings — collapses near-duplicates that snap onto one lin
   test('two findings on different pre-snap lines with equivalent bodies post once', () => {
     const anchors = anchorsFor([['a.js', 12]]);
     const findings = [
-      { path: 'a.js', line: 10, body: 'Bug: off-by-one in the loop' }, // snaps to 12
-      { path: 'a.js', line: 14, body: 'Bug: off-by-one in the loop' }, // snaps to 12
+      { path: 'a.js', line: 10, body: 'Bug: off-by-one in the loop', severity: 4 }, // snaps to 12
+      { path: 'a.js', line: 14, body: 'Bug: off-by-one in the loop', severity: 4 }, // snaps to 12
     ];
     const { anchored } = partitionFindings(findings, anchors);
     assert.equal(anchored.length, 1);
@@ -349,8 +350,8 @@ describe('partitionFindings — collapses near-duplicates that snap onto one lin
   test('two findings snapping to one line with DISTINCT bodies both post', () => {
     const anchors = anchorsFor([['a.js', 12]]);
     const findings = [
-      { path: 'a.js', line: 10, body: 'Bug: off-by-one in the loop' },
-      { path: 'a.js', line: 14, body: 'Edge case: empty input crashes' },
+      { path: 'a.js', line: 10, body: 'Bug: off-by-one in the loop', severity: 4 },
+      { path: 'a.js', line: 14, body: 'Edge case: empty input crashes', severity: 3 },
     ];
     const { anchored } = partitionFindings(findings, anchors);
     assert.equal(anchored.length, 2);
@@ -360,8 +361,8 @@ describe('partitionFindings — collapses near-duplicates that snap onto one lin
   test('collapse uses the SHARED normalization — bodies differing only in whitespace/case merge', () => {
     const anchors = anchorsFor([['a.js', 12]]);
     const findings = [
-      { path: 'a.js', line: 10, body: 'Fix   the   NULL check' },
-      { path: 'a.js', line: 14, body: 'fix the null check' },
+      { path: 'a.js', line: 10, body: 'Fix   the   NULL check', severity: 3 },
+      { path: 'a.js', line: 14, body: 'fix the null check', severity: 3 },
     ];
     const { anchored } = partitionFindings(findings, anchors);
     assert.equal(anchored.length, 1);
@@ -370,17 +371,45 @@ describe('partitionFindings — collapses near-duplicates that snap onto one lin
   test('an exact-anchor finding and an equivalent snapped one collapse; the on-grid survivor is unannotated', () => {
     const anchors = anchorsFor([['a.js', 12]]);
     const findings = [
-      { path: 'a.js', line: 12, body: 'Bug: race on shared map' }, // exact, first-seen
-      { path: 'a.js', line: 14, body: 'Bug: race on shared map' }, // snaps to 12, same key
+      { path: 'a.js', line: 12, body: 'Bug: race on shared map', severity: 4 }, // exact, first-seen
+      { path: 'a.js', line: 14, body: 'Bug: race on shared map', severity: 4 }, // snaps to 12, same key
     ];
     const { anchored } = partitionFindings(findings, anchors);
     assert.equal(anchored.length, 1);
-    assert.deepEqual(anchored[0], { path: 'a.js', line: 12, body: 'Bug: race on shared map' });
+    assert.deepEqual(anchored[0], { path: 'a.js', line: 12, body: 'Bug: race on shared map', severity: 4 });
+  });
+
+  test('the exact-anchored member wins the collapse even when the snapped one arrived FIRST', () => {
+    // The convergence loop makes this real: pass 0 records the issue at a near-miss line, a sweep
+    // re-records it exactly on the anchor. The on-grid recording must never carry the stale
+    // "referenced line M, just outside the diff" note of the earlier snapped member.
+    const anchors = anchorsFor([['a.js', 12]]);
+    const findings = [
+      { path: 'a.js', line: 14, body: 'Bug: race on shared map', severity: 3 }, // snaps to 12, first-seen
+      { path: 'a.js', line: 12, body: 'Bug: race on shared map', severity: 3 }, // exact, later
+    ];
+    const { anchored } = partitionFindings(findings, anchors);
+    assert.equal(anchored.length, 1);
+    assert.deepEqual(anchored[0], { path: 'a.js', line: 12, body: 'Bug: race on shared map', severity: 3 });
+    assert.doesNotMatch(anchored[0].body, /just outside the diff/);
+  });
+
+  test('[LAW:no-silent-failure] the collapse carries the HIGHEST severity of the group regardless of which member survives', () => {
+    const anchors = anchorsFor([['a.js', 12]]);
+    const findings = [
+      { path: 'a.js', line: 14, body: 'Bug: same issue', severity: 5 }, // snapped member, higher severity
+      { path: 'a.js', line: 12, body: 'Bug: same issue', severity: 2 }, // exact member survives the collapse
+    ];
+    const { anchored } = partitionFindings(findings, anchors);
+    assert.equal(anchored.length, 1);
+    assert.equal(anchored[0].line, 12);
+    assert.equal(anchored[0].severity, 5); // exact-anchored presentation, strongest priority
+    assert.doesNotMatch(anchored[0].body, /just outside the diff/);
   });
 
   test('snappedFromLine scaffolding never leaks onto an anchored finding', () => {
     const anchors = anchorsFor([['a.js', 12]]);
-    const { anchored } = partitionFindings([{ path: 'a.js', line: 14, body: 'x' }], anchors);
+    const { anchored } = partitionFindings([{ path: 'a.js', line: 14, body: 'x', severity: 2 }], anchors);
     assert.equal(anchored.length, 1);
     assert.equal('snappedFromLine' in anchored[0], false);
   });
@@ -392,8 +421,8 @@ describe('submitReview — every finding blocks', () => {
     const review = {
       summary: 'Two notes.',
       findings: [
-        { path: 'a.js', line: 10, body: 'add a test' },
-        { path: 'b.js', line: 20, body: 'could be faster' },
+        { path: 'a.js', line: 10, body: 'add a test', severity: 2 },
+        { path: 'b.js', line: 20, body: 'could be faster', severity: 3 },
       ],
       unanchored: [],
       unreviewedScopes: [],
@@ -403,7 +432,21 @@ describe('submitReview — every finding blocks', () => {
     assert.equal(arg.event, 'REQUEST_CHANGES'); // no non-blocking tier: a recorded finding is a blocker
     assert.match(arg.body, /❌ Request Changes/);
     assert.equal(arg.comments.length, 2);
-    assert.equal(arg.comments[0].body, 'add a test'); // no severity tag prefixes the body
+    assert.equal(arg.comments[0].body, '**[S2]** add a test'); // the severity tag is presentation, prefixed once
+  });
+
+  test('severity never gates: a review of only severity-1 findings still REQUEST_CHANGES', async () => {
+    // [LAW:verifiable-goals] the 1-5 label is priority presentation; the verdict counts findings.
+    const octokit = fakeOctokit();
+    const review = {
+      summary: 's',
+      findings: [{ path: 'a.js', line: 10, body: 'Comment mismatch: typo in comment', severity: 1 }],
+      unanchored: [],
+      unreviewedScopes: [],
+    };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    assert.equal(octokit.calls[0].event, 'REQUEST_CHANGES');
+    assert.match(octokit.calls[0].comments[0].body, /^\*\*\[S1\]\*\* /);
   });
 
   test('an UNANCHORED finding alone still blocks — a mis-anchored issue cannot downgrade to APPROVE', async () => {
@@ -411,7 +454,7 @@ describe('submitReview — every finding blocks', () => {
     const review = {
       summary: 's',
       findings: [],
-      unanchored: [{ path: 'b.js', line: 999, body: 'real bug off-grid' }],
+      unanchored: [{ path: 'b.js', line: 999, body: 'real bug off-grid', severity: 5 }],
       unreviewedScopes: [],
     };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
@@ -440,7 +483,7 @@ describe('submitReview — partial coverage (unreviewedScopes)', () => {
     const octokit = fakeOctokit();
     const review = {
       summary: 'S.',
-      findings: [{ path: 'a.js', line: 1, body: 'bug' }],
+      findings: [{ path: 'a.js', line: 1, body: 'bug', severity: 5 }],
       unanchored: [],
       unreviewedScopes: ['docs'],
     };

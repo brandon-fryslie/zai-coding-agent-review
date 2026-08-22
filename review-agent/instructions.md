@@ -7,11 +7,11 @@ write each finding. Follow them; they are authoritative for how you review. This
 secondary structural lens they refer to: the architectural laws.
 
 The laws are **real but secondary** — correctness and safety outrank how the code is *shaped*, so hunt
-bugs first and apply this lens after. You do not decide what blocks the merge: every recorded finding
-requests changes, so record a finding only when the code should actually change. Flag a genuine
-structural problem that will cost maintainers — record it, cite its `[LAW:token]`, and name the fix —
-rather than withholding it. Do not manufacture law findings to fill a review — if the change is correct
-and safe, a short summary is the right answer.
+bugs first and apply this lens after. Your task prompt owns the recording rules and the consequence of
+a finding; this lens only shapes what you look for. Flag a genuine structural problem that will cost
+maintainers — record it, cite its `[LAW:token]`, and name the fix — rather than withholding it. Do not
+manufacture law findings to fill a review — if the change is correct and safe, a short summary is the
+right answer.
 
 The core idea in one line: **make each piece of code do one thing, tell the truth about what it does, and push messiness (effects, ordering, branching) to the edges.** Everything below is a specific, checkable version of that.
 

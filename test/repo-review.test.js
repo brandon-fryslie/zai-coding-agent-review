@@ -79,9 +79,9 @@ describe('buildReviewInput repo-root anchoring', () => {
 const REVIEW_WITH_FINDINGS = {
   summary: 'Two issues across the data layer.',
   findings: [
-    { path: 'src/b.js', line: 5, body: 'first b finding' },
-    { path: 'src/a.js', line: 40, body: 'late a finding' },
-    { path: 'src/a.js', line: 10, body: 'early a finding' },
+    { path: 'src/b.js', line: 5, body: 'first b finding', severity: 4 },
+    { path: 'src/a.js', line: 40, body: 'late a finding', severity: 3 },
+    { path: 'src/a.js', line: 10, body: 'early a finding', severity: 5 },
   ],
 };
 
@@ -95,7 +95,7 @@ describe('renderRepoReport', () => {
     const aIdx = report.indexOf('#### src/a.js');
     assert.ok(bIdx > -1 && aIdx > -1 && bIdx < aIdx, 'b group before a group');
     assert.ok(report.indexOf('early a finding') < report.indexOf('late a finding'), 'lines ascending within a file');
-    assert.match(report, /- \*\*line 10:\*\* early a finding/);
+    assert.match(report, /- \*\*line 10:\*\* \*\*\[S5\]\*\* early a finding/);
   });
 
   test('renders the scope line from a non-empty scope', () => {
@@ -123,22 +123,22 @@ describe('renderRepoReport', () => {
   });
 
   test('flattens multi-line finding bodies to a single scannable line', () => {
-    const review = { summary: 's', findings: [{ path: 'f.js', line: 1, body: 'line one\n  line two\nline three' }] };
+    const review = { summary: 's', findings: [{ path: 'f.js', line: 1, body: 'line one\n  line two\nline three', severity: 3 }] };
     const report = renderRepoReport({ reviewerName: 'R', scope: '', review, footer: '' });
-    assert.match(report, /- \*\*line 1:\*\* line one line two line three/);
+    assert.match(report, /- \*\*line 1:\*\* \*\*\[S3\]\*\* line one line two line three/);
   });
 
-  test('renders every finding body verbatim — there is no severity tag', () => {
+  test('renders each finding with its severity tag — a priority label, not a verdict', () => {
     const review = {
       summary: 's',
       findings: [
-        { path: 'f.js', line: 1, body: 'must fix' },
-        { path: 'f.js', line: 2, body: 'nice to have' },
+        { path: 'f.js', line: 1, body: 'must fix', severity: 5 },
+        { path: 'f.js', line: 2, body: 'comment typo', severity: 1 },
       ],
     };
     const report = renderRepoReport({ reviewerName: 'R', scope: '', review, footer: '' });
-    assert.match(report, /- \*\*line 1:\*\* must fix/);
-    assert.match(report, /- \*\*line 2:\*\* nice to have/);
+    assert.match(report, /- \*\*line 1:\*\* \*\*\[S5\]\*\* must fix/);
+    assert.match(report, /- \*\*line 2:\*\* \*\*\[S1\]\*\* comment typo/);
     assert.doesNotMatch(report, /Advisory/);
   });
 });

@@ -22,15 +22,16 @@ function collectorTools() {
   return [
     {
       name: 'request_change',
-      description: "Record a code issue anchored to a visible diff line. Every recorded issue must change before merge — recording one requests changes on the review. Record EVERY genuine issue you find, including one you are only moderately sure of (state what you are unsure of in the body). Do not use for praise, neutral observations, or pure style/naming preferences.",
+      description: "Record a code issue. Every recorded issue is one the code must address — you do not decide its consequence; that is the host's. severity is a priority label for the author, 1-5: 1 is ONLY trivia on the level of a comment typo that doesn't impair meaning; 5 ships a defect. It never changes whether the issue must be addressed. Record EVERY genuine issue you find, including one you are only moderately sure of (state what you are unsure of in the body). Do not use for praise, neutral observations, or pure style/naming preferences.",
       inputSchema: {
         type: 'object',
         properties: {
-          path: { type: 'string' },
-          line: { type: 'integer' },
-          body: { type: 'string' },
+          path: { type: 'string', minLength: 1 },
+          line: { type: 'integer', minimum: 1 },
+          body: { type: 'string', minLength: 1 },
+          severity: { type: 'integer', minimum: 1, maximum: 5 },
         },
-        required: ['path', 'line', 'body'],
+        required: ['path', 'line', 'body', 'severity'],
         additionalProperties: false,
       },
     },

@@ -30218,15 +30218,16 @@ function collectorTools() {
   return [
     {
       name: 'request_change',
-      description: "Record a code issue anchored to a visible diff line. Every recorded issue must change before merge — recording one requests changes on the review. Record EVERY genuine issue you find, including one you are only moderately sure of (state what you are unsure of in the body). Do not use for praise, neutral observations, or pure style/naming preferences.",
+      description: "Record a code issue. Every recorded issue is one the code must address — you do not decide its consequence; that is the host's. severity is a priority label for the author, 1-5: 1 is ONLY trivia on the level of a comment typo that doesn't impair meaning; 5 ships a defect. It never changes whether the issue must be addressed. Record EVERY genuine issue you find, including one you are only moderately sure of (state what you are unsure of in the body). Do not use for praise, neutral observations, or pure style/naming preferences.",
       inputSchema: {
         type: 'object',
         properties: {
-          path: { type: 'string' },
-          line: { type: 'integer' },
-          body: { type: 'string' },
+          path: { type: 'string', minLength: 1 },
+          line: { type: 'integer', minimum: 1 },
+          body: { type: 'string', minLength: 1 },
+          severity: { type: 'integer', minimum: 1, maximum: 5 },
         },
-        required: ['path', 'line', 'body'],
+        required: ['path', 'line', 'body', 'severity'],
         additionalProperties: false,
       },
     },
@@ -34253,25 +34254,42 @@ function reviewCharter(toolNames) {
        quietly returns different data when the real source fails. Errors must surface, not vanish. [LAW:no-silent-failure]
     7. Resource & lifecycle — an unclosed file/socket/connection, a leaked handle or listener, a timer
        never cleared, a lock never released, unbounded growth.
-    8. Missing tests for risky logic — new non-trivial behavior with no test over its failure modes, or
+    8. Comment/code mismatch — review every comment against the code it describes, and the code against
+       its comments. When they diverge, the STRONGER of the two contracts wins: name which side carries
+       the stronger guarantee — a comment promising more than the code delivers, or code enforcing more
+       than the comment admits — and direct aligning the weaker side to the stronger one. Record ONE
+       finding per mismatched comment+code occurrence; never batch several mismatches into one comment.
+    9. Missing tests for risky logic — new non-trivial behavior with no test over its failure modes, or
        a test that asserts implementation instead of behavior. [LAW:behavior-not-structure]
-    9. Performance on real paths — accidental O(n²), N+1 queries, work repeated in a loop that could be
+    10. Performance on real paths — accidental O(n²), N+1 queries, work repeated in a loop that could be
        hoisted, blocking a hot path.
-    10. Architecture & maintainability — genuine structural problems that will cost maintainers: a part
+    11. Architecture & maintainability — genuine structural problems that will cost maintainers: a part
        doing several things, a type that admits illegal states, a fact with two sources of truth that
        can drift, effects tangled through pure logic, a dependency cycle. These map to the [LAW:*] tokens
        in your guidance; cite the token when one fits. These are real, but they rank BELOW "will this
        ship a bug" — spend your attention on the categories above first.
 
-    You do NOT decide what blocks the merge. Every recorded finding must change before merge — the
-    action requests changes whenever any finding exists — so record a finding only when the code should
-    actually change, and record EVERY such issue. Categorize each finding by where it falls in that
-    list (its tag, below); never soften or withhold one because it feels minor, and never inflate a
-    style preference into a finding to fill a review.
+    You do NOT decide the consequence of a finding — the host does. Every recorded finding is one the
+    code must actually address, so record a finding only when the code should change, and record EVERY
+    such issue; never soften or withhold one because it feels minor, and never inflate a style
+    preference into a finding to fill a review.
+
+    Set each finding's severity: an integer 1-5 priority label for the author, nothing more — it never
+    decides what happens to the review; it tells the reader where to look first.
+      5 — ships a defect: correctness, security, data loss.
+      4 — probable bug: an unhandled edge case, a broken caller or regression, a race.
+      3 — a real risk or gap: silent failure, a resource leak, missing tests on risky logic, a
+          performance problem on a real path.
+      2 — structural/maintainability: a genuine [LAW:*] violation that will cost maintainers.
+      1 — ONLY trivia on the level of a typo in a comment that doesn't impair meaning or
+          comprehension. Nothing with behavioral consequence is ever a 1.
+    A comment/code mismatch rates by what it hides: one masking a real bug takes that bug's severity;
+    a stale-but-harmless comment rates low; a pure comment typo is the canonical 1.
 
     Each ${toolNames.requestChange} body has three parts, in order: (1) a short tag naming the kind —
-    Bug, Edge case, Breaking, Security, Race, Silent failure, Resource leak, Perf, or a [LAW:token] for
-    a structural issue; (2) one or two sentences saying WHAT goes wrong and HOW it manifests — the
+    Bug, Edge case, Breaking, Security, Race, Silent failure, Resource leak, Comment mismatch, Perf, or
+    a [LAW:token] for a structural issue; (2) one or two sentences saying WHAT goes wrong and HOW it
+    manifests — the
     concrete failure and, where you can, the exact input or sequence that triggers it, not just a
     label; (3) the concrete fix. Lead with the impact, not the category. One comment per distinct issue
     — flag the clearest instance and note the pattern once; do not repeat it across many lines.
@@ -34313,7 +34331,7 @@ function renderPriorFindingsBlock(priorFindings, toolNames) {
   // line at prompt indentation could read as a stray instruction rather than part of the listed finding.
   const oneLine = (body) => body.replace(/\s*\n\s*/g, ' ');
   return `\n    THIS IS A CONVERGENCE SWEEP. A previous pass of this same review already examined this material and recorded the findings below. They are ALREADY collected and will be posted — do not re-record, rephrase, re-argue, or re-verify any of them; a re-record is pure noise.\n`
-    + priorFindings.map(f => `      • [${f.path}:${f.line}] ${oneLine(f.body)}`).join('\n')
+    + priorFindings.map(f => `      • [${f.path}:${f.line}] (S${f.severity}) ${oneLine(f.body)}`).join('\n')
     + `\n    Your job in this sweep is ONLY what that list misses: read the material fresh and hunt for real issues NOT already listed — parts of the change no listed finding touches, failure classes the list has none of (edge cases, broken callers, concurrency, security), or a deeper problem behind a listed symptom. Record each genuinely new issue with ${toolNames.requestChange} as usual. If your fresh read surfaces nothing real that is missing, record NOTHING and call ${toolNames.finishReview} with a one-line summary saying the sweep found nothing new — an empty sweep is this review converging, which is a correct and expected outcome, not a failure. Never pad the sweep with speculative or trivial findings to avoid coming back empty.\n`;
 }
 
@@ -34349,11 +34367,12 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   let diffs = includedDiffs.join('\n\n');
 
   // [LAW:dataflow-not-control-flow] The unshowable set is a VALUE: an empty list renders nothing, so this
-  // is one path, not a "patchless mode". The note names the recovery route the pipeline already owns —
-  // unanchored findings reported via finish_review are counted toward the verdict (transport.js), so the
-  // riskiest (biggest) changed files stay reviewable even though their diff cannot be anchored inline.
+  // is one path, not a "patchless mode". The recovery route is the one the pipeline already owns: a
+  // recorded finding whose line is off the diff grid becomes an UNANCHORED finding (partitionFindings),
+  // which counts toward the verdict and renders in the review body — so the riskiest (biggest) changed
+  // files stay reviewable, and an issue in them can never bypass the merge gate via summary prose.
   if (unshowableFiles.length > 0) {
-    diffs += `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`). Read each in full at its absolute path, review its changes, and because its lines cannot be anchored inline, report any issues via the ${toolNames.finishReview} summary rather than ${toolNames.requestChange}:\n${unshowableFiles.map(f => `> - ${reviewedRepoRoot}/${f}`).join('\n')}`;
+    diffs += `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`). Read each in full at its absolute path and review its changes. Record any issue with ${toolNames.requestChange} using the file's real line number from the full file — the line cannot be anchored inline, so the finding will be reported in the review summary instead; never route it to the ${toolNames.finishReview} summary:\n${unshowableFiles.map(f => `> - ${reviewedRepoRoot}/${f}`).join('\n')}`;
   }
 
   if (dependencyDiffNote) {
@@ -34400,9 +34419,10 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
     symbol this repo actually uses — a removed export, a changed function signature, a changed default, a
     renamed field. If nothing this repo uses is affected, say so briefly in the ${toolNames.finishReview}
     summary; if something is, name the exact upstream change and the call site it affects
-    — as ${toolNames.requestChange} on the go.mod version line if that line is shown above (a LINE N
-    anchor), or in the ${toolNames.finishReview} summary if go.mod's own diff was too large to show inline
-    (see the unshowable-files note above) — never silently drop the finding because the anchor isn't available.\n`
+    — as ${toolNames.requestChange} on the go.mod version line: the displayed LINE value if that line is
+    shown above, or go.mod's real line number if its diff was too large to show inline (the finding is
+    then carried as an unanchored finding in the review summary; see the unshowable-files note above) —
+    never route it to the ${toolNames.finishReview} summary and never drop it because the anchor isn't available.\n`
     : '';
 
   // [LAW:dataflow-not-control-flow] The assess directive is rendered by a VALUE, not a mode: it fires only
@@ -34425,8 +34445,9 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
     change?), 'callSite' (the file or file:line where, when affected — omit when not), and 'verdict' ('safe' =
     routine, merge freely; 'review' = worth a human glance; 'risky' = a breaking change that touches this repo).
     The host renders this into the review's dependency summary. It does NOT replace a finding: if the bump breaks
-    a symbol this repo uses, still record that as a ${toolNames.requestChange} (or in the ${toolNames.finishReview}
-    summary if unanchorable), because the assessment's verdict is presentation — findings drive the merge decision.\n`
+    a symbol this repo uses, still record that as a ${toolNames.requestChange} (on go.mod's real version line if
+    no LINE anchor is shown — it is carried as an unanchored finding), because the assessment's verdict is
+    presentation — findings drive the merge decision.\n`
     : '';
 
   // [LAW:dataflow-not-control-flow] The set of files to read in full is a VALUE: a non-empty scopeFiles
@@ -34475,11 +34496,12 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
     withholding it.
 
     Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} for each issue you
-    find. Every recorded change must use path, line (the displayed LINE value), and body. When the
-    review is complete, call ${toolNames.finishReview} exactly once. The summary is a one-line verdict
-    — what the change does and whether it needs fixing — plus any real problem you could not tie to a
-    specific changed line (state that problem here rather than drop it). It is NOT a place to praise the
-    code, describe what you read, narrate your review, or restate the inline findings — those are already
+    find. Every recorded change must use path, line (the displayed LINE value), body, and severity (an
+    integer 1-5 — see the charter below). When the review is complete, call ${toolNames.finishReview}
+    exactly once. The summary is a one-line verdict — what the change does and whether it needs fixing.
+    It is NOT a channel for findings: a real problem always goes through ${toolNames.requestChange}, and
+    it is NOT a place to praise the code, describe what you read, narrate your review, or restate the
+    inline findings — those are already
     posted as comments via ${toolNames.requestChange}. Do not write giant blocks of text explaining why
     well-implemented code is good; if the change is clean, the summary is a single short sentence saying
     so, and nothing more. The collector tools are the only review output channel; you flag issues, you do
@@ -34493,7 +34515,8 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
     problem whose root cause sits in unchanged code (it feeds a bad value into an existing function, or
     relies on an existing loose type), attach the comment to the changed LINE responsible for the new
     problem and explain the upstream link in the body. If a real finding cannot be tied to any changed
-    LINE, put it in the ${toolNames.finishReview} summary rather than dropping it.
+    LINE, still record it with ${toolNames.requestChange} at the most relevant real line of its file —
+    it will be carried as an unanchored finding in the review summary — rather than dropping it.
 
     ${reviewCharter(toolNames)}
     \n\n${diffs}`,
@@ -34530,7 +34553,8 @@ Review this repository for what would hurt if it shipped. There is no diff — t
     working directory is intentionally outside the repository) and judge the code you find. ${focus}${exclude}${priorFindingsBlock}
 
     Call ${toolNames.requestChange} for each issue you find, with path, line (any real line in that file —
-    there is no diff grid here, so any line is valid), and a body. When the review is complete, call
+    there is no diff grid here, so any line is valid), a body, and a severity (an integer 1-5 — see the
+    charter below). When the review is complete, call
     ${toolNames.finishReview} exactly once. The summary is a one-line verdict — what you audited and
     whether it needs fixing — plus any real problem you could not tie to a specific file and line (state
     that problem here rather than drop it). It is NOT a place to praise the code, describe what you read,
@@ -34791,10 +34815,11 @@ module.exports = { synthesizeProviderConfig, PROVIDERS, PROVIDER_ALIASES, PROVID
 /***/ }),
 
 /***/ 8959:
-/***/ ((module) => {
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 "use strict";
 
+const { severityTag, flattenBody } = __nccwpck_require__(1565);
 
 // The printed sink for full-repo review mode. There is no pull request to comment on, so
 // findings are rendered as a single Markdown report written to the GitHub Step Summary and
@@ -34820,8 +34845,7 @@ function groupByPath(findings) {
 // One finding rendered as a list item; the body is flattened to a single line so the grouped
 // list stays scannable in the Step Summary.
 function renderFinding(finding) {
-  const body = finding.body.replace(/\s*\n\s*/g, ' ').trim();
-  return `- **line ${finding.line}:** ${body}`;
+  return `- **line ${finding.line}:** ${severityTag(finding)} ${flattenBody(finding.body)}`;
 }
 
 function renderFindingsSection(findings) {
@@ -34889,10 +34913,16 @@ function parseOneFinding(finding, label) {
   if (typeof body !== 'string' || body.trim().length === 0) {
     throw new Error(`${label} has an invalid body.`);
   }
-  // [LAW:types-are-the-program] A finding carries no severity: every recorded finding blocks the merge.
-  // The blocking/advisory split was deleted deliberately — the model's judgment of "non-blocking" was
-  // not trustworthy, so the distinction is unrepresentable rather than defaulted.
-  return { path: pathValue.trim(), line, body: body.trim() };
+  // [LAW:types-are-the-program] severity is a required integer priority label, 1 (trivial — a comment
+  // typo that doesn't impair meaning) to 5 (ships a defect). It is PRIORITY for the author, never a
+  // gate: the verdict counts findings, not severities — the blocking/advisory tier was deleted
+  // deliberately because the model's non-blocking judgment was not trustworthy, and this label must
+  // never grow back into one.
+  const severity = finding.severity;
+  if (!Number.isInteger(severity) || severity < 1 || severity > 5) {
+    throw new Error(`${label} has an invalid severity (expected an integer 1-5).`);
+  }
+  return { path: pathValue.trim(), line, body: body.trim(), severity };
 }
 
 function parseReviewValue(parsed, context) {
@@ -35034,13 +35064,30 @@ function normalizeBody(body) {
 // collapse, while any genuine difference in wording keeps two findings apart. Cross-worker paraphrases
 // of one issue surviving as near-duplicates is noise, not loss — the accepted direction to err.
 //
-// First-seen wins: members sharing a key are the same recorded finding (every finding blocks the
-// merge, so there is no severity to reconcile), and first-seen order is preserved by the Map.
+// [LAW:no-silent-failure] Severity is the author's priority signal, so a duplicate must never lose it
+// to arrival order (nondeterministic under concurrent workers — [LAW:no-ambient-temporal-coupling]):
+// when two members share a key, the merged finding carries the HIGHEST severity of the group, never
+// the one that happened to arrive first. First-seen order is preserved (a Map keeps a key's original
+// position when its value is replaced).
+//
+// Which MEMBER survives is a separate preference: a candidate mid-anchoring may carry snappedFromLine
+// (partitionFindings scaffolding — the finding cited a line just outside the diff and was snapped).
+// An exact-anchored member (no snappedFromLine) outranks a snapped one regardless of arrival order,
+// so a finding also recorded exactly on the anchor line is never presented with a stale
+// "referenced line M, just outside the diff" note. Pre-anchor callers (multiscope) carry no
+// snappedFromLine on any member, so for them this preference is vacuously first-seen.
 function dedupeFindings(findings) {
   const byKey = new Map();
   for (const f of findings) {
     const key = `${f.path}:${f.line}:${normalizeBody(f.body)}`;
-    if (!byKey.has(key)) byKey.set(key, f);
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, f);
+      continue;
+    }
+    const severity = Math.max(existing.severity, f.severity);
+    const exactBeatsSnapped = existing.snappedFromLine !== undefined && f.snappedFromLine === undefined;
+    byKey.set(key, exactBeatsSnapped ? { ...f, severity } : { ...existing, severity });
   }
   return [...byKey.values()];
 }
@@ -35114,7 +35161,23 @@ function partitionFindings(findings, anchors) {
   return { anchored, unanchored };
 }
 
-module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine };
+// [LAW:one-source-of-truth] The one rendering of a finding's severity label. Every sink that shows a
+// finding to a human (inline PR comment, the unanchored summary section, the whole-repo report, the
+// convergence-sweep prior list) derives the tag from here rather than restating it. The tag is
+// PRESENTATION of the priority value — it never feeds the verdict.
+function severityTag(finding) {
+  return `**[S${finding.severity}]**`;
+}
+
+// [LAW:single-enforcer] The one rule for flattening a multi-line finding body into a single Markdown
+// list line: continuation lines at column 0 would detach from their bullet and render as a new
+// paragraph, so every list-context sink (unanchored section, repo report, prior-findings block)
+// flattens through this, never its own regex.
+function flattenBody(body) {
+  return body.replace(/\s*\n\s*/g, ' ').trim();
+}
+
+module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTag, flattenBody };
 
 
 /***/ }),
@@ -35876,6 +35939,7 @@ module.exports = { selectConfig, BODY_DIRECTIVE_RE };
 
 const core = __nccwpck_require__(7484);
 const { parseUnifiedDiff } = __nccwpck_require__(9898);
+const { severityTag, flattenBody } = __nccwpck_require__(1565);
 const { parseCostMarker } = __nccwpck_require__(9614);
 
 const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
@@ -36109,11 +36173,12 @@ function reviewEvent(requestsChanges, canApprove, transport) {
 }
 
 // [LAW:effects-at-boundaries] Pure: render the findings that could not be posted inline as a
-// summary section. They still carry their path:line so the reader can locate them.
+// summary section. They still carry their path:line so the reader can locate them. Bodies are
+// flattened (flattenBody) so a multi-line body stays one bullet, never a detached paragraph.
 function renderUnanchoredSection(unanchored) {
   if (!unanchored || unanchored.length === 0) return '';
   const items = unanchored
-    .map(f => `- \`${f.path}:${f.line}\` — ${f.body}`)
+    .map(f => `- \`${f.path}:${f.line}\` — ${severityTag(f)} ${flattenBody(f.body)}`)
     .join('\n');
   return `\n\n### Findings outside the reviewed diff\nThese reference lines not present in this PR's diff, so they could not be posted as inline comments:\n\n${items}`;
 }
@@ -36122,8 +36187,9 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   // [LAW:one-source-of-truth] One boolean drives both the GitHub event and the rendered
   // verdict, so they cannot disagree. The model never states the verdict.
   // Every finding blocks: any recorded finding forces REQUEST_CHANGES — the model makes no
-  // blocking/non-blocking call. An unanchored finding still counts, so a mis-anchored real
-  // issue can never silently downgrade the verdict to APPROVE. [LAW:no-silent-failure]
+  // blocking/non-blocking call, and a finding's severity (a 1-5 priority label) is deliberately
+  // NOT an input here. An unanchored finding still counts, so a mis-anchored real issue can
+  // never silently downgrade the verdict to APPROVE. [LAW:no-silent-failure]
   const unanchored = review.unanchored || [];
   const requestsChanges = review.findings.length > 0 || unanchored.length > 0;
   // [LAW:types-are-the-program] unreviewedScopes is a REQUIRED field of the review value, exactly
@@ -36142,7 +36208,7 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   // structured summaries + the model's assessments); this sink only places it. [LAW:single-enforcer]
   const dependencySection = review.dependencySection ? `${review.dependencySection}\n\n` : '';
   const body = `## ${reviewerName}\n\n${dependencySection}${review.summary}${renderUnanchoredSection(unanchored)}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
-  const comments = review.findings.map(finding => transport.toComment(finding));
+  const comments = review.findings.map(finding => transport.toComment({ ...finding, body: `${severityTag(finding)} ${finding.body}` }));
 
   // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.
   await octokit.rest.pulls.createReview({

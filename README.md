@@ -109,7 +109,7 @@ The action installs its bundled reviewer instructions as the engine's user-globa
 
 ## Approvals
 
-**Every finding blocks.** The reviewer makes no blocking/advisory call — a recorded finding is one the code must address, and any finding submits a `REQUEST_CHANGES` review. There is no non-blocking severity tier.
+**Every finding blocks.** The reviewer makes no blocking/advisory call — a recorded finding is one the code must address, and any finding submits a `REQUEST_CHANGES` review. Each finding carries a **severity label, `1`–`5`** (rendered as `[S1]`–`[S5]` on the comment): pure priority information for the author — `5` ships a defect, `1` is reserved for trivia like a comment typo. Severity never changes the verdict; there is no non-blocking tier.
 
 The default `GITHUB_TOKEN` cannot approve PRs. With no `GITHUB_REVIEW_TOKEN`:
 

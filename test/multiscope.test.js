@@ -80,9 +80,9 @@ describe('workerFocusText', () => {
 describe('dedupeFindings', () => {
   test('drops exact-duplicate findings by path:line:body, preserving order', () => {
     const findings = [
-      { path: 'a.js', line: 1, body: '[LAW:x] foo' },
-      { path: 'b.js', line: 2, body: '[LAW:y] bar' },
-      { path: 'a.js', line: 1, body: '[LAW:x] foo' },
+      { path: 'a.js', line: 1, body: '[LAW:x] foo', severity: 2 },
+      { path: 'b.js', line: 2, body: '[LAW:y] bar', severity: 2 },
+      { path: 'a.js', line: 1, body: '[LAW:x] foo', severity: 2 },
     ];
     const out = dedupeFindings(findings);
     assert.equal(out.length, 2);
@@ -91,8 +91,8 @@ describe('dedupeFindings', () => {
 
   test('keeps two findings on the same line with different bodies', () => {
     const out = dedupeFindings([
-      { path: 'a.js', line: 1, body: 'first distinct issue here' },
-      { path: 'a.js', line: 1, body: 'second different issue here' },
+      { path: 'a.js', line: 1, body: 'first distinct issue here', severity: 3 },
+      { path: 'a.js', line: 1, body: 'second different issue here', severity: 3 },
     ]);
     assert.equal(out.length, 2);
   });
@@ -103,8 +103,8 @@ describe('dedupeFindings', () => {
   test('keeps two same-line findings that share a >60-char prefix but differ later', () => {
     const shared = 'Bug: this comparison on the id field looks wrong and needs a closer look here '; // 77 chars
     const out = dedupeFindings([
-      { path: 'a.js', line: 1, body: `${shared}because it uses = instead of ===` },
-      { path: 'a.js', line: 1, body: `${shared}because it runs before the guard` },
+      { path: 'a.js', line: 1, body: `${shared}because it uses = instead of ===`, severity: 4 },
+      { path: 'a.js', line: 1, body: `${shared}because it runs before the guard`, severity: 4 },
     ]);
     assert.equal(out.length, 2);
   });
@@ -112,19 +112,33 @@ describe('dedupeFindings', () => {
   // Byte-identical bodies modulo whitespace/case are the real double-record case: they still collapse.
   test('dedupes bodies that differ only in whitespace and case', () => {
     const out = dedupeFindings([
-      { path: 'a.js', line: 1, body: 'Bug:  the   guard is missing' },
-      { path: 'a.js', line: 1, body: 'bug: the guard is missing' },
+      { path: 'a.js', line: 1, body: 'Bug:  the   guard is missing', severity: 4 },
+      { path: 'a.js', line: 1, body: 'bug: the guard is missing', severity: 4 },
     ]);
     assert.equal(out.length, 1);
   });
 
   test('merging preserves first-seen order across keys', () => {
     const out = dedupeFindings([
-      { path: 'a.js', line: 1, body: 'x' },
-      { path: 'b.js', line: 2, body: 'y' },
-      { path: 'a.js', line: 1, body: 'x' },
+      { path: 'a.js', line: 1, body: 'x', severity: 2 },
+      { path: 'b.js', line: 2, body: 'y', severity: 3 },
+      { path: 'a.js', line: 1, body: 'x', severity: 4 },
     ]);
     assert.deepEqual(out.map(f => f.path), ['a.js', 'b.js']); // a.js keeps its original position
+    assert.equal(out[0].severity, 4); // ...but carries the strongest severity of its group
+  });
+
+  // [LAW:no-silent-failure] severity is the author's priority signal; a duplicate must not lose it to
+  // nondeterministic arrival order — the HIGHER severity wins in either order.
+  test('a duplicate merges to the highest severity regardless of arrival order', () => {
+    for (const pair of [[2, 5], [5, 2]]) {
+      const out = dedupeFindings([
+        { path: 'a.js', line: 1, body: 'same issue', severity: pair[0] },
+        { path: 'a.js', line: 1, body: 'same issue', severity: pair[1] },
+      ]);
+      assert.equal(out.length, 1);
+      assert.equal(out[0].severity, 5);
+    }
   });
 });
 
@@ -770,6 +784,28 @@ describe('buildPrMaterial', () => {
     }
   });
 
+  // The comment/code-mismatch hunt + the 1-5 severity scale are charter content, shared by both
+  // materials. Stronger-contract-wins and one-finding-per-occurrence are the owner's explicit rules.
+  test('the charter directs comment/code mismatch review — stronger contract wins, one finding per occurrence', () => {
+    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, []);
+    assert.match(prompt, /review every comment against the code it describes/);
+    assert.match(prompt, /STRONGER of the two contracts wins/);
+    assert.match(prompt, /aligning the weaker side to the stronger one/);
+    assert.match(prompt, /ONE\s+finding per mismatched comment\+code occurrence/);
+  });
+
+  test('the charter defines severity as a 1-5 priority label that never decides the review outcome', () => {
+    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, []);
+    assert.match(prompt, /integer 1-5 priority label for the author/);
+    assert.match(prompt, /never\s+decides what happens to the review/);
+    // 1 is reserved for trivia; nothing behavioral may hide there.
+    assert.match(prompt, /ONLY trivia on the level of a typo in a comment/);
+    assert.match(prompt, /Nothing with behavioral consequence is ever a 1/);
+    // and the consequence rule is mode-neutral — no merge-gate claim in shared charter text
+    assert.match(prompt, /You do NOT decide the consequence of a finding/);
+    assert.doesNotMatch(prompt, /requests changes whenever any finding exists/);
+  });
+
   // dependencySummaries is the ONE source buildPrMaterial derives both the prompt note (renderDependencyDiffNote)
   // and the resolved-only assess bumps from. [LAW:verifiable-goals]
   test('dependencySummaries drives the worker prompt: the note is injected and the assess directive lists only RESOLVED modules', () => {
@@ -958,8 +994,8 @@ describe('buildReviewInput prior pushbacks', () => {
 describe('buildReviewInput / buildRepoReviewInput convergence-sweep prior findings', () => {
   const FILES = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
   const PRIOR = [
-    { path: 'src/a.js', line: 3, body: 'Bug: leaks the handle' },
-    { path: 'src/b.js', line: 8, body: 'Edge case: empty list crashes' },
+    { path: 'src/a.js', line: 3, body: 'Bug: leaks the handle', severity: 4 },
+    { path: 'src/b.js', line: 8, body: 'Edge case: empty list crashes', severity: 3 },
   ];
 
   test('empty priorFindings renders no sweep block in either builder (byte-identical initial pass)', () => {
@@ -970,19 +1006,19 @@ describe('buildReviewInput / buildRepoReviewInput convergence-sweep prior findin
   });
 
   test('a multi-line finding body renders as exactly one bullet line (no unprefixed continuation)', () => {
-    const multi = [{ path: 'src/a.js', line: 3, body: 'Bug: first line\n  second line\n\nthird line' }];
+    const multi = [{ path: 'src/a.js', line: 3, body: 'Bug: first line\n  second line\n\nthird line', severity: 4 }];
     const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorFindings: multi });
-    assert.match(prompt, /• \[src\/a\.js:3\] Bug: first line second line third line/);
+    assert.match(prompt, /• \[src\/a\.js:3\] \(S4\) Bug: first line second line third line/);
   });
 
-  test('renders every prior finding with location and body — in both builders', () => {
+  test('renders every prior finding with location, severity, and body — in both builders', () => {
     for (const prompt of [
       buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorFindings: PRIOR }).prompt,
       buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, priorFindings: PRIOR }).prompt,
     ]) {
       assert.match(prompt, /CONVERGENCE SWEEP/);
-      assert.match(prompt, /\[src\/a\.js:3\] Bug: leaks the handle/);
-      assert.match(prompt, /\[src\/b\.js:8\] Edge case: empty list crashes/);
+      assert.match(prompt, /\[src\/a\.js:3\] \(S4\) Bug: leaks the handle/);
+      assert.match(prompt, /\[src\/b\.js:8\] \(S3\) Edge case: empty list crashes/);
     }
   });
 
@@ -1040,15 +1076,19 @@ describe('buildReviewInput dependency assess directive', () => {
 // ── buildReviewInput surfaces unshowable files (patchless + budget-skipped) as ONE block ──────────
 // A file GitHub returns without a patch (large/binary) and a file whose diff overran MAX_DIFF_CHARS are
 // two instances of one type — "a changed file whose diff cannot be shown". Both must be named in the
-// prompt with a read-in-full instruction so the worker reviews them via the finish_review summary,
-// never silently dropped while the scout still assigns them to scopes. [LAW:no-silent-failure]
+// prompt with a read-in-full instruction routing issues through request_change (an off-grid line
+// becomes an unanchored finding that still gates the verdict), never through summary prose that the
+// verdict cannot count. [LAW:no-silent-failure]
 describe('buildReviewInput surfaces unshowable files', () => {
   test('a patchless file appears in the block with a read-in-full instruction and no diff fence', () => {
     const files = [{ filename: 'src/big.js', status: 'modified' }]; // no `patch` — GitHub omitted it
     const { prompt } = buildReviewInput({ files, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
     assert.match(prompt, /could not be shown \(too large or binary/);
     assert.match(prompt, new RegExp(`${REPO_ROOT}/src/big\\.js`));
-    assert.match(prompt, new RegExp(`report any issues via the ${TOOL_NAMES.finishReview} summary`));
+    // Issues route through request_change (counted as unanchored findings), never the summary — a
+    // summary-only issue would bypass the merge gate. [LAW:no-silent-failure]
+    assert.match(prompt, new RegExp(`Record any issue with ${TOOL_NAMES.requestChange} using the file's real line number`));
+    assert.match(prompt, new RegExp(`never route it to the ${TOOL_NAMES.finishReview} summary`));
     assert.doesNotMatch(prompt, /```diff/); // nothing to show, so no diff fence
   });
 

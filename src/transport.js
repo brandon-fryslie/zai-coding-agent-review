@@ -1,6 +1,7 @@
 'use strict';
 const core = require('@actions/core');
 const { parseUnifiedDiff } = require('./diff');
+const { severityTag, flattenBody } = require('./review');
 const { parseCostMarker } = require('./usage');
 
 const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
@@ -234,11 +235,12 @@ function reviewEvent(requestsChanges, canApprove, transport) {
 }
 
 // [LAW:effects-at-boundaries] Pure: render the findings that could not be posted inline as a
-// summary section. They still carry their path:line so the reader can locate them.
+// summary section. They still carry their path:line so the reader can locate them. Bodies are
+// flattened (flattenBody) so a multi-line body stays one bullet, never a detached paragraph.
 function renderUnanchoredSection(unanchored) {
   if (!unanchored || unanchored.length === 0) return '';
   const items = unanchored
-    .map(f => `- \`${f.path}:${f.line}\` — ${f.body}`)
+    .map(f => `- \`${f.path}:${f.line}\` — ${severityTag(f)} ${flattenBody(f.body)}`)
     .join('\n');
   return `\n\n### Findings outside the reviewed diff\nThese reference lines not present in this PR's diff, so they could not be posted as inline comments:\n\n${items}`;
 }
@@ -247,8 +249,9 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   // [LAW:one-source-of-truth] One boolean drives both the GitHub event and the rendered
   // verdict, so they cannot disagree. The model never states the verdict.
   // Every finding blocks: any recorded finding forces REQUEST_CHANGES — the model makes no
-  // blocking/non-blocking call. An unanchored finding still counts, so a mis-anchored real
-  // issue can never silently downgrade the verdict to APPROVE. [LAW:no-silent-failure]
+  // blocking/non-blocking call, and a finding's severity (a 1-5 priority label) is deliberately
+  // NOT an input here. An unanchored finding still counts, so a mis-anchored real issue can
+  // never silently downgrade the verdict to APPROVE. [LAW:no-silent-failure]
   const unanchored = review.unanchored || [];
   const requestsChanges = review.findings.length > 0 || unanchored.length > 0;
   // [LAW:types-are-the-program] unreviewedScopes is a REQUIRED field of the review value, exactly
@@ -267,7 +270,7 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   // structured summaries + the model's assessments); this sink only places it. [LAW:single-enforcer]
   const dependencySection = review.dependencySection ? `${review.dependencySection}\n\n` : '';
   const body = `## ${reviewerName}\n\n${dependencySection}${review.summary}${renderUnanchoredSection(unanchored)}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
-  const comments = review.findings.map(finding => transport.toComment(finding));
+  const comments = review.findings.map(finding => transport.toComment({ ...finding, body: `${severityTag(finding)} ${finding.body}` }));
 
   // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.
   await octokit.rest.pulls.createReview({

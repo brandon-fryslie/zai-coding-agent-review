@@ -83,7 +83,7 @@ test('collector smoke: full MCP handshake produces valid records.jsonl', async (
     // 3. tools/call request_change
     const changeResp = await rpc(child, 3, 'tools/call', {
       name: 'request_change',
-      arguments: { path: 'src/foo.js', line: 10, body: 'Fix this invariant.' },
+      arguments: { path: 'src/foo.js', line: 10, body: 'Fix this invariant.', severity: 4 },
     });
     assert.equal(changeResp.id, 3);
     assert.ok(changeResp.result, 'request_change must return a result');
@@ -105,7 +105,7 @@ test('collector smoke: full MCP handshake produces valid records.jsonl', async (
 
     const changeRecord = JSON.parse(lines[0]);
     assert.equal(changeRecord.type, 'request_change');
-    assert.deepEqual(changeRecord.finding, { path: 'src/foo.js', line: 10, body: 'Fix this invariant.' });
+    assert.deepEqual(changeRecord.finding, { path: 'src/foo.js', line: 10, body: 'Fix this invariant.', severity: 4 });
 
     const finishRecord = JSON.parse(lines[1]);
     assert.equal(finishRecord.type, 'finish');

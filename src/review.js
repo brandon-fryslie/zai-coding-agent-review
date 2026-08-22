@@ -21,10 +21,16 @@ function parseOneFinding(finding, label) {
   if (typeof body !== 'string' || body.trim().length === 0) {
     throw new Error(`${label} has an invalid body.`);
   }
-  // [LAW:types-are-the-program] A finding carries no severity: every recorded finding blocks the merge.
-  // The blocking/advisory split was deleted deliberately — the model's judgment of "non-blocking" was
-  // not trustworthy, so the distinction is unrepresentable rather than defaulted.
-  return { path: pathValue.trim(), line, body: body.trim() };
+  // [LAW:types-are-the-program] severity is a required integer priority label, 1 (trivial — a comment
+  // typo that doesn't impair meaning) to 5 (ships a defect). It is PRIORITY for the author, never a
+  // gate: the verdict counts findings, not severities — the blocking/advisory tier was deleted
+  // deliberately because the model's non-blocking judgment was not trustworthy, and this label must
+  // never grow back into one.
+  const severity = finding.severity;
+  if (!Number.isInteger(severity) || severity < 1 || severity > 5) {
+    throw new Error(`${label} has an invalid severity (expected an integer 1-5).`);
+  }
+  return { path: pathValue.trim(), line, body: body.trim(), severity };
 }
 
 function parseReviewValue(parsed, context) {
@@ -166,13 +172,30 @@ function normalizeBody(body) {
 // collapse, while any genuine difference in wording keeps two findings apart. Cross-worker paraphrases
 // of one issue surviving as near-duplicates is noise, not loss — the accepted direction to err.
 //
-// First-seen wins: members sharing a key are the same recorded finding (every finding blocks the
-// merge, so there is no severity to reconcile), and first-seen order is preserved by the Map.
+// [LAW:no-silent-failure] Severity is the author's priority signal, so a duplicate must never lose it
+// to arrival order (nondeterministic under concurrent workers — [LAW:no-ambient-temporal-coupling]):
+// when two members share a key, the merged finding carries the HIGHEST severity of the group, never
+// the one that happened to arrive first. First-seen order is preserved (a Map keeps a key's original
+// position when its value is replaced).
+//
+// Which MEMBER survives is a separate preference: a candidate mid-anchoring may carry snappedFromLine
+// (partitionFindings scaffolding — the finding cited a line just outside the diff and was snapped).
+// An exact-anchored member (no snappedFromLine) outranks a snapped one regardless of arrival order,
+// so a finding also recorded exactly on the anchor line is never presented with a stale
+// "referenced line M, just outside the diff" note. Pre-anchor callers (multiscope) carry no
+// snappedFromLine on any member, so for them this preference is vacuously first-seen.
 function dedupeFindings(findings) {
   const byKey = new Map();
   for (const f of findings) {
     const key = `${f.path}:${f.line}:${normalizeBody(f.body)}`;
-    if (!byKey.has(key)) byKey.set(key, f);
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, f);
+      continue;
+    }
+    const severity = Math.max(existing.severity, f.severity);
+    const exactBeatsSnapped = existing.snappedFromLine !== undefined && f.snappedFromLine === undefined;
+    byKey.set(key, exactBeatsSnapped ? { ...f, severity } : { ...existing, severity });
   }
   return [...byKey.values()];
 }
@@ -246,4 +269,20 @@ function partitionFindings(findings, anchors) {
   return { anchored, unanchored };
 }
 
-module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine };
+// [LAW:one-source-of-truth] The one rendering of a finding's severity label. Every sink that shows a
+// finding to a human (inline PR comment, the unanchored summary section, the whole-repo report, the
+// convergence-sweep prior list) derives the tag from here rather than restating it. The tag is
+// PRESENTATION of the priority value — it never feeds the verdict.
+function severityTag(finding) {
+  return `**[S${finding.severity}]**`;
+}
+
+// [LAW:single-enforcer] The one rule for flattening a multi-line finding body into a single Markdown
+// list line: continuation lines at column 0 would detach from their bullet and render as a new
+// paragraph, so every list-context sink (unanchored section, repo report, prior-findings block)
+// flattens through this, never its own regex.
+function flattenBody(body) {
+  return body.replace(/\s*\n\s*/g, ' ').trim();
+}
+
+module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTag, flattenBody };

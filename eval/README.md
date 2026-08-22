@@ -159,8 +159,8 @@ replay material and pools the other rounds' eligible findings as inventory.
 
 **70 findings total — 20 inventory must-finds (15 of them in the frozen rounds).**
 Diverse across language (TS/Go/JS/Markdown) and change kind (perf, supply-chain,
-feature, spec/CI). `laws-4`'s dribble was entirely advisory, so its inventory adds
-nice-to-finds but no must-finds — an honest reflection of that PR, not a curation gap.
+feature, spec/CI). `laws-4`'s dribble was entirely low-stakes maintainability notes, so its inventory
+adds nice-to-finds but no must-finds — an honest reflection of that PR, not a curation gap.
 
 ## Replaying a case
 
@@ -191,8 +191,9 @@ directory per repeat, so a re-run never clobbers a prior batch's artifacts.
 ```
 eval/out/<case-name>/<timestamp>-run<i>/
   findings.json   — the raw merged findings from runMultiScope, PRE anchor-partition:
-                    an array of { path, line, body } (runs before 1.41.0 also carry a
-                    severity field, kept readable by the scorer). This is what the scorer
+                    an array of { path, line, body, severity } — severity is an integer
+                    1-5 priority label from 1.41.0 on (older frozen runs carry the legacy
+                    'blocking'/'advisory' strings; the scorer reads both). This is what the scorer
                     (copirate-eval-harness-2fk.3) matches against expected.json.
   summary.txt     — the aggregated multi-scope review summary.
   usage.json      — { inputTokens, outputTokens, cost } (cost is the existing discriminated
@@ -410,7 +411,7 @@ lower, and the bar the quality work must raise.
 
 2. **Annotate `expected.json` by hand.** Replace every `UNREVIEWED` with `must-find` /
    `nice-to-find` / `noise` and a written `justification`, reading each finding against
-   the actual code — do not trust the agent's own blocking/advisory label. Prefix
+   the actual code — do not trust the agent's own severity label. Prefix
    genuinely ambiguous calls with `AMBIGUOUS —` and raise them with the maintainer. A
    left-over `UNREVIEWED` is intentionally loud so an un-annotated case is never
    silently scored.
