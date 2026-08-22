@@ -113,7 +113,7 @@ The action installs its bundled reviewer instructions as the engine's user-globa
 
 The default `GITHUB_TOKEN` cannot approve PRs. With no `GITHUB_REVIEW_TOKEN`:
 
-- Any finding is submitted as a `REQUEST_CHANGES` review with inline threads.
+- Any finding is submitted as a `REQUEST_CHANGES` review — anchored findings as inline threads, unanchored ones (an off-grid line or an unshowable file) in the review body's "Findings outside the reviewed diff" section.
 - A clean review just logs `✅ Approved`, with no formal approval submitted.
 
 Set `GITHUB_REVIEW_TOKEN` to an approval-capable user or GitHub App token to have clean reviews submit a formal `APPROVE`. When a finding exists the action requests changes — resolve the threads and dismiss the review to proceed.

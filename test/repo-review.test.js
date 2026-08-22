@@ -60,6 +60,16 @@ describe('buildRepoReviewInput', () => {
     const result = buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
     assert.deepEqual(Object.keys(result), ['prompt']);
   });
+
+  // [LAW:no-silent-failure] the summary must never be a findings channel: in repo mode any real line is
+  // valid, so every issue goes through request_change — a summary-only issue would render as prose the
+  // report cannot itemize. The deleted escape ("state that problem here rather than drop it") must not return.
+  test('the summary is not a findings channel — every issue routes through request_change', () => {
+    const { prompt } = buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
+    assert.match(prompt, /NOT a channel for findings/);
+    assert.match(prompt, /any real line is valid/);
+    assert.doesNotMatch(prompt, /state that problem here rather than drop it/);
+  });
 });
 
 // --- buildReviewInput (the PR-diff MATERIAL) — repo-root anchoring ---

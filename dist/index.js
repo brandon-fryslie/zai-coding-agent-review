@@ -30838,6 +30838,7 @@ module.exports = { TRANSCRIPT_DIR, buildTranscript, emitTranscript };
 
 
 const dns = (__nccwpck_require__(610).promises);
+const { ASSESSMENT_VERDICTS } = __nccwpck_require__(1565);
 
 // Detect a Go module version bump in a PR's go.mod diff, resolve the module to its GitHub
 // repository, and fetch what actually changed upstream between the two versions — so a reviewer
@@ -31144,15 +31145,22 @@ function mdText(str) {
   return escapeHtml(String(str).replace(/[\\`*_[\]()~]/g, m => `\\${m}`));
 }
 
-// [LAW:one-source-of-truth] The verdict enum owns its glyph, label, and action at THIS one site.
-// Nothing else re-spells a verdict; every render derives from here. The verdict is PRESENTATION — the
-// merge gate is driven by findings (every finding blocks), not by this glyph — so a lenient verdict
-// can never silently downgrade a real blocker. [LAW:single-enforcer]
+// [LAW:one-source-of-truth] The verdict VALUE SET is owned by ASSESSMENT_VERDICTS (src/review.js, the
+// validation boundary); this table owns only each verdict's PRESENTATION (glyph, label, action). The
+// module-load check below makes the two impossible to drift silently: adding or renaming a verdict in
+// review.js without a matching entry here fails at import, loudly, not mid-render with a TypeError.
+// The verdict is PRESENTATION — the merge gate is driven by findings (every finding blocks), not by
+// this glyph — so a lenient verdict can never silently downgrade a real blocker. [LAW:single-enforcer]
 const VERDICT_PRESENTATION = {
   safe: { glyph: '✅', label: 'Safe', action: 'routine bump; safe to merge.' },
   review: { glyph: '⚠️', label: 'Review', action: 'worth a human glance before merge.' },
   risky: { glyph: '🛑', label: 'Risky', action: 'breaking change affecting this repo — address before merge.' },
 };
+for (const verdict of ASSESSMENT_VERDICTS) {
+  if (!VERDICT_PRESENTATION[verdict]) {
+    throw new Error(`VERDICT_PRESENTATION is missing an entry for assessment verdict '${verdict}'.`);
+  }
+}
 // [FRAMING:representation] Two distinct not-a-verdict states get two distinct glyphs, so the summary line
 // is self-describing without cross-referencing the tally: ⚪ = upstream could not be fetched (a host-side
 // fetch failure), ❔ = upstream WAS fetched but the model recorded no merge-risk assessment (a model-side
@@ -31184,7 +31192,8 @@ function renderDependencyReviewSection(summaries, assessments = []) {
   const esc = escapeHtml;
   const mdLine = str => mdText(str.replace(/\s+/g, ' ').trim());
 
-  const tally = { safe: 0, review: 0, risky: 0, unresolved: 0, unassessed: 0 };
+  // Verdict buckets derive from the enum (one value set); the two not-a-verdict buckets are local.
+  const tally = Object.fromEntries([...ASSESSMENT_VERDICTS.map(v => [v, 0]), ['unresolved', 0], ['unassessed', 0]]);
   const blocks = summaries.map((s) => {
     if (!s.resolved) {
       tally.unresolved++;
@@ -31239,9 +31248,9 @@ function renderDependencyReviewSection(summaries, assessments = []) {
   // from counts, never a fixed set of branches. verdict buckets first (the headline), then the two
   // not-fully-judged buckets.
   const parts = [];
-  if (tally.safe) parts.push(`${tally.safe} ${VERDICT_PRESENTATION.safe.glyph} safe`);
-  if (tally.review) parts.push(`${tally.review} ${VERDICT_PRESENTATION.review.glyph} review`);
-  if (tally.risky) parts.push(`${tally.risky} ${VERDICT_PRESENTATION.risky.glyph} risky`);
+  for (const verdict of ASSESSMENT_VERDICTS) {
+    if (tally[verdict]) parts.push(`${tally[verdict]} ${VERDICT_PRESENTATION[verdict].glyph} ${verdict}`);
+  }
   if (tally.unassessed) parts.push(`${tally.unassessed} ${UNASSESSED_GLYPH} unassessed`);
   if (tally.unresolved) parts.push(`${tally.unresolved} ${UNRESOLVED_GLYPH} unresolved`);
   const rollup = `**Dependency review** — ${summaries.length} module(s): ${parts.join(' · ')}`;
@@ -34327,12 +34336,14 @@ function reviewCharter(toolNames) {
 // findings to fill the silence — trading the precision the eval gate holds for fake recall. [LAW:no-silent-failure]
 function renderPriorFindingsBlock(priorFindings, toolNames) {
   if (priorFindings.length === 0) return '';
-  // A finding body is free text and routinely multi-line; flattenBody (the one flattening rule)
-  // collapses it so each finding renders as exactly ONE bullet — an unprefixed continuation line at
-  // prompt indentation could read as a stray instruction rather than part of the listed finding. The
-  // severity label likewise derives from severityTag, the one spelling. [LAW:single-enforcer]
+  // The ENTIRE bullet — path, line, tag, and body — is flattened as one string through flattenBody
+  // (the one flattening rule), so each finding renders as exactly ONE bullet no matter which field
+  // carries a newline. The body is the routine case, but a path can legally embed a newline too
+  // (unquoteCStylePath reconstructs one from a quoted diff header), and an unprefixed continuation
+  // line at prompt indentation could read as a stray instruction — an injection vector, not just a
+  // rendering blemish. The severity label derives from severityTag, the one spelling. [LAW:single-enforcer]
   return `\n    THIS IS A CONVERGENCE SWEEP. A previous pass of this same review already examined this material and recorded the findings below. They are ALREADY collected and will be posted — do not re-record, rephrase, re-argue, or re-verify any of them; a re-record is pure noise.\n`
-    + priorFindings.map(f => `      • [${f.path}:${f.line}] ${severityTag(f)} ${flattenBody(f.body)}`).join('\n')
+    + priorFindings.map(f => `      • ${flattenBody(`[${f.path}:${f.line}] ${severityTag(f)} ${f.body}`)}`).join('\n')
     + `\n    Your job in this sweep is ONLY what that list misses: read the material fresh and hunt for real issues NOT already listed — parts of the change no listed finding touches, failure classes the list has none of (edge cases, broken callers, concurrency, security), or a deeper problem behind a listed symptom. Record each genuinely new issue with ${toolNames.requestChange} as usual. If your fresh read surfaces nothing real that is missing, record NOTHING and call ${toolNames.finishReview} with a one-line summary saying the sweep found nothing new — an empty sweep is this review converging, which is a correct and expected outcome, not a failure. Never pad the sweep with speculative or trivial findings to avoid coming back empty.\n`;
 }
 
@@ -34373,7 +34384,7 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // which counts toward the verdict and renders in the review body — so the riskiest (biggest) changed
   // files stay reviewable, and an issue in them can never bypass the merge gate via summary prose.
   if (unshowableFiles.length > 0) {
-    diffs += `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`). Read each in full at its absolute path and review its changes. Record any issue with ${toolNames.requestChange} using the file's real line number from the full file — the line cannot be anchored inline, so the finding will be reported in the review summary instead; never route it to the ${toolNames.finishReview} summary:\n${unshowableFiles.map(f => `> - ${reviewedRepoRoot}/${f}`).join('\n')}`;
+    diffs += `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`). Read each in full at its absolute path and review its changes. Record any issue with ${toolNames.requestChange} using the file's real line number from the full file — the line cannot be anchored inline, so the host will post that finding in the review body's "Findings outside the reviewed diff" section; never put it in the ${toolNames.finishReview} summary:\n${unshowableFiles.map(f => `> - ${reviewedRepoRoot}/${f}`).join('\n')}`;
   }
 
   if (dependencyDiffNote) {
@@ -34421,8 +34432,9 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
     renamed field. If nothing this repo uses is affected, say so briefly in the ${toolNames.finishReview}
     summary; if something is, name the exact upstream change and the call site it affects
     — as ${toolNames.requestChange} on the go.mod version line: the displayed LINE value if that line is
-    shown above, or go.mod's real line number if its diff was too large to show inline (the finding is
-    then carried as an unanchored finding in the review summary; see the unshowable-files note above) —
+    shown above, or go.mod's real line number if its diff was too large to show inline (the host then posts
+    the finding in the review body's "Findings outside the reviewed diff" section; see the unshowable-files
+    note above) —
     never route it to the ${toolNames.finishReview} summary and never drop it because the anchor isn't available.\n`
     : '';
 
@@ -34519,7 +34531,8 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
     relies on an existing loose type), attach the comment to the changed LINE responsible for the new
     problem and explain the upstream link in the body. If a real finding cannot be tied to any changed
     LINE, still record it with ${toolNames.requestChange} at the most relevant real line of its file —
-    it will be carried as an unanchored finding in the review summary — rather than dropping it.
+    the host posts it in the review body's "Findings outside the reviewed diff" section — rather than
+    dropping it.
 
     ${reviewCharter(toolNames)}
     \n\n${diffs}`,
@@ -35181,7 +35194,7 @@ function flattenBody(body) {
   return body.replace(/\s*\n\s*/g, ' ').trim();
 }
 
-module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTag, flattenBody };
+module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, ASSESSMENT_VERDICTS, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTag, flattenBody };
 
 
 /***/ }),

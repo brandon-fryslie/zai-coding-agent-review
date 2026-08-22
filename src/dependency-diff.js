@@ -1,6 +1,7 @@
 'use strict';
 
 const dns = require('node:dns').promises;
+const { ASSESSMENT_VERDICTS } = require('./review');
 
 // Detect a Go module version bump in a PR's go.mod diff, resolve the module to its GitHub
 // repository, and fetch what actually changed upstream between the two versions — so a reviewer
@@ -307,15 +308,22 @@ function mdText(str) {
   return escapeHtml(String(str).replace(/[\\`*_[\]()~]/g, m => `\\${m}`));
 }
 
-// [LAW:one-source-of-truth] The verdict enum owns its glyph, label, and action at THIS one site.
-// Nothing else re-spells a verdict; every render derives from here. The verdict is PRESENTATION — the
-// merge gate is driven by findings (every finding blocks), not by this glyph — so a lenient verdict
-// can never silently downgrade a real blocker. [LAW:single-enforcer]
+// [LAW:one-source-of-truth] The verdict VALUE SET is owned by ASSESSMENT_VERDICTS (src/review.js, the
+// validation boundary); this table owns only each verdict's PRESENTATION (glyph, label, action). The
+// module-load check below makes the two impossible to drift silently: adding or renaming a verdict in
+// review.js without a matching entry here fails at import, loudly, not mid-render with a TypeError.
+// The verdict is PRESENTATION — the merge gate is driven by findings (every finding blocks), not by
+// this glyph — so a lenient verdict can never silently downgrade a real blocker. [LAW:single-enforcer]
 const VERDICT_PRESENTATION = {
   safe: { glyph: '✅', label: 'Safe', action: 'routine bump; safe to merge.' },
   review: { glyph: '⚠️', label: 'Review', action: 'worth a human glance before merge.' },
   risky: { glyph: '🛑', label: 'Risky', action: 'breaking change affecting this repo — address before merge.' },
 };
+for (const verdict of ASSESSMENT_VERDICTS) {
+  if (!VERDICT_PRESENTATION[verdict]) {
+    throw new Error(`VERDICT_PRESENTATION is missing an entry for assessment verdict '${verdict}'.`);
+  }
+}
 // [FRAMING:representation] Two distinct not-a-verdict states get two distinct glyphs, so the summary line
 // is self-describing without cross-referencing the tally: ⚪ = upstream could not be fetched (a host-side
 // fetch failure), ❔ = upstream WAS fetched but the model recorded no merge-risk assessment (a model-side
@@ -347,7 +355,8 @@ function renderDependencyReviewSection(summaries, assessments = []) {
   const esc = escapeHtml;
   const mdLine = str => mdText(str.replace(/\s+/g, ' ').trim());
 
-  const tally = { safe: 0, review: 0, risky: 0, unresolved: 0, unassessed: 0 };
+  // Verdict buckets derive from the enum (one value set); the two not-a-verdict buckets are local.
+  const tally = Object.fromEntries([...ASSESSMENT_VERDICTS.map(v => [v, 0]), ['unresolved', 0], ['unassessed', 0]]);
   const blocks = summaries.map((s) => {
     if (!s.resolved) {
       tally.unresolved++;
@@ -402,9 +411,9 @@ function renderDependencyReviewSection(summaries, assessments = []) {
   // from counts, never a fixed set of branches. verdict buckets first (the headline), then the two
   // not-fully-judged buckets.
   const parts = [];
-  if (tally.safe) parts.push(`${tally.safe} ${VERDICT_PRESENTATION.safe.glyph} safe`);
-  if (tally.review) parts.push(`${tally.review} ${VERDICT_PRESENTATION.review.glyph} review`);
-  if (tally.risky) parts.push(`${tally.risky} ${VERDICT_PRESENTATION.risky.glyph} risky`);
+  for (const verdict of ASSESSMENT_VERDICTS) {
+    if (tally[verdict]) parts.push(`${tally[verdict]} ${VERDICT_PRESENTATION[verdict].glyph} ${verdict}`);
+  }
   if (tally.unassessed) parts.push(`${tally.unassessed} ${UNASSESSED_GLYPH} unassessed`);
   if (tally.unresolved) parts.push(`${tally.unresolved} ${UNRESOLVED_GLYPH} unresolved`);
   const rollup = `**Dependency review** — ${summaries.length} module(s): ${parts.join(' · ')}`;

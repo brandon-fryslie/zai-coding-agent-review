@@ -285,4 +285,4 @@ function flattenBody(body) {
   return body.replace(/\s*\n\s*/g, ' ').trim();
 }
 
-module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTag, flattenBody };
+module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, ASSESSMENT_VERDICTS, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTag, flattenBody };

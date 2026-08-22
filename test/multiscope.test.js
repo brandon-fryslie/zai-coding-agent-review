@@ -1088,7 +1088,8 @@ describe('buildReviewInput surfaces unshowable files', () => {
     // Issues route through request_change (counted as unanchored findings), never the summary — a
     // summary-only issue would bypass the merge gate. [LAW:no-silent-failure]
     assert.match(prompt, new RegExp(`Record any issue with ${TOOL_NAMES.requestChange} using the file's real line number`));
-    assert.match(prompt, new RegExp(`never route it to the ${TOOL_NAMES.finishReview} summary`));
+    assert.match(prompt, new RegExp(`never put it in the ${TOOL_NAMES.finishReview} summary`));
+    assert.match(prompt, /Findings outside the reviewed diff/); // the exact destination is named, not "the summary"
     assert.doesNotMatch(prompt, /```diff/); // nothing to show, so no diff fence
   });
 
