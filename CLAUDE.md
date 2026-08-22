@@ -127,7 +127,7 @@ For claude-code, `buildCommand` always uses `--verbose --output-format stream-js
 
 ### Approval permissions
 
-The default `GITHUB_TOKEN` cannot approve PRs. With no `GITHUB_REVIEW_TOKEN`, a clean review just logs `✅ Approved` (no formal approval submitted); findings still submit a `REQUEST_CHANGES` review. Set `GITHUB_REVIEW_TOKEN` (used for *all* GitHub calls when present) to submit formal approvals.
+The default `GITHUB_TOKEN` cannot approve PRs. With no `GITHUB_REVIEW_TOKEN`, a clean review still posts a review — a `COMMENT` one whose body reads `✅ Approved` (`reviewEvent` in `src/transport.js`), so the visible result lands either way; only the formal `APPROVE` state is withheld. Findings still submit a `REQUEST_CHANGES` review. Set `GITHUB_REVIEW_TOKEN` (used for *all* GitHub calls when present) to submit formal approvals.
 
 ## Two CLAUDE.md files — do not confuse them
 
