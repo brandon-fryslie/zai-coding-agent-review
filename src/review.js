@@ -1,5 +1,12 @@
 'use strict';
 
+// [LAW:one-source-of-truth] The legal severity range, spelled ONCE. The enforcing parser below and the
+// collector tool's advertised JSON schema (src/collector-server.js) both derive from these, so the
+// bound the model is told about and the bound the host actually enforces cannot drift apart — a drift
+// that would either reject a value the schema invited or accept one it forbade. [LAW:single-enforcer]
+const SEVERITY_MIN = 1;
+const SEVERITY_MAX = 5;
+
 // [LAW:decomposition] The single per-finding validator: one job — turn one raw record into a typed
 // finding or throw. Both entry points below call it, each supplying the `label` IT knows names the
 // finding's real position (the array index for a batch, the record index for a single finding), so an
@@ -27,10 +34,15 @@ function parseOneFinding(finding, label) {
   // deliberately because the model's non-blocking judgment was not trustworthy, and this label must
   // never grow back into one.
   const severity = finding.severity;
-  if (!Number.isInteger(severity) || severity < 1 || severity > 5) {
-    throw new Error(`${label} has an invalid severity (expected an integer 1-5).`);
+  if (!Number.isInteger(severity) || severity < SEVERITY_MIN || severity > SEVERITY_MAX) {
+    throw new Error(`${label} has an invalid severity (expected an integer ${SEVERITY_MIN}-${SEVERITY_MAX}).`);
   }
-  return { path: pathValue.trim(), line, body: body.trim(), severity };
+  // [LAW:parse-dont-validate] `path` is stamped single-line HERE, at the one boundary that produces a
+  // finding, so no sink downstream has to remember to flatten it. `body` is deliberately NOT stamped:
+  // it is genuinely block text (an inline PR comment renders paragraphs, and partitionFindings appends
+  // a "\n\n_(Anchored to line N…)_" note), so its line-structured sinks render it through
+  // findingLineText — the one place that flattens a body. [LAW:one-type-per-behavior]
+  return { path: flattenBody(pathValue), line, body: body.trim(), severity };
 }
 
 function parseReviewValue(parsed, context) {
@@ -41,7 +53,11 @@ function parseReviewValue(parsed, context) {
   if (typeof parsed.summary !== 'string' || parsed.summary.trim().length === 0) {
     throw new Error(`${context} must include a non-empty summary.`);
   }
-  const summary = parsed.summary.trim();
+  // [LAW:parse-dont-validate] A spawn's summary is a single-line value in every sink that consumes it —
+  // composeSummary's `**scope** — summary` line, and the scout's summary interpolated as a worker's
+  // structural context. Stamping it here is what makes those sinks safe by construction rather than by
+  // each remembering to flatten a model-authored string. [LAW:single-enforcer]
+  const summary = flattenBody(parsed.summary);
   if (!Array.isArray(parsed.findings)) {
     throw new Error(`${context} must include a findings array.`);
   }
@@ -78,10 +94,16 @@ function parseScopeValue(scope, index) {
   if (typeof focus !== 'string' || focus.trim().length === 0) {
     throw new Error(`Review collector scope ${index + 1} ('${name.trim()}') has an invalid focus.`);
   }
+  // [LAW:parse-dont-validate] name, focus and every file entry are stamped single-line here. All three
+  // reach line-structured sinks — the aggregated summary's scope list, the worker prompt's CONCENTRATE
+  // block (via workerFocusText), the read-targets line — and all three are MODEL-AUTHORED, so an
+  // unstamped one puts attacker-steerable text at column 0 of a prompt, where a continuation line reads
+  // as an instruction rather than as data. Stamping at the single boundary that produces a scope is what
+  // makes every one of those sinks safe without any of them checking. [LAW:single-enforcer]
   const files = Array.isArray(scope.files)
-    ? scope.files.filter(f => typeof f === 'string' && f.trim().length > 0).map(f => f.trim())
+    ? scope.files.filter(f => typeof f === 'string' && f.trim().length > 0).map(f => flattenBody(f))
     : [];
-  return { name: name.trim(), focus: focus.trim(), files };
+  return { name: flattenBody(name), focus: flattenBody(focus), files };
 }
 
 // [LAW:types-are-the-program] A dependency assessment is the same kind of typed, schema-validated
@@ -124,9 +146,14 @@ function parseAssessmentValue(assessment, index) {
   // callSite is a genuine optional: absent/blank collapses to null (no call site to name), a value the
   // renderer handles — never a guard skipping work. [LAW:no-defensive-null-guards]
   const callSite = typeof assessment.callSite === 'string' && assessment.callSite.trim().length > 0
-    ? assessment.callSite.trim()
+    ? flattenBody(assessment.callSite)
     : null;
-  return { module: module.trim(), impact: impact.trim(), affected: assessment.affected, callSite, verdict };
+  // [LAW:parse-dont-validate] module, impact and callSite are stamped single-line here: every one of
+  // them renders as part of a bullet in the posted review's dependency section AND in the worker
+  // prompt's dependency note, both line-structured. dedupeAssessments also keys on `module`, so
+  // stamping it at the boundary keeps one module from splitting into two records over a stray
+  // separator. [LAW:single-enforcer]
+  return { module: flattenBody(module), impact: flattenBody(impact), affected: assessment.affected, callSite, verdict };
 }
 
 // [LAW:one-source-of-truth] "The same assessed module": keyed on the module path alone — a module is
@@ -277,14 +304,55 @@ function severityTag(finding) {
   return `**[S${finding.severity}]**`;
 }
 
-// [LAW:single-enforcer] The one rule for flattening untrusted multi-line text into a single Markdown
-// line: continuation lines at column 0 would detach from their bullet/heading and render as injected
-// markup, so every line-structured sink (unanchored section, repo report, prior-findings block, the
-// prompt's file lists) flattens through this, never its own regex. It collapses EVERY vertical
-// separator — \n, a lone \r (a CommonMark line ending, reconstructable in a filename via
-// unquoteCStylePath), and U+2028/U+2029 — not just \n.
+// [LAW:single-enforcer] The one rendering of a finding as a single line of text. A body is the one
+// model-authored field that is legitimately block text — an inline PR comment renders its paragraphs,
+// and partitionFindings appends a "\n\n_(Anchored to line N…)_" note — so it is the one field a
+// line-structured sink must still collapse. This is that collapse's single owner: the three
+// line-structured finding sinks (the posted review's unanchored section, the whole-repo report, the
+// convergence-sweep prior list) each compose their own prefix around this and none re-authors the
+// tag-plus-flattened-body rule.
+function findingLineText(finding) {
+  return `${severityTag(finding)} ${flattenBody(finding.body)}`;
+}
+
+// [LAW:one-source-of-truth] The one definition of "a vertical separator" — the characters that end a
+// line for a Markdown renderer or a prompt reader: \n, a lone \r (a CommonMark line ending,
+// reconstructable in a filename via unquoteCStylePath), and U+2028/U+2029. Both consumers below build
+// their regex from THIS string, so the set can never drift between the collapser and the detector.
+const VERTICAL_SEPARATORS = '\\n\\r\\u2028\\u2029';
+
+// [LAW:single-enforcer] The one rule for collapsing untrusted text to a single line: a continuation
+// line at column 0 detaches from its bullet/heading and renders as injected markup — or, in a prompt,
+// reads as a stray instruction. It collapses EVERY vertical separator — \n, a lone \r (a CommonMark
+// line ending, reconstructable in a filename via unquoteCStylePath), and U+2028/U+2029 — not just \n.
+//
+// [LAW:parse-dont-validate] This is applied at PARSE BOUNDARIES, not at sinks. Every model-authored
+// field whose domain is single-line (a scope's name/focus/files, a spawn's summary, a finding's path,
+// an assessment's module/impact/callSite) is stamped as it is parsed, so a sink cannot receive an
+// unflattened one and therefore has nothing to check. Sink-side flattening was the previous design and
+// it failed the way call-site discipline always fails: `focus` and a worker's `summary` reached
+// line-structured sinks raw because two of a dozen call sites were missed. The two remaining callers
+// are the ones whose input is NOT single-line by domain: findingLineText (a body is block text) and
+// the diff-path reject check (a path must stay byte-exact, so it is refused, never collapsed).
 function flattenBody(body) {
-  return body.replace(/\s*[\n\r\u2028\u2029]\s*/g, ' ').trim();
+  return body.replace(new RegExp(`\\s*[${VERTICAL_SEPARATORS}]\\s*`, 'g'), ' ').trim();
+}
+
+// [LAW:one-source-of-truth] The detector and the collapser read the SAME character class, so the set of
+// "what counts as a vertical separator" has one definition. A path is refused rather than collapsed
+// (see parseReviewableFiles in diff.js): collapsing a path yields a filename that does not exist, so
+// the worker told to open it reads nothing and the file's review coverage vanishes silently \u2014 the
+// failure this replaces. [LAW:no-silent-failure]
+function hasVerticalSeparator(text) {
+  return new RegExp(`[${VERTICAL_SEPARATORS}]`).test(text);
+}
+
+// [LAW:one-source-of-truth] The subject line of a block of text — everything before its first vertical
+// separator — built from the SAME separator class as the collapser and the detector. A hand-rolled
+// `.split('\n')[0]` is the same rule spelled a fourth time and a strictly weaker one: it keeps a lone
+// \r or a U+2028 and hands the sink a string that still breaks its line.
+function firstLine(text) {
+  return text.split(new RegExp(`[${VERTICAL_SEPARATORS}]`))[0].trim();
 }
 
 // [LAW:single-enforcer] The one rule for rendering untrusted text as a Markdown code span: the
@@ -299,4 +367,4 @@ function codeSpan(content) {
   return `${fence}${pad}${content}${pad}${fence}`;
 }
 
-module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, ASSESSMENT_VERDICTS, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTag, flattenBody, codeSpan };
+module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, ASSESSMENT_VERDICTS, SEVERITY_MIN, SEVERITY_MAX, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTag, findingLineText, flattenBody, hasVerticalSeparator, firstLine, codeSpan };

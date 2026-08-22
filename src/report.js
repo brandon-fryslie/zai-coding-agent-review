@@ -1,5 +1,5 @@
 'use strict';
-const { severityTag, flattenBody } = require('./review');
+const { findingLineText } = require('./review');
 
 // The printed sink for full-repo review mode. There is no pull request to comment on, so
 // findings are rendered as a single Markdown report written to the GitHub Step Summary and
@@ -22,10 +22,10 @@ function groupByPath(findings) {
   return byPath;
 }
 
-// One finding rendered as a list item; the body is flattened to a single line so the grouped
-// list stays scannable in the Step Summary.
+// One finding rendered as a list item. findingLineText owns the tag-plus-single-line-body rule, so
+// the grouped list stays scannable and this sink does not re-author it. [LAW:single-enforcer]
 function renderFinding(finding) {
-  return `- **line ${finding.line}:** ${severityTag(finding)} ${flattenBody(finding.body)}`;
+  return `- **line ${finding.line}:** ${findingLineText(finding)}`;
 }
 
 function renderFindingsSection(findings) {
@@ -34,9 +34,9 @@ function renderFindingsSection(findings) {
   }
   const lines = [`### Findings (${findings.length})`];
   for (const [path, list] of groupByPath(findings)) {
-    // The path heads an ATX heading line; flattened so a newline-bearing filename cannot inject
-    // its own heading into the Step Summary. [LAW:single-enforcer]
-    lines.push('', `#### ${flattenBody(path)}`, ...list.map(renderFinding));
+    // The path heads an ATX heading line and needs no flattening here: parseOneFinding stamped it
+    // single-line, so a path that could inject its own heading cannot reach this sink. [LAW:parse-dont-validate]
+    lines.push('', `#### ${path}`, ...list.map(renderFinding));
   }
   return lines;
 }

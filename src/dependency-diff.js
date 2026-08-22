@@ -1,7 +1,7 @@
 'use strict';
 
 const dns = require('node:dns').promises;
-const { ASSESSMENT_VERDICTS, flattenBody, codeSpan } = require('./review');
+const { ASSESSMENT_VERDICTS, flattenBody, firstLine, codeSpan } = require('./review');
 
 // Detect a Go module version bump in a PR's go.mod diff, resolve the module to its GitHub
 // repository, and fetch what actually changed upstream between the two versions — so a reviewer
@@ -193,15 +193,24 @@ const MAX_FILES = 50;
 // three. resolveModuleRepo's own network call (the vanity-import discovery fetch) is not exempt: a
 // DNS failure or timeout there is caught here exactly like a compareCommits failure below, so both
 // of this function's network calls share one no-throw contract, not two.
+// [LAW:parse-dont-validate] The one constructor of an unresolved summary, and therefore the one place
+// `reason` is produced. Every reason embeds an error message the host does not control (a DNS failure,
+// an octokit error body), so it is stamped single-line HERE rather than at each of the sinks that
+// render it into a bullet or a <summary> line. Three call sites producing the value and two rendering
+// it is exactly the ratio at which sink-side discipline starts missing one. [LAW:single-enforcer]
+function unresolvedSummary(bump, reason) {
+  return { ...bump, resolved: false, reason: flattenBody(reason) };
+}
+
 async function fetchUpstreamChangeSummary(octokit, bump, fetchImpl = fetch, lookupImpl = dns.lookup) {
   let repo;
   try {
     repo = await resolveModuleRepo(bump.modulePath, fetchImpl, lookupImpl);
   } catch (e) {
-    return { ...bump, resolved: false, reason: `could not resolve a GitHub repository for this module path (${e.message})` };
+    return unresolvedSummary(bump, `could not resolve a GitHub repository for this module path (${e.message})`);
   }
   if (!repo) {
-    return { ...bump, resolved: false, reason: 'could not resolve a GitHub repository for this module path' };
+    return unresolvedSummary(bump, 'could not resolve a GitHub repository for this module path');
   }
   const base = refFor(bump.from);
   const head = refFor(bump.to);
@@ -216,12 +225,17 @@ async function fetchUpstreamChangeSummary(octokit, bump, fetchImpl = fetch, look
       repoName: repo.repo,
       compareUrl: data.html_url,
       totalCommits: commits.length,
-      commits: commits.slice(-MAX_COMMITS).map((c) => ({ sha: c.sha.slice(0, 12), message: c.commit.message.split('\n')[0] })),
+      // [LAW:parse-dont-validate] Upstream commit subjects and filenames are attacker-influenceable
+      // (anyone who can land a commit in the dependency) and both render as bullets — in the worker
+      // PROMPT as well as the posted review — so they are stamped single-line here, at the one place
+      // this summary is built. firstLine replaces a `split('\n')[0]` that kept a lone \r or U+2028 and
+      // handed the bullet a string that still broke its line.
+      commits: commits.slice(-MAX_COMMITS).map((c) => ({ sha: c.sha.slice(0, 12), message: firstLine(c.commit.message) })),
       totalFiles: files.length,
-      files: files.slice(0, MAX_FILES).map((f) => f.filename),
+      files: files.slice(0, MAX_FILES).map((f) => flattenBody(f.filename)),
     };
   } catch (e) {
-    return { ...bump, resolved: false, reason: `GitHub compare ${repo.owner}/${repo.repo}@${base}...${head} failed: ${e.message}` };
+    return unresolvedSummary(bump, `GitHub compare ${repo.owner}/${repo.repo}@${base}...${head} failed: ${e.message}`);
   }
 }
 
@@ -349,11 +363,12 @@ function renderDependencyReviewSection(summaries, assessments = []) {
   if (!summaries || summaries.length === 0) return '';
   const byModule = new Map(assessments.map(a => [a.module, a]));
 
-  // esc: HTML-only, for values inside <code> (markdown is not parsed there). mdLine: markdown+HTML, for a
-  // value on the single <summary> line or in a body list item (a markdown context) — also whitespace-
-  // collapsed so a stray newline can't close the collapsible early.
+  // esc: HTML-only, for values inside <code> (markdown is not parsed there). mdText: markdown+HTML, for
+  // a value on the single <summary> line or in a body list item (a markdown context). mdLine — mdText
+  // plus its OWN whitespace-collapse regex — is gone: it was a second spelling of the flatten rule, and
+  // the model-authored values it guarded (impact, callSite, reason) are now stamped single-line at their
+  // parse boundaries, so nothing here re-collapses them. [LAW:single-enforcer] [LAW:one-source-of-truth]
   const esc = escapeHtml;
-  const mdLine = str => mdText(str.replace(/\s+/g, ' ').trim());
 
   // Verdict buckets derive from the enum (one value set); the two not-a-verdict buckets are local.
   const tally = Object.fromEntries([...ASSESSMENT_VERDICTS.map(v => [v, 0]), ['unresolved', 0], ['unassessed', 0]]);
@@ -362,9 +377,10 @@ function renderDependencyReviewSection(summaries, assessments = []) {
       tally.unresolved++;
       // modulePath/from/to come straight from the PR's go.mod diff (unresolved = never validated
       // upstream), so they are fenced through codeSpan — a backtick in the token cannot close the
-      // span — and flattened first, since a code span cannot contain a newline. reason is markdown
-      // running text → mdText it.
-      return `- ${UNRESOLVED_GLYPH} ${codeSpan(flattenBody(s.modulePath))} ${codeSpan(flattenBody(`${s.from} → ${s.to}`))} — upstream not fetched (${mdText(s.reason)}).`;
+      // span. They need no flattening: GO_MOD_REQUIRE_LINE captures them with `\S+`, which cannot
+      // match a separator, so a go.mod bump is single-line by construction. reason is markdown running
+      // text stamped by unresolvedSummary → mdText it. [LAW:parse-dont-validate]
+      return `- ${UNRESOLVED_GLYPH} ${codeSpan(s.modulePath)} ${codeSpan(`${s.from} → ${s.to}`)} — upstream not fetched (${mdText(s.reason)}).`;
     }
     const magnitude = semverMagnitude(s.from, s.to);
     // URLs are built from host-owned, shape-constrained parts (owner/repoName from the resolved repo, sha
@@ -400,9 +416,9 @@ function renderDependencyReviewSection(summaries, assessments = []) {
     // Escape only the untrusted callSite value; the '(call site not named)' fallback is a host literal and
     // must not be backslash-mangled. [FRAMING:representation] escape the data, never our own constants.
     const repoImpact = assessment.affected
-      ? `Affected — ${assessment.callSite ? mdLine(assessment.callSite) : '(call site not named)'}`
+      ? `Affected — ${assessment.callSite ? mdText(assessment.callSite) : '(call site not named)'}`
       : 'Not affected.';
-    return `<details>\n<summary>${v.glyph} ${codeHead} · ${magnitude} · ${mdLine(assessment.impact)}</summary>\n\n`
+    return `<details>\n<summary>${v.glyph} ${codeHead} · ${magnitude} · ${mdText(assessment.impact)}</summary>\n\n`
       + `${compareLine}\n`
       + `- **Notable commits:**\n${commitLines}${releaseLine}\n`
       + `- **Impact on this repo:** ${repoImpact}\n`

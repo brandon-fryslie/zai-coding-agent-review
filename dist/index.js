@@ -30196,7 +30196,10 @@ module.exports = {
 "use strict";
 
 const fs = __nccwpck_require__(9896);
-const { parseFindingValue, parseScopeValue, parseAssessmentValue } = __nccwpck_require__(1565);
+// [LAW:one-source-of-truth] The advertised schema derives its severity bounds and verdict value set
+// from review.js — the module that ENFORCES them — so what the model is told is legal and what the
+// host actually accepts are one fact, not two that drift.
+const { parseFindingValue, parseScopeValue, parseAssessmentValue, ASSESSMENT_VERDICTS, SEVERITY_MIN, SEVERITY_MAX } = __nccwpck_require__(1565);
 
 function writeJsonRpcResponse(id, result) {
   process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, result })}\n`);
@@ -30225,7 +30228,7 @@ function collectorTools() {
           path: { type: 'string', minLength: 1, pattern: '\\S' },
           line: { type: 'integer', minimum: 1 },
           body: { type: 'string', minLength: 1, pattern: '\\S' },
-          severity: { type: 'integer', minimum: 1, maximum: 5 },
+          severity: { type: 'integer', minimum: SEVERITY_MIN, maximum: SEVERITY_MAX },
         },
         required: ['path', 'line', 'body', 'severity'],
         additionalProperties: false,
@@ -30255,7 +30258,7 @@ function collectorTools() {
           impact: { type: 'string', minLength: 1, pattern: '\\S' },
           affected: { type: 'boolean' },
           callSite: { type: 'string' },
-          verdict: { type: 'string', enum: ['safe', 'review', 'risky'] },
+          verdict: { type: 'string', enum: ASSESSMENT_VERDICTS },
         },
         required: ['module', 'impact', 'affected', 'verdict'],
         additionalProperties: false,
@@ -30354,7 +30357,9 @@ function runReviewCollectorServer() {
   });
 }
 
-module.exports = { runReviewCollectorServer };
+// collectorTools is exported for tests only (the consumer contract is action.yml + dist), so the
+// advertised schema can be asserted against the values review.js enforces. [LAW:one-source-of-truth]
+module.exports = { runReviewCollectorServer, collectorTools };
 
 
 /***/ }),
@@ -30838,7 +30843,7 @@ module.exports = { TRANSCRIPT_DIR, buildTranscript, emitTranscript };
 
 
 const dns = (__nccwpck_require__(610).promises);
-const { ASSESSMENT_VERDICTS, flattenBody, codeSpan } = __nccwpck_require__(1565);
+const { ASSESSMENT_VERDICTS, flattenBody, firstLine, codeSpan } = __nccwpck_require__(1565);
 
 // Detect a Go module version bump in a PR's go.mod diff, resolve the module to its GitHub
 // repository, and fetch what actually changed upstream between the two versions — so a reviewer
@@ -31030,15 +31035,24 @@ const MAX_FILES = 50;
 // three. resolveModuleRepo's own network call (the vanity-import discovery fetch) is not exempt: a
 // DNS failure or timeout there is caught here exactly like a compareCommits failure below, so both
 // of this function's network calls share one no-throw contract, not two.
+// [LAW:parse-dont-validate] The one constructor of an unresolved summary, and therefore the one place
+// `reason` is produced. Every reason embeds an error message the host does not control (a DNS failure,
+// an octokit error body), so it is stamped single-line HERE rather than at each of the sinks that
+// render it into a bullet or a <summary> line. Three call sites producing the value and two rendering
+// it is exactly the ratio at which sink-side discipline starts missing one. [LAW:single-enforcer]
+function unresolvedSummary(bump, reason) {
+  return { ...bump, resolved: false, reason: flattenBody(reason) };
+}
+
 async function fetchUpstreamChangeSummary(octokit, bump, fetchImpl = fetch, lookupImpl = dns.lookup) {
   let repo;
   try {
     repo = await resolveModuleRepo(bump.modulePath, fetchImpl, lookupImpl);
   } catch (e) {
-    return { ...bump, resolved: false, reason: `could not resolve a GitHub repository for this module path (${e.message})` };
+    return unresolvedSummary(bump, `could not resolve a GitHub repository for this module path (${e.message})`);
   }
   if (!repo) {
-    return { ...bump, resolved: false, reason: 'could not resolve a GitHub repository for this module path' };
+    return unresolvedSummary(bump, 'could not resolve a GitHub repository for this module path');
   }
   const base = refFor(bump.from);
   const head = refFor(bump.to);
@@ -31053,12 +31067,17 @@ async function fetchUpstreamChangeSummary(octokit, bump, fetchImpl = fetch, look
       repoName: repo.repo,
       compareUrl: data.html_url,
       totalCommits: commits.length,
-      commits: commits.slice(-MAX_COMMITS).map((c) => ({ sha: c.sha.slice(0, 12), message: c.commit.message.split('\n')[0] })),
+      // [LAW:parse-dont-validate] Upstream commit subjects and filenames are attacker-influenceable
+      // (anyone who can land a commit in the dependency) and both render as bullets — in the worker
+      // PROMPT as well as the posted review — so they are stamped single-line here, at the one place
+      // this summary is built. firstLine replaces a `split('\n')[0]` that kept a lone \r or U+2028 and
+      // handed the bullet a string that still broke its line.
+      commits: commits.slice(-MAX_COMMITS).map((c) => ({ sha: c.sha.slice(0, 12), message: firstLine(c.commit.message) })),
       totalFiles: files.length,
-      files: files.slice(0, MAX_FILES).map((f) => f.filename),
+      files: files.slice(0, MAX_FILES).map((f) => flattenBody(f.filename)),
     };
   } catch (e) {
-    return { ...bump, resolved: false, reason: `GitHub compare ${repo.owner}/${repo.repo}@${base}...${head} failed: ${e.message}` };
+    return unresolvedSummary(bump, `GitHub compare ${repo.owner}/${repo.repo}@${base}...${head} failed: ${e.message}`);
   }
 }
 
@@ -31186,11 +31205,12 @@ function renderDependencyReviewSection(summaries, assessments = []) {
   if (!summaries || summaries.length === 0) return '';
   const byModule = new Map(assessments.map(a => [a.module, a]));
 
-  // esc: HTML-only, for values inside <code> (markdown is not parsed there). mdLine: markdown+HTML, for a
-  // value on the single <summary> line or in a body list item (a markdown context) — also whitespace-
-  // collapsed so a stray newline can't close the collapsible early.
+  // esc: HTML-only, for values inside <code> (markdown is not parsed there). mdText: markdown+HTML, for
+  // a value on the single <summary> line or in a body list item (a markdown context). mdLine — mdText
+  // plus its OWN whitespace-collapse regex — is gone: it was a second spelling of the flatten rule, and
+  // the model-authored values it guarded (impact, callSite, reason) are now stamped single-line at their
+  // parse boundaries, so nothing here re-collapses them. [LAW:single-enforcer] [LAW:one-source-of-truth]
   const esc = escapeHtml;
-  const mdLine = str => mdText(str.replace(/\s+/g, ' ').trim());
 
   // Verdict buckets derive from the enum (one value set); the two not-a-verdict buckets are local.
   const tally = Object.fromEntries([...ASSESSMENT_VERDICTS.map(v => [v, 0]), ['unresolved', 0], ['unassessed', 0]]);
@@ -31199,9 +31219,10 @@ function renderDependencyReviewSection(summaries, assessments = []) {
       tally.unresolved++;
       // modulePath/from/to come straight from the PR's go.mod diff (unresolved = never validated
       // upstream), so they are fenced through codeSpan — a backtick in the token cannot close the
-      // span — and flattened first, since a code span cannot contain a newline. reason is markdown
-      // running text → mdText it.
-      return `- ${UNRESOLVED_GLYPH} ${codeSpan(flattenBody(s.modulePath))} ${codeSpan(flattenBody(`${s.from} → ${s.to}`))} — upstream not fetched (${mdText(s.reason)}).`;
+      // span. They need no flattening: GO_MOD_REQUIRE_LINE captures them with `\S+`, which cannot
+      // match a separator, so a go.mod bump is single-line by construction. reason is markdown running
+      // text stamped by unresolvedSummary → mdText it. [LAW:parse-dont-validate]
+      return `- ${UNRESOLVED_GLYPH} ${codeSpan(s.modulePath)} ${codeSpan(`${s.from} → ${s.to}`)} — upstream not fetched (${mdText(s.reason)}).`;
     }
     const magnitude = semverMagnitude(s.from, s.to);
     // URLs are built from host-owned, shape-constrained parts (owner/repoName from the resolved repo, sha
@@ -31237,9 +31258,9 @@ function renderDependencyReviewSection(summaries, assessments = []) {
     // Escape only the untrusted callSite value; the '(call site not named)' fallback is a host literal and
     // must not be backslash-mangled. [FRAMING:representation] escape the data, never our own constants.
     const repoImpact = assessment.affected
-      ? `Affected — ${assessment.callSite ? mdLine(assessment.callSite) : '(call site not named)'}`
+      ? `Affected — ${assessment.callSite ? mdText(assessment.callSite) : '(call site not named)'}`
       : 'Not affected.';
-    return `<details>\n<summary>${v.glyph} ${codeHead} · ${magnitude} · ${mdLine(assessment.impact)}</summary>\n\n`
+    return `<details>\n<summary>${v.glyph} ${codeHead} · ${magnitude} · ${mdText(assessment.impact)}</summary>\n\n`
       + `${compareLine}\n`
       + `- **Notable commits:**\n${commitLines}${releaseLine}\n`
       + `- **Impact on this repo:** ${repoImpact}\n`
@@ -31278,10 +31299,13 @@ module.exports = {
 /***/ }),
 
 /***/ 9898:
-/***/ ((module) => {
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 "use strict";
 
+// [LAW:one-way-deps] diff.js depends on review.js for the ONE definition of a vertical separator;
+// review.js requires nothing, so the arrow points downhill and no cycle exists.
+const { hasVerticalSeparator } = __nccwpck_require__(1565);
 
 function matchesPattern(filename, pattern) {
   const escaped = pattern
@@ -31458,8 +31482,37 @@ function parseUnifiedDiff(diff) {
   return { files, warnings };
 }
 
+// [LAW:parse-dont-validate] The boundary that turns a raw host/diff file list into REVIEWABLE files.
+// A changed path can legally embed a vertical separator — git C-quotes it in the diff header and
+// unquoteCStylePath faithfully reconstructs it — but every representation downstream of here is
+// line-structured: a `### path` prompt heading, a `> - path` read-target bullet, a report bullet, a
+// GitHub comment anchor. There is no lossless way to put such a path on one of those lines.
+//
+// The previous design collapsed the separator at each sink, which is strictly worse than refusing it:
+// the collapsed path names a file that does not exist, so the worker instructed to open it reads
+// nothing and that file's review coverage disappears with no error anywhere. [LAW:no-silent-failure]
+// So the path is REFUSED here instead, once, and surfaced as a typed `unreviewable` entry the caller
+// reports. Every file that survives this boundary provably renders on one line, which is why no sink
+// downstream flattens a filename.
+function parseReviewableFiles(files) {
+  const reviewable = [];
+  const unreviewable = [];
+  for (const file of files) {
+    if (hasVerticalSeparator(file.filename)) {
+      unreviewable.push({
+        filename: file.filename,
+        reason: 'path contains a line separator, so it cannot be named on a prompt line or anchored to a review comment',
+      });
+      continue;
+    }
+    reviewable.push(file);
+  }
+  return { files: reviewable, unreviewable };
+}
+
 module.exports = {
   matchesPattern,
+  parseReviewableFiles,
   filterFiles,
   patchLines,
   buildFileAnchors,
@@ -33608,7 +33661,7 @@ module.exports = {
 const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS } = __nccwpck_require__(2887);
 const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = __nccwpck_require__(6757);
 const { defaultEffortProfile, maxTier } = __nccwpck_require__(4652);
-const { dedupeFindings, dedupeAssessments, flattenBody } = __nccwpck_require__(1565);
+const { dedupeFindings, dedupeAssessments, parseScopeValue } = __nccwpck_require__(1565);
 const { renderDependencyDiffNote } = __nccwpck_require__(9838);
 const {
   buildReviewInput,
@@ -33696,10 +33749,13 @@ function sumUsage(usages) {
 function composeSummary(scopes, workerResults, sweeps = [], budget = { exhausted: false, unreviewedScopes: [] }) {
   const unreviewed = new Set(budget.unreviewedScopes);
   const reviewed = scopes.filter(s => !unreviewed.has(s.name));
-  // Scope names and file paths are untrusted single-line values in a line-structured summary; flatten. [LAW:single-enforcer]
-  const lines = [`Reviewed ${reviewed.length} scope(s): ${flattenBody(reviewed.map(s => s.name).join(', '))}.`, ''];
+  // [LAW:parse-dont-validate] Nothing is flattened here. A scope's name comes stamped single-line from
+  // parseScopeValue and a worker's summary from parseReviewValue, so neither can break this
+  // line-structured summary. This sink previously flattened the name and NOT the summary — the exact
+  // shape of bug that call-site discipline produces, and the reason the rule moved to the boundary.
+  const lines = [`Reviewed ${reviewed.length} scope(s): ${reviewed.map(s => s.name).join(', ')}.`, ''];
   for (const r of workerResults) {
-    lines.push(`**${flattenBody(r.name)}** — ${(r.summary || '(no summary)').trim()}`);
+    lines.push(`**${r.name}** — ${r.summary || '(no summary)'}`);
   }
   for (const [i, s] of sweeps.entries()) {
     // [FRAMING:representation] A curtailed sweep must never render as convergence: "added nothing
@@ -33711,7 +33767,7 @@ function composeSummary(scopes, workerResults, sweeps = [], budget = { exhausted
   if (budget.exhausted) {
     lines.push(budget.unreviewedScopes.length > 0
       ? `⏳ **Time budget exhausted** — ${reviewed.length} of ${scopes.length} scope(s) were reviewed; `
-        + `NOT reviewed: ${flattenBody(budget.unreviewedScopes.join(', '))}. The findings above cover only the reviewed scopes.`
+        + `NOT reviewed: ${budget.unreviewedScopes.join(', ')}. The findings above cover only the reviewed scopes.`
       : '⏳ **Time budget exhausted** — every scope was reviewed, but convergence sweeps were cut short; '
         + 'late-round findings may be missing.');
   }
@@ -33820,11 +33876,15 @@ function planScopes(scopes, changedPaths) {
     seen.add(p);
   }
   if (sweptPaths.length === 0) return { scopes: uniquelyNamed(scopes), sweptPaths, duplicatePaths };
-  const catchAll = {
+  // [LAW:single-enforcer] The catch-all is built through parseScopeValue like every scout-recorded
+  // scope, so EVERY Scope value in the system carries the same single-line stamp — a hand-built one
+  // would be the one object in the program whose fields skipped the boundary, which is precisely the
+  // hole a "just construct it here" shortcut opens. [LAW:one-type-per-behavior]
+  const catchAll = parseScopeValue({
     name: 'unassigned files',
-    focus: `These changed files were not covered by the planned scopes: ${flattenBody(sweptPaths.join(', '))}. Review their changes fully.`,
+    focus: `These changed files were not covered by the planned scopes: ${sweptPaths.join(', ')}. Review their changes fully.`,
     files: sweptPaths,
-  };
+  }, 0);
   return { scopes: uniquelyNamed([...scopes, catchAll]), sweptPaths, duplicatePaths };
 }
 
@@ -34229,7 +34289,7 @@ module.exports = { preflight, probeConfig, classifyProbe, PROBE_TIMEOUT_MS };
 "use strict";
 
 const { annotatePatchWithLines } = __nccwpck_require__(9898);
-const { severityTag, flattenBody } = __nccwpck_require__(1565);
+const { findingLineText } = __nccwpck_require__(1565);
 
 // [LAW:one-source-of-truth] The REVIEW PHILOSOPHY lives here, once, shared by both the PR-diff and
 // whole-repo review builders. It is deliberately NOT a laws-compliance audit: a code review exists to
@@ -34339,14 +34399,13 @@ function reviewCharter(toolNames) {
 // findings to fill the silence — trading the precision the eval gate holds for fake recall. [LAW:no-silent-failure]
 function renderPriorFindingsBlock(priorFindings, toolNames) {
   if (priorFindings.length === 0) return '';
-  // The ENTIRE bullet — path, line, tag, and body — is flattened as one string through flattenBody
-  // (the one flattening rule), so each finding renders as exactly ONE bullet no matter which field
-  // carries a newline. The body is the routine case, but a path can legally embed a newline too
-  // (unquoteCStylePath reconstructs one from a quoted diff header), and an unprefixed continuation
-  // line at prompt indentation could read as a stray instruction — an injection vector, not just a
-  // rendering blemish. The severity label derives from severityTag, the one spelling. [LAW:single-enforcer]
+  // Each finding renders as exactly ONE bullet: the path came stamped single-line from parseOneFinding,
+  // and the body — the one legitimately multi-line field — is collapsed by findingLineText, the single
+  // owner of that rule. An unprefixed continuation line at prompt indentation would read as a stray
+  // instruction rather than as part of the listed finding: an injection vector, not just a rendering
+  // blemish. [LAW:single-enforcer]
   return `\n    THIS IS A CONVERGENCE SWEEP. A previous pass of this same review already examined this material and recorded the findings below. They are ALREADY collected and will be posted — do not re-record, rephrase, re-argue, or re-verify any of them; a re-record is pure noise.\n`
-    + priorFindings.map(f => `      • ${flattenBody(`[${f.path}:${f.line}] ${severityTag(f)} ${f.body}`)}`).join('\n')
+    + priorFindings.map(f => `      • [${f.path}:${f.line}] ${findingLineText(f)}`).join('\n')
     + `\n    Your job in this sweep is ONLY what that list misses: read the material fresh and hunt for real issues NOT already listed — parts of the change no listed finding touches, failure classes the list has none of (edge cases, broken callers, concurrency, security), or a deeper problem behind a listed symptom. Record each genuinely new issue with ${toolNames.requestChange} as usual. If your fresh read surfaces nothing real that is missing, record NOTHING and call ${toolNames.finishReview} with a one-line summary saying the sweep found nothing new — an empty sweep is this review converging, which is a correct and expected outcome, not a failure. Never pad the sweep with speculative or trivial findings to avoid coming back empty.\n`;
 }
 
@@ -34369,7 +34428,9 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   let totalChars = 0;
 
   for (const f of patchableFiles) {
-    const entry = `### ${flattenBody(f.filename)} (${f.status})\n\`\`\`diff\n${annotatePatchWithLines(f.patch)}\n\`\`\``;
+    // No flatten: parseReviewableFiles refused any path that could break this heading, and flattening
+    // one here would hand the model a filename that does not match the file it must read.
+    const entry = `### ${f.filename} (${f.status})\n\`\`\`diff\n${annotatePatchWithLines(f.patch)}\n\`\`\``;
     if (maxDiffChars > 0 && totalChars + entry.length > maxDiffChars) {
       unshowableFiles.push(f.filename);
     } else {
@@ -34387,7 +34448,7 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // which counts toward the verdict and renders in the review body — so the riskiest (biggest) changed
   // files stay reviewable, and an issue in them can never bypass the merge gate via summary prose.
   if (unshowableFiles.length > 0) {
-    diffs += `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`). Read each in full at its absolute path and review its changes. Record any issue with ${toolNames.requestChange} using the file's real line number from the full file — the line cannot be anchored inline, so the host will post that finding in the review body's "Findings outside the reviewed diff" section; never put it in the ${toolNames.finishReview} summary:\n${unshowableFiles.map(f => `> - ${flattenBody(`${reviewedRepoRoot}/${f}`)}`).join('\n')}`;
+    diffs += `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`). Read each in full at its absolute path and review its changes. Record any issue with ${toolNames.requestChange} using the file's real line number from the full file — the line cannot be anchored inline, so the host will post that finding in the review body's "Findings outside the reviewed diff" section; never put it in the ${toolNames.finishReview} summary:\n${unshowableFiles.map(f => `> - ${reviewedRepoRoot}/${f}`).join('\n')}`;
   }
 
   if (dependencyDiffNote) {
@@ -34481,7 +34542,11 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // uncertainty stated in the body (never withheld). One lever, two directions; the record-time
   // consequence lives in the buildReviewInput passage below, not a second "read more context" instruction.
   const readTargets = scopeFiles.length > 0
-    ? `Read the complete content of THESE files — this scope's assigned changed files: ${flattenBody(scopeFiles.join(', '))}. `
+    // No flatten: these are paths the worker must OPEN. Collapsing a separator here would name a file
+    // that does not exist and the worker would silently review nothing — parseReviewableFiles refuses
+    // such a path at the boundary instead, so every path reaching this line is byte-exact and
+    // single-line. [LAW:no-silent-failure]
+    ? `Read the complete content of THESE files — this scope's assigned changed files: ${scopeFiles.join(', ')}. `
       + `Skip any among them that are generated or vendored artifacts (bundled or minified output, lockfiles) or pure documentation. `
       + `Another scope's worker reads the other changed files, so do NOT read them in full — that duplicates their work and their cost. `
       + `You may consult another file when a specific finding needs it — one your assigned files import, or a caller elsewhere that uses a symbol they change: prefer Grep to confirm a symbol, signature, or its call sites `
@@ -34514,7 +34579,9 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
     Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} for each issue you
     find. Every recorded change must use path, line (the displayed LINE value), body, and severity (an
     integer 1-5 — see the charter below). When the review is complete, call ${toolNames.finishReview}
-    exactly once. The summary is a one-line verdict — what the change does and whether it needs fixing.
+    exactly once. The summary is one line describing what the change does. It states no verdict: whether
+    the change needs fixing is the HOST's call, derived from the recorded findings, and the charter below
+    forbids stating it here — asking for it here too would be the prompt contradicting itself. [LAW:one-source-of-truth]
     It is NOT a channel for findings: a real problem always goes through ${toolNames.requestChange}, and
     it is NOT a place to praise the code, describe what you read, narrate your review, or restate the
     inline findings — those are already
@@ -34574,8 +34641,9 @@ Review this repository for what would hurt if it shipped. There is no diff — t
     Call ${toolNames.requestChange} for each issue you find, with path, line (any real line in that file —
     there is no diff grid here, so any line is valid), a body, and a severity (an integer 1-5 — see the
     charter below). When the review is complete, call
-    ${toolNames.finishReview} exactly once. The summary is a one-line verdict — what you audited and
-    whether it needs fixing. It is NOT a channel for findings: every real problem has a file and a line
+    ${toolNames.finishReview} exactly once. The summary is one line describing what you audited. It
+    states no verdict — the host derives that from the recorded findings, and the charter below forbids
+    stating it here. It is NOT a channel for findings: every real problem has a file and a line
     here (any real line is valid), so record it with ${toolNames.requestChange}. It is NOT a place to
     praise the code, describe what you read, narrate your review, or restate the inline findings — those
     are already posted via
@@ -34623,6 +34691,9 @@ function scoutOutputContract(toolNames, { assignFiles = false } = {}) {
 // threshold: the scope COUNT falls out of grouping changed files by concern and following the import
 // edges the change actually crosses. [LAW:dataflow-not-control-flow]
 function buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot }) {
+  // Rendered raw, and correctly so: changedPaths are diff filenames, and parseReviewableFiles refused
+  // any that could break this list. Do not "harden" this with a flatten — these are paths the scout
+  // assigns and a worker later opens, so collapsing one would name a file that does not exist.
   const fileList = changedPaths.map(p => `      - ${p}`).join('\n');
   return {
     prompt: `
@@ -34839,7 +34910,7 @@ module.exports = { synthesizeProviderConfig, PROVIDERS, PROVIDER_ALIASES, PROVID
 
 "use strict";
 
-const { severityTag, flattenBody } = __nccwpck_require__(1565);
+const { findingLineText } = __nccwpck_require__(1565);
 
 // The printed sink for full-repo review mode. There is no pull request to comment on, so
 // findings are rendered as a single Markdown report written to the GitHub Step Summary and
@@ -34862,10 +34933,10 @@ function groupByPath(findings) {
   return byPath;
 }
 
-// One finding rendered as a list item; the body is flattened to a single line so the grouped
-// list stays scannable in the Step Summary.
+// One finding rendered as a list item. findingLineText owns the tag-plus-single-line-body rule, so
+// the grouped list stays scannable and this sink does not re-author it. [LAW:single-enforcer]
 function renderFinding(finding) {
-  return `- **line ${finding.line}:** ${severityTag(finding)} ${flattenBody(finding.body)}`;
+  return `- **line ${finding.line}:** ${findingLineText(finding)}`;
 }
 
 function renderFindingsSection(findings) {
@@ -34874,9 +34945,9 @@ function renderFindingsSection(findings) {
   }
   const lines = [`### Findings (${findings.length})`];
   for (const [path, list] of groupByPath(findings)) {
-    // The path heads an ATX heading line; flattened so a newline-bearing filename cannot inject
-    // its own heading into the Step Summary. [LAW:single-enforcer]
-    lines.push('', `#### ${flattenBody(path)}`, ...list.map(renderFinding));
+    // The path heads an ATX heading line and needs no flattening here: parseOneFinding stamped it
+    // single-line, so a path that could inject its own heading cannot reach this sink. [LAW:parse-dont-validate]
+    lines.push('', `#### ${path}`, ...list.map(renderFinding));
   }
   return lines;
 }
@@ -34914,6 +34985,13 @@ module.exports = { renderRepoReport, groupByPath };
 "use strict";
 
 
+// [LAW:one-source-of-truth] The legal severity range, spelled ONCE. The enforcing parser below and the
+// collector tool's advertised JSON schema (src/collector-server.js) both derive from these, so the
+// bound the model is told about and the bound the host actually enforces cannot drift apart — a drift
+// that would either reject a value the schema invited or accept one it forbade. [LAW:single-enforcer]
+const SEVERITY_MIN = 1;
+const SEVERITY_MAX = 5;
+
 // [LAW:decomposition] The single per-finding validator: one job — turn one raw record into a typed
 // finding or throw. Both entry points below call it, each supplying the `label` IT knows names the
 // finding's real position (the array index for a batch, the record index for a single finding), so an
@@ -34941,10 +35019,15 @@ function parseOneFinding(finding, label) {
   // deliberately because the model's non-blocking judgment was not trustworthy, and this label must
   // never grow back into one.
   const severity = finding.severity;
-  if (!Number.isInteger(severity) || severity < 1 || severity > 5) {
-    throw new Error(`${label} has an invalid severity (expected an integer 1-5).`);
+  if (!Number.isInteger(severity) || severity < SEVERITY_MIN || severity > SEVERITY_MAX) {
+    throw new Error(`${label} has an invalid severity (expected an integer ${SEVERITY_MIN}-${SEVERITY_MAX}).`);
   }
-  return { path: pathValue.trim(), line, body: body.trim(), severity };
+  // [LAW:parse-dont-validate] `path` is stamped single-line HERE, at the one boundary that produces a
+  // finding, so no sink downstream has to remember to flatten it. `body` is deliberately NOT stamped:
+  // it is genuinely block text (an inline PR comment renders paragraphs, and partitionFindings appends
+  // a "\n\n_(Anchored to line N…)_" note), so its line-structured sinks render it through
+  // findingLineText — the one place that flattens a body. [LAW:one-type-per-behavior]
+  return { path: flattenBody(pathValue), line, body: body.trim(), severity };
 }
 
 function parseReviewValue(parsed, context) {
@@ -34955,7 +35038,11 @@ function parseReviewValue(parsed, context) {
   if (typeof parsed.summary !== 'string' || parsed.summary.trim().length === 0) {
     throw new Error(`${context} must include a non-empty summary.`);
   }
-  const summary = parsed.summary.trim();
+  // [LAW:parse-dont-validate] A spawn's summary is a single-line value in every sink that consumes it —
+  // composeSummary's `**scope** — summary` line, and the scout's summary interpolated as a worker's
+  // structural context. Stamping it here is what makes those sinks safe by construction rather than by
+  // each remembering to flatten a model-authored string. [LAW:single-enforcer]
+  const summary = flattenBody(parsed.summary);
   if (!Array.isArray(parsed.findings)) {
     throw new Error(`${context} must include a findings array.`);
   }
@@ -34992,10 +35079,16 @@ function parseScopeValue(scope, index) {
   if (typeof focus !== 'string' || focus.trim().length === 0) {
     throw new Error(`Review collector scope ${index + 1} ('${name.trim()}') has an invalid focus.`);
   }
+  // [LAW:parse-dont-validate] name, focus and every file entry are stamped single-line here. All three
+  // reach line-structured sinks — the aggregated summary's scope list, the worker prompt's CONCENTRATE
+  // block (via workerFocusText), the read-targets line — and all three are MODEL-AUTHORED, so an
+  // unstamped one puts attacker-steerable text at column 0 of a prompt, where a continuation line reads
+  // as an instruction rather than as data. Stamping at the single boundary that produces a scope is what
+  // makes every one of those sinks safe without any of them checking. [LAW:single-enforcer]
   const files = Array.isArray(scope.files)
-    ? scope.files.filter(f => typeof f === 'string' && f.trim().length > 0).map(f => f.trim())
+    ? scope.files.filter(f => typeof f === 'string' && f.trim().length > 0).map(f => flattenBody(f))
     : [];
-  return { name: name.trim(), focus: focus.trim(), files };
+  return { name: flattenBody(name), focus: flattenBody(focus), files };
 }
 
 // [LAW:types-are-the-program] A dependency assessment is the same kind of typed, schema-validated
@@ -35038,9 +35131,14 @@ function parseAssessmentValue(assessment, index) {
   // callSite is a genuine optional: absent/blank collapses to null (no call site to name), a value the
   // renderer handles — never a guard skipping work. [LAW:no-defensive-null-guards]
   const callSite = typeof assessment.callSite === 'string' && assessment.callSite.trim().length > 0
-    ? assessment.callSite.trim()
+    ? flattenBody(assessment.callSite)
     : null;
-  return { module: module.trim(), impact: impact.trim(), affected: assessment.affected, callSite, verdict };
+  // [LAW:parse-dont-validate] module, impact and callSite are stamped single-line here: every one of
+  // them renders as part of a bullet in the posted review's dependency section AND in the worker
+  // prompt's dependency note, both line-structured. dedupeAssessments also keys on `module`, so
+  // stamping it at the boundary keeps one module from splitting into two records over a stray
+  // separator. [LAW:single-enforcer]
+  return { module: flattenBody(module), impact: flattenBody(impact), affected: assessment.affected, callSite, verdict };
 }
 
 // [LAW:one-source-of-truth] "The same assessed module": keyed on the module path alone — a module is
@@ -35191,14 +35289,55 @@ function severityTag(finding) {
   return `**[S${finding.severity}]**`;
 }
 
-// [LAW:single-enforcer] The one rule for flattening untrusted multi-line text into a single Markdown
-// line: continuation lines at column 0 would detach from their bullet/heading and render as injected
-// markup, so every line-structured sink (unanchored section, repo report, prior-findings block, the
-// prompt's file lists) flattens through this, never its own regex. It collapses EVERY vertical
-// separator — \n, a lone \r (a CommonMark line ending, reconstructable in a filename via
-// unquoteCStylePath), and U+2028/U+2029 — not just \n.
+// [LAW:single-enforcer] The one rendering of a finding as a single line of text. A body is the one
+// model-authored field that is legitimately block text — an inline PR comment renders its paragraphs,
+// and partitionFindings appends a "\n\n_(Anchored to line N…)_" note — so it is the one field a
+// line-structured sink must still collapse. This is that collapse's single owner: the three
+// line-structured finding sinks (the posted review's unanchored section, the whole-repo report, the
+// convergence-sweep prior list) each compose their own prefix around this and none re-authors the
+// tag-plus-flattened-body rule.
+function findingLineText(finding) {
+  return `${severityTag(finding)} ${flattenBody(finding.body)}`;
+}
+
+// [LAW:one-source-of-truth] The one definition of "a vertical separator" — the characters that end a
+// line for a Markdown renderer or a prompt reader: \n, a lone \r (a CommonMark line ending,
+// reconstructable in a filename via unquoteCStylePath), and U+2028/U+2029. Both consumers below build
+// their regex from THIS string, so the set can never drift between the collapser and the detector.
+const VERTICAL_SEPARATORS = '\\n\\r\\u2028\\u2029';
+
+// [LAW:single-enforcer] The one rule for collapsing untrusted text to a single line: a continuation
+// line at column 0 detaches from its bullet/heading and renders as injected markup — or, in a prompt,
+// reads as a stray instruction. It collapses EVERY vertical separator — \n, a lone \r (a CommonMark
+// line ending, reconstructable in a filename via unquoteCStylePath), and U+2028/U+2029 — not just \n.
+//
+// [LAW:parse-dont-validate] This is applied at PARSE BOUNDARIES, not at sinks. Every model-authored
+// field whose domain is single-line (a scope's name/focus/files, a spawn's summary, a finding's path,
+// an assessment's module/impact/callSite) is stamped as it is parsed, so a sink cannot receive an
+// unflattened one and therefore has nothing to check. Sink-side flattening was the previous design and
+// it failed the way call-site discipline always fails: `focus` and a worker's `summary` reached
+// line-structured sinks raw because two of a dozen call sites were missed. The two remaining callers
+// are the ones whose input is NOT single-line by domain: findingLineText (a body is block text) and
+// the diff-path reject check (a path must stay byte-exact, so it is refused, never collapsed).
 function flattenBody(body) {
-  return body.replace(/\s*[\n\r\u2028\u2029]\s*/g, ' ').trim();
+  return body.replace(new RegExp(`\\s*[${VERTICAL_SEPARATORS}]\\s*`, 'g'), ' ').trim();
+}
+
+// [LAW:one-source-of-truth] The detector and the collapser read the SAME character class, so the set of
+// "what counts as a vertical separator" has one definition. A path is refused rather than collapsed
+// (see parseReviewableFiles in diff.js): collapsing a path yields a filename that does not exist, so
+// the worker told to open it reads nothing and the file's review coverage vanishes silently \u2014 the
+// failure this replaces. [LAW:no-silent-failure]
+function hasVerticalSeparator(text) {
+  return new RegExp(`[${VERTICAL_SEPARATORS}]`).test(text);
+}
+
+// [LAW:one-source-of-truth] The subject line of a block of text — everything before its first vertical
+// separator — built from the SAME separator class as the collapser and the detector. A hand-rolled
+// `.split('\n')[0]` is the same rule spelled a fourth time and a strictly weaker one: it keeps a lone
+// \r or a U+2028 and hands the sink a string that still breaks its line.
+function firstLine(text) {
+  return text.split(new RegExp(`[${VERTICAL_SEPARATORS}]`))[0].trim();
 }
 
 // [LAW:single-enforcer] The one rule for rendering untrusted text as a Markdown code span: the
@@ -35213,7 +35352,7 @@ function codeSpan(content) {
   return `${fence}${pad}${content}${pad}${fence}`;
 }
 
-module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, ASSESSMENT_VERDICTS, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTag, flattenBody, codeSpan };
+module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, ASSESSMENT_VERDICTS, SEVERITY_MIN, SEVERITY_MAX, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTag, findingLineText, flattenBody, hasVerticalSeparator, firstLine, codeSpan };
 
 
 /***/ }),
@@ -35974,8 +36113,8 @@ module.exports = { selectConfig, BODY_DIRECTIVE_RE };
 "use strict";
 
 const core = __nccwpck_require__(7484);
-const { parseUnifiedDiff } = __nccwpck_require__(9898);
-const { severityTag, flattenBody, codeSpan } = __nccwpck_require__(1565);
+const { parseUnifiedDiff, parseReviewableFiles } = __nccwpck_require__(9898);
+const { severityTag, findingLineText, codeSpan } = __nccwpck_require__(1565);
 const { parseCostMarker } = __nccwpck_require__(9614);
 
 const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
@@ -36026,8 +36165,20 @@ function giteaTransport(files) {
   return { files, toComment: f => ({ path: f.path, new_position: f.line, body: f.body }), approveEvent: 'APPROVED' };
 }
 
+// [LAW:single-enforcer] Every changed-file list — GitHub's listFiles and Gitea's parsed unified diff
+// alike — crosses parseReviewableFiles exactly once, here, before any consumer sees it. Refusing an
+// unrenderable path at the one boundary is what lets every sink downstream name a filename without
+// flattening it. [LAW:no-silent-failure] a refused path is WARNED with its reason, never dropped
+// quietly: a file vanishing from a review must be visible in the run log.
+function admitReviewableFiles(files) {
+  const { files: reviewable, unreviewable } = parseReviewableFiles(files);
+  unreviewable.forEach(u => core.warning(
+    `Skipping ${JSON.stringify(u.filename)} from the review: ${u.reason}.`));
+  return reviewable;
+}
+
 async function selectTransport(octokit, owner, repo, pullNumber) {
-  const files = await listAllFiles(octokit, owner, repo, pullNumber);
+  const files = admitReviewableFiles(await listAllFiles(octokit, owner, repo, pullNumber));
   if (files.length === 0 || files.some(f => typeof f.patch === 'string')) {
     return gitHubTransport(files);
   }
@@ -36037,8 +36188,9 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
     repo,
     pull_number: pullNumber,
   });
-  const { files: parsed, warnings } = parseUnifiedDiff(typeof data === 'string' ? data : String(data));
+  const { files: rawParsed, warnings } = parseUnifiedDiff(typeof data === 'string' ? data : String(data));
   warnings.forEach(w => core.warning(w));
+  const parsed = admitReviewableFiles(rawParsed);
   if (parsed.length === 0) {
     throw new Error(`No reviewable diff for PR #${pullNumber}: listFiles returned no patch and the unified diff was empty.`);
   }
@@ -36209,14 +36361,15 @@ function reviewEvent(requestsChanges, canApprove, transport) {
 }
 
 // [LAW:effects-at-boundaries] Pure: render the findings that could not be posted inline as a
-// summary section. They still carry their path:line so the reader can locate them. The path:line is
-// flattened THEN fenced (codeSpan) — a filename can legally embed a newline (unquoteCStylePath
-// reconstructs one from a quoted diff header) or backticks, and neither may split the bullet or
-// close the span; the body is flattened so a multi-line body stays one bullet.
+// summary section. They still carry their path:line so the reader can locate them. The path needs no
+// flattening — parseOneFinding stamped it single-line and parseReviewableFiles refused any diff path
+// that could not be — but it is still fenced through codeSpan, because backticks are orthogonal to
+// line structure and a backtick-bearing path must not close the span early. The body is the one field
+// that is legitimately block text, so it renders through findingLineText. [LAW:single-enforcer]
 function renderUnanchoredSection(unanchored) {
   if (!unanchored || unanchored.length === 0) return '';
   const items = unanchored
-    .map(f => `- ${codeSpan(flattenBody(`${f.path}:${f.line}`))} — ${severityTag(f)} ${flattenBody(f.body)}`)
+    .map(f => `- ${codeSpan(`${f.path}:${f.line}`)} — ${findingLineText(f)}`)
     .join('\n');
   return `\n\n### Findings outside the reviewed diff\nThese reference lines not present in this PR's diff, so they could not be posted as inline comments:\n\n${items}`;
 }

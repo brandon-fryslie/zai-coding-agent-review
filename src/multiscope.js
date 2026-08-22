@@ -2,7 +2,7 @@
 const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS } = require('./failover');
 const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = require('./deadline');
 const { defaultEffortProfile, maxTier } = require('./effort');
-const { dedupeFindings, dedupeAssessments, flattenBody } = require('./review');
+const { dedupeFindings, dedupeAssessments, parseScopeValue } = require('./review');
 const { renderDependencyDiffNote } = require('./dependency-diff');
 const {
   buildReviewInput,
@@ -90,10 +90,13 @@ function sumUsage(usages) {
 function composeSummary(scopes, workerResults, sweeps = [], budget = { exhausted: false, unreviewedScopes: [] }) {
   const unreviewed = new Set(budget.unreviewedScopes);
   const reviewed = scopes.filter(s => !unreviewed.has(s.name));
-  // Scope names and file paths are untrusted single-line values in a line-structured summary; flatten. [LAW:single-enforcer]
-  const lines = [`Reviewed ${reviewed.length} scope(s): ${flattenBody(reviewed.map(s => s.name).join(', '))}.`, ''];
+  // [LAW:parse-dont-validate] Nothing is flattened here. A scope's name comes stamped single-line from
+  // parseScopeValue and a worker's summary from parseReviewValue, so neither can break this
+  // line-structured summary. This sink previously flattened the name and NOT the summary — the exact
+  // shape of bug that call-site discipline produces, and the reason the rule moved to the boundary.
+  const lines = [`Reviewed ${reviewed.length} scope(s): ${reviewed.map(s => s.name).join(', ')}.`, ''];
   for (const r of workerResults) {
-    lines.push(`**${flattenBody(r.name)}** — ${(r.summary || '(no summary)').trim()}`);
+    lines.push(`**${r.name}** — ${r.summary || '(no summary)'}`);
   }
   for (const [i, s] of sweeps.entries()) {
     // [FRAMING:representation] A curtailed sweep must never render as convergence: "added nothing
@@ -105,7 +108,7 @@ function composeSummary(scopes, workerResults, sweeps = [], budget = { exhausted
   if (budget.exhausted) {
     lines.push(budget.unreviewedScopes.length > 0
       ? `⏳ **Time budget exhausted** — ${reviewed.length} of ${scopes.length} scope(s) were reviewed; `
-        + `NOT reviewed: ${flattenBody(budget.unreviewedScopes.join(', '))}. The findings above cover only the reviewed scopes.`
+        + `NOT reviewed: ${budget.unreviewedScopes.join(', ')}. The findings above cover only the reviewed scopes.`
       : '⏳ **Time budget exhausted** — every scope was reviewed, but convergence sweeps were cut short; '
         + 'late-round findings may be missing.');
   }
@@ -214,11 +217,15 @@ function planScopes(scopes, changedPaths) {
     seen.add(p);
   }
   if (sweptPaths.length === 0) return { scopes: uniquelyNamed(scopes), sweptPaths, duplicatePaths };
-  const catchAll = {
+  // [LAW:single-enforcer] The catch-all is built through parseScopeValue like every scout-recorded
+  // scope, so EVERY Scope value in the system carries the same single-line stamp — a hand-built one
+  // would be the one object in the program whose fields skipped the boundary, which is precisely the
+  // hole a "just construct it here" shortcut opens. [LAW:one-type-per-behavior]
+  const catchAll = parseScopeValue({
     name: 'unassigned files',
-    focus: `These changed files were not covered by the planned scopes: ${flattenBody(sweptPaths.join(', '))}. Review their changes fully.`,
+    focus: `These changed files were not covered by the planned scopes: ${sweptPaths.join(', ')}. Review their changes fully.`,
     files: sweptPaths,
-  };
+  }, 0);
   return { scopes: uniquelyNamed([...scopes, catchAll]), sweptPaths, duplicatePaths };
 }
 

@@ -133,12 +133,17 @@ function resolveConfig(opts) {
 }
 
 function loadDiffFiles(opts) {
-  const { parseUnifiedDiff } = require('../src/diff');
+  const { parseUnifiedDiff, parseReviewableFiles } = require('../src/diff');
   const diffText = opts.diff
     ? fs.readFileSync(opts.diff, 'utf8')
     : execFileSync('git', ['-C', opts.repo, 'diff', ...opts.range.split(/\s+/).filter(Boolean)], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-  const { files, warnings } = parseUnifiedDiff(diffText);
+  const { files: parsed, warnings } = parseUnifiedDiff(diffText);
   warnings.forEach(w => console.warn(w));
+  // The same boundary production crosses in selectTransport. This script's whole value is that a local
+  // run matches a production run for the same inputs, so it must not skip a boundary that changes which
+  // files get reviewed. [LAW:single-enforcer]
+  const { files, unreviewable } = parseReviewableFiles(parsed);
+  unreviewable.forEach(u => console.warn(`Skipping ${JSON.stringify(u.filename)} from the review: ${u.reason}.`));
   if (files.length === 0) {
     throw new Error(`No changed files in the diff (${opts.diff || `git diff ${opts.range}`}). Pick a range with changes, or use --mode repo.`);
   }

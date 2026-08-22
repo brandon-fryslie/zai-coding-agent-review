@@ -1,7 +1,7 @@
 'use strict';
 const core = require('@actions/core');
-const { parseUnifiedDiff } = require('./diff');
-const { severityTag, flattenBody, codeSpan } = require('./review');
+const { parseUnifiedDiff, parseReviewableFiles } = require('./diff');
+const { severityTag, findingLineText, codeSpan } = require('./review');
 const { parseCostMarker } = require('./usage');
 
 const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
@@ -52,8 +52,20 @@ function giteaTransport(files) {
   return { files, toComment: f => ({ path: f.path, new_position: f.line, body: f.body }), approveEvent: 'APPROVED' };
 }
 
+// [LAW:single-enforcer] Every changed-file list — GitHub's listFiles and Gitea's parsed unified diff
+// alike — crosses parseReviewableFiles exactly once, here, before any consumer sees it. Refusing an
+// unrenderable path at the one boundary is what lets every sink downstream name a filename without
+// flattening it. [LAW:no-silent-failure] a refused path is WARNED with its reason, never dropped
+// quietly: a file vanishing from a review must be visible in the run log.
+function admitReviewableFiles(files) {
+  const { files: reviewable, unreviewable } = parseReviewableFiles(files);
+  unreviewable.forEach(u => core.warning(
+    `Skipping ${JSON.stringify(u.filename)} from the review: ${u.reason}.`));
+  return reviewable;
+}
+
 async function selectTransport(octokit, owner, repo, pullNumber) {
-  const files = await listAllFiles(octokit, owner, repo, pullNumber);
+  const files = admitReviewableFiles(await listAllFiles(octokit, owner, repo, pullNumber));
   if (files.length === 0 || files.some(f => typeof f.patch === 'string')) {
     return gitHubTransport(files);
   }
@@ -63,8 +75,9 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
     repo,
     pull_number: pullNumber,
   });
-  const { files: parsed, warnings } = parseUnifiedDiff(typeof data === 'string' ? data : String(data));
+  const { files: rawParsed, warnings } = parseUnifiedDiff(typeof data === 'string' ? data : String(data));
   warnings.forEach(w => core.warning(w));
+  const parsed = admitReviewableFiles(rawParsed);
   if (parsed.length === 0) {
     throw new Error(`No reviewable diff for PR #${pullNumber}: listFiles returned no patch and the unified diff was empty.`);
   }
@@ -235,14 +248,15 @@ function reviewEvent(requestsChanges, canApprove, transport) {
 }
 
 // [LAW:effects-at-boundaries] Pure: render the findings that could not be posted inline as a
-// summary section. They still carry their path:line so the reader can locate them. The path:line is
-// flattened THEN fenced (codeSpan) — a filename can legally embed a newline (unquoteCStylePath
-// reconstructs one from a quoted diff header) or backticks, and neither may split the bullet or
-// close the span; the body is flattened so a multi-line body stays one bullet.
+// summary section. They still carry their path:line so the reader can locate them. The path needs no
+// flattening — parseOneFinding stamped it single-line and parseReviewableFiles refused any diff path
+// that could not be — but it is still fenced through codeSpan, because backticks are orthogonal to
+// line structure and a backtick-bearing path must not close the span early. The body is the one field
+// that is legitimately block text, so it renders through findingLineText. [LAW:single-enforcer]
 function renderUnanchoredSection(unanchored) {
   if (!unanchored || unanchored.length === 0) return '';
   const items = unanchored
-    .map(f => `- ${codeSpan(flattenBody(`${f.path}:${f.line}`))} — ${severityTag(f)} ${flattenBody(f.body)}`)
+    .map(f => `- ${codeSpan(`${f.path}:${f.line}`)} — ${findingLineText(f)}`)
     .join('\n');
   return `\n\n### Findings outside the reviewed diff\nThese reference lines not present in this PR's diff, so they could not be posted as inline comments:\n\n${items}`;
 }

@@ -1,6 +1,9 @@
 'use strict';
 const fs = require('fs');
-const { parseFindingValue, parseScopeValue, parseAssessmentValue } = require('./review');
+// [LAW:one-source-of-truth] The advertised schema derives its severity bounds and verdict value set
+// from review.js — the module that ENFORCES them — so what the model is told is legal and what the
+// host actually accepts are one fact, not two that drift.
+const { parseFindingValue, parseScopeValue, parseAssessmentValue, ASSESSMENT_VERDICTS, SEVERITY_MIN, SEVERITY_MAX } = require('./review');
 
 function writeJsonRpcResponse(id, result) {
   process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, result })}\n`);
@@ -29,7 +32,7 @@ function collectorTools() {
           path: { type: 'string', minLength: 1, pattern: '\\S' },
           line: { type: 'integer', minimum: 1 },
           body: { type: 'string', minLength: 1, pattern: '\\S' },
-          severity: { type: 'integer', minimum: 1, maximum: 5 },
+          severity: { type: 'integer', minimum: SEVERITY_MIN, maximum: SEVERITY_MAX },
         },
         required: ['path', 'line', 'body', 'severity'],
         additionalProperties: false,
@@ -59,7 +62,7 @@ function collectorTools() {
           impact: { type: 'string', minLength: 1, pattern: '\\S' },
           affected: { type: 'boolean' },
           callSite: { type: 'string' },
-          verdict: { type: 'string', enum: ['safe', 'review', 'risky'] },
+          verdict: { type: 'string', enum: ASSESSMENT_VERDICTS },
         },
         required: ['module', 'impact', 'affected', 'verdict'],
         additionalProperties: false,
@@ -158,4 +161,6 @@ function runReviewCollectorServer() {
   });
 }
 
-module.exports = { runReviewCollectorServer };
+// collectorTools is exported for tests only (the consumer contract is action.yml + dist), so the
+// advertised schema can be asserted against the values review.js enforces. [LAW:one-source-of-truth]
+module.exports = { runReviewCollectorServer, collectorTools };

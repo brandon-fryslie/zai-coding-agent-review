@@ -1,6 +1,6 @@
 'use strict';
 const { annotatePatchWithLines } = require('./diff');
-const { severityTag, flattenBody } = require('./review');
+const { findingLineText } = require('./review');
 
 // [LAW:one-source-of-truth] The REVIEW PHILOSOPHY lives here, once, shared by both the PR-diff and
 // whole-repo review builders. It is deliberately NOT a laws-compliance audit: a code review exists to
@@ -110,14 +110,13 @@ function reviewCharter(toolNames) {
 // findings to fill the silence — trading the precision the eval gate holds for fake recall. [LAW:no-silent-failure]
 function renderPriorFindingsBlock(priorFindings, toolNames) {
   if (priorFindings.length === 0) return '';
-  // The ENTIRE bullet — path, line, tag, and body — is flattened as one string through flattenBody
-  // (the one flattening rule), so each finding renders as exactly ONE bullet no matter which field
-  // carries a newline. The body is the routine case, but a path can legally embed a newline too
-  // (unquoteCStylePath reconstructs one from a quoted diff header), and an unprefixed continuation
-  // line at prompt indentation could read as a stray instruction — an injection vector, not just a
-  // rendering blemish. The severity label derives from severityTag, the one spelling. [LAW:single-enforcer]
+  // Each finding renders as exactly ONE bullet: the path came stamped single-line from parseOneFinding,
+  // and the body — the one legitimately multi-line field — is collapsed by findingLineText, the single
+  // owner of that rule. An unprefixed continuation line at prompt indentation would read as a stray
+  // instruction rather than as part of the listed finding: an injection vector, not just a rendering
+  // blemish. [LAW:single-enforcer]
   return `\n    THIS IS A CONVERGENCE SWEEP. A previous pass of this same review already examined this material and recorded the findings below. They are ALREADY collected and will be posted — do not re-record, rephrase, re-argue, or re-verify any of them; a re-record is pure noise.\n`
-    + priorFindings.map(f => `      • ${flattenBody(`[${f.path}:${f.line}] ${severityTag(f)} ${f.body}`)}`).join('\n')
+    + priorFindings.map(f => `      • [${f.path}:${f.line}] ${findingLineText(f)}`).join('\n')
     + `\n    Your job in this sweep is ONLY what that list misses: read the material fresh and hunt for real issues NOT already listed — parts of the change no listed finding touches, failure classes the list has none of (edge cases, broken callers, concurrency, security), or a deeper problem behind a listed symptom. Record each genuinely new issue with ${toolNames.requestChange} as usual. If your fresh read surfaces nothing real that is missing, record NOTHING and call ${toolNames.finishReview} with a one-line summary saying the sweep found nothing new — an empty sweep is this review converging, which is a correct and expected outcome, not a failure. Never pad the sweep with speculative or trivial findings to avoid coming back empty.\n`;
 }
 
@@ -140,7 +139,9 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   let totalChars = 0;
 
   for (const f of patchableFiles) {
-    const entry = `### ${flattenBody(f.filename)} (${f.status})\n\`\`\`diff\n${annotatePatchWithLines(f.patch)}\n\`\`\``;
+    // No flatten: parseReviewableFiles refused any path that could break this heading, and flattening
+    // one here would hand the model a filename that does not match the file it must read.
+    const entry = `### ${f.filename} (${f.status})\n\`\`\`diff\n${annotatePatchWithLines(f.patch)}\n\`\`\``;
     if (maxDiffChars > 0 && totalChars + entry.length > maxDiffChars) {
       unshowableFiles.push(f.filename);
     } else {
@@ -158,7 +159,7 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // which counts toward the verdict and renders in the review body — so the riskiest (biggest) changed
   // files stay reviewable, and an issue in them can never bypass the merge gate via summary prose.
   if (unshowableFiles.length > 0) {
-    diffs += `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`). Read each in full at its absolute path and review its changes. Record any issue with ${toolNames.requestChange} using the file's real line number from the full file — the line cannot be anchored inline, so the host will post that finding in the review body's "Findings outside the reviewed diff" section; never put it in the ${toolNames.finishReview} summary:\n${unshowableFiles.map(f => `> - ${flattenBody(`${reviewedRepoRoot}/${f}`)}`).join('\n')}`;
+    diffs += `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`). Read each in full at its absolute path and review its changes. Record any issue with ${toolNames.requestChange} using the file's real line number from the full file — the line cannot be anchored inline, so the host will post that finding in the review body's "Findings outside the reviewed diff" section; never put it in the ${toolNames.finishReview} summary:\n${unshowableFiles.map(f => `> - ${reviewedRepoRoot}/${f}`).join('\n')}`;
   }
 
   if (dependencyDiffNote) {
@@ -252,7 +253,11 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // uncertainty stated in the body (never withheld). One lever, two directions; the record-time
   // consequence lives in the buildReviewInput passage below, not a second "read more context" instruction.
   const readTargets = scopeFiles.length > 0
-    ? `Read the complete content of THESE files — this scope's assigned changed files: ${flattenBody(scopeFiles.join(', '))}. `
+    // No flatten: these are paths the worker must OPEN. Collapsing a separator here would name a file
+    // that does not exist and the worker would silently review nothing — parseReviewableFiles refuses
+    // such a path at the boundary instead, so every path reaching this line is byte-exact and
+    // single-line. [LAW:no-silent-failure]
+    ? `Read the complete content of THESE files — this scope's assigned changed files: ${scopeFiles.join(', ')}. `
       + `Skip any among them that are generated or vendored artifacts (bundled or minified output, lockfiles) or pure documentation. `
       + `Another scope's worker reads the other changed files, so do NOT read them in full — that duplicates their work and their cost. `
       + `You may consult another file when a specific finding needs it — one your assigned files import, or a caller elsewhere that uses a symbol they change: prefer Grep to confirm a symbol, signature, or its call sites `
@@ -285,7 +290,9 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
     Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} for each issue you
     find. Every recorded change must use path, line (the displayed LINE value), body, and severity (an
     integer 1-5 — see the charter below). When the review is complete, call ${toolNames.finishReview}
-    exactly once. The summary is a one-line verdict — what the change does and whether it needs fixing.
+    exactly once. The summary is one line describing what the change does. It states no verdict: whether
+    the change needs fixing is the HOST's call, derived from the recorded findings, and the charter below
+    forbids stating it here — asking for it here too would be the prompt contradicting itself. [LAW:one-source-of-truth]
     It is NOT a channel for findings: a real problem always goes through ${toolNames.requestChange}, and
     it is NOT a place to praise the code, describe what you read, narrate your review, or restate the
     inline findings — those are already
@@ -345,8 +352,9 @@ Review this repository for what would hurt if it shipped. There is no diff — t
     Call ${toolNames.requestChange} for each issue you find, with path, line (any real line in that file —
     there is no diff grid here, so any line is valid), a body, and a severity (an integer 1-5 — see the
     charter below). When the review is complete, call
-    ${toolNames.finishReview} exactly once. The summary is a one-line verdict — what you audited and
-    whether it needs fixing. It is NOT a channel for findings: every real problem has a file and a line
+    ${toolNames.finishReview} exactly once. The summary is one line describing what you audited. It
+    states no verdict — the host derives that from the recorded findings, and the charter below forbids
+    stating it here. It is NOT a channel for findings: every real problem has a file and a line
     here (any real line is valid), so record it with ${toolNames.requestChange}. It is NOT a place to
     praise the code, describe what you read, narrate your review, or restate the inline findings — those
     are already posted via
@@ -394,6 +402,9 @@ function scoutOutputContract(toolNames, { assignFiles = false } = {}) {
 // threshold: the scope COUNT falls out of grouping changed files by concern and following the import
 // edges the change actually crosses. [LAW:dataflow-not-control-flow]
 function buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot }) {
+  // Rendered raw, and correctly so: changedPaths are diff filenames, and parseReviewableFiles refused
+  // any that could break this list. Do not "harden" this with a flatten — these are paths the scout
+  // assigns and a worker later opens, so collapsing one would name a file that does not exist.
   const fileList = changedPaths.map(p => `      - ${p}`).join('\n');
   return {
     prompt: `

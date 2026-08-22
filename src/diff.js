@@ -1,4 +1,7 @@
 'use strict';
+// [LAW:one-way-deps] diff.js depends on review.js for the ONE definition of a vertical separator;
+// review.js requires nothing, so the arrow points downhill and no cycle exists.
+const { hasVerticalSeparator } = require('./review');
 
 function matchesPattern(filename, pattern) {
   const escaped = pattern
@@ -175,8 +178,37 @@ function parseUnifiedDiff(diff) {
   return { files, warnings };
 }
 
+// [LAW:parse-dont-validate] The boundary that turns a raw host/diff file list into REVIEWABLE files.
+// A changed path can legally embed a vertical separator — git C-quotes it in the diff header and
+// unquoteCStylePath faithfully reconstructs it — but every representation downstream of here is
+// line-structured: a `### path` prompt heading, a `> - path` read-target bullet, a report bullet, a
+// GitHub comment anchor. There is no lossless way to put such a path on one of those lines.
+//
+// The previous design collapsed the separator at each sink, which is strictly worse than refusing it:
+// the collapsed path names a file that does not exist, so the worker instructed to open it reads
+// nothing and that file's review coverage disappears with no error anywhere. [LAW:no-silent-failure]
+// So the path is REFUSED here instead, once, and surfaced as a typed `unreviewable` entry the caller
+// reports. Every file that survives this boundary provably renders on one line, which is why no sink
+// downstream flattens a filename.
+function parseReviewableFiles(files) {
+  const reviewable = [];
+  const unreviewable = [];
+  for (const file of files) {
+    if (hasVerticalSeparator(file.filename)) {
+      unreviewable.push({
+        filename: file.filename,
+        reason: 'path contains a line separator, so it cannot be named on a prompt line or anchored to a review comment',
+      });
+      continue;
+    }
+    reviewable.push(file);
+  }
+  return { files: reviewable, unreviewable };
+}
+
 module.exports = {
   matchesPattern,
+  parseReviewableFiles,
   filterFiles,
   patchLines,
   buildFileAnchors,

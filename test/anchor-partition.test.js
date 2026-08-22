@@ -185,13 +185,15 @@ describe('submitReview — unanchored findings', () => {
   });
 
   test('a newline in an unanchored path cannot split the bullet — the span content is flattened before fencing', async () => {
-    // A filename can legally embed a newline (unquoteCStylePath reconstructs one from a quoted diff
-    // header). Unflattened, `a.js\n\n# Fake heading` would close the list item and inject markdown.
+    // Built through the REAL boundary (parseFindingValue), because the contract under test is "a
+    // recorded path can never close the list item and inject markdown into the posted review" — not
+    // which layer removes the newline. A hand-built finding would pin the old sink-side flattening and
+    // keep passing even if the boundary stopped stamping. [LAW:behavior-not-structure]
     const octokit = fakeOctokit();
     const review = {
       summary: 's',
       findings: [],
-      unanchored: [{ path: 'a.js\n\n# Fake heading', line: 7, body: 'x', severity: 3 }],
+      unanchored: [parseFindingValue({ path: 'a.js\n\n# Fake heading', line: 7, body: 'x', severity: 3 }, 0)],
       unreviewedScopes: [],
     };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
