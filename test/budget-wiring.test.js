@@ -121,7 +121,27 @@ describe('resolveBudgetedEffort', () => {
     },
   });
 
-  const ledgerComment = (usd, created_at) => ({ body: ledgerEntryBody({ available: true, usd }), created_at });
+  const ledgerComment = (usd, created_at) => ({ body: ledgerEntryBody({ basis: 'dollars', usd }), created_at });
+  const subscriptionLedgerComment = (notionalUsd, created_at) => ({ body: ledgerEntryBody({ basis: 'subscription', notionalUsd }), created_at });
+
+  // [LAW:verifiable-goals] AC for zai-billing-xl0.2, end to end through the seam that actually
+  // rations. The two halves of this test are the SAME day and the SAME dollar figure, differing only
+  // in what paid for it — which is exactly the fact the old two-arm cost type could not represent.
+  // Real spend of $63.59 against a $10 budget throttles to the floor; $63.59 of Anthropic LIST PRICE
+  // billed to plan quota must not move the gate at all, because no money was spent.
+  // The evidence on the ticket: reviewing PR #113 reported $63.59 across four subscription rounds.
+  test('subscription list price does not throttle the budget; the same figure in real dollars does', async () => {
+    const budgeted = (comments) => resolveBudgetedEffort({
+      octokit: fakeOctokit(comments), owner: 'o', repo: 'r', issueNumber: 1, now: today,
+      filteredFiles: smallDiff, candidates, dailyBudget: 10,
+    });
+    const spent = await budgeted([ledgerComment(63.59, '2026-07-11T08:00:00Z')]);
+    const quota = await budgeted([subscriptionLedgerComment(63.59, '2026-07-11T08:00:00Z')]);
+    assert.equal(quota.roundCap, 5, 'a quota-billed day must leave the full budget available');
+    assert.ok(spent.roundCap < quota.roundCap, `real overspend must throttle: spent=${spent.roundCap} quota=${quota.roundCap}`);
+    // And the control: an empty day and a quota-only day are indistinguishable to the gradient.
+    assert.equal(quota.roundCap, (await budgeted([])).roundCap);
+  });
 
   test('ample remaining budget chooses the full configured effort (the ceiling)', async () => {
     const octokit = fakeOctokit([]); // nothing spent today

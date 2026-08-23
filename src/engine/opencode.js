@@ -170,11 +170,13 @@ function assertSucceeded(stdout) {
 // like claude-code and unlike codex — so cost needs no local price table. Cost is available only
 // when a numeric cost field was actually observed; a run that emitted no token counts at all is
 // reported as no usage (null), and a run with tokens but no cost field yields cost
-// {available:false, reason:'not-reported'} — never a fabricated $0.00. [LAW:no-silent-failure]
-// This gates availability on an OBSERVED cost exactly as claude-code gates on a present
+// {basis:'unpriced', reason:'not-reported'} — never a fabricated $0.00. [LAW:no-silent-failure]
+// This gates the figure on an OBSERVED cost exactly as claude-code gates on a present
 // total_cost_usd, so a missing figure surfaces "unknown" loudly. [LAW:one-type-per-behavior]
-// An observed numeric 0 (subscription/unpriced provider) is a real available:true usd:0; the
+// An observed numeric 0 (a provider OpenCode does not price) is a real {basis:'dollars', usd:0}; the
 // reported USD is OpenCode's estimate, so the renderer marks every cost line "est." [FRAMING:representation]
+// The basis is always 'dollars': opencode declares credentialKinds ['api-key'], so no opencode run
+// can be billed to a subscription and this adapter has no notional arm to reach.
 function extractUsage(stdout) {
   let sawTokens = false;
   let sawCost = false;
@@ -205,8 +207,8 @@ function extractUsage(stdout) {
   }
   if (!sawTokens) return null;
   const cost = sawCost
-    ? { available: true, usd }
-    : { available: false, reason: 'not-reported' };
+    ? { basis: 'dollars', usd }
+    : { basis: 'unpriced', reason: 'not-reported' };
   return { inputTokens, outputTokens, cost };
 }
 

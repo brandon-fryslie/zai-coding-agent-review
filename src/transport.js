@@ -4,7 +4,7 @@ const { parseUnifiedDiff, parseReviewableFiles } = require('./diff');
 // flattenBody is imported for the pairPushbacks BOUNDARY (stamping author-written comment text), not
 // for any sink in this file — the sinks below receive values already stamped. [LAW:parse-dont-validate]
 const { severityTag, findingLineText, flattenBody, codeSpan } = require('./review');
-const { parseCostMarker } = require('./usage');
+const { parseCost, emptyTallies, tallyCost } = require('./usage');
 
 const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
 const APPROVED_MESSAGE = '✅ Approved';
@@ -132,9 +132,11 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
 // pagination is exhausted so a PR with many reviews is summarized in full, never truncated.
 async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
   let count = 0;
-  let usd = 0;
-  let knownRounds = 0;
-  let unknownRounds = 0;
+  // [LAW:one-type-per-behavior] Two tallies of one shape — dollars actually spent, and Anthropic
+  // list price for the rounds billed to subscription quota. They are reported side by side and
+  // NEVER added: a PR whose early rounds ran on a paid API and whose later rounds ran on the
+  // subscription must not report one blended number that is true of neither.
+  const tallies = emptyTallies();
   // [LAW:one-source-of-truth] The IDs of the marker-bearing (RA) reviews, collected inside the SAME
   // marker gate that drives count/cost — so "which reviews are RA's" is defined exactly once here, never
   // re-derived downstream. fetchPriorPushbacks consumes this to tell an RA finding's inline comment
@@ -158,18 +160,18 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
       if (!body.trimEnd().endsWith(REVIEW_MARKER)) continue;
       count++;
       reviewIds.push(r.id);
-      // [LAW:no-silent-failure] An agent round with a numeric cost marker is summed; any other case —
-      // an explicit 'unknown' marker, a pre-feature review with no marker, or a malformed value that
-      // won't parse — is a round whose cost we don't have, counted as unknown so the PR total is an
-      // honest lower bound (+), never silently omitted.
-      const cost = parseCostMarker(body);
-      if (typeof cost === 'number') { usd += cost; knownRounds++; }
-      else unknownRounds++;
+      // [LAW:parse-dont-validate] The body's marker is parsed back into the Cost value that wrote it,
+      // then folded by the one tally rule — this module never re-decides what a marker string means.
+      // [LAW:no-silent-failure] An agent round with a numeric figure is summed into its own basis;
+      // any other case — an explicit 'unknown' marker, a pre-feature review with no marker, or a
+      // malformed value that won't parse — is a round whose cost we don't have, counted as unknown so
+      // that basis's total is an honest lower bound (+), never silently omitted.
+      tallyCost(tallies, parseCost(body));
     }
     if (data.length < 100) break;
     page++;
   }
-  return { count, cost: { usd, knownRounds, unknownRounds }, reviewIds };
+  return { count, cost: tallies, reviewIds };
 }
 
 // [LAW:effects-at-boundaries] Pure, split from the fetch below so it is testable without a fake API:

@@ -93,8 +93,8 @@ test('parseProduced accepts the raw merged-findings shape and rejects malformed'
 });
 
 test('parseUsage passes cost through and tolerates missing fields', () => {
-  assert.deepEqual(parseUsage(JSON.stringify({ inputTokens: 100, outputTokens: 20, cost: { available: true, usd: 0.01 } }), 'u'),
-    { inputTokens: 100, outputTokens: 20, cost: { available: true, usd: 0.01 } });
+  assert.deepEqual(parseUsage(JSON.stringify({ inputTokens: 100, outputTokens: 20, cost: { basis: 'dollars', usd: 0.01 } }), 'u'),
+    { inputTokens: 100, outputTokens: 20, cost: { basis: 'dollars', usd: 0.01 } });
   assert.deepEqual(parseUsage('{}', 'u'), { inputTokens: null, outputTokens: null, cost: null });
   // A wrong-typed usage.json is rejected loudly, never silently treated as {} (all-null).
   assert.throws(() => parseUsage('123', 'u'), /not a JSON object/);
@@ -220,7 +220,7 @@ test('scoreRun produces a timestamp-free, re-runnable scorecard', async () => {
     { path: 'a.ts', line: 10, body: 'null pointer at close()', severity: 'blocking' },
     { path: 'q.ts', line: 1, body: 'novel unrelated thing', severity: 'advisory' },
   ]), 'f');
-  const args = { expected: EXPECTED_V, produced, usage: { inputTokens: 1, outputTokens: 2, cost: { available: true, usd: 0.5 } }, meta: { case: 'demo', config: { model: 'm' } }, judge: keywordJudge, matcherLabel: 'fake' };
+  const args = { expected: EXPECTED_V, produced, usage: { inputTokens: 1, outputTokens: 2, cost: { basis: 'dollars', usd: 0.5 } }, meta: { case: 'demo', config: { model: 'm' } }, judge: keywordJudge, matcherLabel: 'fake' };
   const a = await scoreRun(args);
   const b = await scoreRun(args);
   assert.deepEqual(a, b); // deterministic given the same judge
@@ -241,7 +241,7 @@ test('aggregateRuns forms a mean/min/max band and skips null recalls', () => {
     niceToFind: { found: 0, total: 0, recall: null },
     inventoryNiceToFind: { found: 1, total: 2, recall: 0.5 },
     noise: { count: noise },
-    usage: { cost: { available: true, usd } },
+    usage: { cost: { basis: 'dollars', usd } },
   });
   const s = aggregateRuns('demo', [mk(7, 7, 8, 9, 2, 0.01), mk(5, 7, 5, 9, 4, 0.02), mk(6, 7, 6, 9, 3, 0.03)]);
   assert.equal(s.runs, 3);

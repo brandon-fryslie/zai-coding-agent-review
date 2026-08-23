@@ -101,7 +101,7 @@ test('formatReport surfaces the explore verdict, beyond-diff reads, findings, an
     result: {
       findings: [{ path: 'src/run.js', line: 52, body: 'comment is a WHAT-comment' }],
       summary: 'looks fine',
-      usage: { inputTokens: 1000, outputTokens: 200, cost: { available: true, usd: 0.0123 } },
+      usage: { inputTokens: 1000, outputTokens: 200, cost: { basis: 'dollars', usd: 0.0123 } },
     },
     // Read the changed file (src/run.js) AND a sibling (src/engine/run.js): same basename, different
     // file — only the latter is beyond the diff, and repo-relative paths must keep them distinct.
@@ -112,7 +112,9 @@ test('formatReport surfaces the explore verdict, beyond-diff reads, findings, an
   assert.match(report, /beyond diff:\s+src\/engine\/run\.js/); // the sibling, not the changed file
   assert.doesNotMatch(report, /beyond diff:\s+src\/engine\/run\.js, src\/run\.js/); // changed file is NOT beyond
   assert.match(report, /src\/run\.js:52/);
-  assert.match(report, /\$0\.0123 est\./);
+  // [LAW:one-source-of-truth] The diagnostic renders through the action's OWN renderCostLine, so this
+  // asserts the production format — the two cannot drift into disagreeing about what a run cost.
+  assert.match(report, /Cost: \$0\.0123 · 1,000 in \/ 200 out tokens · claude-code\/deepseek-v4-pro · est\./);
   assert.match(report, /endpoint: api-key → https:\/\/x\/anthropic/);
 });
 
@@ -133,11 +135,18 @@ test('formatReport labels an oauth endpoint as subscription-billed', () => {
     mode: 'pr',
     repo: '/repo',
     files: [{ filename: 'src/run.js' }],
-    result: { findings: [], summary: 'clean', usage: null },
+    result: {
+      findings: [],
+      summary: 'clean',
+      usage: { inputTokens: 1000, outputTokens: 200, cost: { basis: 'subscription', notionalUsd: 63.59 } },
+    },
     sessions: [],
   });
   assert.match(report, /endpoint: oauth \(subscription\) → https:\/\/api\.anthropic\.com/);
   assert.match(report, /billed to plan quota, not per token/);
+  // The local diagnostic reads the same way the posted footer will: the list price is present, and
+  // labelled as not-billed rather than presented as spend.
+  assert.match(report, /Not billed \(Claude subscription\) · \$63\.5900 at Anthropic list price/);
 });
 
 // [LAW:one-source-of-truth] formatReport looks a credential kind up in a label table, and PRESETS is

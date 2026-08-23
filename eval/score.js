@@ -337,7 +337,11 @@ function aggregateRuns(caseName, scorecards) {
       n: nums.length,
     };
   };
-  const costUsd = (u) => (u && u.cost && u.cost.available === true ? u.cost.usd : null);
+  // [LAW:one-source-of-truth] Only a DOLLARS-basis run contributes a cost figure. A run billed to
+  // subscription quota carries a notional list price, not spend — folding it in here would let one
+  // baseline mix two units and quietly compare list price against money. It reports null and lands
+  // in the existing uncosted-run count, which the baseline report already states out loud.
+  const costUsd = (u) => (u && u.cost && u.cost.basis === 'dollars' ? u.cost.usd : null);
   return {
     case: caseName,
     runs: scorecards.length,

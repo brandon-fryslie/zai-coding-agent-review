@@ -390,7 +390,21 @@ The transcript dumps the engine's own raw streams verbatim — it is not a recon
 
 Every review reports its estimated USD cost in the attribution footer and the run log (tokens × a hand-maintained price table). A model with no table entry renders cost as `unknown` (tokens still shown) and logs a warning. Costs are estimates, never billed charges.
 
-> **Under `PROVIDER: claude-subscription` the reported figure is Anthropic *list price* for a review that was billed to your plan's quota** — useful for "what would this have cost?", but not money spent. It is still summed into the daily ledger today, so pair the subscription provider with `DAILY_BUDGET_USD` only if you want the budget gradient to ration against notional dollars.
+**A review is paid for in one of two ways, and the two are never added together.** A per-token API provider (`codex`, `zai`, `deepseek`) costs real dollars. `PROVIDER: claude-subscription` costs plan quota — no money changes hands — but Claude Code still reports what those tokens *would* have cost at Anthropic list price, and that figure is worth having: it is how you answer "is the subscription cheaper than the API bill, and how much of the plan am I using?"
+
+So a subscription review reports its list price everywhere a cost is reported, labelled as what it is:
+
+```
+Not billed (Claude subscription) · $18.4100 at Anthropic list price · 12,231,000 in / 82,000 out tokens · claude-code/claude-sonnet-5 · est. · PR list-price total $63.5900 across 4 rounds
+```
+
+and it contributes **$0.00** to spend. Concretely:
+
+- `DAILY_BUDGET_USD` rations dollars only. A day of subscription reviews leaves the whole budget available — the gradient never throttles against money nobody spent.
+- The daily ledger still records every subscription review (its consumption stays visible), under a separate list-price roll-up that the spend total cannot read.
+- A PR that ran some rounds on an API key and some on the subscription reports **two** totals side by side, never one blended number.
+
+If Claude Code reports no list price for a subscription run, that is stated as unavailable and logged — never as `$0.00`, which would read as "we know it was free."
 
 ## Architecture
 

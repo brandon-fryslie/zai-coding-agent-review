@@ -3,6 +3,7 @@ const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS } =
 const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = require('./deadline');
 const { defaultEffortProfile, maxTier } = require('./effort');
 const { dedupeFindings, dedupeAssessments, parseScopeValue } = require('./review');
+const { sumCost } = require('./usage');
 const { renderDependencyDiffNote } = require('./dependency-diff');
 const {
   buildReviewInput,
@@ -59,9 +60,12 @@ function workerFocusText(scope, context) {
 // in partitionFindings share one key. [LAW:single-enforcer]
 
 // [LAW:effects-at-boundaries] Pure: sum the per-spawn Usage values into one. Token counts always add.
-// Cost is uniform by construction — every spawn in a pass runs on ONE config, so all costs share the
-// same model and the same availability — so the sum is available iff every spawn's cost is, carrying
-// the same unavailable reason otherwise. [LAW:no-silent-failure] no spawn's cost is silently dropped.
+// [LAW:single-enforcer] Summing COSTS is delegated to sumCost (src/usage.js), the one owner of the
+// "never add across bases" rule — this module knows how to add tokens, not what a dollar means.
+// The cost basis is uniform by construction here (every spawn in a pass runs on ONE config), so all
+// costs share the same model and the same basis; sumCost still resolves the mixed case as a value.
+// [LAW:no-silent-failure] no spawn's cost is silently dropped: one unpriced spawn makes the whole
+// sum unpriced, carrying that spawn's reason.
 // usage === null (an engine reported nothing) is excluded; all-null sums to null, matching the
 // single-spawn behavior the cost renderer already handles.
 function sumUsage(usages) {
@@ -69,10 +73,7 @@ function sumUsage(usages) {
   if (present.length === 0) return null;
   const inputTokens = present.reduce((sum, u) => sum + u.inputTokens, 0);
   const outputTokens = present.reduce((sum, u) => sum + u.outputTokens, 0);
-  const cost = present.every(u => u.cost.available)
-    ? { available: true, usd: present.reduce((sum, u) => sum + u.cost.usd, 0) }
-    : { available: false, reason: present.find(u => !u.cost.available).cost.reason };
-  return { inputTokens, outputTokens, cost };
+  return { inputTokens, outputTokens, cost: sumCost(present.map(u => u.cost)) };
 }
 
 // [LAW:effects-at-boundaries] Pure: the aggregated review summary. It names every scope reviewed and

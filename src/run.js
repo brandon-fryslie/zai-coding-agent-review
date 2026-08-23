@@ -188,11 +188,25 @@ async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, c
   let spentToday = 0;
   try {
     const ledger = await readSpentToday(octokit, owner, repo, issueNumber, now);
-    spentToday = ledger.usd;
-    if (ledger.unknownEntries > 0) {
+    // [LAW:types-are-the-program] The gradient rations DOLLARS, so it reads the `billed` tally and
+    // nothing else. Subscription rounds are tallied separately under `notional` and have no `usd`
+    // field here to pick up — they cannot throttle a budget against money that was never spent.
+    spentToday = ledger.billed.usd;
+    if (ledger.billed.unknownCount > 0) {
       core.warning(
-        `Budget: ledger issue #${issueNumber} has ${ledger.unknownEntries} entr(ies) with unknown cost — `
+        `Budget: ledger issue #${issueNumber} has ${ledger.billed.unknownCount} entr(ies) with unknown cost — `
         + `today's spend ($${spentToday.toFixed(4)}) is a LOWER bound; the gradient rations at least this cautiously.`,
+      );
+    }
+    // [LAW:no-silent-failure] Subscription consumption is reported, not hidden: the operator sees what
+    // the day's quota-billed reviews would have cost at list price, stated as the separate figure it
+    // is. It is emitted here and summed into nothing.
+    const notionalRounds = ledger.notional.count + ledger.notional.unknownCount;
+    if (notionalRounds > 0) {
+      core.info(
+        `Budget: ${notionalRounds} of today's review(s) were billed to Claude subscription quota, not `
+        + `dollars — $${ledger.notional.usd.toFixed(4)} at Anthropic list price, excluded from the `
+        + `$${spentToday.toFixed(4)} spend above.`,
       );
     }
   } catch (e) {

@@ -1,5 +1,5 @@
 'use strict';
-const { costMarker, parseCostMarker } = require('./usage');
+const { costMarker, parseCost, emptyTallies, tallyCost } = require('./usage');
 
 // The append-only daily cost ledger: the persistent cross-run store of actual review spend, scoped to
 // one repo-day, that the budget gradient (zai-budget-qzm) reads before deciding this review's effort.
@@ -31,9 +31,13 @@ const { costMarker, parseCostMarker } = require('./usage');
 const LEDGER_MARKER = '<!-- agent-review-cost-ledger-entry -->';
 
 // [LAW:effects-at-boundaries] Pure: the body of one ledger entry — the sentinel then the reused cost
-// marker. `cost` is the same discriminated value costMarker already consumes ({available, usd, reason}),
-// so an unavailable cost writes an honest `unknown` marker: the entry still exists (a review happened),
-// its cost is simply counted as unknown on read, never fabricated as zero. [LAW:no-silent-failure]
+// marker. `cost` is the same discriminated value costMarker already consumes (see THE COST VALUE in
+// src/usage.js), so an unpriced cost writes an honest `unknown` marker: the entry still exists (a
+// review happened), its cost is simply counted as unknown on read, never fabricated as zero.
+// [LAW:dataflow-not-control-flow] The append is UNCONDITIONAL for every basis — a subscription review
+// records an entry like any other, and its exclusion from the day's dollars is the marker NAME
+// costMarker chose, never a caller that skips appendCost. A skipped append would make the
+// subscription's consumption invisible instead of merely unbilled. [LAW:no-silent-failure]
 function ledgerEntryBody(cost) {
   return `${LEDGER_MARKER}\n${costMarker(cost)}`;
 }
@@ -47,27 +51,31 @@ function utcDay(dateish) {
   return new Date(dateish).toISOString().slice(0, 10);
 }
 
-// [LAW:effects-at-boundaries] Pure: sum the cost of the ledger entries dated today (UTC of `now`).
-// [LAW:single-enforcer] ONE definition of "a today ledger entry" gates the sum: a comment that LEADS
+// [LAW:effects-at-boundaries] Pure: tally the cost of the ledger entries dated today (UTC of `now`).
+// [LAW:single-enforcer] ONE definition of "a today ledger entry" gates the tally: a comment that LEADS
 // with LEDGER_MARKER and whose created_at falls on today's UTC date. A comment failing either test —
 // a human note, a quoted marker mid-prose, yesterday's entry — contributes nothing.
-// [LAW:no-silent-failure] An entry inside the gate whose marker is 'unknown' or unparseable is counted
-// as an unknownEntry, never dropped, so the caller can report the day's spend as an honest lower bound
-// rather than a silently-partial sum — the same shape summarizePriorReviews returns for a PR.
+// [LAW:parse-dont-validate] Each gated body is parsed back into the same Cost value costMarker wrote
+// and folded by tallyCost, so this module never re-decides what a raw marker string means.
+// [LAW:no-silent-failure] An entry whose figure is 'unknown' or unparseable raises unknownCount,
+// never dropped, so the caller reports the day's spend as an honest lower bound rather than a
+// silently-partial sum — the same shape summarizePriorReviews returns for a PR.
+//
+// THE SPEND EXCLUSION, IN PRACTICE. A subscription review's entry carries the NOTIONAL marker, so it
+// lands in the `notional` tally and contributes nothing to `billed` — the day's dollar spend excludes
+// it BY CONSTRUCTION, not by a guard, and no `usd` field exists on its cost for this fold to read.
+// It is equally NOT an unknown billed entry: its spend is known exactly, and it is zero. The
+// subscription's consumption stays visible in `notional` rather than becoming invisible.
 function sumCostToday(comments, now) {
   const today = utcDay(now);
-  let usd = 0;
-  let knownEntries = 0;
-  let unknownEntries = 0;
+  const tallies = emptyTallies();
   for (const c of comments) {
     const body = typeof c.body === 'string' ? c.body : '';
     if (!body.trimStart().startsWith(LEDGER_MARKER)) continue;
     if (utcDay(c.created_at) !== today) continue;
-    const cost = parseCostMarker(body);
-    if (typeof cost === 'number') { usd += cost; knownEntries++; }
-    else unknownEntries++;
+    tallyCost(tallies, parseCost(body));
   }
-  return { usd, knownEntries, unknownEntries };
+  return tallies;
 }
 
 // [LAW:effects-at-boundaries] Effect: read the ledger issue's comments and return today's summed spend
