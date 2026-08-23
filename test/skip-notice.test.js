@@ -126,7 +126,9 @@ describe('a review-less run speaks at the PR', () => {
     assert.equal(await cappedPush(pr, 'sha3', DERATED_MESSAGE), 'already-posted');
   });
 
-  test('a post the host refuses warns loudly and never throws', async () => {
+  // Scoped to the FORK notice deliberately: since severity became a carried value, "a refused post warns"
+  // is true of this notice, not of the mechanism. The round cap's opposite is asserted below.
+  test('a FORK post the host refuses warns loudly and never throws', async () => {
     const octokit = {
       rest: {
         pulls: {
