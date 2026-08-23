@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { filterFiles, buildReviewAnchors, diffChurn } = require('./diff');
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, fetchPriorPushbacks, roundCapReached, parseMaxRounds } = require('./transport');
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, fetchPriorPushbacks, roundCapReached, parseMaxRounds } = require('./transport');
 const { buildReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
@@ -363,11 +363,34 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     return;
   }
 
+  // [LAW:no-silent-failure] Name the prior-review summary as the failure point, matching the PR fetch
+  // above — a bare throw would surface only the generic top-level message, hiding which step failed. A
+  // listReviews error fails the run loud rather than silently skipping the cap. ONE fetch feeds three
+  // consumers: the round cap (.count), the PR-total footer (.cost), and every skip notice's idempotency
+  // key (.latestArtifact). [LAW:one-source-of-truth]
+  //
+  // It runs BEFORE the fork gate because both skip paths below announce themselves on the PR and need
+  // that key to avoid re-posting on every push. This costs a fork PR one extra listReviews read and
+  // leaves the security invariant untouched: the fork gate's job is that no AI CREDENTIAL is read and
+  // no engine is spawned for an outside contributor, and neither happens here.
+  let prior;
+  try {
+    prior = await summarizePriorReviews(octokit, owner, repo, pullNumber);
+  } catch (e) {
+    core.setFailed(`Failed to summarize prior reviews for PR #${pullNumber}: ${e.message}`);
+    return;
+  }
+
+  // [LAW:one-type-per-behavior] The two exits that end a run WITHOUT reviewing — a fork PR and a spent
+  // round cap — differ only in the notice VALUE they hand to announceNotReviewed. Both are still clean
+  // exit-0 no-ops with no engine spawned; what changed is that the PR now says so, because a run that
+  // reviewed nothing and a run that reviewed cleanly were otherwise identical at every sink a consumer
+  // reads. [LAW:no-silent-failure]
+
   // [LAW:dataflow-not-control-flow] Fork eligibility is read from the PR data, not a mode: the
   // action never reviews a fork PR (its diff is untrusted and would spend the host's own AI credits
-  // on outside contributors). Skipping is an intentional clean no-op — logged, exit 0, no review
-  // posted, no engine spawned. [LAW:no-silent-failure] the skip is announced; malformed PR data (no
-  // base repo) throws here and surfaces as a loud failure, never a skip.
+  // on outside contributors). Malformed PR data (no base repo) throws here and surfaces as a loud
+  // failure, never a skip.
   let isFork;
   try {
     isFork = prIsFromFork(pr);
@@ -376,30 +399,15 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     return;
   }
   if (isFork) {
-    core.info(
-      `Skipping review: PR #${pullNumber} is from a fork. Fork pull requests are not reviewed `
-      + 'by this action.',
-    );
-    return;
-  }
-
-  // [LAW:dataflow-not-control-flow] The round cap is the same clean pre-spawn skip as the fork gate:
-  // the number of rounds already spent is derived from the PR's marker-bearing reviews (one review per
-  // round), and a maxed-out PR is a logged no-op — exit 0, no engine spawned, the last review's verdict
-  // stands. [LAW:no-silent-failure] the skip names the cap so a missing review is never mistaken for a
-  // clean pass. A weak model surfaces everything important in the first few rounds; beyond the cap,
-  // re-reviewing every push only re-spends the diff's full token cost for diminishing return.
-  // [LAW:single-enforcer] The cap is read off the effort profile — parsed and validated once at the
-  // producing boundary in run() — never re-parsed here.
-  // [LAW:no-silent-failure] Name the prior-review summary as the failure point, matching the fork-gate
-  // fetch above — a bare throw would surface only the generic top-level message, hiding which step
-  // failed. A listReviews error fails the run loud rather than silently skipping the cap. One fetch
-  // feeds both the round cap (.count) and the PR-total footer (.cost). [LAW:one-source-of-truth]
-  let prior;
-  try {
-    prior = await summarizePriorReviews(octokit, owner, repo, pullNumber);
-  } catch (e) {
-    core.setFailed(`Failed to summarize prior reviews for PR #${pullNumber}: ${e.message}`);
+    await announceNotReviewed(reviewOctokit, {
+      owner, repo, pullNumber, commitId: headSha, reviewerName, latestArtifact: prior.latestArtifact,
+      notice: {
+        reason: 'fork',
+        message: `PR #${pullNumber} is from a fork. Fork pull requests are not reviewed by this action — `
+          + "their diff is untrusted and reviewing it would spend the host repository's AI credits on an "
+          + 'outside contributor.',
+      },
+    });
     return;
   }
 
@@ -487,6 +495,12 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   // it can only fall via the difficulty ceiling or the budget cap), so the list is never empty here. The
   // both-off path leaves the cap at the default and takes the MAX_REVIEW_ROUNDS branch (a byte-identical
   // run down to the log).
+  //
+  // The cap itself is a cost control worth keeping: a weak model surfaces everything important in the
+  // first few rounds, and re-reviewing every push past that re-spends the diff's full token cost for
+  // diminishing return. The rounds already spent are derived from the PR's marker-bearing reviews (one
+  // review per round) — never a separate counter. What the cap must NOT do is go quiet, which is why the
+  // exit announces itself below rather than only logging. [LAW:no-silent-failure]
   if (roundCapReached(prior.count, effort.roundCap)) {
     const { deRated, budgetBound, difficultyBound } = bindingLevers({
       effortRoundCap: effort.roundCap,
@@ -501,12 +515,19 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
       budgetBound && 'raise the daily budget',
       difficultyBound && 'push a larger change (or unset DIFFICULTY_SCALING)',
     ].filter(Boolean);
-    core.info(deRated
-      ? `Skipping review: PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
+    // [LAW:one-source-of-truth] The cap sentence is composed ONCE and read by both sinks — the run log
+    // and the notice posted to the PR — so the operator remedy can never differ between the two places
+    // it appears. announceNotReviewed owns the logging, so this site only produces the value.
+    const message = deRated
+      ? `PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
         + `the de-rated round cap of ${effort.roundCap} set by ${setters.join(' / ')} (lowered from `
         + `MAX_REVIEW_ROUNDS ${defaultEffort.roundCap}). To review further pushes, ${remedies.join(' or ')}.`
-      : `Skipping review: PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
-        + `the MAX_REVIEW_ROUNDS cap of ${effort.roundCap}. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.`);
+      : `PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
+        + `the MAX_REVIEW_ROUNDS cap of ${effort.roundCap}. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.`;
+    await announceNotReviewed(reviewOctokit, {
+      owner, repo, pullNumber, commitId: headSha, reviewerName, latestArtifact: prior.latestArtifact,
+      notice: { reason: 'round-cap', message },
+    });
     return;
   }
 

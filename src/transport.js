@@ -7,6 +7,31 @@ const { severityTag, findingLineText, flattenBody, codeSpan } = require('./revie
 const { parseCost, emptyTallies, tallyCost } = require('./usage');
 
 const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
+
+// [LAW:types-are-the-program] The two things this action can leave on a PR are two DIFFERENT values,
+// and their markers are structurally disjoint so no reader can confuse them: a completed review round
+// ends with REVIEW_MARKER; a run that reviewed NOTHING ends with a not-reviewed marker naming why.
+//
+// Disjointness is by construction, not by convention. `<!-- copirate-code-review-agent:not-reviewed:
+// round-cap -->` cannot satisfy `endsWith(REVIEW_MARKER)`, because a reason is drawn from a closed
+// enumeration of `[a-z-]` literals — a charset with no space, no `<`, no `>` — so no reason can splice
+// the review marker back onto the end. That is why a notice can NEVER be counted as a review round or
+// have a cost tallied against it: not a rule summarizePriorReviews must remember, a shape it cannot see.
+//
+// This exists because a run that skipped was previously INDISTINGUISHABLE from a clean review at every
+// sink a consumer reads — same green conclusion, same zero findings, same absence of a posted review.
+// On 2026-08-21 an automated merge loop read that absence as approval and came one step from merging an
+// unreviewed head commit that a later review found 19 real findings in. [LAW:no-silent-failure]
+const NOT_REVIEWED_MARKER_PREFIX = '<!-- copirate-code-review-agent:not-reviewed:';
+// [LAW:one-type-per-behavior] ONE notice mechanism serves every path that exits 0 without reviewing;
+// the path is a VALUE in this enumeration, never a second mechanism. Today that is exactly two paths —
+// a fork PR (never reviewed, by design) and a spent round cap. The third candidate, a time budget that
+// expires before any scope completes, is deliberately NOT here: it already throws DeadlineExceededError
+// and reds the run (src/multiscope.js), so it is loud already and needs no notice.
+const NOT_REVIEWED_REASONS = ['fork', 'round-cap'];
+// The headline is fixed prose, identical for every reason, so a reader (or a grep) recognizes the state
+// before parsing the cause. It deliberately shares no vocabulary with APPROVED_MESSAGE.
+const NOT_REVIEWED_MESSAGE = '⚠️ **NOT REVIEWED** — this action did not review this pull request.';
 const APPROVED_MESSAGE = '✅ Approved';
 const REQUEST_CHANGES_MESSAGE = '❌ Request Changes';
 // The incomplete-coverage verdict: part of the change was never judged, and nothing surfaced in the
@@ -123,6 +148,20 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
   return announce(giteaTransport(parsed.files, parsed.unreviewable));
 }
 
+// [LAW:parse-dont-validate] The one reader that turns a raw review body into what this action left
+// there: a completed round, a not-reviewed notice naming its cause, or null for a body this action did
+// not write. Every consumer takes the parsed value; none re-inspects the string. [LAW:single-enforcer]
+//
+// Matching the ENDING (not a loose `includes`) is inherited from the round-count gate for the same
+// reason: a human review that quotes a marker mid-body is not one of ours and must satisfy neither arm.
+// The review marker is tested first because it is the narrower literal; the two cannot both match.
+function parseAgentArtifact(rawBody) {
+  const body = (typeof rawBody === 'string' ? rawBody : '').trimEnd();
+  if (body.endsWith(REVIEW_MARKER)) return { kind: 'review' };
+  const m = /<!-- copirate-code-review-agent:not-reviewed:([a-z-]+) -->$/.exec(body);
+  return m ? { kind: 'not-reviewed', reason: m[1] } : null;
+}
+
 // [LAW:one-source-of-truth] A completed review round IS a posted review carrying REVIEW_MARKER, and its
 // cost IS the cost marker in that same body — there is no separate counter or ledger to drift. One pass
 // over the PR's own reviews yields BOTH the round count (for the round cap) and the summed cost (for the
@@ -142,6 +181,14 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
   // re-derived downstream. fetchPriorPushbacks consumes this to tell an RA finding's inline comment
   // (pull_request_review_id ∈ reviewIds) from a human reviewer's, without a second marker check.
   const reviewIds = [];
+  // [LAW:one-source-of-truth] The NEWEST thing this action left on the PR — a round or a not-reviewed
+  // notice — read out of the SAME pass that counts rounds, so "what does this PR currently say about
+  // itself" has one definition. announceNotReviewed consumes it as its idempotency key: it stays quiet
+  // only while its own notice is still the last word. That is deliberately not a per-PR "already told
+  // them" flag, which would go permanently silent — if the cap is later raised and a real round posts,
+  // the notice is no longer newest and the next skip speaks again. listReviews pages ascend, so the
+  // last assignment wins. [LAW:no-silent-failure]
+  let latestArtifact = null;
   let page = 1;
   while (true) {
     const { data } = await octokit.rest.pulls.listReviews({
@@ -153,11 +200,16 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
     });
     for (const r of data) {
       const body = typeof r.body === 'string' ? r.body : '';
-      // [LAW:single-enforcer] ONE definition of "an agent review round" — a body whose trailing
-      // sentinel is REVIEW_MARKER — gates the count, the cost sum, AND the RA-review-id set. Matching the
-      // ending (not a loose `includes`) means a human review that merely quotes a marker satisfies none,
-      // so it can over-count neither rounds nor cost nor be mistaken for an RA finding's parent review.
-      if (!body.trimEnd().endsWith(REVIEW_MARKER)) continue;
+      // [LAW:single-enforcer] ONE definition of "an agent review round" — the 'review' arm of
+      // parseAgentArtifact — gates the count, the cost sum, AND the RA-review-id set, so none of the
+      // three can drift from the others or from what submitReview writes.
+      const artifact = parseAgentArtifact(body);
+      if (!artifact) continue; // a human's review, or a body this action did not write
+      latestArtifact = artifact;
+      // [LAW:dataflow-not-control-flow] The one branch is the artifact type's own discriminator. A
+      // notice contributes to `latestArtifact` alone: it recorded no round and spent no money, so
+      // counting it would push a PR past its cap using a review that never happened.
+      if (artifact.kind !== 'review') continue;
       count++;
       reviewIds.push(r.id);
       // [LAW:parse-dont-validate] The body's marker is parsed back into the Cost value that wrote it,
@@ -171,7 +223,7 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
     if (data.length < 100) break;
     page++;
   }
-  return { count, cost: tallies, reviewIds };
+  return { count, cost: tallies, reviewIds, latestArtifact };
 }
 
 // [LAW:effects-at-boundaries] Pure, split from the fetch below so it is testable without a fake API:
@@ -375,6 +427,72 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   core.info(verdict);
 }
 
+// [LAW:effects-at-boundaries] Pure: the body of a not-reviewed notice. Split from the post below so the
+// contract that matters — "a reader cannot mistake this for an approval, and a machine can tell them
+// apart" — is asserted without a fake API.
+//
+// [LAW:parse-dont-validate] The reason is checked HERE, at the boundary that turns it into a marker,
+// because the marker's charset is what keeps the two markers disjoint (see NOT_REVIEWED_MARKER_PREFIX).
+// An unknown reason is a programming error and throws; it can never reach the PR as a marker no reader
+// knows how to parse. [LAW:no-silent-failure]
+function renderNotReviewedBody(reviewerName, notice) {
+  if (!NOT_REVIEWED_REASONS.includes(notice.reason)) {
+    throw new Error(
+      `Unknown not-reviewed reason "${notice.reason}"; expected one of ${NOT_REVIEWED_REASONS.join(', ')}.`,
+    );
+  }
+  return `## ${reviewerName}\n\n${NOT_REVIEWED_MESSAGE}\n\n${notice.message}\n\n`
+    + 'This is not an approval — no code was read and no findings were produced, so the head commit '
+    + 'stands unreviewed. A green check on this run means the action ran, not that the change was '
+    + `reviewed.\n\n${NOT_REVIEWED_MARKER_PREFIX}${notice.reason} -->`;
+}
+
+// [LAW:one-type-per-behavior] THE mechanism by which every review-less exit speaks at the sinks a
+// consumer actually reads. Both silent exits (a fork PR, a spent round cap) call this one function with
+// a different notice VALUE — never a second channel, and never a flag to opt into being told.
+//
+// The channel is a COMMENT review, the same one the reviewer already uses to say "✅ Approved" when it
+// holds no approval token. A skip has strictly more standing to speak than that does. The three shapes
+// the ticket ruled out are ruled out here too: the run still exits 0 (failing it would break a required
+// check over a deliberate cost control), the event is never REQUEST_CHANGES (nothing was reviewed, so
+// there is no finding to justify one), and there is no input to turn this on.
+//
+// [LAW:no-silent-failure] Announcing is best-effort but never quiet about failing. A fork PR reviewed on
+// a `pull_request` trigger gets a read-only GITHUB_TOKEN — GitHub forbids write scopes there, whatever
+// the workflow's `permissions:` block says — so createReview 403s and there is no configuration that
+// fixes it. Reddening the run on that would red every fork PR forever, so the failure degrades to a loud
+// warning (still a visible run annotation) rather than a red check. On the triggers that CAN write
+// (pull_request_target, workflow_run) the notice lands.
+async function announceNotReviewed(octokit, { owner, repo, pullNumber, commitId, reviewerName, notice, latestArtifact }) {
+  core.info(`Skipping review: ${notice.message}`);
+  // The idempotency key is "my own notice is still the last word on this PR", so a second push while
+  // still capped adds nothing. See summarizePriorReviews' latestArtifact for why this is not a flag.
+  if (latestArtifact && latestArtifact.kind === 'not-reviewed' && latestArtifact.reason === notice.reason) {
+    core.info(`PR #${pullNumber} already carries a '${notice.reason}' not-reviewed notice; not posting a duplicate.`);
+    return 'already-posted';
+  }
+  try {
+    await octokit.rest.pulls.createReview({
+      owner,
+      repo,
+      pull_number: pullNumber,
+      commit_id: commitId,
+      event: 'COMMENT',
+      body: renderNotReviewedBody(reviewerName, notice),
+    });
+  } catch (e) {
+    core.warning(
+      `Could not post the '${notice.reason}' not-reviewed notice to PR #${pullNumber}: ${e.message}. `
+      + 'The run did NOT review this pull request; nothing on the PR says so. On a `pull_request` '
+      + 'trigger a fork PR gets a read-only token and cannot be commented on — use pull_request_target '
+      + 'or workflow_run if the notice must land.',
+    );
+    return 'failed';
+  }
+  core.info(`Posted a '${notice.reason}' not-reviewed notice to PR #${pullNumber}.`);
+  return 'posted';
+}
+
 // [LAW:single-enforcer] One resolver decides which pull request to review, from
 // whichever provenance the triggering event offers. pull_request / pull_request_target
 // carry the PR in the event payload; other events (workflow_run, workflow_dispatch)
@@ -417,6 +535,11 @@ module.exports = {
   resolveReviewTarget,
   prIsFromFork,
   summarizePriorReviews,
+  parseAgentArtifact,
+  announceNotReviewed,
+  renderNotReviewedBody,
+  NOT_REVIEWED_MESSAGE,
+  NOT_REVIEWED_REASONS,
   fetchPriorPushbacks,
   pairPushbacks,
   roundCapReached,

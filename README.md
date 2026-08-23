@@ -119,7 +119,7 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | `ZAI_REVIEWER_NAME` | `CoPirate Code Review` | Name shown in the review comment header (applies to every provider; the `ZAI_` prefix is historical). |
 | `EXCLUDE_PATTERNS` | `*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml` | Comma-separated file patterns to exclude. |
 | `MAX_DIFF_CHARS` | `0` (unlimited) | Max characters of diff sent to the engine. |
-| `MAX_REVIEW_ROUNDS` | `5` | Max times the action reviews one PR; further pushes skip cleanly with no engine spawned (`0` = unlimited). Bounds cost on PRs pushed many times. |
+| `MAX_REVIEW_ROUNDS` | `5` | Max times the action reviews one PR; further pushes skip cleanly with no engine spawned and [say so on the PR](#a-skipped-run-says-so-on-the-pr) (`0` = unlimited). Bounds cost on PRs pushed many times. |
 | `TIME_BUDGET_MINUTES` | `25` | Wall-clock budget for the whole review run, in both modes. When it expires, the review stops starting new scope workers and sweeps and **delivers what it has** instead of the job's `timeout-minutes` cancelling the run with every finding undelivered: in `pr` mode the review is submitted with unreviewed scopes named in the summary and the verdict withholding approval; in `repo` mode the Step Summary report still renders, carrying the same partial-coverage note (there is no verdict to withhold). A budget that expires before **any** scope completes instead fails the run loudly, naming this input — there is no review to deliver. Set it a few minutes below the job's `timeout-minutes`. `0` = no budget. |
 | `DAILY_BUDGET_USD` | `0` (off) | Daily spend ceiling honored as a **gradient** — see [Daily budget](#daily-budget). `0`/unset = off (today's default effort, no ledger I/O). PR mode only; requires `LEDGER_ISSUE` and `issues: write`. |
 | `LEDGER_ISSUE` | — | Issue number of the append-only daily cost ledger the budget gradient reads and writes (typically `${{ vars.LEDGER_ISSUE }}`). Required when `DAILY_BUDGET_USD` is set. |
@@ -148,9 +148,19 @@ Set `GITHUB_REVIEW_TOKEN` to an approval-capable user or GitHub App token to hav
 - The [time budget](#inputs) expired before every scope was reviewed — the unreviewed scopes are named in the summary.
 - A changed file's path cannot be reviewed (it embeds a line separator, so no prompt line can name it and no review comment can anchor to it) — those files are listed under **Changed files NOT reviewed** with the reason.
 
+## A skipped run says so on the PR
+
+Two things end a run without reviewing anything: a PR from a fork, and a PR that has spent its `MAX_REVIEW_ROUNDS`. Both are deliberate and both still exit 0 with green checks — and both post a `COMMENT` review that opens `⚠️ **NOT REVIEWED**` and names the cause and its remedy.
+
+Without that notice a skip is indistinguishable from a clean review: same successful workflow run, same zero findings, same absence of a posted review. Anything reading those signals — an automerge loop, a dashboard, a person glancing at the checks — sees approval. That is not hypothetical: on 2026-08-21 an automated loop came one step from merging a head commit nobody had reviewed, which a later review found 19 real issues in.
+
+The notice never fails the run and never requests changes — nothing was reviewed, so there is no finding to justify one. It posts once per cause rather than once per push: while it is still the newest thing the action has left on the PR, a further push adds nothing. Raise the cap, let a real review round land, and the next skip speaks again. There is no input to turn any of this on; a skip should never have been silent.
+
+One case cannot be delivered. On a `pull_request` trigger a fork PR gets a read-only `GITHUB_TOKEN` — GitHub grants no write scope there, whatever the workflow's `permissions:` block says — so the notice fails to post. The run warns loudly in its log and stays green; the PR itself says nothing. Trigger on `pull_request_target` or `workflow_run` if you need fork skips visible on the PR.
+
 ## Fork PRs are never reviewed
 
-PRs opened from a fork (head repo ≠ base repo) are skipped cleanly — logged, exit 0, no engine spawned, no review posted — *before any credential is read*. This is unconditional with no opt-in, so an outside contributor's PR can never spend the host's AI credits or meet a secret. Your own branches (head and base in the same repo) review normally.
+PRs opened from a fork (head repo ≠ base repo) are skipped cleanly — logged, exit 0, no engine spawned — *before any credential is read*. This is unconditional with no opt-in, so an outside contributor's PR can never spend the host's AI credits or meet a secret. Your own branches (head and base in the same repo) review normally. The skip [announces itself on the PR](#a-skipped-run-says-so-on-the-pr) when the trigger's token can write.
 
 ## Daily budget
 
