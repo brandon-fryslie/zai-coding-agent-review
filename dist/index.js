@@ -33470,13 +33470,20 @@ function parseRetryAfterMs(text) {
 // codes (ECONNRESET/…), never a bare English word — so ordinary review content (a diff mentioning
 // "socket hang up" or "line 502") can't false-match; classifyError runs only on an already-failed
 // spawn regardless.
-// A spent Claude subscription and a 429 of backpressure are THE SAME WORDS here — the CLI reports a
-// quota wall as `"error":"rate_limit"` too — and no attempt is made to tell them apart. That is a
-// decision, not an oversight: separating them means matching a vendor's own error prose ("You've hit
-// your limit · resets 1pm"), which leaves this permanently one message revision behind, and a wall
-// misread as a blip is then retried forever. The safety lives in produceReview instead, whose ladder
-// is bounded by COUNT and so needs to recognize nothing at all — covering walls never seen (a
-// suspended account, a spent prepay balance) on the same path. [LAW:no-mode-explosion]
+// The two alternatives here catch two DIFFERENT real conditions, and conflating them is a known
+// hazard rather than a harmless overlap. `\b429\b` is an HTTP 429 — genuine backpressure, clears in
+// seconds, retrying is right. `rate.?limit` also matches the claude-code CLI's structured
+// `"error":"rate_limit"` event, which is how a SPENT SUBSCRIPTION QUOTA arrives: a wall that stands
+// until a fixed future reset ("You've hit your limit · resets 1pm (UTC)"), where retrying is
+// provably futile. Same class here, opposite right answers.
+//
+// They are NOT separated at this seam, deliberately, and the reason is evidence rather than taste:
+// run 32641456876 gives 135 samples of the wall and ZERO samples of a real 429 from this engine, so
+// any predicate splitting them would be validated on one side only — the classic enumeration gap,
+// shipped as a confident-looking check. Until a genuine 429 is captured, the safety lives one layer
+// down in produceReview, whose ladder is bounded by COUNT and therefore needs to recognize nothing
+// at all: the wall, a real 429 that never clears, and walls never yet seen (a suspended account, a
+// spent prepay balance) all terminate on the same path. [LAW:no-mode-explosion]
 const TRANSIENT_RATE_LIMIT = /\b429\b|rate.?limit/i;
 const TRANSIENT_OVERLOADED = /\b529\b|overloaded/i;
 const TRANSIENT_NETWORK = /api error:\s*(?:terminated|connection error|internal server error|socket hang up|fetch failed|5\d\d)\b|\bECONNRESET\b|\bETIMEDOUT\b|\bECONNREFUSED\b|\bEPIPE\b|\bEAI_AGAIN\b|\bENOTFOUND\b/i;
