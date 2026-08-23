@@ -37152,41 +37152,26 @@ function roundCapNotice(message, latestArtifact) {
 // check over a deliberate cost control), the event is never REQUEST_CHANGES (nothing was reviewed, so
 // there is no finding to justify one), and there is no input to turn this on.
 //
-// [LAW:no-silent-failure] Announcing is best-effort but never quiet about failing. A fork PR reviewed on
-// a `pull_request` trigger gets a read-only GITHUB_TOKEN — GitHub forbids write scopes there, whatever
-// the workflow's `permissions:` block says — so createReview 403s and there is no configuration that
-// fixes it. Reddening the run on that would red every fork PR forever, so the failure degrades to a loud
-// warning (still a visible run annotation) rather than a red check. On the trigger that can write
-// without exposing the fork's code (workflow_run) the notice lands.
+// [LAW:no-silent-failure] Announcing is best-effort but never quiet about failing: a host that refuses
+// the post degrades to a loud warning carrying the notice's own remedy, never a red check — the fork
+// case cannot be fixed by any configuration, so reddening it would red every fork PR forever.
 async function announceNotReviewed(octokit, { owner, repo, pullNumber, commitId, reviewerName, notice }) {
   core.info(`Skipping review: ${notice.message}`);
-  // [LAW:no-silent-failure] Rendered BEFORE the idempotency check and outside the try below, so the
-  // unknown-reason throw stays a loud run failure. Inside the try it would have been caught by the
-  // host-failure arm and reported as a permissions problem — a programming error wearing a transient
-  // error's costume, on a run that exits 0.
+  // [LAW:no-silent-failure] Rendered BEFORE the check and outside the try below, so the unknown-reason
+  // throw stays a loud run failure instead of being caught by the host-failure arm and reported as a
+  // permissions problem — a programming error wearing a transient error's costume, on a run that exits 0.
   const body = renderNotReviewedBody(reviewerName, notice);
-  // The idempotency key is "my own notice is still the last word on this PR", so a second push while
-  // still capped adds nothing. See summarizePriorReviews' latestArtifact for why this is not a flag.
+  // The key is "the PR's newest agent artifact already says byte-for-byte what I am about to say", so a
+  // second push while still capped adds nothing while a CHANGED message (the budget gradient starting to
+  // bind) speaks again. Keying on the reason alone let a notice outlive its own content; keying on a
+  // per-PR flag would have gone permanently silent. Comparing bodies also makes a reason check redundant,
+  // since the body ends with the marker carrying it. [LAW:one-source-of-truth]
   //
-  // Once per cause holds PER RUN, not across concurrent runs: the key is read before this function is
-  // called, so two runs racing on the same PR (two rapid pushes, or a re-run beside a fresh push) can
-  // both read "no notice yet" and both post. The workflow's `concurrency` group is what prevents that,
-  // and the README names it as the precondition. Deliberately not defended against here — GitHub offers
-  // no compare-and-swap on reviews, a re-check would only narrow the window, and this race can only make
-  // the action speak TWICE, never fall silent. Silence is the bug; a duplicate notice is cosmetic.
-  //
-  // The key is the BODY, not the reason: "the newest artifact already says byte-for-byte what I am about
-  // to say." Keying on the reason let a notice outlive its own content — a PR capped by MAX_REVIEW_ROUNDS
-  // kept that notice when a later run was capped by the budget gradient instead, so the operator read the
-  // wrong cap number and a remedy that would not have helped. Comparing bodies also makes the reason
-  // check redundant, since the body ends with the marker that carries it. [LAW:one-source-of-truth]
-  //
-  // If the host ever normalized whitespace on the round trip, this fails to match and the action speaks
-  // TWICE — the same safe direction every trade here takes, and why this is an exact compare rather than
-  // a digest embedded in the marker.
-  //
-  // `notice.latestArtifact === null` is a real value, not an omission: it says "nothing here is worth
-  // trusting, post it", and the notice constructors decide that per path (see forkNotice above).
+  // `null` is a real value here — "nothing worth trusting, post it" — chosen per path by the notice
+  // constructors above, not an omission. Two failure directions are accepted for the same reason, that
+  // silence is the bug and a duplicate is cosmetic: concurrent runs both reading "no notice yet" (the
+  // workflow's `concurrency` group is the stated precondition), and a host that normalized whitespace on
+  // the round trip defeating the exact compare — which is why this is a compare and not a marker digest.
   if (notice.latestArtifact && notice.latestArtifact.kind === 'not-reviewed' && notice.latestArtifact.body === body) {
     core.info(`PR #${pullNumber} already carries this exact '${notice.reason}' not-reviewed notice; not posting a duplicate.`);
     return 'already-posted';
