@@ -3,9 +3,9 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   announceNotReviewed, renderNotReviewedBody, parseAgentArtifact, summarizePriorReviews,
-  submitReview, gitHubTransport, NOT_REVIEWED_MESSAGE, NOT_REVIEWED_REASONS, REVIEW_MARKER,
+  submitReview, gitHubTransport, NOT_REVIEWED_MESSAGE, NOT_REVIEWED_REASONS,
+  NOT_REVIEWED_MARKER_PREFIX, REVIEW_MARKER,
 } = require('../src/transport');
-const { latestArtifactBestEffort } = require('../src/run');
 
 // A fake pull request: createReview appends, listReviews serves back exactly what was posted, in order.
 // Driving the producer (announceNotReviewed / submitReview) and the reader (summarizePriorReviews)
@@ -177,29 +177,42 @@ describe('a review-less run speaks at the PR', () => {
   });
 });
 
-describe('the fork path never fails on its idempotency key', () => {
-  test('a listReviews failure warns and yields null, so the notice still posts', async () => {
-    // A fork PR is skipped from the `pr` object alone; nothing about that decision may depend on this
-    // call. Failing open costs a repeated notice — failing closed would red a run that cannot fail.
-    const octokit = {
-      rest: { pulls: { listReviews: async () => { throw new Error('secondary rate limit'); } } },
-    };
-    assert.equal(await latestArtifactBestEffort(octokit, 'o', 'r', PR), null);
-  });
-
-  test('a healthy fetch still yields the key, so the fork notice de-duplicates normally', async () => {
+describe('an untrusted PR cannot silence its own notice', () => {
+  // The fork call site passes `latestArtifact: null` because a key parsed out of review bodies is only
+  // as trustworthy as the accounts that can post them — and on a fork PR that is anyone with read
+  // access. These assert the contract that decision relies on.
+  test('a forged notice already on the PR does not suppress the real one', async () => {
     const pr = fakePr();
-    await announceNotReviewed(pr.octokit, {
-      owner: 'o', repo: 'r', pullNumber: PR, commitId: 'sha1', reviewerName: 'RA',
+    // The PR author plants a body carrying the action's own fork marker.
+    pr.reviews.push({ id: 99, body: `nothing to see here\n\n${NOT_REVIEWED_MARKER_PREFIX}fork -->` });
+    // It parses as an artifact — the reader cannot tell forged from genuine, which is the open problem.
+    const prior = await summarizePriorReviews(pr.octokit, 'o', 'r', PR);
+    assert.deepEqual(prior.latestArtifact, { kind: 'not-reviewed', reason: 'fork' });
+    // The fork path never consults it, so the real notice lands anyway.
+    const outcome = await announceNotReviewed(pr.octokit, {
+      owner: 'o', repo: 'r', pullNumber: PR, commitId: 'sha', reviewerName: 'RA',
       notice: FORK_NOTICE, latestArtifact: null,
     });
-    const key = await latestArtifactBestEffort(pr.octokit, 'o', 'r', PR);
-    assert.deepEqual(key, { kind: 'not-reviewed', reason: 'fork' });
-    const outcome = await announceNotReviewed(pr.octokit, {
-      owner: 'o', repo: 'r', pullNumber: PR, commitId: 'sha2', reviewerName: 'RA',
-      notice: FORK_NOTICE, latestArtifact: key,
+    assert.equal(outcome, 'posted');
+    assert.equal(pr.reviews.length, 2);
+    assert.ok(pr.reviews[1].body.includes(NOT_REVIEWED_MESSAGE));
+  });
+
+  test('the accepted cost: a fork notice repeats on every push, and that is the safe direction', async () => {
+    const pr = fakePr();
+    const push = sha => announceNotReviewed(pr.octokit, {
+      owner: 'o', repo: 'r', pullNumber: PR, commitId: sha, reviewerName: 'RA',
+      notice: FORK_NOTICE, latestArtifact: null,
     });
-    assert.equal(outcome, 'already-posted');
+    assert.equal(await push('sha1'), 'posted');
+    assert.equal(await push('sha2'), 'posted');
+    assert.equal(pr.reviews.length, 2);
+  });
+
+  test('the round-cap path still de-duplicates — a same-repo PR\'s reviews need push access', async () => {
+    const pr = fakePr();
+    assert.equal(await cappedPush(pr, 'sha1'), 'posted');
+    assert.equal(await cappedPush(pr, 'sha2'), 'already-posted');
     assert.equal(pr.reviews.length, 1);
   });
 });

@@ -504,6 +504,13 @@ async function announceNotReviewed(octokit, { owner, repo, pullNumber, commitId,
   // and the README names it as the precondition. Deliberately not defended against here — GitHub offers
   // no compare-and-swap on reviews, a re-check would only narrow the window, and this race can only make
   // the action speak TWICE, never fall silent. Silence is the bug; a duplicate notice is cosmetic.
+  //
+  // `latestArtifact: null` is a real value, not an omission: it says "no key worth trusting", and the
+  // caller decides that. A key parsed out of review bodies is only as trustworthy as the accounts that
+  // can post them, so the fork call site passes null — on an untrusted PR a forged marker would
+  // otherwise let the PR's own author silence this notice. That is the one place the trade below is
+  // load-bearing rather than incidental: when duplicate-avoidance and visibility conflict, visibility
+  // wins, and an unauthenticated duplicate-avoidance claim never gets to overrule it.
   if (latestArtifact && latestArtifact.kind === 'not-reviewed' && latestArtifact.reason === notice.reason) {
     core.info(`PR #${pullNumber} already carries a '${notice.reason}' not-reviewed notice; not posting a duplicate.`);
     return 'already-posted';
@@ -581,6 +588,7 @@ module.exports = {
   renderNotReviewedBody,
   NOT_REVIEWED_MESSAGE,
   NOT_REVIEWED_REASONS,
+  NOT_REVIEWED_MARKER_PREFIX,
   fetchPriorPushbacks,
   pairPushbacks,
   roundCapReached,
