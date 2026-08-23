@@ -66,7 +66,22 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
   const { files: parsed, warnings } = parseUnifiedDiff(typeof data === 'string' ? data : String(data));
   warnings.forEach(w => core.warning(w));
   if (parsed.length === 0) {
-    throw new Error(`No reviewable diff for PR #${pullNumber}: listFiles returned no patch and the unified diff was empty.`);
+    // [LAW:no-silent-failure] Warn loudly — but do NOT abort. "No file carries a patch" is not only
+    // Gitea's signature: GitHub omits `patch` for a file too large to inline, so a PR whose every change
+    // is a big generated artifact (this repo's own committed 1.7 MB dist/index.js) lands here on GitHub
+    // and has nothing anchorable rather than nothing changed. Throwing reddened those PRs even when the
+    // artifact was in EXCLUDE_PATTERNS and there was genuinely nothing to review.
+    //
+    // Returning the unpatched files as a value hands the decision to the ONE place that can judge it:
+    // runPrReview filters by EXCLUDE_PATTERNS and, finding nothing patchable, submits a clean
+    // "No patchable changes found after filtering." review. Same treatment partitionFindings gives a
+    // mis-anchored finding — reconcile as a value, never abort the whole review over it.
+    core.warning(
+      `PR #${pullNumber}: no per-file patch from listFiles and the unified diff parsed to zero files, so ` +
+      `nothing in it is anchorable. Changed file(s): ${files.map(f => f.filename).join(', ')}. This is ` +
+      'expected when every changed file is too large for the host to return a patch (e.g. a committed bundle).',
+    );
+    return gitHubTransport(files);
   }
   return giteaTransport(parsed);
 }
