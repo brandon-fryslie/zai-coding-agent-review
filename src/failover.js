@@ -65,6 +65,13 @@ function parseRetryAfterMs(text) {
 // codes (ECONNRESET/…), never a bare English word — so ordinary review content (a diff mentioning
 // "socket hang up" or "line 502") can't false-match; classifyError runs only on an already-failed
 // spawn regardless.
+// A spent Claude subscription and a 429 of backpressure are THE SAME WORDS here — the CLI reports a
+// quota wall as `"error":"rate_limit"` too — and no attempt is made to tell them apart. That is a
+// decision, not an oversight: separating them means matching a vendor's own error prose ("You've hit
+// your limit · resets 1pm"), which leaves this permanently one message revision behind, and a wall
+// misread as a blip is then retried forever. The safety lives in produceReview instead, whose ladder
+// is bounded by COUNT and so needs to recognize nothing at all — covering walls never seen (a
+// suspended account, a spent prepay balance) on the same path. [LAW:no-mode-explosion]
 const TRANSIENT_RATE_LIMIT = /\b429\b|rate.?limit/i;
 const TRANSIENT_OVERLOADED = /\b529\b|overloaded/i;
 const TRANSIENT_NETWORK = /api error:\s*(?:terminated|connection error|internal server error|socket hang up|fetch failed|5\d\d)\b|\bECONNRESET\b|\bETIMEDOUT\b|\bECONNREFUSED\b|\bEPIPE\b|\bEAI_AGAIN\b|\bENOTFOUND\b/i;
@@ -94,26 +101,6 @@ function transientBackoffMs(attempt) {
 // [LAW:no-mode-explosion] Short-horizon attempts for spawn-level recovery: 1 initial + 2 retries.
 // Matches produceReview's PER_CONFIG_LIMIT, but is a DIFFERENT axis (see retryTransientSpawn).
 const TRANSIENT_SPAWN_ATTEMPTS = 3;
-
-// The circuit breaker on the retry ladder. Every OTHER layer is already a counted value —
-// retryTransientSpawn's 3 spawns, produceReview's 3 attempts per config — but the sweep that restarts
-// chain[0] was unbounded, exiting only when the wall clock ran out. That is survivable for a blip and
-// catastrophic for a WALL: a Claude subscription whose quota is spent answers every spawn in ~500ms
-// with `"error":"rate_limit"`, which classifyTransient types as transient (correctly — from the text
-// alone a spent quota and a 429 of backpressure are the same words). Run 32641456876 therefore burned
-// the ENTIRE TIME_BUDGET_MINUTES on 138 spawns it could never have won, then blamed the wrong knob:
-// the deadline kill overwrote the rate-limit cause with "raise TIME_BUDGET_MINUTES", so the remedy on
-// screen would have doubled the waste rather than ending it. [FRAMING:representation]
-//
-// Bounding the sweeps is deliberately the GENERAL fix rather than typing the quota wall: recognizing
-// it means matching a vendor's own error prose, which leaves us permanently one message revision
-// behind, while a bound needs to recognize nothing at all — a hard wall we have never seen (a
-// suspended account, a spent prepay balance) costs seconds instead of the budget.
-// [LAW:single-enforcer] It bounds the EXISTING ladder rather than adding a second retry counter
-// beside PER_CONFIG_LIMIT, which would be a rival owner of "when do we stop" and drift from it.
-// Two sweeps keeps exactly one full chain restart — real value when a brief outage outlasts the
-// first pass — while capping a single-config chain at 6 attempts, tens of seconds, not 25 minutes.
-const MAX_CHAIN_SWEEPS = 2;
 
 // [LAW:decomposition] Spawn-level transient recovery — a DIFFERENT axis from produceReview's config
 // failover. produceReview walks a chain of CONFIGS with a global budget; this retries ONE flaky
@@ -182,10 +169,11 @@ async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sl
 // in its prompt. [LAW:types-are-the-program] A plain string bakes in chain[0]'s toolNames.
 // Per-config retry limit: 3 total attempts (1 initial + 2 retries), honoring Retry-After.
 // After 3 transient failures on one config: advance to next config IMMEDIATELY — different
-// provider, waiting buys nothing. Chain exhausted → exponential backoff (cap 60s) by sweep
-// count, restart from chain[0] — for MAX_CHAIN_SWEEPS sweeps, then surface the last transient.
-// The budget still clamps every sleep, but it is no longer what ENDS the ladder: a wall that
-// fails instantly can otherwise spend the whole budget without ever making progress.
+// provider, waiting buys nothing. Chain exhausted → surface the last transient as the run's
+// cause. The chain is walked ONCE (see the loop below on why there is no second sweep), so the
+// ladder is bounded at PER_CONFIG_LIMIT × chain.length. The budget still clamps every sleep, but
+// it is no longer what ENDS the ladder: a provider that fails instantly and permanently would
+// otherwise spend the entire budget without ever making progress, and then be blamed on the clock.
 // [LAW:effects-at-boundaries] budgetMs is injectable so tests can set a zero/tiny budget
 // to cover the 'deadline exceeded mid-retry' throw path without real 60-min waits.
 // [LAW:no-ambient-temporal-coupling] `now` is the injected clock, the SAME seam the multi-scope
@@ -199,78 +187,68 @@ async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepF
   let lastErr;
   const PER_CONFIG_LIMIT = 3;
 
-  for (let sweep = 1; sweep <= MAX_CHAIN_SWEEPS; sweep++) {
-    // The index is what makes "last config" a POSITIONAL fact rather than object identity: a chain
-    // may legitimately hold two references to equal configs, and `config === chain.at(-1)` would
-    // then call the wrong rung final. [LAW:types-are-the-program]
-    for (const [configIndex, config] of chain.entries()) {
-      for (let attempt = 1; attempt <= PER_CONFIG_LIMIT; attempt++) {
-        totalAttempts++;
-        try {
-          const review = await produceOnce(config, buildPromptFor, anchors);
-          return { review, configUsed: config, attempts: totalAttempts };
-        } catch (err) {
-          if (!(err instanceof TransientError)) throw err; // non-transient: surface immediately
-          lastErr = err;
-          const budgetLeft = Math.max(0, deadline - now());
-          if (budgetLeft === 0) throw lastErr;
+  // [LAW:one-type-per-behavior] There is deliberately NO outer "sweep the chain again" loop, and its
+  // absence is the whole fix. Walking the chain a second time re-runs work already done: for the
+  // one-config chain that is the default (`PROVIDER: auto`), sweep 2 is the SAME config, endpoint,
+  // credential and prompt as sweep 1 — identical behavior, differing only in that the backoff curve
+  // restarts. It was never a second KIND of attempt; it was a multiplier on PER_CONFIG_LIMIT wearing
+  // a loop, and its only real content ("let more time pass before retrying") is exactly what the
+  // per-config backoff below already does.
+  //
+  // [LAW:carrying-cost] That duplicate axis is what turned a spent subscription quota into a
+  // 25-minute run: the ladder multiplied (3 spawn-level × 3 per-config × N sweeps) and nothing but
+  // the wall clock ever stopped it, so the run lasted exactly as long as it was ALLOWED and the
+  // attempt count was merely however many fit. Deleting the axis is what bounds the ladder — a cap
+  // on it would have been the identical behavior with a knob left behind to tune forever.
+  // [LAW:no-mode-explosion] the flag that is never added needs no owner and no deletion date.
+  //
+  // The index makes "last config" a POSITIONAL fact rather than object identity: a chain may
+  // legitimately hold two references to equal configs, and `config === chain.at(-1)` would then
+  // call the wrong rung final. [LAW:types-are-the-program]
+  for (const [configIndex, config] of chain.entries()) {
+    for (let attempt = 1; attempt <= PER_CONFIG_LIMIT; attempt++) {
+      totalAttempts++;
+      try {
+        const review = await produceOnce(config, buildPromptFor, anchors);
+        return { review, configUsed: config, attempts: totalAttempts };
+      } catch (err) {
+        if (!(err instanceof TransientError)) throw err; // non-transient: surface immediately
+        lastErr = err;
+        const budgetLeft = Math.max(0, deadline - now());
+        if (budgetLeft === 0) throw lastErr;
 
-          if (attempt < PER_CONFIG_LIMIT) {
-            // Retry same config: honor Retry-After or use exponential backoff.
-            const hintOrBackoff = err.retryAfterMs ?? transientBackoffMs(attempt);
-            const delay = Math.min(hintOrBackoff, budgetLeft);
-            const minsLeft = Math.ceil(budgetLeft / 60_000);
-            const src = err.retryAfterMs != null ? 'Retry-After' : 'backoff';
-            core.warning(
-              `Transient error on '${config.name}' (${config.engine}/${config.model}) attempt ${attempt}/${PER_CONFIG_LIMIT}: ${err.message}. ` +
-              `Retrying in ${Math.round(delay / 1000)}s [${src}] (~${minsLeft}m budget left).`,
-            );
-            await sleepFn(delay);
-          } else {
-            // All per-config attempts exhausted. [LAW:one-source-of-truth] The sentence names what
-            // ACTUALLY happens next, derived from the same two facts the loops terminate on, rather
-            // than asserting a fixed "Advancing…" that the very next statement can falsify. Capping
-            // the sweeps is what made that rung reachable: while the loop was unbounded, the last
-            // config of a sweep really did advance — to chain[0] on the sweep after. A run whose
-            // whole purpose is an accurate diagnosis must not sign off with a lie.
-            const isFinalRung = sweep === MAX_CHAIN_SWEEPS && configIndex === chain.length - 1;
-            core.warning(
-              `Transient error on '${config.name}' (${config.engine}/${config.model}) — all ${PER_CONFIG_LIMIT} attempts exhausted: ${err.message}. ` +
-              (isFinalRung
-                ? `Retry ladder spent (${MAX_CHAIN_SWEEPS} sweep(s) × ${chain.length} config(s)); surfacing this error as the run's cause.`
-                : 'Advancing to next config.'),
-            );
-          }
+        if (attempt < PER_CONFIG_LIMIT) {
+          // Retry same config: honor Retry-After or use exponential backoff.
+          const hintOrBackoff = err.retryAfterMs ?? transientBackoffMs(attempt);
+          const delay = Math.min(hintOrBackoff, budgetLeft);
+          const minsLeft = Math.ceil(budgetLeft / 60_000);
+          const src = err.retryAfterMs != null ? 'Retry-After' : 'backoff';
+          core.warning(
+            `Transient error on '${config.name}' (${config.engine}/${config.model}) attempt ${attempt}/${PER_CONFIG_LIMIT}: ${err.message}. ` +
+            `Retrying in ${Math.round(delay / 1000)}s [${src}] (~${minsLeft}m budget left).`,
+          );
+          await sleepFn(delay);
+        } else {
+          // All per-config attempts exhausted. [LAW:one-source-of-truth] The sentence names what
+          // ACTUALLY happens next, read off the same fact the loop terminates on, rather than
+          // asserting a fixed "Advancing…" that the last config falsifies one statement later. A
+          // run whose whole purpose is an accurate diagnosis must not sign off with an inaccuracy.
+          const isLastConfig = configIndex === chain.length - 1;
+          core.warning(
+            `Transient error on '${config.name}' (${config.engine}/${config.model}) — all ${PER_CONFIG_LIMIT} attempts exhausted: ${err.message}. ` +
+            (isLastConfig
+              ? `Chain spent (${chain.length} config(s) × ${PER_CONFIG_LIMIT} attempts); surfacing this error as the run's cause.`
+              : 'Advancing to next config.'),
+          );
         }
       }
     }
-
-    // [LAW:no-silent-failure] The ladder is spent — every config failed PER_CONFIG_LIMIT times on
-    // every sweep — so the last transient IS the run's cause and surfaces as itself. Breaking HERE,
-    // before the backoff, is what keeps that diagnosis: sleeping on into a budget that will not buy
-    // another attempt is how the deadline kill used to fire last and overwrite the rate-limit cause
-    // with a complaint about TIME_BUDGET_MINUTES. The final sweep also has no restart to wait for.
-    if (sweep === MAX_CHAIN_SWEEPS) break;
-
-    // All configs exhausted for this sweep. Back off before restarting chain[0].
-    // Honor lastErr.retryAfterMs if the last failure carried a Retry-After hint —
-    // the per-config path does the same; omitting it here would make the sweep
-    // restart immediately when the provider said to wait. [LAW:one-source-of-truth]
-    const budgetLeft = Math.max(0, deadline - now());
-    if (budgetLeft === 0) throw lastErr;
-    const hintOrBackoff = lastErr.retryAfterMs ?? transientBackoffMs(sweep);
-    const delay = Math.min(hintOrBackoff, budgetLeft);
-    const minsLeft = Math.ceil(budgetLeft / 60_000);
-    const src = lastErr.retryAfterMs != null ? 'Retry-After' : 'backoff';
-    core.warning(
-      `All ${chain.length} config(s) exhausted (sweep ${sweep}). ` +
-      `Restarting chain in ${Math.round(delay / 1000)}s [${src}] (~${minsLeft}m budget left).`,
-    );
-    await sleepFn(delay);
   }
-  // [LAW:no-silent-failure] Every sweep is spent. lastErr is necessarily assigned — the only path
-  // that reaches the loop's end is the catch that assigned it — so the breaker reports the provider's
-  // own last word, never an opaque `throw undefined` and never a success-shaped empty review.
+  // [LAW:no-silent-failure] Every config is spent, so the last transient IS the run's cause and
+  // surfaces as itself — the diagnosis the 25-minute deadline kill used to fire last and overwrite
+  // with a complaint about TIME_BUDGET_MINUTES. lastErr is necessarily assigned: the only path that
+  // reaches here is the catch that assigned it (a chain with zero configs is refused above), so this
+  // can never be an opaque `throw undefined`, and never a success-shaped empty review.
   throw lastErr;
 }
 
@@ -290,7 +268,6 @@ function buildAttributionFooter(config) {
 module.exports = {
   TRANSIENT_RETRY_BUDGET_MS,
   TRANSIENT_SPAWN_ATTEMPTS,
-  MAX_CHAIN_SWEEPS,
   TransientError,
   ProtocolError,
   isRetryableSpawnError,
