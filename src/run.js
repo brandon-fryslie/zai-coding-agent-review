@@ -203,10 +203,19 @@ async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, c
     // is. It is emitted here and summed into nothing.
     const notionalRounds = ledger.notional.count + ledger.notional.unknownCount;
     if (notionalRounds > 0) {
+      // [LAW:no-silent-failure] The rounds counted and the dollars summed come from DIFFERENT
+      // populations: every notional round is counted, but only the ones that reported a list price
+      // are summed. Printing the figure bare would pass a partial total off as complete — the exact
+      // accounting lie this change exists to kill — so an unreported remainder is named, the same
+      // honesty the billed tally gets above. [LAW:dataflow-not-control-flow] the remainder selects a
+      // string; one unconditional render consumes it.
+      const unreported = ledger.notional.unknownCount > 0
+        ? `, a LOWER bound — ${ledger.notional.unknownCount} of them reported no list price`
+        : '';
       core.info(
         `Budget: ${notionalRounds} of today's review(s) were billed to Claude subscription quota, not `
-        + `dollars — $${ledger.notional.usd.toFixed(4)} at Anthropic list price, excluded from the `
-        + `$${spentToday.toFixed(4)} spend above.`,
+        + `dollars — $${ledger.notional.usd.toFixed(4)} at Anthropic list price${unreported}. It is `
+        + "excluded from the day's dollar spend and summed into nothing.",
       );
     }
   } catch (e) {

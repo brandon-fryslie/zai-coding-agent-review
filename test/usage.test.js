@@ -395,6 +395,27 @@ describe('cost marker (machine-readable per-round cost)', () => {
     assert.deepEqual(parseCost(costMarker({ basis: 'unpriced', reason: 'no-price' })), { basis: 'unpriced', reason: 'not-reported' });
     assert.equal(parseCost('a human review with no marker'), null);
   });
+
+  // The last-match rule has to hold ACROSS the two marker names, not just within each. Deciding the
+  // basis by "is there a notional marker anywhere?" before looking at the spend marker read a real
+  // DOLLARS round as subscription — and a subscription-basis cost has no `usd` for any spend fold to
+  // find, so that round's actual spend left the daily ledger and the PR total silently. A review OF
+  // this feature quotes both marker names in its prose, so this is the ordinary case, not a stunt.
+  test('a dollars review that QUOTES a notional marker in its prose is still dollars', () => {
+    const body = [
+      'The subscription arm writes <!-- agent-review-notional-usd:63.590000 --> instead.',
+      costMarker({ basis: 'dollars', usd: 0.4200 }),
+    ].join('\n');
+    assert.deepEqual(parseCost(body), { basis: 'dollars', usd: 0.42 });
+  });
+
+  test('a subscription review that QUOTES a spend marker in its prose is still subscription', () => {
+    const body = [
+      'A paid round writes <!-- agent-review-cost-usd:0.420000 --> instead.',
+      costMarker({ basis: 'subscription', notionalUsd: 63.59 }),
+    ].join('\n');
+    assert.deepEqual(parseCost(body), { basis: 'subscription', notionalUsd: 63.59 });
+  });
 });
 
 // --- sumCost (the "never add across bases" rule) ---

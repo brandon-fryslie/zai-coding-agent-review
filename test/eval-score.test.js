@@ -263,6 +263,34 @@ test('aggregateRuns forms a mean/min/max band and skips null recalls', () => {
   assert.ok(renderTable(s).includes('inventory recall'));
 });
 
+// The eval scorer is a spend fold like any other, so it obeys the same rule: only a DOLLARS-basis run
+// contributes to the cost band. A subscription run's notional list price is Anthropic's sticker for
+// tokens nobody was charged for — folding it in would make one baseline compare list price against
+// money, the exact miscount ($63.59 of notional read as spend) this change exists to kill. A notional
+// run drops out of the band entirely rather than landing in it as a zero, which would drag the mean.
+test('aggregateRuns costs only dollars-basis runs — notional and unpriced drop out of the band', () => {
+  const mk = cost => ({
+    matcher: 'fake',
+    mustFind: { found: 1, total: 1, recall: 1 },
+    inventoryMustFind: { found: 1, total: 1, recall: 1 },
+    niceToFind: { found: 0, total: 0, recall: null },
+    inventoryNiceToFind: { found: 0, total: 0, recall: null },
+    noise: { count: 0 },
+    usage: cost === null ? null : { cost },
+  });
+  const s = aggregateRuns('demo', [
+    mk({ basis: 'dollars', usd: 0.10 }),
+    mk({ basis: 'subscription', notionalUsd: 63.59 }),
+    mk({ basis: 'unpriced', reason: 'no-price' }),
+    mk(null),
+    mk({ basis: 'dollars', usd: 0.30 }),
+  ]);
+  assert.equal(s.runs, 5);
+  assert.equal(s.costUsd.n, 2, 'only the two dollars runs are costed');
+  assert.ok(Math.abs(s.costUsd.mean - 0.20) < 1e-9, 'the notional 63.59 never reaches the mean');
+  assert.equal(s.costUsd.max, 0.30);
+});
+
 // ── lexical judge (the offline fallback) ─────────────────────────────────────────────────────────────
 
 test('jaccard and the lexical judge match paraphrases, reject unrelated', async () => {

@@ -133,7 +133,6 @@ const MARKER_VALUE = '([0-9]+(?:\\.[0-9]+)?|unknown)';
 // dollars are kept out of the daily spend by the regex, not by a guard someone must remember to
 // write, and a future reader who adds a fourth spend fold inherits the exclusion for free.
 const COST_MARKER_RE = new RegExp(`<!-- agent-review-cost-usd:${MARKER_VALUE} -->`, 'g');
-const NOTIONAL_MARKER_RE = new RegExp(`<!-- agent-review-notional-usd:${MARKER_VALUE} -->`, 'g');
 
 // [LAW:one-source-of-truth] ONE table of what each basis IS, for accounting purposes: which marker
 // name carries it, which tally bucket it lands in, and where its figure lives. A separate table per
@@ -153,6 +152,15 @@ function basisOf(cost) {
   return BASIS[cost && cost.basis] || BASIS.unpriced;
 }
 
+// [LAW:one-source-of-truth] Both marker names in ONE alternation, built from the BASIS table the
+// writer picks them from — so the reader can never recognize a name the writer stopped emitting.
+// One scan over both names is what makes the last-match rule hold ACROSS them: asking "is there a
+// notional marker anywhere?" before looking at the spend marker reintroduced exactly the bug
+// lastMatch exists to prevent — a dollars review whose prose quoted a notional marker was read as a
+// subscription review, and its real spend silently left every fold. Position decides, not precedence.
+const ANY_MARKER_RE = new RegExp(
+  `<!-- (${BASIS.dollars.marker}|${BASIS.subscription.marker}):${MARKER_VALUE} -->`, 'g');
+
 // [LAW:types-are-the-program] The marker never carries a non-number: a finite figure renders as a
 // decimal, everything else (an unpriced cost, an unreported notional, or a non-finite number from a
 // broken upstream) as 'unknown' — symmetric with parseMarker's finiteness guard below, so the
@@ -163,19 +171,29 @@ function costMarker(cost) {
   return `<!-- ${basis.marker}:${Number.isFinite(figure) ? figure.toFixed(6) : 'unknown'} -->`;
 }
 
-function parseMarker(body, re) {
+// [LAW:single-enforcer] ONE rule for which marker in a body is authoritative: the LAST one. It lives
+// in the footer, after all summary/finding prose, so a review that QUOTES a marker in its prose (e.g.
+// a review OF this feature) cannot hijack the reading. Every marker reader below scans through here,
+// so none of them can hold a different opinion about which match wins.
+function lastMatch(body, re) {
   if (typeof body !== 'string') return null; // not a marker-bearing body (human review, old review)
-  // [LAW:one-source-of-truth] The authoritative marker is the LAST one in the body — it lives in the
-  // footer, after all summary/finding prose. A review that QUOTES a marker in its prose (e.g. a review
-  // OF this feature) would otherwise let a first-match grab the wrong one. Take the final match.
   const matches = [...body.matchAll(re)];
-  if (matches.length === 0) return null;
-  const value = matches[matches.length - 1][1];
-  if (value === 'unknown') return 'unknown';
-  const n = Number(value);
+  return matches.length === 0 ? null : matches[matches.length - 1];
+}
+
+// [LAW:one-source-of-truth] ONE coercion from a captured marker value to the value the folds consume,
+// shared by every reader, so a body one reader scores as 'unknown' can never be a number to another.
+function markerValue(raw) {
+  if (raw === 'unknown') return 'unknown';
+  const n = Number(raw);
   // [LAW:no-silent-failure] belt to the strict regex: a value that does not parse to a finite number
   // is null (→ counted as an unknown-cost round), never a NaN summed into and poisoning the PR total.
   return Number.isFinite(n) ? n : null;
+}
+
+function parseMarker(body, re) {
+  const m = lastMatch(body, re);
+  return m === null ? null : markerValue(m[1]);
 }
 
 // The spend reader. Matches ONLY the dollars/unpriced marker name, so a subscription review is
@@ -189,13 +207,14 @@ function parseCostMarker(body) {
 // instead of each re-deciding what a raw marker string means. Returns null for a body carrying no
 // marker at all — a pre-feature review round, whose cost is genuinely unknown rather than zero.
 function parseCost(body) {
-  const notional = parseMarker(body, NOTIONAL_MARKER_RE);
-  if (notional !== null) {
-    return { basis: 'subscription', notionalUsd: typeof notional === 'number' ? notional : null };
+  const m = lastMatch(body, ANY_MARKER_RE);
+  if (m === null) return null;
+  const [, name, raw] = m;
+  const value = markerValue(raw);
+  if (name === BASIS.subscription.marker) {
+    return { basis: 'subscription', notionalUsd: typeof value === 'number' ? value : null };
   }
-  const usd = parseCostMarker(body);
-  if (usd === null) return null;
-  return typeof usd === 'number' ? { basis: 'dollars', usd } : { basis: 'unpriced', reason: 'not-reported' };
+  return typeof value === 'number' ? { basis: 'dollars', usd: value } : { basis: 'unpriced', reason: 'not-reported' };
 }
 
 // [LAW:one-source-of-truth] SUMMING IS THE ONE PLACE the "never add across bases" rule lives. A
