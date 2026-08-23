@@ -63,8 +63,8 @@ function buildOpencodeConfig(config, collectorSpawn, agentsPath) {
     provider: {
       [providerId]: {
         options: {
-          baseURL: config.endpoint.baseUrl,
-          apiKey: config.endpoint.apiKey,
+          baseURL: config.endpoint.auth.baseUrl,
+          apiKey: config.endpoint.auth.credential,
         },
       },
     },
@@ -234,6 +234,9 @@ const opencodeAdapter = makeCliAdapter({
     reasoningEfforts: [],
     // The OpenAI/Anthropic-compatible provider protocols OpenCode can front via an endpoint override.
     endpointKinds: ['openai-chat', 'openai-responses', 'anthropic-messages'],
+    // OpenCode authenticates a provider override by baseURL + apiKey; it has no channel for a Claude
+    // subscription token, so that method is rejected at load rather than written into opencode.json.
+    authMethods: ['api-key'],
   },
   // [LAW:one-source-of-truth] Reference TOOL_NAMES — do not redeclare the strings here.
   toolNames: TOOL_NAMES,

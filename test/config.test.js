@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { validateFile, resolveChain, resolveSecrets, loadConfig } = require('../src/config');
+const { validateFile, resolveChain, resolveSecrets, loadConfig, AUTH_FIELDS } = require('../src/config');
 
 // [LAW:verifiable-goals] AC for T4: table-driven validation matrix covering every
 // rejection case named in the acceptance criteria, plus happy-path chain resolution
@@ -18,18 +18,21 @@ const MOCK_REGISTRY = {
         capabilities: {
           endpointKinds: ['anthropic-messages'],
           reasoningEfforts: ['low', 'medium', 'high', 'max'],
+          authMethods: ['api-key', 'subscription'],
         },
       },
       codex: {
         capabilities: {
           endpointKinds: ['openai-responses'],
           reasoningEfforts: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+          authMethods: ['api-key'],
         },
       },
       opencode: {
         capabilities: {
           endpointKinds: ['openai-chat', 'openai-responses'],
           reasoningEfforts: [],
+          authMethods: ['api-key'],
         },
       },
     };
@@ -53,8 +56,7 @@ const VALID_RAW = {
       reasoning: 'high',
       endpoint: {
         kind: 'anthropic-messages',
-        baseUrl: 'https://api.z.ai/api/anthropic',
-        apiKeyEnv: 'ZAI_API_KEY',
+        auth: { method: 'api-key', baseUrl: 'https://api.z.ai/api/anthropic', credentialEnv: 'ZAI_API_KEY' },
       },
     },
     'codex-gpt55': {
@@ -63,8 +65,7 @@ const VALID_RAW = {
       reasoning: 'xhigh',
       endpoint: {
         kind: 'openai-responses',
-        baseUrl: 'https://api.openai.com/v1',
-        apiKeyEnv: 'OPENAI_API_KEY',
+        auth: { method: 'api-key', baseUrl: 'https://api.openai.com/v1', credentialEnv: 'OPENAI_API_KEY' },
       },
     },
     'oc-mini': {
@@ -72,8 +73,7 @@ const VALID_RAW = {
       model: 'openai/gpt-4o-mini',
       endpoint: {
         kind: 'openai-chat',
-        baseUrl: 'https://api.openai.com/v1',
-        apiKeyEnv: 'OPENAI_API_KEY',
+        auth: { method: 'api-key', baseUrl: 'https://api.openai.com/v1', credentialEnv: 'OPENAI_API_KEY' },
       },
     },
   },
@@ -172,6 +172,91 @@ describe('validateFile — endpoint.kind vs adapter endpointKinds', () => {
         assert.ok(/Allowed:/.test(err.message));
         return true;
       },
+    );
+  });
+});
+
+// [LAW:verifiable-goals] AC for zai-billing-xl0.1: the auth union is enforced at the config-file
+// boundary — the engine's declared authMethods gate the method, and each variant takes exactly its
+// own fields. "Subscription token pointed at z.ai" must be a LOAD-TIME error, not a silent drop.
+describe('validateFile — endpoint.auth vs adapter authMethods', () => {
+  test('claude-code + subscription auth is accepted', () => {
+    const raw = clone(VALID_RAW);
+    raw.configs['zai-glm'].endpoint.auth = { method: 'subscription', credentialEnv: 'CLAUDE_CODE_OAUTH_TOKEN' };
+    assert.doesNotThrow(() => validateFile(raw, MOCK_REGISTRY));
+  });
+
+  test('codex + subscription auth is rejected — the engine has no channel for it', () => {
+    const raw = clone(VALID_RAW);
+    raw.configs['codex-gpt55'].endpoint.auth = { method: 'subscription', credentialEnv: 'CLAUDE_CODE_OAUTH_TOKEN' };
+    assert.throws(
+      () => validateFile(raw, MOCK_REGISTRY),
+      err => {
+        assert.ok(/Config 'codex-gpt55'/.test(err.message), `missing config name in: ${err.message}`);
+        assert.ok(/endpoint\.auth\.method 'subscription'/.test(err.message), `missing method in: ${err.message}`);
+        assert.ok(/Allowed: api-key/.test(err.message), `missing allowed list in: ${err.message}`);
+        return true;
+      },
+    );
+  });
+
+  test('a subscription auth carrying a baseUrl is REJECTED, never silently ignored', () => {
+    const raw = clone(VALID_RAW);
+    raw.configs['zai-glm'].endpoint.auth = {
+      method: 'subscription',
+      credentialEnv: 'CLAUDE_CODE_OAUTH_TOKEN',
+      baseUrl: 'https://api.z.ai/api/anthropic',
+    };
+    assert.throws(
+      () => validateFile(raw, MOCK_REGISTRY),
+      err => {
+        assert.ok(/Config 'zai-glm'/.test(err.message), `missing config name in: ${err.message}`);
+        assert.ok(/'baseUrl'/.test(err.message), `missing offending field in: ${err.message}`);
+        assert.ok(/subscription/.test(err.message), `missing method in: ${err.message}`);
+        return true;
+      },
+    );
+  });
+
+  test('an api-key auth missing baseUrl names the field and the method that requires it', () => {
+    const raw = clone(VALID_RAW);
+    delete raw.configs['zai-glm'].endpoint.auth.baseUrl;
+    assert.throws(
+      () => validateFile(raw, MOCK_REGISTRY),
+      { message: /endpoint\.auth\.baseUrl.*api-key/ },
+    );
+  });
+
+  test('a missing credentialEnv is rejected for every method', () => {
+    for (const auth of [
+      { method: 'api-key', baseUrl: 'https://api.z.ai/api/anthropic' },
+      { method: 'subscription' },
+    ]) {
+      const raw = clone(VALID_RAW);
+      raw.configs['zai-glm'].endpoint.auth = auth;
+      assert.throws(
+        () => validateFile(raw, MOCK_REGISTRY),
+        { message: /endpoint\.auth\.credentialEnv/ },
+        `method '${auth.method}' accepted a config with no credentialEnv`,
+      );
+    }
+  });
+
+  test('a missing auth block names the methods the engine allows', () => {
+    const raw = clone(VALID_RAW);
+    delete raw.configs['zai-glm'].endpoint.auth;
+    assert.throws(
+      () => validateFile(raw, MOCK_REGISTRY),
+      { message: /endpoint\.auth\.method.*Allowed for engine 'claude-code': api-key, subscription/ },
+    );
+  });
+
+  test('an unknown auth method names the config and the allowed methods', () => {
+    const raw = clone(VALID_RAW);
+    raw.configs['zai-glm'].endpoint.auth = { method: 'oauth-device-flow', credentialEnv: 'X' };
+    assert.throws(
+      () => validateFile(raw, MOCK_REGISTRY),
+      { message: /Config 'zai-glm'.*oauth-device-flow.*Allowed: api-key, subscription/ },
     );
   });
 });
@@ -286,14 +371,25 @@ describe('resolveChain — chain ordering', () => {
     assert.equal(chain[0].name, 'zai-glm');
   });
 
-  test('chain entries carry model, engine, endpoint.kind, endpoint.baseUrl, endpoint.apiKeyEnv', () => {
+  test('chain entries carry model, engine, endpoint.kind, and the whole auth variant', () => {
     const chain = resolveChain(VALID_RAW, null);
     const entry = chain[0];
     assert.equal(entry.engine, 'claude-code');
     assert.equal(entry.model, 'glm-5.1');
     assert.equal(entry.endpoint.kind, 'anthropic-messages');
-    assert.equal(entry.endpoint.baseUrl, 'https://api.z.ai/api/anthropic');
-    assert.equal(entry.endpoint.apiKeyEnv, 'ZAI_API_KEY');
+    assert.deepEqual(entry.endpoint.auth, {
+      method: 'api-key',
+      baseUrl: 'https://api.z.ai/api/anthropic',
+      credentialEnv: 'ZAI_API_KEY',
+    });
+  });
+
+  test('a subscription entry resolves to the variant with NO baseUrl key at all', () => {
+    const raw = clone(VALID_RAW);
+    raw.configs['zai-glm'].endpoint.auth = { method: 'subscription', credentialEnv: 'CLAUDE_CODE_OAUTH_TOKEN' };
+    const entry = resolveChain(raw, null)[0];
+    assert.deepEqual(entry.endpoint.auth, { method: 'subscription', credentialEnv: 'CLAUDE_CODE_OAUTH_TOKEN' });
+    assert.ok(!('baseUrl' in entry.endpoint.auth), 'subscription auth must carry no baseUrl');
   });
 
   test('reasoning is preserved when set', () => {
@@ -319,17 +415,27 @@ describe('resolveChain — chain ordering', () => {
 // ─── resolveSecrets — env-secret population ──────────────────────────────────
 
 describe('resolveSecrets — env resolution', () => {
-  test('apiKey is populated from env[apiKeyEnv]', () => {
+  test('credential is populated from env[credentialEnv]', () => {
     const chain = resolveChain(VALID_RAW, null);
     const resolved = resolveSecrets(chain, { ZAI_API_KEY: 'sk-test-123', OPENAI_API_KEY: 'sk-oai-456' });
-    assert.equal(resolved[0].endpoint.apiKey, 'sk-test-123');
-    assert.equal(resolved[1].endpoint.apiKey, 'sk-oai-456');
+    assert.equal(resolved[0].endpoint.auth.credential, 'sk-test-123');
+    assert.equal(resolved[1].endpoint.auth.credential, 'sk-oai-456');
   });
 
-  test('apiKeyEnv is removed from the resolved endpoint', () => {
+  test('credentialEnv is removed from the resolved auth', () => {
     const chain = resolveChain(VALID_RAW, null);
     const resolved = resolveSecrets(chain, { ZAI_API_KEY: 'k', OPENAI_API_KEY: 'k2' });
-    assert.ok(!('apiKeyEnv' in resolved[0].endpoint));
+    assert.ok(!('credentialEnv' in resolved[0].endpoint.auth));
+  });
+
+  // [LAW:one-type-per-behavior] One swap serves every variant — the subscription token resolves by
+  // the same path as an API key, with no second branch that a new variant could miss.
+  test('a subscription token resolves through the same one swap, keeping the variant intact', () => {
+    const raw = clone(VALID_RAW);
+    raw.configs['zai-glm'].endpoint.auth = { method: 'subscription', credentialEnv: 'CLAUDE_CODE_OAUTH_TOKEN' };
+    const chain = resolveChain(raw, null);
+    const resolved = resolveSecrets(chain, { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat-live', OPENAI_API_KEY: 'k2' });
+    assert.deepEqual(resolved[0].endpoint.auth, { method: 'subscription', credential: 'sk-ant-oat-live' });
   });
 
   test('missing env var rejects with config name and var name', () => {
@@ -373,15 +479,17 @@ configs:
     model: glm-5.1
     endpoint:
       kind: anthropic-messages
-      baseUrl: https://api.z.ai/api/anthropic
-      apiKeyEnv: MY_API_KEY
+      auth:
+        method: api-key
+        baseUrl: https://api.z.ai/api/anthropic
+        credentialEnv: MY_API_KEY
 `);
     try {
       const chain = loadConfig(filePath, null, { MY_API_KEY: 'sk-live-xyz' }, MOCK_REGISTRY);
       assert.equal(chain.length, 1);
       assert.equal(chain[0].name, 'zai-glm');
-      assert.equal(chain[0].endpoint.apiKey, 'sk-live-xyz');
-      assert.ok(!('apiKeyEnv' in chain[0].endpoint));
+      assert.equal(chain[0].endpoint.auth.credential, 'sk-live-xyz');
+      assert.ok(!('credentialEnv' in chain[0].endpoint.auth));
     } finally {
       cleanup();
     }
@@ -397,20 +505,24 @@ configs:
     model: glm-5.1
     endpoint:
       kind: anthropic-messages
-      baseUrl: https://api.z.ai/api/anthropic
-      apiKeyEnv: ZAI_KEY
+      auth:
+        method: api-key
+        baseUrl: https://api.z.ai/api/anthropic
+        credentialEnv: ZAI_KEY
   codex-gpt55:
     engine: codex
     model: gpt-5.5
     endpoint:
       kind: openai-responses
-      baseUrl: https://api.openai.com/v1
-      apiKeyEnv: OAI_KEY
+      auth:
+        method: api-key
+        baseUrl: https://api.openai.com/v1
+        credentialEnv: OAI_KEY
 `);
     try {
       const chain = loadConfig(filePath, 'codex-gpt55', { ZAI_KEY: 'a', OAI_KEY: 'b' }, MOCK_REGISTRY);
       assert.equal(chain[0].name, 'codex-gpt55');
-      assert.equal(chain[0].endpoint.apiKey, 'b');
+      assert.equal(chain[0].endpoint.auth.credential, 'b');
     } finally {
       cleanup();
     }
@@ -426,8 +538,10 @@ configs:
     model: glm-5.1
     endpoint:
       kind: anthropic-messages
-      baseUrl: https://api.z.ai/api/anthropic
-      apiKeyEnv: MY_KEY
+      auth:
+        method: api-key
+        baseUrl: https://api.z.ai/api/anthropic
+        credentialEnv: MY_KEY
 `);
     try {
       assert.throws(
@@ -444,10 +558,89 @@ configs:
     }
   });
 
+  test('a subscription config loads end to end from YAML', () => {
+    const { filePath, cleanup } = writeTempConfig(`
+version: 1
+default: claude-sub
+configs:
+  claude-sub:
+    engine: claude-code
+    model: claude-sonnet-5
+    endpoint:
+      kind: anthropic-messages
+      auth:
+        method: subscription
+        credentialEnv: CLAUDE_CODE_OAUTH_TOKEN
+`);
+    try {
+      const chain = loadConfig(filePath, null, { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-live' }, MOCK_REGISTRY);
+      assert.deepEqual(chain[0].endpoint.auth, { method: 'subscription', credential: 'sk-ant-oat01-live' });
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('a subscription config with a baseUrl is refused at load, not silently stripped', () => {
+    const { filePath, cleanup } = writeTempConfig(`
+version: 1
+default: claude-sub
+configs:
+  claude-sub:
+    engine: claude-code
+    model: claude-sonnet-5
+    endpoint:
+      kind: anthropic-messages
+      auth:
+        method: subscription
+        credentialEnv: CLAUDE_CODE_OAUTH_TOKEN
+        baseUrl: https://api.z.ai/api/anthropic
+`);
+    try {
+      assert.throws(
+        () => loadConfig(filePath, null, { CLAUDE_CODE_OAUTH_TOKEN: 'k' }, MOCK_REGISTRY),
+        { message: /'baseUrl'.*subscription/ },
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
   test('missing file rejects with informative message', () => {
     assert.throws(
       () => loadConfig('/nonexistent/review-agents.yml', null, {}, MOCK_REGISTRY),
       { message: /Failed to read config file/ },
     );
+  });
+});
+
+// [LAW:single-enforcer] Every auth method an adapter ADVERTISES must be a variant this module knows
+// how to parse and resolve. Without this, an adapter could declare a method whose fields AUTH_FIELDS
+// has no entry for, and validateFile would crash on a config file instead of rejecting it. The two
+// tables are one contract enumerated twice; this is what keeps them one. [FRAMING:representation]
+describe('AUTH_FIELDS covers every auth method the real adapters declare', () => {
+  const realRegistry = require('../src/engine/registry');
+  for (const engine of ['claude-code', 'codex', 'opencode']) {
+    test(`'${engine}': every declared authMethod has an AUTH_FIELDS entry`, () => {
+      const { authMethods } = realRegistry.get(engine).capabilities;
+      assert.ok(Array.isArray(authMethods) && authMethods.length > 0, `${engine} declares no authMethods`);
+      for (const method of authMethods) {
+        assert.ok(
+          Array.isArray(AUTH_FIELDS[method]),
+          `engine '${engine}' declares auth method '${method}' with no AUTH_FIELDS entry`,
+        );
+      }
+    });
+  }
+
+  // [LAW:one-type-per-behavior] The uniform credential name is what lets resolveSecrets be one swap
+  // and core.setSecret one read. A variant that named its credential something else would resolve to
+  // undefined and, worse, go unmasked in the Actions log.
+  test('every AUTH_FIELDS variant names the credential the same way', () => {
+    for (const [method, fields] of Object.entries(AUTH_FIELDS)) {
+      assert.ok(
+        fields.includes('credentialEnv'),
+        `variant '${method}' must name its credential 'credentialEnv'`,
+      );
+    }
   });
 });

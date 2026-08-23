@@ -49,14 +49,15 @@ That's it. Open a PR and the action reviews it. The checkout is optional context
 
 ## Providers
 
-`PROVIDER` selects the engine in simple mode. Each provider needs its own API key secret.
+`PROVIDER` selects the engine in simple mode. Each provider needs its own credential secret.
 
-| `PROVIDER` | Engine | Key | Default model |
-|---|---|---|---|
-| `auto` *(default)* | Claude Code → DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-v4-pro` |
-| `deepseek` | Claude Code → DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-v4-pro` |
-| `zai` | Claude Code → Z.ai | `ZAI_API_KEY` | `glm-5.1` |
-| `codex` | Codex → OpenAI | `OPENAI_API_KEY` | `gpt-5.4-mini` |
+| `PROVIDER` | Engine | Credential | Billing | Default model |
+|---|---|---|---|---|
+| `auto` *(default)* | Claude Code → DeepSeek | `DEEPSEEK_API_KEY` | per token | `deepseek-v4-pro` |
+| `deepseek` | Claude Code → DeepSeek | `DEEPSEEK_API_KEY` | per token | `deepseek-v4-pro` |
+| `zai` | Claude Code → Z.ai | `ZAI_API_KEY` | per token | `glm-5.1` |
+| `codex` | Codex → OpenAI | `OPENAI_API_KEY` | per token | `gpt-5.4-mini` |
+| `claude-subscription` | Claude Code → Anthropic | `CLAUDE_CODE_OAUTH_TOKEN` | your Claude Pro/Max plan | `claude-sonnet-5` |
 
 `auto` resolves to whichever provider the action currently points at (DeepSeek today). Pinning `auto` lets the maintainer retarget every consumer with a release, without anyone editing their workflow — supply the key for whatever `auto` currently resolves to.
 
@@ -69,16 +70,37 @@ To run Codex instead:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 ```
 
+### Reviewing on a Claude Pro/Max subscription
+
+`PROVIDER: claude-subscription` runs the same Claude Code engine against Anthropic's own API using your **subscription**, so a review consumes plan quota instead of billing per token.
+
+Mint the token once, locally — it is valid for a year:
+
+```bash
+claude setup-token          # prints the token; store it as a repo secret
+```
+
+```yaml
+      - uses: promptctl/copirate-code-review-agent@v1
+        with:
+          PROVIDER: claude-subscription
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+```
+
+There is deliberately no base-URL input for this provider: the token is only valid against Anthropic's own API, so pointing it elsewhere is not something the config can express. The preflight probe is skipped for subscription auth (and says so in the log) rather than guessing a request shape that could reject a working token.
+
 For a failover chain or per-PR engine selection, use the [config file](#multi-engine-configuration) instead.
 
 ## Inputs
 
 | Input | Default | Description |
 |---|---|---|
-| `PROVIDER` | `auto` | Engine: `auto`, `deepseek`, `zai`, or `codex`. Ignored when a `CONFIG_FILE` exists. |
+| `PROVIDER` | `auto` | Engine: `auto`, `deepseek`, `zai`, `codex`, or `claude-subscription`. Ignored when a `CONFIG_FILE` exists. |
 | `DEEPSEEK_API_KEY` | — | Required for `auto`/`deepseek`. |
 | `DEEPSEEK_MODEL` | `deepseek-v4-pro` | Model for the `deepseek` provider. |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/anthropic` | Anthropic-compatible endpoint for `deepseek`. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | — | Required for `claude-subscription`. A Claude Pro/Max token from `claude setup-token` (valid one year); the review is billed to the subscription's quota, not per token. |
+| `CLAUDE_MODEL` | `claude-sonnet-5` | Model for the `claude-subscription` provider. |
 | `ZAI_API_KEY` | — | Required for `zai`. |
 | `ZAI_MODEL` | `glm-5.1` | Model for the `zai` provider. |
 | `ZAI_BASE_URL` | `https://api.z.ai/api/anthropic` | Anthropic-compatible endpoint for `zai`. |
@@ -253,8 +275,21 @@ configs:
     reasoning: high              # validated against the engine's declared efforts
     endpoint:
       kind: anthropic-messages
-      baseUrl: https://api.deepseek.com/anthropic
-      apiKeyEnv: DEEPSEEK_API_KEY  # the NAME of an env var — never a secret value
+      auth:
+        method: api-key
+        baseUrl: https://api.deepseek.com/anthropic
+        credentialEnv: DEEPSEEK_API_KEY  # the NAME of an env var — never a secret value
+
+  claude-sub:                    # runs on a Claude Pro/Max subscription, not a paid API key
+    engine: claude-code
+    model: claude-sonnet-5
+    endpoint:
+      kind: anthropic-messages
+      auth:
+        method: subscription
+        credentialEnv: CLAUDE_CODE_OAUTH_TOKEN
+        # No baseUrl: a subscription token is only valid against Anthropic's own API, and
+        # writing one here is a load-time error rather than a setting that gets ignored.
 
   codex-gpt55:
     engine: codex
@@ -262,38 +297,43 @@ configs:
     reasoning: xhigh
     endpoint:
       kind: openai-responses
-      baseUrl: https://api.openai.com/v1
-      apiKeyEnv: OPENAI_API_KEY
+      auth:
+        method: api-key
+        baseUrl: https://api.openai.com/v1
+        credentialEnv: OPENAI_API_KEY
 ```
 
-Every field is validated **once, at startup** against the engine's capabilities. An illegal combination (codex with an `anthropic-messages` endpoint, a `reasoning` on opencode, an unknown engine, a `default`/`fallback` naming an undefined config, or an `apiKeyEnv` whose variable is unset) fails the run with a message naming the config, field, and allowed values.
+Every field is validated **once, at startup** against the engine's capabilities. An illegal combination (codex with an `anthropic-messages` endpoint, a `subscription` auth on an engine that cannot use one, a `baseUrl` under a `subscription` auth, a `reasoning` on opencode, an unknown engine, a `default`/`fallback` naming an undefined config, or a `credentialEnv` whose variable is unset) fails the run with a message naming the config, field, and allowed values.
+
+> **Schema change in 1.41.0.** `endpoint.baseUrl` / `endpoint.apiKeyEnv` moved under `endpoint.auth` and `apiKeyEnv` was renamed `credentialEnv`, so the credential's *delivery mechanism* is part of the type: an api-key endpoint has a base URL, a subscription does not. Existing config files need the nesting above — the old flat form fails at load with a message naming the missing field.
 
 ### Engine capability matrix
 
-A config is rejected at load unless its `endpoint.kind` and `reasoning` are valid for its `engine`:
+A config is rejected at load unless its `endpoint.kind`, `endpoint.auth.method`, and `reasoning` are valid for its `engine`:
 
-| Engine | `endpoint.kind` | `reasoning` efforts |
-|---|---|---|
-| `claude-code` | `anthropic-messages` | `low`, `medium`, `high`, `max` |
-| `codex` | `openai-responses` | `minimal`, `low`, `medium`, `high`, `xhigh` |
-| `opencode` | `openai-chat`, `openai-responses`, `anthropic-messages` | *(none — setting `reasoning` is a config error)* |
+| Engine | `endpoint.kind` | `auth.method` | `reasoning` efforts |
+|---|---|---|---|
+| `claude-code` | `anthropic-messages` | `api-key`, `subscription` | `low`, `medium`, `high`, `max` |
+| `codex` | `openai-responses` | `api-key` | `minimal`, `low`, `medium`, `high`, `xhigh` |
+| `opencode` | `openai-chat`, `openai-responses`, `anthropic-messages` | `api-key` | *(none — setting `reasoning` is a config error)* |
 
 `opencode` models are `<provider>/<model>`. The same provider can be reached through more than one engine — e.g. DeepSeek via `claude-code` (`anthropic-messages`, `…/anthropic`) or `opencode` (`openai-chat`, base host).
 
 ### Secrets
 
-A config never holds a secret — `apiKeyEnv` names an env var the **workflow** maps from a GitHub secret. Map each one in the step's `env:` block:
+A config never holds a secret — `credentialEnv` names an env var the **workflow** maps from a GitHub secret. Map each one in the step's `env:` block:
 
 ```yaml
       - uses: promptctl/copirate-code-review-agent@v1
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         with:
           GITHUB_REVIEW_TOKEN: ${{ secrets.GITHUB_REVIEW_TOKEN }}
 ```
 
-Every `apiKeyEnv` reachable in the chain must be set and non-empty at startup, or the run fails fast.
+Every `credentialEnv` reachable in the chain must be set and non-empty at startup, or the run fails fast.
 
 ### Per-PR selection
 
@@ -342,6 +382,8 @@ The transcript dumps the engine's own raw streams verbatim — it is not a recon
 ## Cost reporting
 
 Every review reports its estimated USD cost in the attribution footer and the run log (tokens × a hand-maintained price table). A model with no table entry renders cost as `unknown` (tokens still shown) and logs a warning. Costs are estimates, never billed charges.
+
+> **Under `PROVIDER: claude-subscription` the reported figure is Anthropic *list price* for a review that was billed to your plan's quota** — useful for "what would this have cost?", but not money spent. It is still summed into the daily ledger today, so pair the subscription provider with `DAILY_BUDGET_USD` only if you want the budget gradient to ration against notional dollars.
 
 ## Architecture
 

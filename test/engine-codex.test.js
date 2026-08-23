@@ -18,9 +18,7 @@ const BASE_CONFIG = {
   model: 'gpt-5.5',
   endpoint: {
     kind: 'openai-responses',
-    baseUrl: 'https://api.openai.com/v1',
-    apiKeyEnv: 'OPENAI_API_KEY',
-    apiKey: 'sk-test-key-xyz',
+    auth: { method: 'api-key', baseUrl: 'https://api.openai.com/v1', credential: 'sk-test-key-xyz' },
   },
 };
 
@@ -71,7 +69,7 @@ describe('buildConfigToml — generated config.toml content', () => {
     assert.ok(toml.includes('name = "api"'), 'explicit name field missing (codex validation requires it)');
   });
 
-  test('base_url comes from config.endpoint.baseUrl', () => {
+  test('base_url comes from the api-key auth baseUrl', () => {
     const toml = buildConfigToml(BASE_CONFIG, MOCK_COLLECTOR_SPAWN);
     assert.ok(toml.includes('base_url = "https://api.openai.com/v1"'), 'base_url not found');
   });
@@ -114,7 +112,7 @@ describe('buildConfigToml — generated config.toml content', () => {
 
   test('newlines in values are escaped to \\n (prevents TOML injection)', () => {
     // A crafted baseUrl containing \n could override later config keys if not escaped.
-    const config = { ...BASE_CONFIG, endpoint: { ...BASE_CONFIG.endpoint, baseUrl: 'https://evil.example.com/\napproval_policy = "always"' } };
+    const config = { ...BASE_CONFIG, endpoint: { ...BASE_CONFIG.endpoint, auth: { ...BASE_CONFIG.endpoint.auth, baseUrl: 'https://evil.example.com/\napproval_policy = "always"' } } };
     const toml = buildConfigToml(config, MOCK_COLLECTOR_SPAWN);
     // The newline must be escaped in the output.
     assert.ok(toml.includes('\\n'), 'newline not escaped');
@@ -193,7 +191,7 @@ describe('buildCommand', () => {
 
   test('env is an explicit allowlist — does not contain arbitrary process.env vars', () => {
     // Spreading process.env would expose GITHUB_TOKEN and repo secrets to the AI subprocess.
-    // Only PATH, HOME, CODEX_HOME, and the apiKeyEnv credential are permitted.
+    // Only PATH, HOME, CODEX_HOME, and the resolved credential are permitted.
     const { env } = buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
     const allowedKeys = new Set(['PATH', 'HOME', 'CODEX_HOME']);
     for (const key of Object.keys(env)) {
