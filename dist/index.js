@@ -35805,7 +35805,7 @@ const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 
 const { filterFiles, buildReviewAnchors, diffChurn } = __nccwpck_require__(9898);
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds } = __nccwpck_require__(7228);
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = __nccwpck_require__(7228);
 const { buildReviewInput } = __nccwpck_require__(3479);
 const { partitionFindings } = __nccwpck_require__(1565);
 const { buildAttributionFooter } = __nccwpck_require__(2887);
@@ -36493,7 +36493,10 @@ async function run() {
   // if-no-files-found handles that. [LAW:no-silent-failure] the path is never conditional on success.
   core.setOutput('transcript-dir', TRANSCRIPT_DIR);
 
-  const reviewerName = core.getInput('ZAI_REVIEWER_NAME');
+  // [LAW:parse-dont-validate] The raw input crosses into a real name exactly here, once, before either
+  // mode can carry it to a renderer. See parseReviewerName (transport.js) for why a blank must not
+  // reach one and why the default's only home is that module rather than action.yml.
+  const reviewerName = parseReviewerName(core.getInput('ZAI_REVIEWER_NAME'));
   const excludePatterns = core.getInput('EXCLUDE_PATTERNS')
     .split(',')
     .map(p => p.trim())
@@ -37031,6 +37034,37 @@ function renderUnreviewableSection(unreviewable) {
   return `\n\n### Changed files NOT reviewed\nThese files are part of this change but could not be reviewed, so this review does not cover them:\n\n${items}`;
 }
 
+// [LAW:parse-dont-validate] '' is not a reviewer name — it is the ABSENCE of one wearing a string's
+// type. Every artifact this action posts opens with `## ${reviewerName}` (submitReview and
+// renderNotReviewedBody below, renderRepoReport in report.js), so a blank reaching a renderer
+// unexamined publishes a dangling `## ` heading on the PR — observed live on PR #117 in both artifact
+// kinds. The blank family (unset, '', whitespace) collapses HERE, at the one boundary that reads the
+// input, into a name every render site prints unchecked; no renderer guards, because by the time a
+// name reaches one there is nothing left to check. [LAW:single-enforcer] one resolution, three sinks.
+//
+// [LAW:one-source-of-truth] This literal is the ONLY home of the default name — action.yml declares no
+// `default:` for ZAI_REVIEWER_NAME, for exactly the reason its provider MODEL/BASE_URL inputs declare
+// none. A manifest default wins when the input is ABSENT and loses when the workflow passes it
+// EXPLICITLY blank, which is what `${{ vars.ZAI_REVIEWER_NAME }}` interpolates to when the repo
+// variable is unset: the action's own default was defeated by a workflow trying to make the name
+// configurable. Two maps of one name, disagreeing on precisely the case that broke. With no manifest
+// default, absent and blank arrive identically as '' and this function is the single producer.
+//
+// This is not a silenced failure: ZAI_REVIEWER_NAME is documented optional, so blank is a consumer
+// declining to name the reviewer and the default IS the documented answer to that. Nothing is lost to
+// report. [LAW:no-silent-failure] Contrast parseMaxRounds/parseTimeBudgetMinutes, which keep their
+// action.yml defaults deliberately: '' is a real member of THEIR domains (0 = unlimited/disabled).
+// A display name has no empty member, which is what makes this input, and only this one, defective.
+//
+// NOT `String(raw).trim()`, the shape parseMaxRounds uses: there a non-string coerces to a word that
+// fails the digits regex and throws, whereas here `String(undefined)` is the truthy name 'undefined'
+// and would publish `## undefined` — a blank laundered into a plausible name, the very trade this
+// boundary exists to refuse. Anything that is not a string is a name nobody supplied.
+const DEFAULT_REVIEWER_NAME = 'CoPirate Code Review';
+function parseReviewerName(raw) {
+  return (typeof raw === 'string' ? raw.trim() : '') || DEFAULT_REVIEWER_NAME;
+}
+
 async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review, canApprove, transport, attributionFooter) {
   // [LAW:one-source-of-truth] One boolean drives both the GitHub event and the rendered
   // verdict, so they cannot disagree. The model never states the verdict.
@@ -37280,6 +37314,8 @@ module.exports = {
   pairPushbacks,
   roundCapReached,
   parseMaxRounds,
+  parseReviewerName,
+  DEFAULT_REVIEWER_NAME,
   REVIEW_MARKER,
 };
 

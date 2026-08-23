@@ -413,6 +413,37 @@ function renderUnreviewableSection(unreviewable) {
   return `\n\n### Changed files NOT reviewed\nThese files are part of this change but could not be reviewed, so this review does not cover them:\n\n${items}`;
 }
 
+// [LAW:parse-dont-validate] '' is not a reviewer name — it is the ABSENCE of one wearing a string's
+// type. Every artifact this action posts opens with `## ${reviewerName}` (submitReview and
+// renderNotReviewedBody below, renderRepoReport in report.js), so a blank reaching a renderer
+// unexamined publishes a dangling `## ` heading on the PR — observed live on PR #117 in both artifact
+// kinds. The blank family (unset, '', whitespace) collapses HERE, at the one boundary that reads the
+// input, into a name every render site prints unchecked; no renderer guards, because by the time a
+// name reaches one there is nothing left to check. [LAW:single-enforcer] one resolution, three sinks.
+//
+// [LAW:one-source-of-truth] This literal is the ONLY home of the default name — action.yml declares no
+// `default:` for ZAI_REVIEWER_NAME, for exactly the reason its provider MODEL/BASE_URL inputs declare
+// none. A manifest default wins when the input is ABSENT and loses when the workflow passes it
+// EXPLICITLY blank, which is what `${{ vars.ZAI_REVIEWER_NAME }}` interpolates to when the repo
+// variable is unset: the action's own default was defeated by a workflow trying to make the name
+// configurable. Two maps of one name, disagreeing on precisely the case that broke. With no manifest
+// default, absent and blank arrive identically as '' and this function is the single producer.
+//
+// This is not a silenced failure: ZAI_REVIEWER_NAME is documented optional, so blank is a consumer
+// declining to name the reviewer and the default IS the documented answer to that. Nothing is lost to
+// report. [LAW:no-silent-failure] Contrast parseMaxRounds/parseTimeBudgetMinutes, which keep their
+// action.yml defaults deliberately: '' is a real member of THEIR domains (0 = unlimited/disabled).
+// A display name has no empty member, which is what makes this input, and only this one, defective.
+//
+// NOT `String(raw).trim()`, the shape parseMaxRounds uses: there a non-string coerces to a word that
+// fails the digits regex and throws, whereas here `String(undefined)` is the truthy name 'undefined'
+// and would publish `## undefined` — a blank laundered into a plausible name, the very trade this
+// boundary exists to refuse. Anything that is not a string is a name nobody supplied.
+const DEFAULT_REVIEWER_NAME = 'CoPirate Code Review';
+function parseReviewerName(raw) {
+  return (typeof raw === 'string' ? raw.trim() : '') || DEFAULT_REVIEWER_NAME;
+}
+
 async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review, canApprove, transport, attributionFooter) {
   // [LAW:one-source-of-truth] One boolean drives both the GitHub event and the rendered
   // verdict, so they cannot disagree. The model never states the verdict.
@@ -662,5 +693,7 @@ module.exports = {
   pairPushbacks,
   roundCapReached,
   parseMaxRounds,
+  parseReviewerName,
+  DEFAULT_REVIEWER_NAME,
   REVIEW_MARKER,
 };

@@ -1,10 +1,17 @@
 name: "CoPirate Code Review"
 description: "Runs a coding agent as a read-only PR or whole-repo code reviewer."
+# A `default:` here is only reachable when the consumer's workflow OMITS the input entirely. A workflow
+# that passes it explicitly blank — the shape `${{ vars.X }}` interpolates to whenever the repo variable
+# is unset, which the Quickstart arguably invites — hands the runner a PROVIDED empty value, and
+# core.getInput returns '' with this default never consulted. So an input whose default ALSO lives in
+# src/ has two maps of one fact that disagree on exactly that case, and the src-side one is the map that
+# is actually always consulted. [LAW:one-source-of-truth] the rule, applied throughout this file: when a
+# default lives in src/, it is declared THERE and nowhere here, so absent and blank arrive identically as
+# '' and one producer resolves both. A `default:` below therefore means the runner is the sole source.
 inputs:
   MODE:
-    description: "Review material: a pull request diff or the whole repo."
+    description: "Review material: a pull request diff or the whole repo (default: pr)."
     required: false
-    default: "pr"
   SCOPE:
     description: "Free-text focus for the whole-repo review."
     required: false
@@ -20,10 +27,9 @@ inputs:
     description: "auto|deepseek|codex|zai|claude-subscription (default: auto, which resolves to claude-subscription)"
     required: false
     default: "auto"
-  # No `default:` on the provider MODEL / BASE_URL inputs below, deliberately: the defaults live
-  # in src/provider.js (PROVIDERS.defaultModel, PRESETS.defaultBaseUrl) and a copy here would be a
-  # second map of the same fact that silently wins over it. An unset input arrives as "" and the
-  # resolver reads that as "not set". [LAW:one-source-of-truth]
+  # No `default:` on the provider MODEL / BASE_URL inputs below: per the rule at the top of `inputs:`,
+  # their defaults live in src/provider.js (PROVIDERS.defaultModel, PRESETS.defaultBaseUrl) and the
+  # resolver reads the "" an unset input arrives as to mean "not set".
   OPENAI_API_KEY:
     description: "OpenAI API key for the codex provider."
     required: false
@@ -65,9 +71,8 @@ inputs:
     description: "Model for the claude-subscription provider."
     required: false
   ZAI_REVIEWER_NAME:
-    description: "Name shown in the review comment header."
+    description: "Name shown in the review comment header (default: CoPirate Code Review). A blank value resolves to that default — an empty string is not a name."
     required: false
-    default: "CoPirate Code Review"
   EXCLUDE_PATTERNS:
     description: "Comma-separated file patterns to exclude from review."
     required: false
