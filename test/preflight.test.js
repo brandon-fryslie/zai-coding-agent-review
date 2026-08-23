@@ -108,6 +108,29 @@ test('preflight: a subscription-only chain stays ok — an unprobed config never
   assert.equal(results[0].skipped, true);
 });
 
+// [LAW:verifiable-goals] Regression: a SKIPPED config is unproven, not absent. Filtering skipped
+// configs out of the verdict false-blocked this exact chain — the one a subscription user most likely
+// has — before any engine could spawn.
+test('preflight: a skipped primary in front of a DEAD probed fallback still passes', async () => {
+  const chain = [
+    {
+      name: 'claude-subscription-default', engine: 'claude-code', model: 'claude-sonnet-5',
+      endpoint: { kind: 'anthropic-messages', auth: { method: 'subscription', credential: 'k' } },
+    },
+    anthropicConfig('deepseek-fallback'),
+  ];
+  const { ok, results } = await preflight(chain, async () => ({ status: 401 }));
+  assert.equal(results[0].skipped, true, 'subscription primary must be skipped, not probed');
+  assert.equal(results[1].healthy, false, 'the api-key fallback is genuinely down');
+  assert.equal(ok, true, 'an unproven primary must not be treated as proven down');
+});
+
+test('preflight: every config probed and every one down is still a hard fail', async () => {
+  const chain = [anthropicConfig('primary'), anthropicConfig('fallback')];
+  const { ok } = await preflight(chain, async () => ({ status: 401 }));
+  assert.equal(ok, false, 'nothing unproven and nothing healthy — the chain really is dead');
+});
+
 test('preflight: chain is ok when any config is healthy (failover survives a dead primary)', async () => {
   const chain = [anthropicConfig('primary'), anthropicConfig('fallback')];
   // Probed in chain order: primary down (401), fallback healthy (200).

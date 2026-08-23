@@ -112,8 +112,18 @@ async function preflight(chain, fetchImpl = fetch) {
     // eslint-disable-next-line no-await-in-loop -- chains are tiny (1-3); sequential keeps logs ordered
     results.push(await probeConfig(config, fetchImpl));
   }
-  const probed = results.filter(r => !r.skipped);
-  const ok = probed.length === 0 || probed.some(r => r.healthy);
+  // [LAW:types-are-the-program] A config is in one of three states, and only one of them is evidence
+  // against the chain: healthy (proven up), unhealthy (proven down), skipped (UNPROVEN — no probe exists
+  // for its endpoint kind + auth method). The chain is usable unless every config is proven down, so a
+  // skipped config counts for it, never as if absent.
+  //
+  // Filtering skipped configs out first made "unproven" indistinguishable from "not there", which
+  // false-blocked a real chain: a subscription primary (skipped — an OAuth probe would need beta headers
+  // whose behaviour is unobserved here) in front of an api-key fallback with an expired key gave
+  // probed=[unhealthy] ⇒ ok=false, so the run was killed before any engine spawned even though failover
+  // would have tried the perfectly good subscription first and never reached the dead fallback.
+  // This also subsumes the old all-skipped special case rather than needing a clause of its own.
+  const ok = results.some(r => r.skipped || r.healthy);
   return { ok, results };
 }
 
