@@ -505,17 +505,24 @@ function forkNotice(pullNumber) {
       + "their diff is untrusted and reviewing it would spend the host repository's AI credits on an "
       + 'outside contributor.',
     latestArtifact: null,
+    // Warn, never red: a fork `pull_request` run receives no repository secrets at all and no
+    // `permissions:` block overrides that, so this failure is unfixable and reddening it would red every
+    // fork PR forever over a cause no operator can action. The round cap's is fixable, hence its
+    // setFailed. [LAW:dataflow-not-control-flow]
+    reportPostFailure: core.warning,
     // A hint NAMES what the reader can check; it never asserts a cause the code cannot know. The fork
     // path is trigger-independent (prIsFromFork reads the PR's repos, not the event), so it is reached
-    // under workflow_run too — where secrets ARE available and the secrets diagnosis would be false,
-    // telling a maintainer who already took that advice to take it again. Both branches are named and
-    // the reader resolves them instantly from their own workflow; consulting GITHUB_EVENT_NAME here
-    // would answer it slower, from ambient environment, inside a transport. [LAW:no-silent-failure]
+    // under every other trigger too — where secrets ARE available and the secrets diagnosis would be
+    // false, telling a maintainer who already took that advice to take it again. The two branches
+    // partition on the fact that decides the remedy — were secrets available at all — rather than
+    // enumerating triggers: `resolveReviewTarget` accepts workflow_run AND workflow_dispatch, so an
+    // enumeration would silently exclude whichever trigger is added next. Consulting GITHUB_EVENT_NAME
+    // here would answer it from ambient environment, inside a transport. [LAW:no-silent-failure]
     postFailureHint: 'If this ran on a `pull_request` trigger, that IS the cause and no configuration '
       + 'fixes it: a fork PR receives no repository secrets and a read-only GITHUB_TOKEN, so '
-      + 'GITHUB_REVIEW_TOKEN is empty too — trigger on workflow_run instead. If you are already on '
-      + 'workflow_run, secrets were available and the cause is elsewhere: the token needs '
-      + '`pull-requests: write`, and the PR must be open.',
+      + 'GITHUB_REVIEW_TOKEN is empty too — trigger on workflow_run instead. On any other trigger '
+      + '(workflow_run, workflow_dispatch) secrets were available and the cause is elsewhere: the token '
+      + 'needs `pull-requests: write`, and the PR must be open.',
   };
 }
 
@@ -524,6 +531,12 @@ function roundCapNotice(message, latestArtifact) {
     reason: NOT_REVIEWED_REASONS.ROUND_CAP,
     message,
     latestArtifact,
+    // Red, not a warning: the PR artifact is this mechanism's primary sink, so a post it cannot make
+    // leaves the run conclusion as the ONLY sink a consumer still reads — green-and-silent is precisely
+    // the state a capped PR must never present again. The red terminates, unlike the fork's: a round cap
+    // is only reachable on a same-repo PR, where `pull-requests: write` is always grantable. It also
+    // matches submitReview, which already throws on this same refusal. [LAW:no-silent-failure]
+    reportPostFailure: core.setFailed,
     // A round cap is only ever reached on a same-repo PR — forks are gated out long before they can
     // accumulate rounds — so the fork read-only-token diagnosis cannot apply here, and offering it would
     // send the operator down a path that cannot be the cause. [LAW:no-silent-failure]
@@ -542,9 +555,12 @@ function roundCapNotice(message, latestArtifact) {
 // check over a deliberate cost control), the event is never REQUEST_CHANGES (nothing was reviewed, so
 // there is no finding to justify one), and there is no input to turn this on.
 //
-// [LAW:no-silent-failure] Announcing is best-effort but never quiet about failing: a host that refuses
-// the post degrades to a loud warning carrying the notice's own remedy, never a red check — the fork
-// case cannot be fixed by any configuration, so reddening it would red every fork PR forever.
+// [LAW:no-silent-failure] Announcing is best-effort but never quiet, and how loudly a REFUSED post
+// speaks rides on the notice like everything else that differs between these two paths — a round cap
+// reds the run, a fork warns, for reasons stated at their constructors. The severity had to become a
+// carried value the moment the two paths stopped agreeing: applying the fork's warn-only policy to a
+// round cap handed back a green run with nothing on the PR, which is the exact state this whole
+// mechanism exists to abolish, reached from the one path it was built for. [LAW:dataflow-not-control-flow]
 async function announceNotReviewed(octokit, { owner, repo, pullNumber, commitId, reviewerName, notice }) {
   core.info(`Skipping review: ${notice.message}`);
   // [LAW:no-silent-failure] Rendered BEFORE the check and outside the try below, so the unknown-reason
@@ -576,11 +592,13 @@ async function announceNotReviewed(octokit, { owner, repo, pullNumber, commitId,
       body,
     });
   } catch (e) {
-    core.warning(
+    // [LAW:dataflow-not-control-flow] Severity AND remedy are carried by the notice, so this catch serves
+    // both callers with one unbranched call. A `reason === 'round-cap'` test here is exactly the invisible
+    // argument swap the notice constructors were introduced to make unrepresentable, and a hint naming an
+    // impossible cause (the fork read-only-token case, on a path only same-repo PRs reach) is worse than
+    // no hint at all.
+    notice.reportPostFailure(
       `Could not post the '${notice.reason}' not-reviewed notice to PR #${pullNumber}: ${e.message}. `
-      // [LAW:dataflow-not-control-flow] The remedy is carried BY the notice, not branched on here: this
-      // catch serves both callers, and the fork read-only-token diagnosis cannot apply to a round cap
-      // (only same-repo PRs ever reach one). A hint that names an impossible cause is worse than none.
       + `The run did NOT review this pull request; nothing on the PR says so. ${notice.postFailureHint}`,
     );
     return 'failed';

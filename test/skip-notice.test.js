@@ -1,6 +1,7 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
+const core = require('@actions/core');
 const {
   announceNotReviewed, renderNotReviewedBody, parseAgentArtifact, summarizePriorReviews,
   forkNotice, roundCapNotice, submitReview, gitHubTransport,
@@ -199,13 +200,60 @@ describe('the notice value carries what differs, so no call site can pair it wro
   });
 
   test('the fork remedy names the trigger it depends on rather than asserting one', () => {
-    // prIsFromFork reads the PR's repos, not the event, so this path is reached under workflow_run
-    // too — where secrets ARE available. A hint that asserted the secrets cause would tell a
+    // prIsFromFork reads the PR's repos, not the event, so this path is reached under every other
+    // trigger too — where secrets ARE available. A hint that asserted the secrets cause would tell a
     // maintainer already on workflow_run to switch to workflow_run.
     const hint = forkNotice(PR).postFailureHint;
     assert.match(hint, /If this ran on a `pull_request` trigger/);
-    assert.match(hint, /If you are already on workflow_run/);
+    // The second branch is the COMPLEMENT of the first, not an enumeration. resolveReviewTarget accepts
+    // workflow_dispatch as well as workflow_run, so listing triggers left that operator reading two
+    // branches both literally false about their own workflow — and would do so again for the next
+    // trigger added. The fact that decides the remedy is whether secrets were available at all.
+    assert.match(hint, /On any other trigger/);
+    assert.match(hint, /workflow_dispatch/);
     assert.match(hint, /pull-requests: write/); // the other branch stays actionable
+  });
+});
+
+describe('a notice that cannot be posted is as loud as the gap it was hiding', () => {
+  const refusing = {
+    rest: {
+      pulls: {
+        createReview: async () => { throw new Error('Resource not accessible by integration'); },
+      },
+    },
+  };
+
+  test('severity is carried by the notice, so the catch has nothing to branch on', () => {
+    assert.equal(forkNotice(PR).reportPostFailure, core.warning);
+    assert.equal(roundCapNotice(CAP_MESSAGE, null).reportPostFailure, core.setFailed);
+  });
+
+  test('the sink reports through the notice, carrying the cause AND that notice\'s own remedy', async () => {
+    const said = [];
+    const spy = { ...roundCapNotice(CAP_MESSAGE, null), reportPostFailure: m => said.push(m) };
+    assert.equal(await announce(refusing, spy), 'failed');
+    assert.equal(said.length, 1);
+    assert.match(said[0], /The run did NOT review this pull request; nothing on the PR says so/);
+    assert.match(said[0], /pull-requests: write/);
+  });
+
+  test('a refused round-cap notice REDS the run; a refused fork notice does not', async () => {
+    // Setting process.exitCode is the whole point of core.setFailed, so it is saved and restored around
+    // the assertion rather than left to fail this suite. Applying the fork's warn-only policy to a round
+    // cap is what left a capped PR green with nothing posted on it — this mechanism's own failure mode.
+    const before = process.exitCode;
+    try {
+      process.exitCode = 0;
+      assert.equal(await announce(refusing, roundCapNotice(CAP_MESSAGE, null)), 'failed');
+      assert.equal(process.exitCode, 1, 'a capped PR carrying no notice must not also be green');
+
+      process.exitCode = 0;
+      assert.equal(await announce(refusing, forkNotice(PR)), 'failed');
+      assert.equal(process.exitCode, 0, 'a fork run can never be granted the token, so red would be forever');
+    } finally {
+      process.exitCode = before;
+    }
   });
 });
 
