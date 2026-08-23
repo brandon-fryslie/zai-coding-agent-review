@@ -65,14 +65,51 @@ function materializeHome({ instructionsPath }) {
   return home;
 }
 
+// [LAW:dataflow-not-control-flow] The credential's DELIVERY MECHANISM is a value, not a branch: each
+// auth method maps to the env fragment that carries it, and buildCommand splices whichever fragment it
+// is handed without ever asking which one. A new method is one entry here and no new structure.
+//
+// [LAW:types-are-the-program] The fragments are DISJOINT, and that is load-bearing rather than tidy.
+// The CLI's auth precedence is cloud-provider creds > ANTHROPIC_AUTH_TOKEN > ANTHROPIC_API_KEY >
+// apiKeyHelper > CLAUDE_CODE_OAUTH_TOKEN, and the first two win SILENTLY in non-interactive mode — so
+// a run that set both would quietly bill the API key while the operator believed the subscription paid
+// for it, with no error anywhere to notice. Making each method produce only its own vars means that
+// state cannot be constructed. The explicit env allowlist below is the other half: no ambient
+// ANTHROPIC_API_KEY on the runner can reach the child and outrank the OAuth token either.
+const AUTH_ENV = {
+  'api-key': auth => ({ ANTHROPIC_AUTH_TOKEN: auth.credential, ANTHROPIC_BASE_URL: auth.baseUrl }),
+  // A subscription token IS Anthropic's own endpoint — there is no base URL to set, and setting one
+  // would be the "subscription token pointed at z.ai" state the auth union exists to delete.
+  subscription: auth => ({ CLAUDE_CODE_OAUTH_TOKEN: auth.credential }),
+};
+
+// [LAW:no-silent-failure] An unmapped method must never spawn an engine carrying NO credential — that
+// surfaces as an opaque 401 deep inside the CLI, minutes and one full prompt later. Config validation
+// rejects unknown methods upstream against the adapter's capability declaration; this names the gap
+// loudly if the enumeration and this map ever drift apart.
+function authEnv(auth) {
+  const fragment = AUTH_ENV[auth.method];
+  if (!fragment) {
+    throw new Error(
+      `claude-code: no auth env mapping for method '${auth.method}'. Known methods: ${Object.keys(AUTH_ENV).join(', ')}.`,
+    );
+  }
+  return fragment(auth);
+}
+
 // [LAW:effects-at-boundaries] Pure: returns a full spawn spec from a validated ReviewConfig.
-// [LAW:single-enforcer] Z.ai/Anthropic auth translation happens exactly once, here in the adapter.
+// [LAW:single-enforcer] Auth translation happens exactly once, here in the adapter: the resolved
+// config's auth variant becomes the engine's own credential channel via AUTH_ENV and nowhere else.
 function buildCommand({ config, collector, home }) {
   // [LAW:one-type-per-behavior] One canonical output format: `stream-json --verbose` emits every
   // assistant/thinking/tool-use event as JSONL, so every session transcript carries the full
   // prompt/response/thinking/tool-call flow (the signal for "did the engine actually read the repo").
   // parseResultEnvelope normalizes the terminal `result` event back to the same envelope the plain
   // `json` form produced, so assertSucceeded/extractUsage are unaffected. stream-json requires --verbose.
+  //
+  // NEVER add `--bare` here, however tempting its startup saving looks: `--bare` does not read
+  // CLAUDE_CODE_OAUTH_TOKEN at all, so it silently breaks every subscription-auth run while leaving
+  // api-key runs working — the worst shape of breakage, invisible on the path most tests exercise.
   const args = [
     '-y',
     `${CLAUDE_CODE_PACKAGE}@${CLAUDE_CODE_VERSION}`,
@@ -112,15 +149,14 @@ function buildCommand({ config, collector, home }) {
   // minimum is passed: the runner vars npx/node need (PATH resolution, TMPDIR for scratch, and the
   // npm download cache so npx does not re-fetch the pinned CLI into the throwaway HOME every run —
   // each omitted by node's spawn when unset, so an absent one is simply not present in the child)
-  // plus the claude-code-specific values this adapter owns (temp HOME, the ANTHROPIC_* auth
-  // translation, timeout, and CLI flags). [LAW:effects-at-boundaries]
+  // plus the claude-code-specific values this adapter owns (temp HOME, the auth translation, timeout,
+  // and CLI flags). [LAW:effects-at-boundaries]
   const env = {
     PATH: process.env.PATH,
     TMPDIR: process.env.TMPDIR,
     npm_config_cache: process.env.npm_config_cache,
     HOME: home,
-    ANTHROPIC_AUTH_TOKEN: config.endpoint.apiKey,
-    ANTHROPIC_BASE_URL: config.endpoint.baseUrl,
+    ...authEnv(config.endpoint.auth),
     ANTHROPIC_MODEL: config.model,
     API_TIMEOUT_MS: String(CLAUDE_TIMEOUT_MS),
     CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1',
@@ -237,6 +273,10 @@ const claudeCodeAdapter = makeCliAdapter({
     // time via these declarations, never discovered at spawn time.
     reasoningEfforts: CLAUDE_REASONING_EFFORTS,
     endpointKinds: ['anthropic-messages'],
+    // [LAW:one-source-of-truth] Derived from AUTH_ENV rather than restated: the methods this engine
+    // ADVERTISES are exactly the methods it can actually translate into a credential channel, so
+    // declaring one it cannot spawn is not a mistake that can be made.
+    authMethods: Object.keys(AUTH_ENV),
   },
   // [LAW:one-source-of-truth] Reference TOOL_NAMES — do not redeclare the strings here.
   toolNames: TOOL_NAMES,

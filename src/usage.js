@@ -58,7 +58,13 @@ function computeCostUsd({ inputTokens, outputTokens, cachedInputTokens = 0 }, mo
 // impostors: default to "not Anthropic" so every foreign endpoint is excluded by construction, not
 // one vendor at a time. An absent baseUrl means Claude Code's built-in default — Anthropic's own API.
 function isAnthropicEndpoint(config) {
-  const baseUrl = config.endpoint && config.endpoint.baseUrl;
+  const auth = (config.endpoint && config.endpoint.auth) || {};
+  // [LAW:types-are-the-program] A subscription token is minted against Anthropic and the variant
+  // carries no baseUrl to point elsewhere, so this question is answered by the type rather than by
+  // parsing a hostname. The sniff below exists only for the api-key variant, where a base URL exists
+  // and may belong to an Anthropic-COMPATIBLE vendor whose bill is not Anthropic's.
+  if (auth.method === 'subscription') return true;
+  const baseUrl = auth.baseUrl;
   if (!baseUrl) return true;
   try {
     // [LAW:types-are-the-program] Match the anthropic.com domain exactly — the apex or a true

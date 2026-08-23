@@ -19,21 +19,21 @@ const CODEX_CONFIG = {
   name: 'codex-mini',
   engine: 'codex',
   model: 'gpt-5.4-mini',
-  endpoint: { kind: 'openai-responses', baseUrl: 'https://api.openai.com/v1', apiKey: 'sk-x' },
+  endpoint: { kind: 'openai-responses', auth: { method: 'api-key', baseUrl: 'https://api.openai.com/v1', credential: 'sk-x' } },
 };
 
 const ZAI_CONFIG = {
   name: 'zai-glm',
   engine: 'claude-code',
   model: 'glm-5.1',
-  endpoint: { kind: 'anthropic-messages', baseUrl: 'https://api.z.ai/api/anthropic', apiKey: 'k' },
+  endpoint: { kind: 'anthropic-messages', auth: { method: 'api-key', baseUrl: 'https://api.z.ai/api/anthropic', credential: 'k' } },
 };
 
 const DEEPSEEK_CONFIG = {
   name: 'deepseek',
   engine: 'claude-code',
   model: 'deepseek-v4-pro',
-  endpoint: { kind: 'anthropic-messages', baseUrl: 'https://api.deepseek.com/anthropic', apiKey: 'k' },
+  endpoint: { kind: 'anthropic-messages', auth: { method: 'api-key', baseUrl: 'https://api.deepseek.com/anthropic', credential: 'k' } },
 };
 
 // A genuine Anthropic endpoint — the only case where claude-code's total_cost_usd is a usable cost.
@@ -41,7 +41,7 @@ const ANTHROPIC_CONFIG = {
   name: 'anthropic',
   engine: 'claude-code',
   model: 'claude-x',
-  endpoint: { kind: 'anthropic-messages', baseUrl: 'https://api.anthropic.com', apiKey: 'k' },
+  endpoint: { kind: 'anthropic-messages', auth: { method: 'api-key', baseUrl: 'https://api.anthropic.com', credential: 'k' } },
 };
 
 // --- computeCostUsd ---
@@ -190,7 +190,7 @@ describe('claudeExtractUsage', () => {
 
   test('a foreign endpoint whose model is not in the table reports no-price (tokens still shown)', () => {
     const stdout = JSON.stringify({ type: 'result', total_cost_usd: 0.5, usage: { input_tokens: 10, output_tokens: 5 } });
-    const unlisted = { engine: 'claude-code', model: 'glm-unreleased', endpoint: { baseUrl: 'https://api.z.ai/api/anthropic' } };
+    const unlisted = { engine: 'claude-code', model: 'glm-unreleased', endpoint: { auth: { method: 'api-key', baseUrl: 'https://api.z.ai/api/anthropic' } } };
     assert.deepEqual(claudeExtractUsage(stdout, unlisted).cost, { available: false, reason: 'no-price' });
   });
 
@@ -198,10 +198,24 @@ describe('claudeExtractUsage', () => {
     // [LAW:types-are-the-program] regression: endsWith('anthropic.com') wrongly accepted this host.
     // model not in the table → no-price (proves total_cost_usd was NOT used); genuine host → total_cost_usd.
     const stdout = JSON.stringify({ type: 'result', total_cost_usd: 0.5, usage: { input_tokens: 10, output_tokens: 5 } });
-    const lookalike = { engine: 'claude-code', model: 'x', endpoint: { baseUrl: 'https://api.notanthropic.com' } };
+    const lookalike = { engine: 'claude-code', model: 'x', endpoint: { auth: { method: 'api-key', baseUrl: 'https://api.notanthropic.com' } } };
     assert.deepEqual(claudeExtractUsage(stdout, lookalike).cost, { available: false, reason: 'no-price' });
-    const sub = { engine: 'claude-code', model: 'x', endpoint: { baseUrl: 'https://api.anthropic.com' } };
+    const sub = { engine: 'claude-code', model: 'x', endpoint: { auth: { method: 'api-key', baseUrl: 'https://api.anthropic.com' } } };
     assert.deepEqual(claudeExtractUsage(stdout, sub).cost, { available: true, usd: 0.5 });
+  });
+
+  // [LAW:verifiable-goals] AC for zai-billing-xl0.1: a subscription run is Anthropic BY CONSTRUCTION —
+  // the variant carries no baseUrl to sniff, so the classification comes from the type, not a hostname.
+  // NOTE: the figure it yields is Anthropic LIST price for a run billed to plan quota, so it is
+  // notional, not spend. Discriminating that is zai-billing-xl0.2's job, ranked immediately after.
+  test('a subscription run is Anthropic by construction, with no baseUrl to inspect', () => {
+    const stdout = JSON.stringify({ type: 'result', total_cost_usd: 0.42, usage: { input_tokens: 10, output_tokens: 5 } });
+    const subscription = {
+      engine: 'claude-code',
+      model: 'claude-sonnet-5',
+      endpoint: { kind: 'anthropic-messages', auth: { method: 'subscription', credential: 'sk-ant-oat01-x' } },
+    };
+    assert.deepEqual(claudeExtractUsage(stdout, subscription).cost, { available: true, usd: 0.42 });
   });
 
   test('returns null when the envelope has no usage', () => {
@@ -229,7 +243,7 @@ describe('renderCostLine', () => {
   });
 
   test('a non-z.ai claude-code run is still marked an estimate (total_cost_usd is client-side)', () => {
-    const anthropicConfig = { engine: 'claude-code', model: 'claude-x', endpoint: { baseUrl: 'https://api.anthropic.com' } };
+    const anthropicConfig = { engine: 'claude-code', model: 'claude-x', endpoint: { auth: { method: 'api-key', baseUrl: 'https://api.anthropic.com' } } };
     const line = renderCostLine({ inputTokens: 100, outputTokens: 50, cost: { available: true, usd: 0.5 } }, anthropicConfig);
     assert.match(line, /· est\._$/);
     assert.doesNotMatch(line, /z\.ai/);

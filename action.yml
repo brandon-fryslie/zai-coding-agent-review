@@ -17,7 +17,7 @@ inputs:
     description: "Named config to select from the config file."
     required: false
   PROVIDER:
-    description: "auto|deepseek|codex|zai (default: auto)"
+    description: "auto|deepseek|codex|zai|claude-subscription (default: auto)"
     required: false
     default: "auto"
   OPENAI_API_KEY:
@@ -60,6 +60,13 @@ inputs:
     description: "Base URL for the deepseek provider's endpoint."
     required: false
     default: "https://api.deepseek.com/anthropic"
+  CLAUDE_CODE_OAUTH_TOKEN:
+    description: "Claude Pro/Max subscription token for the claude-subscription provider, minted locally by `claude setup-token` (valid one year). The review is billed to the subscription's quota rather than per token. There is deliberately no CLAUDE_BASE_URL: this credential is only valid against Anthropic's own API."
+    required: false
+  CLAUDE_MODEL:
+    description: "Model for the claude-subscription provider."
+    required: false
+    default: "claude-sonnet-5"
   ZAI_REVIEWER_NAME:
     description: "Name shown in the review comment header."
     required: false

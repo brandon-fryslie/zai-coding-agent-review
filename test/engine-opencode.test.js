@@ -21,9 +21,7 @@ const BASE_CONFIG = {
   model: 'openai/gpt-5.4-mini',
   endpoint: {
     kind: 'openai-chat',
-    baseUrl: 'https://api.openai.com/v1',
-    apiKeyEnv: 'OPENAI_API_KEY',
-    apiKey: 'sk-test-key-xyz',
+    auth: { method: 'api-key', baseUrl: 'https://api.openai.com/v1', credential: 'sk-test-key-xyz' },
   },
 };
 
@@ -345,7 +343,7 @@ describe('config validation rejects reasoning on a real opencode config (T8 AC)'
           engine: 'opencode',
           model: 'openai/gpt-5.4-mini',
           reasoning: 'high',
-          endpoint: { kind: 'openai-chat', baseUrl: 'https://api.openai.com/v1', apiKeyEnv: 'OPENAI_API_KEY' },
+          endpoint: { kind: 'openai-chat', auth: { method: 'api-key', baseUrl: 'https://api.openai.com/v1', credentialEnv: 'OPENAI_API_KEY' } },
         },
       },
     };

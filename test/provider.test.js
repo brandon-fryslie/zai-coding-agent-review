@@ -25,8 +25,9 @@ describe('synthesizeProviderConfig — defaults', () => {
     assert.equal(config.engine, 'codex');
     assert.equal(config.model, 'gpt-5.4-mini');
     assert.equal(config.endpoint.kind, 'openai-responses');
-    assert.equal(config.endpoint.baseUrl, 'https://api.openai.com/v1');
-    assert.equal(config.endpoint.apiKey, 'sk-openai');
+    assert.deepEqual(config.endpoint.auth, {
+      method: 'api-key', baseUrl: 'https://api.openai.com/v1', credential: 'sk-openai',
+    });
     assert.equal(config.reasoning, undefined);
   });
 
@@ -35,8 +36,9 @@ describe('synthesizeProviderConfig — defaults', () => {
     assert.equal(config.engine, 'claude-code');
     assert.equal(config.model, 'glm-5.1');
     assert.equal(config.endpoint.kind, 'anthropic-messages');
-    assert.equal(config.endpoint.baseUrl, 'https://api.z.ai/api/anthropic');
-    assert.equal(config.endpoint.apiKey, 'zai-key');
+    assert.deepEqual(config.endpoint.auth, {
+      method: 'api-key', baseUrl: 'https://api.z.ai/api/anthropic', credential: 'zai-key',
+    });
   });
 });
 
@@ -68,7 +70,7 @@ describe('synthesizeProviderConfig — provider is chosen only by PROVIDER, neve
       MOCK_REGISTRY,
     );
     assert.equal(config.engine, 'codex');
-    assert.equal(config.endpoint.apiKey, 'sk-openai');
+    assert.equal(config.endpoint.auth.credential, 'sk-openai');
   });
 });
 
@@ -83,7 +85,7 @@ describe('synthesizeProviderConfig — overrides', () => {
       { provider: 'codex', openaiApiKey: 'k', openaiBaseUrl: 'https://gateway.example/v1' },
       MOCK_REGISTRY,
     );
-    assert.equal(config.endpoint.baseUrl, 'https://gateway.example/v1');
+    assert.equal(config.endpoint.auth.baseUrl, 'https://gateway.example/v1');
   });
 
   test('valid reasoning effort passes through', () => {
@@ -114,8 +116,9 @@ describe('synthesizeProviderConfig — deepseek provider', () => {
     assert.equal(config.engine, 'claude-code');
     assert.equal(config.model, 'deepseek-v4-pro');
     assert.equal(config.endpoint.kind, 'anthropic-messages');
-    assert.equal(config.endpoint.baseUrl, 'https://api.deepseek.com/anthropic');
-    assert.equal(config.endpoint.apiKey, 'sk-deepseek');
+    assert.deepEqual(config.endpoint.auth, {
+      method: 'api-key', baseUrl: 'https://api.deepseek.com/anthropic', credential: 'sk-deepseek',
+    });
     assert.equal(config.name, 'deepseek-default');
   });
 
@@ -135,7 +138,7 @@ describe('synthesizeProviderConfig — deepseek provider', () => {
       MOCK_REGISTRY,
     );
     assert.equal(config.model, 'deepseek-v4-flash');
-    assert.equal(config.endpoint.baseUrl, 'https://gw.example/anthropic');
+    assert.equal(config.endpoint.auth.baseUrl, 'https://gw.example/anthropic');
   });
 });
 
@@ -181,4 +184,76 @@ describe('synthesizeProviderConfig — unknown provider', () => {
   test('empty provider also fails as unknown', () => {
     assert.throws(() => synthesizeProviderConfig({ provider: '', openaiApiKey: 'k' }, MOCK_REGISTRY));
   });
+});
+
+// [LAW:verifiable-goals] AC for zai-billing-xl0.1: the subscription provider synthesizes an endpoint
+// with no base URL anywhere in it, on the same claude-code engine the paid providers use.
+describe('synthesizeProviderConfig — claude-subscription provider', () => {
+  test('an OAuth token alone yields a subscription endpoint carrying NO baseUrl', () => {
+    const config = synthesizeProviderConfig(
+      { provider: 'claude-subscription', claudeCodeOauthToken: 'sk-ant-oat01-live' },
+      MOCK_REGISTRY,
+    );
+    assert.equal(config.engine, 'claude-code');
+    assert.equal(config.model, 'claude-sonnet-5');
+    assert.equal(config.name, 'claude-subscription-default');
+    assert.equal(config.endpoint.kind, 'anthropic-messages');
+    assert.deepEqual(config.endpoint.auth, { method: 'subscription', credential: 'sk-ant-oat01-live' });
+  });
+
+  test('an explicit CLAUDE_MODEL overrides the default', () => {
+    const config = synthesizeProviderConfig(
+      { provider: 'claude-subscription', claudeCodeOauthToken: 'k', claudeModel: 'claude-opus-5' },
+      MOCK_REGISTRY,
+    );
+    assert.equal(config.model, 'claude-opus-5');
+  });
+
+  test('a missing token fails loud naming CLAUDE_CODE_OAUTH_TOKEN', () => {
+    assert.throws(
+      () => synthesizeProviderConfig({ provider: 'claude-subscription', deepseekApiKey: 'sk-ds' }, MOCK_REGISTRY),
+      err => {
+        assert.ok(/CLAUDE_CODE_OAUTH_TOKEN/.test(err.message), err.message);
+        return true;
+      },
+    );
+  });
+
+  test("PROVIDER: auto still resolves to deepseek — the subscription is opt-in", () => {
+    const viaAuto = synthesizeProviderConfig({ provider: 'auto', deepseekApiKey: 'k' }, MOCK_REGISTRY);
+    assert.equal(viaAuto.endpoint.auth.method, 'api-key');
+    assert.equal(viaAuto.name, 'auto→deepseek');
+  });
+
+  test('claude-subscription is listed among valid PROVIDER values', () => {
+    assert.ok(PROVIDER_NAMES.includes('claude-subscription'));
+  });
+});
+
+// [LAW:single-enforcer] The provider table and the adapter capability declarations are two
+// representations of one fact — what a given engine can be pointed at. Nothing in the RUNTIME
+// re-checks the static table, so this is the check: a row naming an endpoint kind or auth method its
+// engine does not declare would fail only at spawn time, on a real PR, having already paid for the
+// prompt. [FRAMING:representation]
+describe('PROVIDERS rows agree with the real adapter capabilities', () => {
+  const realRegistry = require('../src/engine/registry');
+  const { PROVIDERS, AUTH_FROM_INPUTS } = require('../src/provider');
+
+  for (const [name, spec] of Object.entries(PROVIDERS)) {
+    test(`'${name}': engine '${spec.engine}' declares its endpointKind and authMethod`, () => {
+      const caps = realRegistry.get(spec.engine).capabilities;
+      assert.ok(
+        caps.endpointKinds.includes(spec.endpointKind),
+        `endpointKind '${spec.endpointKind}' not in [${caps.endpointKinds.join(', ')}]`,
+      );
+      assert.ok(
+        caps.authMethods.includes(spec.authMethod),
+        `authMethod '${spec.authMethod}' not in [${caps.authMethods.join(', ')}]`,
+      );
+    });
+
+    test(`'${name}': its auth method has a builder`, () => {
+      assert.equal(typeof AUTH_FROM_INPUTS[spec.authMethod], 'function');
+    });
+  }
 });

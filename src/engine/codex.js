@@ -85,7 +85,7 @@ function buildConfigToml(config, collectorSpawn) {
     '',
     `[model_providers.${INTERNAL_PROVIDER}]`,
     `name = ${q(INTERNAL_PROVIDER)}`,
-    `base_url = ${q(config.endpoint.baseUrl)}`,
+    `base_url = ${q(config.endpoint.auth.baseUrl)}`,
     // Explicitly opt the custom provider into OpenAI API-key auth so Codex uses the
     // auth.json credential, rather than relying on implicit fallback. [LAW:types-are-the-program]
     `requires_openai_auth = true`,
@@ -111,10 +111,10 @@ function materializeHome({ config, instructionsPath, collector }) {
 
   // [LAW:single-enforcer] auth.json is the one credential channel Codex 0.139 reads for the
   // Responses transport; a provider env_key is ignored there and yields 401 missing-bearer.
-  // The key name is Codex's fixed API-key slot, independent of config.endpoint.apiKeyEnv.
+  // The key name is Codex's fixed API-key slot, independent of the config's credentialEnv.
   fs.writeFileSync(
     path.join(home, 'auth.json'),
-    JSON.stringify({ OPENAI_API_KEY: config.endpoint.apiKey }),
+    JSON.stringify({ OPENAI_API_KEY: config.endpoint.auth.credential }),
     'utf8',
   );
 
@@ -228,6 +228,9 @@ const codexAdapter = makeCliAdapter({
     // endpoint with codex) are rejected at load time, never discovered at spawn time.
     reasoningEfforts: CODEX_REASONING_EFFORTS,
     endpointKinds: ['openai-responses'],
+    // Codex authenticates only by API key (auth.json). A Claude subscription token is meaningless
+    // here, so config validation rejects it at load time rather than writing an unusable auth.json.
+    authMethods: ['api-key'],
   },
   toolNames: TOOL_NAMES,
   materializeHome,

@@ -5,11 +5,24 @@ const defaultRegistry = require('./engine/registry');
 
 // [LAW:types-are-the-program] The config file schema is the single type contract for
 // multi-engine configurations. Every illegal combination (unknown engine, unsupported
-// endpoint kind, invalid reasoning effort) is caught here at load time.
-// [LAW:single-enforcer] This module is the one place that validates engine/endpoint/
+// endpoint kind, unsupported auth method, invalid reasoning effort) is caught here at load time.
+// [LAW:single-enforcer] This module is the one place that validates engine/endpoint/auth/
 // reasoning combinations against adapter capability declarations.
 
 const SUPPORTED_VERSIONS = [1];
+
+// [LAW:one-source-of-truth] What each auth variant CARRIES, declared once, in the pre-resolution
+// shape the file speaks (a credential is named by env var, never written into the file). Validation
+// reads this to demand exactly these fields and REJECT any other, and resolveChain reads it to copy
+// exactly these fields through — so an auth block cannot be validated as one shape and then resolved
+// as another. [LAW:types-are-the-program] YAML cannot express a discriminated union, so this table is
+// how the union is recovered at the boundary: an `auth` block is parsed into one variant or refused.
+const AUTH_FIELDS = {
+  'api-key': ['baseUrl', 'credentialEnv'],
+  // No baseUrl, deliberately: a subscription token is only ever valid against Anthropic's own API,
+  // so "subscription token pointed at z.ai" has no spelling here rather than being caught later.
+  subscription: ['credentialEnv'],
+};
 
 // [LAW:effects-at-boundaries] Pure: validates raw parsed YAML against the adapter
 // registry. Throws with a message naming the config, field, and allowed values.
@@ -70,12 +83,39 @@ function validateFile(raw, registry) {
       }
     }
 
-    if (!entry.endpoint.baseUrl) {
-      throw new Error(`Config '${name}': missing required field 'endpoint.baseUrl'.`);
+    const auth = entry.endpoint.auth;
+    const allowedMethods = adapter.capabilities.authMethods;
+    if (!auth || typeof auth !== 'object' || !auth.method) {
+      throw new Error(
+        `Config '${name}': missing required field 'endpoint.auth.method'. Allowed for engine '${entry.engine}': ${allowedMethods.join(', ')}.`,
+      );
     }
 
-    if (!entry.endpoint.apiKeyEnv) {
-      throw new Error(`Config '${name}': missing required field 'endpoint.apiKeyEnv'.`);
+    // [LAW:single-enforcer] Auth validity is owned by the adapter's capability declaration — the same
+    // source simple mode's provider table is tested against — so both config paths reject identically.
+    if (!allowedMethods.includes(auth.method)) {
+      throw new Error(
+        `Config '${name}': endpoint.auth.method '${auth.method}' is not supported by engine '${entry.engine}'. Allowed: ${allowedMethods.join(', ')}.`,
+      );
+    }
+
+    const authFields = AUTH_FIELDS[auth.method];
+    for (const field of authFields) {
+      if (!auth[field]) {
+        throw new Error(
+          `Config '${name}': missing required field 'endpoint.auth.${field}' (required by auth method '${auth.method}').`,
+        );
+      }
+    }
+
+    // [LAW:no-silent-failure] A field the variant does not have is an ERROR, not something quietly
+    // ignored: a `baseUrl` written under a subscription auth is someone believing they redirected the
+    // endpoint, and silently dropping it would leave that belief intact and wrong.
+    const extra = Object.keys(auth).filter(k => k !== 'method' && !authFields.includes(k));
+    if (extra.length > 0) {
+      throw new Error(
+        `Config '${name}': endpoint.auth has field(s) ${extra.map(k => `'${k}'`).join(', ')} that auth method '${auth.method}' does not take. Allowed: ${authFields.map(k => `'${k}'`).join(', ')}.`,
+      );
     }
   }
 
@@ -111,14 +151,19 @@ function resolveChain(raw, selectedName) {
   const names = [chosen, ...fallback.filter(n => n !== chosen)];
   return names.map(name => {
     const entry = raw.configs[name];
+    // [LAW:one-source-of-truth] Copy exactly the fields the variant declares — never a spread of the
+    // raw block — so the resolved value carries the same shape validation just proved, and a stray
+    // key in the file can never ride along into a spawn spec.
+    const rawAuth = entry.endpoint.auth;
+    const auth = { method: rawAuth.method };
+    for (const field of AUTH_FIELDS[rawAuth.method]) auth[field] = rawAuth[field];
     const config = {
       name,
       engine: entry.engine,
       model: entry.model || '',
       endpoint: {
         kind: entry.endpoint.kind,
-        baseUrl: entry.endpoint.baseUrl,
-        apiKeyEnv: entry.endpoint.apiKeyEnv,
+        auth,
       },
     };
     if (entry.reasoning !== undefined && entry.reasoning !== null) {
@@ -129,19 +174,22 @@ function resolveChain(raw, selectedName) {
 }
 
 // [LAW:effects-at-boundaries] Reads env (external state) but accepts it as a value for
-// isolation. Throws if any apiKeyEnv in the chain is absent or empty so startup fails
+// isolation. Throws if any credentialEnv in the chain is absent or empty so startup fails
 // fast rather than at failover time. [LAW:no-silent-failure]
+// [LAW:one-type-per-behavior] ONE swap covers every auth variant, because every variant names its
+// credential the same way — resolution is `credentialEnv → credential` and nothing else, so a new
+// variant is resolved correctly the day it is added, with no second code path to remember.
 function resolveSecrets(chain, env) {
   return chain.map(config => {
-    const apiKey = env[config.endpoint.apiKeyEnv];
-    if (!apiKey) {
+    const { credentialEnv, ...auth } = config.endpoint.auth;
+    const credential = env[credentialEnv];
+    if (!credential) {
       throw new Error(
-        `Config '${config.name}': env var '${config.endpoint.apiKeyEnv}' is not set or empty. ` +
+        `Config '${config.name}': env var '${credentialEnv}' is not set or empty. ` +
         'Ensure the workflow maps a secret to this variable.',
       );
     }
-    const { apiKeyEnv: _, ...rest } = config.endpoint;
-    return { ...config, endpoint: { ...rest, apiKey } };
+    return { ...config, endpoint: { ...config.endpoint, auth: { ...auth, credential } } };
   });
 }
 
@@ -199,4 +247,4 @@ function peekConfigNames(filePath) {
   return { configNames, defaultName };
 }
 
-module.exports = { loadConfig, validateFile, resolveChain, resolveSecrets, peekConfigNames };
+module.exports = { loadConfig, validateFile, resolveChain, resolveSecrets, peekConfigNames, AUTH_FIELDS };

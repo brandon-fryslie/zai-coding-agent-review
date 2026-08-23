@@ -24,8 +24,19 @@ const BASE_CONFIG = {
   model: 'claude-sonnet-4-6',
   endpoint: {
     kind: 'anthropic-messages',
-    baseUrl: ZAI_ANTHROPIC_BASE_URL,
-    apiKey: 'test-api-key-xyz',
+    auth: { method: 'api-key', baseUrl: ZAI_ANTHROPIC_BASE_URL, credential: 'test-api-key-xyz' },
+  },
+};
+
+// The same engine and model reached through the OTHER credential channel: a Claude Pro/Max
+// subscription token. No baseUrl exists on this variant to set.
+const SUBSCRIPTION_CONFIG = {
+  name: 'claude-subscription-default',
+  engine: 'claude-code',
+  model: 'claude-sonnet-5',
+  endpoint: {
+    kind: 'anthropic-messages',
+    auth: { method: 'subscription', credential: 'sk-ant-oat01-test-token' },
   },
 };
 
@@ -125,7 +136,7 @@ describe('buildCommand — env is an explicit allowlist', () => {
     assert.equal(env.HOME, '/custom/home/dir');
   });
 
-  test('ANTHROPIC_AUTH_TOKEN comes from config.endpoint.apiKey', () => {
+  test('ANTHROPIC_AUTH_TOKEN comes from the api-key auth credential', () => {
     const { env } = buildCommand({
       config: BASE_CONFIG,
       collector: MOCK_COLLECTOR,
@@ -134,7 +145,7 @@ describe('buildCommand — env is an explicit allowlist', () => {
     assert.equal(env.ANTHROPIC_AUTH_TOKEN, 'test-api-key-xyz');
   });
 
-  test('ANTHROPIC_BASE_URL comes from config.endpoint.baseUrl (ZAI URL for compat shim)', () => {
+  test('ANTHROPIC_BASE_URL comes from the api-key auth baseUrl (ZAI URL for compat shim)', () => {
     const { env } = buildCommand({
       config: BASE_CONFIG,
       collector: MOCK_COLLECTOR,
@@ -217,7 +228,7 @@ describe('buildCommand — env is an explicit allowlist', () => {
     });
     const allowedKeys = new Set([
       'PATH', 'TMPDIR', 'npm_config_cache', 'HOME',
-      'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL',
+      'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'CLAUDE_CODE_OAUTH_TOKEN',
       'API_TIMEOUT_MS', 'CLAUDE_CODE_SKIP_PROMPT_HISTORY', 'NO_COLOR',
       'CLAUDE_CODE_EFFORT_LEVEL',
     ]);
@@ -246,6 +257,90 @@ describe('buildCommand — env is an explicit allowlist', () => {
   });
 });
 
+// [LAW:verifiable-goals] AC for zai-billing-xl0.1. The two auth variants produce two byte-exact envs,
+// asserted whole rather than field by field: what matters is not only what IS set but what is NOT,
+// and a whole-object assertion is the only form that fails when a var quietly reappears.
+describe('buildCommand — the auth variant decides the credential channel, byte-exactly', () => {
+  const RUNNER_VARS = {
+    PATH: process.env.PATH,
+    TMPDIR: process.env.TMPDIR,
+    npm_config_cache: process.env.npm_config_cache,
+  };
+  const CONSTANTS = {
+    API_TIMEOUT_MS: String(CLAUDE_TIMEOUT_MS),
+    CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1',
+    NO_COLOR: '1',
+  };
+
+  test('api-key: the env is byte-identical to the pre-auth-union set', () => {
+    const { env } = buildCommand({ config: BASE_CONFIG, collector: MOCK_COLLECTOR, home: MOCK_HOME });
+    assert.deepEqual(env, {
+      ...RUNNER_VARS,
+      HOME: MOCK_HOME,
+      ANTHROPIC_AUTH_TOKEN: 'test-api-key-xyz',
+      ANTHROPIC_BASE_URL: ZAI_ANTHROPIC_BASE_URL,
+      ANTHROPIC_MODEL: 'claude-sonnet-4-6',
+      ...CONSTANTS,
+    });
+  });
+
+  test('subscription: CLAUDE_CODE_OAUTH_TOKEN is the ONLY credential var, and there is no base URL', () => {
+    const { env } = buildCommand({ config: SUBSCRIPTION_CONFIG, collector: MOCK_COLLECTOR, home: MOCK_HOME });
+    assert.deepEqual(env, {
+      ...RUNNER_VARS,
+      HOME: MOCK_HOME,
+      CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-test-token',
+      ANTHROPIC_MODEL: 'claude-sonnet-5',
+      ...CONSTANTS,
+    });
+  });
+
+  test('subscription: none of the three vars that OUTRANK the OAuth token are set', () => {
+    // Stated separately from the deepEqual because the reason is not self-evident from it. The CLI's
+    // precedence is ANTHROPIC_AUTH_TOKEN > ANTHROPIC_API_KEY > apiKeyHelper > CLAUDE_CODE_OAUTH_TOKEN,
+    // and it resolves SILENTLY: any of these present means the run bills an API key while the operator
+    // believes the subscription paid for it. ANTHROPIC_BASE_URL is here too — it redirects the very
+    // endpoint the OAuth token is scoped to.
+    const { env } = buildCommand({ config: SUBSCRIPTION_CONFIG, collector: MOCK_COLLECTOR, home: MOCK_HOME });
+    for (const key of ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL']) {
+      assert.equal(key in env, false, `${key} must be absent for a subscription run — it outranks CLAUDE_CODE_OAUTH_TOKEN`);
+    }
+  });
+
+  test('an ambient ANTHROPIC_API_KEY on the runner never reaches a subscription run', () => {
+    // The precedence trap arriving from OUTSIDE the config: a runner that happens to export an API key
+    // would hijack the subscription run if the env were a process.env spread. The allowlist forbids it.
+    const had = 'ANTHROPIC_API_KEY' in process.env;
+    const prior = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-ambient-must-not-win';
+    try {
+      const { env } = buildCommand({ config: SUBSCRIPTION_CONFIG, collector: MOCK_COLLECTOR, home: MOCK_HOME });
+      assert.equal('ANTHROPIC_API_KEY' in env, false);
+    } finally {
+      if (had) process.env.ANTHROPIC_API_KEY = prior;
+      else delete process.env.ANTHROPIC_API_KEY;
+    }
+  });
+
+  test('--bare is never passed: it does not read CLAUDE_CODE_OAUTH_TOKEN', () => {
+    for (const config of [BASE_CONFIG, SUBSCRIPTION_CONFIG]) {
+      const { args } = buildCommand({ config, collector: MOCK_COLLECTOR, home: MOCK_HOME });
+      assert.equal(args.includes('--bare'), false, `--bare breaks subscription auth silently (config '${config.name}')`);
+    }
+  });
+
+  test('an unknown auth method fails loudly instead of spawning with no credential', () => {
+    assert.throws(
+      () => buildCommand({
+        config: { ...BASE_CONFIG, endpoint: { kind: 'anthropic-messages', auth: { method: 'oauth-device-flow', credential: 'x' } } },
+        collector: MOCK_COLLECTOR,
+        home: MOCK_HOME,
+      }),
+      { message: /no auth env mapping for method 'oauth-device-flow'.*api-key, subscription/ },
+    );
+  });
+});
+
 describe('claudeCodeAdapter interface declarations', () => {
   test('name is "claude-code"', () => {
     assert.equal(claudeCodeAdapter.name, 'claude-code');
@@ -261,6 +356,10 @@ describe('claudeCodeAdapter interface declarations', () => {
 
   test('reasoningEfforts contains the four claude effort levels', () => {
     assert.deepEqual(claudeCodeAdapter.capabilities.reasoningEfforts, ['low', 'medium', 'high', 'max']);
+  });
+
+  test('authMethods declares both credential channels this engine can actually spawn', () => {
+    assert.deepEqual(claudeCodeAdapter.capabilities.authMethods, ['api-key', 'subscription']);
   });
 
   test('toolNames reference mcp__review_collector__ prefix', () => {
