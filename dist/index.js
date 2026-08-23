@@ -33583,9 +33583,12 @@ async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sl
 // After 3 transient failures on one config: advance to next config IMMEDIATELY — different
 // provider, waiting buys nothing. Chain exhausted → surface the last transient as the run's
 // cause. The chain is walked ONCE (see the loop below on why there is no second sweep), so the
-// ladder is bounded at PER_CONFIG_LIMIT × chain.length. The budget still clamps every sleep, but
-// it is no longer what ENDS the ladder: a provider that fails instantly and permanently would
-// otherwise spend the entire budget without ever making progress, and then be blamed on the clock.
+// ladder has TWO bounds and ends at whichever fires first: the COUNT, PER_CONFIG_LIMIT ×
+// chain.length, and the CLOCK, the `budgetLeft === 0` throw below — which an uncapped server
+// Retry-After can reach well before the count does, making it frequently the tighter of the two.
+// The clock did not stop applying; a count bound simply exists now, where before the clock was the
+// ONLY terminator. That is the whole bug: with nothing counting, a provider that fails instantly
+// and permanently spent the entire budget without ever making progress, and was then blamed on it.
 // [LAW:effects-at-boundaries] budgetMs is injectable so tests can set a zero/tiny budget
 // to cover the 'deadline exceeded mid-retry' throw path without real 60-min waits.
 // [LAW:no-ambient-temporal-coupling] `now` is the injected clock, the SAME seam the multi-scope
