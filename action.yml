@@ -17,34 +17,34 @@ inputs:
     description: "Named config to select from the config file."
     required: false
   PROVIDER:
-    description: "auto|deepseek|codex|zai (default: auto)"
+    description: "auto|deepseek|codex|zai|claude-subscription (default: auto, which resolves to claude-subscription)"
     required: false
     default: "auto"
+  # No `default:` on the provider MODEL / BASE_URL inputs below, deliberately: the defaults live
+  # in src/provider.js (PROVIDERS.defaultModel, PRESETS.defaultBaseUrl) and a copy here would be a
+  # second map of the same fact that silently wins over it. An unset input arrives as "" and the
+  # resolver reads that as "not set". [LAW:one-source-of-truth]
   OPENAI_API_KEY:
     description: "OpenAI API key for the codex provider."
     required: false
   OPENAI_MODEL:
     description: "Model for the codex provider."
     required: false
-    default: "gpt-5.4-mini"
   OPENAI_REASONING_EFFORT:
     description: "Reasoning effort for the codex provider."
     required: false
   OPENAI_BASE_URL:
     description: "Base URL for the codex provider's endpoint."
     required: false
-    default: "https://api.openai.com/v1"
   ZAI_API_KEY:
     description: "Z.ai API key for the zai provider."
     required: false
   ZAI_MODEL:
     description: "Model for the zai provider."
     required: false
-    default: "glm-5.1"
   ZAI_BASE_URL:
     description: "Base URL for the zai provider's endpoint."
     required: false
-    default: "https://api.z.ai/api/anthropic"
   ZAI_SYSTEM_PROMPT:
     description: "Optional extra system prompt appended for the reviewer. Empty by default — the built-in review charter already carries the whole review standard."
     required: false
@@ -55,11 +55,15 @@ inputs:
   DEEPSEEK_MODEL:
     description: "Model for the deepseek provider."
     required: false
-    default: "deepseek-v4-pro"
   DEEPSEEK_BASE_URL:
     description: "Base URL for the deepseek provider's endpoint."
     required: false
-    default: "https://api.deepseek.com/anthropic"
+  CLAUDE_CODE_OAUTH_TOKEN:
+    description: "Claude Pro/Max subscription token for the claude-subscription provider, minted locally by `claude setup-token` (valid one year). The review is billed to the subscription's quota rather than per token. There is deliberately no CLAUDE_BASE_URL: this credential is only valid against Anthropic's own API."
+    required: false
+  CLAUDE_MODEL:
+    description: "Model for the claude-subscription provider."
+    required: false
   ZAI_REVIEWER_NAME:
     description: "Name shown in the review comment header."
     required: false

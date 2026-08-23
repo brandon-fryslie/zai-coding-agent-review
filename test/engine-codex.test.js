@@ -16,11 +16,7 @@ const BASE_CONFIG = {
   name: 'codex-gpt55',
   engine: 'codex',
   model: 'gpt-5.5',
-  endpoint: {
-    kind: 'openai-responses',
-    baseUrl: 'https://api.openai.com/v1',
-    apiKeyEnv: 'OPENAI_API_KEY',
-    apiKey: 'sk-test-key-xyz',
+  endpoint: { apiType: 'openai-responses', baseUrl: 'https://api.openai.com/v1', credential: { kind: 'api-key', value: 'sk-test-key-xyz' },
   },
 };
 
@@ -71,7 +67,7 @@ describe('buildConfigToml — generated config.toml content', () => {
     assert.ok(toml.includes('name = "api"'), 'explicit name field missing (codex validation requires it)');
   });
 
-  test('base_url comes from config.endpoint.baseUrl', () => {
+  test('base_url comes from the api-key auth baseUrl', () => {
     const toml = buildConfigToml(BASE_CONFIG, MOCK_COLLECTOR_SPAWN);
     assert.ok(toml.includes('base_url = "https://api.openai.com/v1"'), 'base_url not found');
   });
@@ -193,7 +189,7 @@ describe('buildCommand', () => {
 
   test('env is an explicit allowlist — does not contain arbitrary process.env vars', () => {
     // Spreading process.env would expose GITHUB_TOKEN and repo secrets to the AI subprocess.
-    // Only PATH, HOME, CODEX_HOME, and the apiKeyEnv credential are permitted.
+    // Only PATH, HOME, CODEX_HOME, and the resolved credential are permitted.
     const { env } = buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
     const allowedKeys = new Set(['PATH', 'HOME', 'CODEX_HOME']);
     for (const key of Object.keys(env)) {
@@ -344,8 +340,8 @@ describe('codexAdapter interface declarations', () => {
     assert.equal(CODEX_TIMEOUT_MS, 3_000_000);
   });
 
-  test('endpointKinds contains only "openai-responses"', () => {
-    assert.deepEqual(codexAdapter.capabilities.endpointKinds, ['openai-responses']);
+  test('apiTypes contains only "openai-responses"', () => {
+    assert.deepEqual(codexAdapter.capabilities.apiTypes, ['openai-responses']);
   });
 
   test('reasoningEfforts contains the five codex effort levels', () => {

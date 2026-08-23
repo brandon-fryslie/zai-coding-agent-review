@@ -47,17 +47,22 @@ function classifyProbe({ status, networkError }) {
   };
 }
 
-// The minimal request for an endpoint kind. Only kinds whose live behaviour has been observed are
-// probed; an unobserved kind returns null and the caller skips it loudly, rather than shipping a
-// probe that could false-fail a working setup. [FRAMING:representation] [LAW:no-silent-failure]
+// The minimal request for an endpoint kind + auth method. Only combinations whose live behaviour has
+// been observed are probed; anything else returns null and the caller skips it loudly, rather than
+// shipping a probe that could false-fail a working setup. [FRAMING:representation] [LAW:no-silent-failure]
+//
+// The subscription variant is deliberately unprobed: an OAuth subscription token against the raw
+// Messages API needs beta headers whose live behaviour has NOT been observed here, so a guessed probe
+// would reject a perfectly working subscription before the engine ever spawned — the exact false
+// failure this function's contract exists to avoid.
 function probeRequest(endpoint, model) {
-  if (endpoint.kind === 'anthropic-messages') {
+  if (endpoint.apiType === 'anthropic-messages' && endpoint.credential.kind === 'api-key') {
     return {
       url: `${endpoint.baseUrl.replace(/\/+$/, '')}/v1/messages`,
       init: {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${endpoint.apiKey}`,
+          Authorization: `Bearer ${endpoint.credential.value}`,
           'anthropic-version': '2023-06-01',
           'content-type': 'application/json',
         },
@@ -77,7 +82,9 @@ async function probeConfig(config, fetchImpl = fetch) {
     return {
       name: config.name,
       skipped: true,
-      hint: `no preflight probe is implemented for endpoint kind '${config.endpoint.kind}'`,
+      // Name BOTH axes: 'anthropic-messages' alone IS probed under api-key auth, so reporting only the
+      // kind would read as a contradiction to anyone who has seen the probe run. [LAW:no-silent-failure]
+      hint: `no preflight probe is implemented for apiType '${config.endpoint.apiType}' with credential kind '${config.endpoint.credential.kind}'`,
     };
   }
   const controller = new AbortController();
@@ -105,8 +112,18 @@ async function preflight(chain, fetchImpl = fetch) {
     // eslint-disable-next-line no-await-in-loop -- chains are tiny (1-3); sequential keeps logs ordered
     results.push(await probeConfig(config, fetchImpl));
   }
-  const probed = results.filter(r => !r.skipped);
-  const ok = probed.length === 0 || probed.some(r => r.healthy);
+  // [LAW:types-are-the-program] A config is in one of three states, and only one of them is evidence
+  // against the chain: healthy (proven up), unhealthy (proven down), skipped (UNPROVEN — no probe exists
+  // for its endpoint kind + auth method). The chain is usable unless every config is proven down, so a
+  // skipped config counts for it, never as if absent.
+  //
+  // Filtering skipped configs out first made "unproven" indistinguishable from "not there", which
+  // false-blocked a real chain: a subscription primary (skipped — an OAuth probe would need beta headers
+  // whose behaviour is unobserved here) in front of an api-key fallback with an expired key gave
+  // probed=[unhealthy] ⇒ ok=false, so the run was killed before any engine spawned even though failover
+  // would have tried the perfectly good subscription first and never reached the dead fallback.
+  // This also subsumes the old all-skipped special case rather than needing a clause of its own.
+  const ok = results.some(r => r.skipped || r.healthy);
   return { ok, results };
 }
 

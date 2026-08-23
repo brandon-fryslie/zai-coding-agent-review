@@ -59,7 +59,10 @@ function buildConfigChain(selection) {
     const selectedName = selectConfig(selection, { configInput: configNameInput, configNames, defaultName });
     core.info(`Selected reviewer config: '${selectedName}'`);
     const chain = loadConfig(configFilePath, selectedName, process.env);
-    chain.forEach(c => core.setSecret(c.endpoint.apiKey));
+    // [LAW:one-type-per-behavior] Every auth variant names its credential the same, so masking is one
+    // read that covers all of them — a variant added later is masked by construction rather than by
+    // someone remembering to extend a per-variant switch. [LAW:no-silent-failure]
+    chain.forEach(c => core.setSecret(c.endpoint.credential.value));
     return chain;
   }
 
@@ -79,9 +82,18 @@ function buildConfigChain(selection) {
     deepseekApiKey: core.getInput('DEEPSEEK_API_KEY'),
     deepseekModel: core.getInput('DEEPSEEK_MODEL'),
     deepseekBaseUrl: core.getInput('DEEPSEEK_BASE_URL'),
+    // No CLAUDE_BASE_URL: a subscription token is only valid against Anthropic's own API, so the
+    // provider row takes no base-URL input and there is nothing here to read. [LAW:types-are-the-program]
+    claudeCodeOauthToken: core.getInput('CLAUDE_CODE_OAUTH_TOKEN'),
+    claudeModel: core.getInput('CLAUDE_MODEL'),
   });
-  core.setSecret(config.endpoint.apiKey);
-  core.info(`Using provider '${config.name}' (engine: ${config.engine}, model: ${config.model}).`);
+  core.setSecret(config.endpoint.credential.value);
+  core.info(
+    `Using provider '${config.name}' (engine: ${config.engine}, model: ${config.model}, ` +
+    // The auth method is operator news: it is how a run log answers "did this actually bill the
+    // subscription, or did it quietly fall back to a paid key?" [LAW:no-silent-failure]
+    `auth: ${config.endpoint.credential.kind}).`,
+  );
   return [config];
 }
 

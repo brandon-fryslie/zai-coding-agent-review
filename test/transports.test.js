@@ -451,3 +451,49 @@ describe('selectTransport — refused paths reach the caller as data', () => {
     assert.deepEqual(t.unreviewable, [], 'the listFiles refusal is not re-reported over the diff\'s own');
   });
 });
+
+// [LAW:verifiable-goals] Regression: "no file carries a patch" is not proof of Gitea. GitHub omits
+// `patch` for a file too large to inline, so a PR whose only change is a big committed artifact landed
+// in the unified-diff fallback, parsed to zero files, and threw — reddening PRs that had nothing to
+// review at all (the artifact being in EXCLUDE_PATTERNS). It must WARN and hand the files onward so the
+// caller can post its clean "no patchable changes" review.
+describe('selectTransport — a PR whose files carry no patch', () => {
+  test('an empty unified diff does NOT throw — it returns the files unpatched', async () => {
+    const files = [{ filename: 'dist/index.js', status: 'modified' }];
+    const transport = await selectTransport(fakeHost(files, ''), 'o', 'r', 111);
+    assert.deepEqual(transport.files, files);
+    assert.equal(transport.files.filter(f => f.patch).length, 0, 'nothing is patchable, which the caller handles');
+  });
+
+  // This arm hands back the listFiles rendering, so it owes that rendering's coverage loss — a refused
+  // path must not be dropped just because the unified-diff fallback found nothing to anchor.
+  test('the unpatched fallback still carries the listFiles refusals', async () => {
+    const transport = await selectTransport(fakeHost([
+      { filename: 'dist/index.js', status: 'modified' },
+      { filename: 'src/a\nEVIL.js', status: 'modified' },
+    ], ''), 'o', 'r', 112);
+    assert.deepEqual(transport.files.map(f => f.filename), ['dist/index.js']);
+    assert.equal(transport.unreviewable.length, 1, 'the refusal survives the empty-diff fallback');
+  });
+
+  test('a parseable unified diff still selects the Gitea transport', async () => {
+    const diff = [
+      'diff --git a/a.txt b/a.txt',
+      '--- a/a.txt',
+      '+++ b/a.txt',
+      '@@ -1 +1,2 @@',
+      ' one',
+      '+two',
+      '',
+    ].join('\n');
+    const files = [{ filename: 'a.txt', status: 'modified' }];
+    const transport = await selectTransport(fakeHost(files, diff), 'o', 'r', 7);
+    assert.equal(transport.files.length, 1);
+    assert.ok(transport.files[0].patch, 'the parsed hunk is carried');
+    assert.deepEqual(
+      transport.toComment({ path: 'a.txt', line: 2, body: 'x' }),
+      { path: 'a.txt', new_position: 2, body: 'x' },
+      'still the Gitea anchor shape',
+    );
+  });
+});

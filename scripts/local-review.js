@@ -35,8 +35,9 @@ the engine explored the repo or reviewed the diff only.
 
 Usage: node scripts/local-review.js [options]
 
-  --provider <name>   Provider: auto (default), deepseek, zai, codex. Key read from the matching
-                      env var: DEEPSEEK_API_KEY / ZAI_API_KEY / OPENAI_API_KEY.
+  --provider <name>   Provider: auto (default), deepseek, zai, codex, claude-subscription. Credential
+                      read from the matching env var: DEEPSEEK_API_KEY / ZAI_API_KEY /
+                      OPENAI_API_KEY / CLAUDE_CODE_OAUTH_TOKEN.
   --range <expr>      git diff range for the material (default: "HEAD~1 HEAD"). Ignored in repo mode.
   --diff <file>       Use a unified .diff file instead of computing one from --range.
   --repo <path>       Reviewed repo root (default: current directory). Read by the engine by absolute path.
@@ -44,7 +45,7 @@ Usage: node scripts/local-review.js [options]
   --scope <text>      Optional free-text scope, repo mode only.
   --workers <N>       Max concurrent scope workers (default: 4).
   --model <id>        Override the provider's default model.
-  --base-url <url>    Override the provider's endpoint base URL.
+  --base-url <url>    Override the provider's endpoint base URL (api-key providers only).
   --help              Show this help.
 `;
 
@@ -65,10 +66,41 @@ function parseArgs(argv) {
     opts[name === 'base-url' ? 'baseUrl' : name] = value;
   }
   if (opts.mode !== 'pr' && opts.mode !== 'repo') throw new Error(`--mode must be 'pr' or 'repo' (got '${opts.mode}').`);
+  // [LAW:no-silent-failure] A pinned provider reads no base URL — accepting the flag and quietly
+  // dropping it would leave the operator believing they had redirected the endpoint.
+  // [LAW:one-source-of-truth] WHICH providers those are is not a name to hardcode: it is the preset's
+  // pinned `baseUrl`, read from the same table src/provider.js resolves every endpoint from, so a
+  // future pinned provider is covered the day its row lands. The require is lazy to keep module load
+  // free of the engine stack (see the header); parseArgs stays pure — a require performs no IO here.
+  if (opts.baseUrl) {
+    const { PROVIDERS, PRESETS, PROVIDER_ALIASES } = require('../src/provider');
+    // Resolve the alias FIRST. The default provider is 'auto', which forwards to a concrete row — ask
+    // before resolving and the common no-`--provider` invocation slips past this guard entirely.
+    const requested = opts.provider;
+    const provider = PROVIDER_ALIASES[requested] || requested;
+    // An unknown provider is not this guard's business: synthesizeProviderConfig rejects it loudly,
+    // naming every valid value. Duplicating that here would be a second enforcer of one rule.
+    const spec = PROVIDERS[provider];
+    const pinned = spec && PRESETS[spec.preset].baseUrl;
+    if (pinned) {
+      const label = requested === provider ? `'${provider}'` : `'${requested}' (→ '${provider}')`;
+      throw new Error(
+        `--base-url does not apply to --provider ${label}: its endpoint is PINNED to ${pinned} in code, ` +
+        'because its credential is only valid against that host.',
+      );
+    }
+  }
   opts.workers = parseInt(opts.workers, 10);
   if (isNaN(opts.workers) || opts.workers < 1) throw new Error('--workers must be a positive integer.');
   return opts;
 }
+
+// [LAW:dataflow-not-control-flow] How an auth variant READS is one entry per variant, so the report
+// never has to reach for a baseUrl the subscription variant does not carry.
+const AUTH_LABEL = {
+  'api-key': e => `api-key → ${e.baseUrl}`,
+  oauth: e => `oauth (subscription) → ${e.baseUrl} — billed to plan quota, not per token`,
+};
 
 // [LAW:effects-at-boundaries] Pure: render the report string from values. Highlights the one signal
 // this tool exists for — explore-or-not, and whether exploration reached beyond the changed files.
@@ -76,7 +108,7 @@ function formatReport({ config, mode, files, result, sessions, repo }) {
   const lines = [];
   lines.push('================ local-review report ================');
   lines.push(`config:   ${config.name}  (engine=${config.engine}, model=${config.model})`);
-  lines.push(`endpoint: ${config.endpoint.baseUrl}`);
+  lines.push(`endpoint: ${AUTH_LABEL[config.endpoint.credential.kind](config.endpoint)}`);
   lines.push(`mode:     ${mode}${mode === 'pr' ? `  (${files.length} changed file(s))` : ''}`);
   lines.push('');
 
@@ -129,6 +161,7 @@ function resolveConfig(opts) {
     openaiApiKey: process.env.OPENAI_API_KEY, openaiModel: opts.model, openaiBaseUrl: opts.baseUrl,
     zaiApiKey: process.env.ZAI_API_KEY, zaiModel: opts.model, zaiBaseUrl: opts.baseUrl,
     deepseekApiKey: process.env.DEEPSEEK_API_KEY, deepseekModel: opts.model, deepseekBaseUrl: opts.baseUrl,
+    claudeCodeOauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN, claudeModel: opts.model,
   });
 }
 

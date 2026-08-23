@@ -95,12 +95,30 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
   });
   const { files: rawParsed, warnings } = parseUnifiedDiff(typeof data === 'string' ? data : String(data));
   warnings.forEach(w => core.warning(w));
-  // The listFiles refusals are NOT carried forward: the unified diff is a second, complete rendering of
-  // the same change, so every path it names crosses this boundary on its own terms. Merging both lists
-  // would double-report each refusal. [LAW:one-source-of-truth]
+  // The listFiles refusals are NOT carried forward onto the Gitea transport: the unified diff is a
+  // second, complete rendering of the same change, so every path it names crosses this boundary on its
+  // own terms. Merging both lists would double-report each refusal. [LAW:one-source-of-truth]
   const parsed = parseReviewableFiles(rawParsed);
   if (parsed.files.length === 0) {
-    throw new Error(`No reviewable diff for PR #${pullNumber}: listFiles returned no patch and the unified diff was empty.`);
+    // [LAW:no-silent-failure] Warn loudly — but do NOT abort. "No file carries a patch" is not only
+    // Gitea's signature: GitHub omits `patch` for a file too large to inline, so a PR whose every change
+    // is a big generated artifact (this repo's own committed 1.7 MB dist/index.js) lands here on GitHub
+    // and has nothing anchorable rather than nothing changed. Throwing reddened those PRs even when the
+    // artifact was in EXCLUDE_PATTERNS and there was genuinely nothing to review.
+    //
+    // Returning the unpatched files as a value hands the decision to the ONE place that can judge it:
+    // runPrReview filters by EXCLUDE_PATTERNS and, finding nothing patchable, submits a clean
+    // "No patchable changes found after filtering." review. Same treatment partitionFindings gives a
+    // mis-anchored finding — reconcile as a value, never abort the whole review over it.
+    //
+    // The refusals that travel with it are listFiles' own, not the diff's: this arm hands back the
+    // listFiles rendering, so it must report exactly that rendering's coverage loss. [FRAMING:representation]
+    core.warning(
+      `PR #${pullNumber}: no per-file patch from listFiles and the unified diff parsed to zero files, so ` +
+      `nothing in it is anchorable. Changed file(s): ${files.map(f => f.filename).join(', ')}. This is ` +
+      'expected when every changed file is too large for the host to return a patch (e.g. a committed bundle).',
+    );
+    return announce(gitHubTransport(files, unreviewable));
   }
   return announce(giteaTransport(parsed.files, parsed.unreviewable));
 }

@@ -32,9 +32,17 @@ jobs:
         with:
           # Dogfood the SHIPPED default. With no .github/review-agents.yml committed, the
           # action runs in simple mode and PROVIDER=auto (action.yml's default) resolves to
-          # DeepSeek — exactly the engine an unconfigured consumer gets. The repo reviews its
-          # own PRs with its own default, so every PR is live coverage of the real default path.
+          # whatever PROVIDER_ALIASES currently names — exactly the engine an unconfigured
+          # consumer gets. The repo reviews its own PRs with its own default, so every PR is
+          # live coverage of the real default path.
+          #
+          # BOTH credentials are supplied on purpose. 'auto' is retargetable in one line of
+          # src/provider.js, and a workflow carrying only the current target's secret would break
+          # the day it moves. Passing both makes a retarget need no edit here — the unused one is
+          # simply never read, since PROVIDER alone selects the provider and credential presence
+          # never steers it. [LAW:dataflow-not-control-flow]
           PROVIDER: auto
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           ZAI_REVIEWER_NAME: ${{ vars.ZAI_REVIEWER_NAME }}
           # dist/** is committed BUNDLED output (ncc): every feature PR changes it, and reviewing

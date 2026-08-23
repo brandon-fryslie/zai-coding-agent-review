@@ -19,11 +19,7 @@ const BASE_CONFIG = {
   name: 'oc-mini',
   engine: 'opencode',
   model: 'openai/gpt-5.4-mini',
-  endpoint: {
-    kind: 'openai-chat',
-    baseUrl: 'https://api.openai.com/v1',
-    apiKeyEnv: 'OPENAI_API_KEY',
-    apiKey: 'sk-test-key-xyz',
+  endpoint: { apiType: 'openai-chat', baseUrl: 'https://api.openai.com/v1', credential: { kind: 'api-key', value: 'sk-test-key-xyz' },
   },
 };
 
@@ -97,7 +93,7 @@ describe('buildOpencodeConfig — generated opencode.json content', () => {
   });
 
   test('provider id tracks the model prefix for a non-openai provider', () => {
-    const config = { ...BASE_CONFIG, model: 'anthropic/claude-x', endpoint: { ...BASE_CONFIG.endpoint, kind: 'anthropic-messages' } };
+    const config = { ...BASE_CONFIG, model: 'anthropic/claude-x', endpoint: { ...BASE_CONFIG.endpoint, apiType: 'anthropic-messages' } };
     const provider = buildOpencodeConfig(config, MOCK_COLLECTOR_SPAWN, MOCK_AGENTS_PATH).provider;
     assert.deepEqual(Object.keys(provider), ['anthropic']);
   });
@@ -294,9 +290,9 @@ describe('opencodeAdapter interface declarations', () => {
     assert.deepEqual(opencodeAdapter.capabilities.reasoningEfforts, []);
   });
 
-  test('endpointKinds are the provider protocols opencode can front', () => {
+  test('apiTypes are the provider protocols opencode can front', () => {
     assert.deepEqual(
-      opencodeAdapter.capabilities.endpointKinds,
+      opencodeAdapter.capabilities.apiTypes,
       ['openai-chat', 'openai-responses', 'anthropic-messages'],
     );
   });
@@ -345,7 +341,7 @@ describe('config validation rejects reasoning on a real opencode config (T8 AC)'
           engine: 'opencode',
           model: 'openai/gpt-5.4-mini',
           reasoning: 'high',
-          endpoint: { kind: 'openai-chat', baseUrl: 'https://api.openai.com/v1', apiKeyEnv: 'OPENAI_API_KEY' },
+          endpoint: { apiType: 'openai-chat', baseUrl: 'https://api.openai.com/v1', credentialEnv: 'OPENAI_API_KEY' },
         },
       },
     };

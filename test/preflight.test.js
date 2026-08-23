@@ -9,7 +9,7 @@ const anthropicConfig = (name, overrides = {}) => ({
   name,
   engine: 'claude-code',
   model: 'deepseek-v4-pro',
-  endpoint: { kind: 'anthropic-messages', baseUrl: 'https://api.example.com/anthropic', apiKey: 'k', ...overrides },
+  endpoint: { apiType: 'anthropic-messages', baseUrl: 'https://api.example.com/anthropic', credential: { kind: 'api-key', value: 'k' }, ...overrides },
 });
 
 // A fake fetch that yields a fixed status, or throws to simulate a network failure.
@@ -74,12 +74,61 @@ test('probeConfig: a thrown fetch becomes unreachable', async () => {
 test('probeConfig: an unobserved endpoint kind is skipped, never falsely probed', async () => {
   const config = {
     name: 'codex-default', engine: 'codex', model: 'gpt-5.4-mini',
-    endpoint: { kind: 'openai-responses', baseUrl: 'https://api.openai.com/v1', apiKey: 'k' },
+    endpoint: { apiType: 'openai-responses', baseUrl: 'https://api.openai.com/v1', credential: { kind: 'api-key', value: 'k' } },
   };
   let called = false;
   const r = await probeConfig(config, async () => { called = true; return { status: 200 }; });
   assert.equal(called, false, 'must not hit the network for an unobserved kind');
   assert.equal(r.skipped, true);
+});
+
+// [LAW:verifiable-goals] AC for zai-billing-xl0.1: the subscription variant is UNPROBED. A guessed
+// OAuth probe (beta headers unobserved here) would reject a working subscription before the engine
+// ever ran — worse than no probe. The skip must be loud and must name the auth method, since
+// 'anthropic-messages' on its own IS probed under api-key auth.
+test('probeConfig: a subscription auth is skipped loudly, never probed with a guessed request', async () => {
+  const config = {
+    name: 'claude-subscription-default', engine: 'claude-code', model: 'claude-sonnet-5',
+    endpoint: { apiType: 'anthropic-messages', baseUrl: 'https://api.anthropic.com', credential: { kind: 'oauth', value: 'sk-ant-oat01-x' } },
+  };
+  let called = false;
+  const r = await probeConfig(config, async () => { called = true; return { status: 401 }; });
+  assert.equal(called, false, 'must not hit the network for an unobserved auth method');
+  assert.equal(r.skipped, true);
+  assert.match(r.hint, /credential kind 'oauth'/);
+});
+
+test('preflight: a subscription-only chain stays ok — an unprobed config never blocks the review', async () => {
+  const chain = [{
+    name: 'claude-subscription-default', engine: 'claude-code', model: 'claude-sonnet-5',
+    endpoint: { apiType: 'anthropic-messages', baseUrl: 'https://api.anthropic.com', credential: { kind: 'oauth', value: 'k' } },
+  }];
+  const { ok, results } = await preflight(chain, async () => { throw new Error('must not be called'); });
+  assert.equal(ok, true);
+  assert.equal(results[0].skipped, true);
+});
+
+// [LAW:verifiable-goals] Regression: a SKIPPED config is unproven, not absent. Filtering skipped
+// configs out of the verdict false-blocked this exact chain — the one a subscription user most likely
+// has — before any engine could spawn.
+test('preflight: a skipped primary in front of a DEAD probed fallback still passes', async () => {
+  const chain = [
+    {
+      name: 'claude-subscription-default', engine: 'claude-code', model: 'claude-sonnet-5',
+      endpoint: { apiType: 'anthropic-messages', baseUrl: 'https://api.anthropic.com', credential: { kind: 'oauth', value: 'k' } },
+    },
+    anthropicConfig('deepseek-fallback'),
+  ];
+  const { ok, results } = await preflight(chain, async () => ({ status: 401 }));
+  assert.equal(results[0].skipped, true, 'subscription primary must be skipped, not probed');
+  assert.equal(results[1].healthy, false, 'the api-key fallback is genuinely down');
+  assert.equal(ok, true, 'an unproven primary must not be treated as proven down');
+});
+
+test('preflight: every config probed and every one down is still a hard fail', async () => {
+  const chain = [anthropicConfig('primary'), anthropicConfig('fallback')];
+  const { ok } = await preflight(chain, async () => ({ status: 401 }));
+  assert.equal(ok, false, 'nothing unproven and nothing healthy — the chain really is dead');
 });
 
 test('preflight: chain is ok when any config is healthy (failover survives a dead primary)', async () => {
@@ -103,7 +152,7 @@ test('preflight: chain fails only when every probed config is down', async () =>
 test('preflight: all-skipped chain stays ok (nothing was actually validated)', async () => {
   const chain = [{
     name: 'codex-default', engine: 'codex', model: 'm',
-    endpoint: { kind: 'openai-responses', baseUrl: 'https://x', apiKey: 'k' },
+    endpoint: { apiType: 'openai-responses', baseUrl: 'https://x', credential: { kind: 'api-key', value: 'k' } },
   }];
   let called = false;
   const { ok, results } = await preflight(chain, async () => { called = true; return { status: 200 }; });
