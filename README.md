@@ -119,7 +119,7 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | `ZAI_REVIEWER_NAME` | `CoPirate Code Review` | Name shown in the review comment header (applies to every provider; the `ZAI_` prefix is historical). |
 | `EXCLUDE_PATTERNS` | `*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml` | Comma-separated file patterns to exclude. |
 | `MAX_DIFF_CHARS` | `0` (unlimited) | Max characters of diff sent to the engine. |
-| `MAX_REVIEW_ROUNDS` | `5` | Max times the action reviews one PR; further pushes skip cleanly with no engine spawned (`0` = unlimited). Bounds cost on PRs pushed many times. |
+| `MAX_REVIEW_ROUNDS` | `5` | Max times the action reviews one PR; further pushes skip cleanly with no engine spawned and [say so on the PR](#a-skipped-run-says-so-on-the-pr) (`0` = unlimited). Bounds cost on PRs pushed many times. |
 | `TIME_BUDGET_MINUTES` | `25` | Wall-clock budget for the whole review run, in both modes. When it expires, the review stops starting new scope workers and sweeps and **delivers what it has** instead of the job's `timeout-minutes` cancelling the run with every finding undelivered: in `pr` mode the review is submitted with unreviewed scopes named in the summary and the verdict withholding approval; in `repo` mode the Step Summary report still renders, carrying the same partial-coverage note (there is no verdict to withhold). A budget that expires before **any** scope completes instead fails the run loudly, naming this input — there is no review to deliver. Set it a few minutes below the job's `timeout-minutes`. `0` = no budget. |
 | `DAILY_BUDGET_USD` | `0` (off) | Daily spend ceiling honored as a **gradient** — see [Daily budget](#daily-budget). `0`/unset = off (today's default effort, no ledger I/O). PR mode only; requires `LEDGER_ISSUE` and `issues: write`. |
 | `LEDGER_ISSUE` | — | Issue number of the append-only daily cost ledger the budget gradient reads and writes (typically `${{ vars.LEDGER_ISSUE }}`). Required when `DAILY_BUDGET_USD` is set. |
@@ -148,9 +148,33 @@ Set `GITHUB_REVIEW_TOKEN` to an approval-capable user or GitHub App token to hav
 - The [time budget](#inputs) expired before every scope was reviewed — the unreviewed scopes are named in the summary.
 - A changed file's path cannot be reviewed (it embeds a line separator, so no prompt line can name it and no review comment can anchor to it) — those files are listed under **Changed files NOT reviewed** with the reason.
 
+## A skipped run says so on the PR
+
+Two things end a run without reviewing anything: a PR from a fork, and a PR that has spent its `MAX_REVIEW_ROUNDS`. Both are deliberate and both still exit 0 with green checks — and both post a `COMMENT` review that opens `⚠️ **NOT REVIEWED**` and names the cause and, where one exists, the remedy. (A round cap has one: raise it. A fork skip has none, by design.)
+
+Without that notice a skip is indistinguishable from a clean review: same successful workflow run, same zero findings, same absence of a posted review. Anything reading those signals — an automerge loop, a dashboard, a person glancing at the checks — sees approval. That is not hypothetical: on 2026-08-21 an automated loop came one step from merging a head commit nobody had reviewed, which a later review found 19 real issues in.
+
+Being skipped never fails the run, and the notice never requests changes — nothing was reviewed, so there is no finding to justify one. For the round cap it posts once per cause rather than once per push: while it is still the newest thing the action has left on the PR, a further push adds nothing. Raise the cap, let a real review round land, and the next skip speaks again. A fork skip instead repeats on every push, deliberately — see below. There is no input to turn any of this on; a skip should never have been silent.
+
+What *does* fail the run is a round-cap notice the host refuses to accept. The notice is the sink this whole feature exists to write to, so when it cannot be written the run's own conclusion is the only signal a consumer has left, and it goes red rather than handing back the green-and-silent state above. On a same-repo PR — the only kind that ever reaches a round cap — the usual cause is a token without `pull-requests: write`; grant it and the run is green again. A refused *fork* notice only warns, because a fork PR on a `pull_request` trigger receives no repository secrets at all: no configuration could fix it, so a red check there would be permanent noise rather than a signal.
+
+**Once per cause applies to the round cap, not to fork skips.** A fork PR gets a notice on every push, deliberately. The "already said this" check reads the markers in the PR's existing reviews, and on a public repo anyone with read access can post a review — so on a fork PR its own author can plant the marker and switch off the warning about their own unreviewed PR. A PR the action refuses to review because it does not trust it cannot also be a PR whose reviews it trusts.
+
+The round cap keeps its check, at a stated risk rather than a claim of safety. The same marker is equally forgeable on a same-repo PR; what differs is who gains. There the author already has push access and can do considerably worse than hide a notice, and a passing stranger gains nothing by silencing a notice on someone else's PR — whereas on a fork the beneficiary *is* the untrusted outsider.
+
+**Once per cause also assumes a `concurrency` group.** The Quickstart workflow sets one; keep it. Two runs racing on the same PR — two rapid pushes, or a re-run beside a fresh push — can both check for an existing notice before either has posted, and both post. Like the fork case, this race can only make the action speak twice; it can never make it fall silent.
+
+**Fork skips need a trigger whose token can write.** On `pull_request` a fork PR gets a read-only `GITHUB_TOKEN` — GitHub grants no write scope there, whatever the workflow's `permissions:` block says — so the notice cannot post. The run warns loudly in its log and stays green; the PR itself says nothing. Trigger on `workflow_run` if you need fork skips visible.
+
+`GITHUB_REVIEW_TOKEN` does not help here, despite being used for every other GitHub call when set. On a `pull_request` event from a fork, GitHub passes **no repository secrets** to the runner at all — `GITHUB_TOKEN` is the one exception, and it arrives read-only. The secret resolves to an empty string on exactly the runs that would need it. That same rule is why `workflow_run` works: it runs in the base repository's context, where secrets are available.
+
+Do not reach for `pull_request_target` to solve this. It hands a write-scoped token and your secrets to a job running in the base branch's context — and the Quickstart above checks out `${{ github.event.pull_request.head.sha }}`, which on a fork PR is the contributor's code. Combining the two is the "pwn request" pattern: any step that builds, tests, or lints that checkout executes attacker-controlled code holding a token that can push to your repository. A fork skip staying invisible on the PR is a far smaller problem than that.
+
 ## Fork PRs are never reviewed
 
-PRs opened from a fork (head repo ≠ base repo) are skipped cleanly — logged, exit 0, no engine spawned, no review posted — *before any credential is read*. This is unconditional with no opt-in, so an outside contributor's PR can never spend the host's AI credits or meet a secret. Your own branches (head and base in the same repo) review normally.
+PRs opened from a fork (head repo ≠ base repo) are skipped cleanly — logged, exit 0, no engine spawned — *before any AI credential is read*. This is unconditional with no opt-in, so an outside contributor's PR can never spend the host's AI credits or put its diff in front of a model. Your own branches (head and base in the same repo) review normally.
+
+The skip [announces itself on the PR](#a-skipped-run-says-so-on-the-pr) when the trigger's token can write, and that notice is the one GitHub call the path makes beyond detecting the fork. It uses the GitHub token, never a provider credential, and its body is composed entirely from values the action owns — the fork's diff is never read, by the notice or by anything else.
 
 ## Daily budget
 
