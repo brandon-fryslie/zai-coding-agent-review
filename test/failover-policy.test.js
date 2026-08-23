@@ -410,6 +410,44 @@ describe('produceReview — single-config chain', () => {
     assert.equal(result.configUsed.name, 'solo');
     assert.equal(result.attempts, 3);
   });
+
+  // The COMPOSED ladder — both axes at once, which no other test in this file exercises. Every test
+  // above measures one axis in isolation (produceReview's attempts, or retryTransientSpawn's), and
+  // that gap is not academic: a reviewer reading only the per-config limit computed the wall's total
+  // cost as "3 attempts, 2 sleeps, a few seconds" — off by 4× — because the two axes MULTIPLY. The
+  // whole point of this PR is a specific bound on what a spent quota costs, so the bound is asserted
+  // here as a number rather than left as a sentence in CLAUDE.md that a human must remember to redraw.
+  // [FRAMING:representation] [LAW:behavior-not-structure] this asserts the observable retry policy —
+  // spawns issued and time waited — not how either loop is written.
+  it('the two nested axes multiply: a single-config chain costs 9 spawns and ~12-24s, not 3 and ~5s', async () => {
+    const chain = [cfg('auto')];
+    const wall = new TransientError('rate-limited: quota wall');
+    let spawns = 0;
+    const sleeps = [];
+    const sleepFn = async ms => { sleeps.push(ms); };
+    const frozenNow = () => 1_000_000; // clock never advances: isolate the COUNT bound from the clock
+
+    // One produceOnce is a whole scout->workers pass, whose every spawn goes through the spawn-level
+    // axis — exactly how runMultiScopePass composes them (src/multiscope.js).
+    const produceOnce = () => retryTransientSpawn(
+      () => { spawns++; return Promise.reject(wall); },
+      { sleepFn, deadline: null, now: frozenNow },
+    );
+
+    await assert.rejects(
+      () => produceReview(chain, () => 'p', {}, produceOnce, sleepFn, 60 * 60 * 1000, frozenNow),
+      err => err === wall, // the provider's own error is the run's cause, never a deadline complaint
+    );
+
+    // PER_CONFIG_LIMIT (3) × TRANSIENT_SPAWN_ATTEMPTS (3), one walk of a 1-config chain.
+    assert.equal(spawns, 3 * TRANSIENT_SPAWN_ATTEMPTS);
+    // Each axis sleeps on all but its final attempt: 3 passes × 2 + 2 = 8.
+    assert.equal(sleeps.length, 8);
+    // Jittered backoff of 1-2s then 2-4s per axis-run, so the total is bounded on BOTH sides —
+    // a lower bound too, because a ladder that stopped waiting at all would also "pass" an upper one.
+    const totalMs = sleeps.reduce((a, b) => a + b, 0);
+    assert.ok(totalMs >= 12_000 && totalMs <= 24_000, `total backoff ${totalMs}ms outside 12000-24000ms`);
+  });
 });
 
 // ────────────────────────────────────────────────────────────────────────────

@@ -33410,6 +33410,14 @@ const { remainingMs } = __nccwpck_require__(6757);
 
 const TRANSIENT_RETRY_BUDGET_MS = 60 * 60 * 1000;
 const TRANSIENT_BACKOFF_BASE_MS = 2_000;
+// A CEILING on the exponential curve, not a value it currently reaches — a distinction neither constant
+// can state alone, so it is stated here. transientBackoffMs is called only with `attempt < limit`, and
+// both limits are 3 (PER_CONFIG_LIMIT, TRANSIENT_SPAWN_ATTEMPTS), so the largest argument is 2 and the
+// curve tops out at BASE × 2¹ = 4s: the live range is ~1–4s and this 60s cap is unreachable today.
+// [FRAMING:representation] It was reachable before the chain-sweep axis was deleted — that loop fed
+// transientBackoffMs an UNBOUNDED sweep counter, which is exactly how the ladder ran until the clock
+// stopped it. Kept rather than lowered to 4s: a ceiling that bounds a future limit increase is doing a
+// job precisely when nothing reaches it, whereas one derived from today's limits could never bind at all.
 const TRANSIENT_BACKOFF_MAX_MS = 60_000;
 
 // [LAW:types-are-the-program] "Transient retryable error" is a type, not a flag bolted
@@ -33616,6 +33624,23 @@ async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepF
   // attempt count was merely however many fit. Deleting the axis is what bounds the ladder — a cap
   // on it would have been the identical behavior with a knob left behind to tune forever.
   // [LAW:no-mode-explosion] the flag that is never added needs no owner and no deletion date.
+  //
+  // What a SINGLE-config chain gets — the default (`PROVIDER: auto`, no `fallback`), and the case the
+  // count bound's "PER_CONFIG_LIMIT × chain.length" phrasing reads right past. The ladder is TWO NESTED
+  // axes, not one: every engine spawn is wrapped in retryTransientSpawn (TRANSIENT_SPAWN_ATTEMPTS = 3,
+  // src/multiscope.js), and each produceOnce below is an entire scout→workers pass, so one config is
+  // 3 × 3 = 9 spawns and 8 backoff sleeps (~12–24s) before the error surfaces. Tens of seconds of
+  // patience, not the tens of minutes the deleted sweep bought — which means a genuine 60s provider
+  // outage now reds the run where it once self-healed.
+  //
+  // That regression is the intended trade, and the asymmetry is the whole argument. Failing fast costs
+  // ONE red run naming the true cause, and a code reviewer has no state to lose — no partial write, no
+  // corruption; the next push re-runs it. Patience costs what run 32641456876 cost: 138 spawns, the
+  // entire budget spent losing to a wall that answers in 500ms, and the DEADLINE then reported as the
+  // cause — so the remedy printed on screen would have doubled the waste. [LAW:carrying-cost] Buying
+  // patience back for "only the genuinely transient" errors is not cheaper than it looks either: it
+  // needs a predicate splitting a real 429 from the wall, the enumeration gap named at
+  // TRANSIENT_RATE_LIMIT above, which today could only be validated on one side.
   //
   // The index makes "last config" a POSITIONAL fact rather than object identity: a chain may
   // legitimately hold two references to equal configs, and `config === chain.at(-1)` would then
