@@ -1,5 +1,5 @@
 'use strict';
-const { annotatePatchWithLines } = require('./diff');
+const { annotatePatchWithLines, NO_EXCLUSIONS } = require('./diff');
 const { findingLineText } = require('./review');
 
 // [LAW:one-source-of-truth] The REVIEW PHILOSOPHY lives here, once, shared by both the PR-diff and
@@ -131,7 +131,10 @@ function renderPriorFindingsBlock(priorFindings, toolNames) {
 // or a PR with no author replies — renders nothing, so a cold review is byte-identical. [LAW:dataflow-not-control-flow]
 // priorFindings is the convergence-sweep value (see renderPriorFindingsBlock): the findings already
 // recorded by this round's earlier passes. [] — the initial pass — renders nothing. [LAW:dataflow-not-control-flow]
-function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = [], dependencyDiffNote = '', dependencyBumps = [], priorPushbacks = [], priorFindings = [] }) {
+// excluded is filterFiles' record of what EXCLUDE_PATTERNS removed from this diff ({patterns, paths}).
+// NO_EXCLUSIONS (nothing removed) renders nothing, so an unfiltered review is byte-identical.
+// [LAW:dataflow-not-control-flow]
+function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = [], dependencyDiffNote = '', dependencyBumps = [], priorPushbacks = [], priorFindings = [], excluded = NO_EXCLUSIONS }) {
   const patchableFiles = files.filter(f => f.patch);
   const includedDiffs = [];
   const includedFiles = [];
@@ -166,6 +169,21 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // files stay reviewable, and an issue in them can never bypass the merge gate via summary prose.
   if (unshowableFiles.length > 0) {
     diffs += `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`). Read each in full at its absolute path and review its changes. Record any issue with ${toolNames.requestChange} using the file's real line number from the full file — the line cannot be anchored inline, so the host will post that finding in the review body's "Findings outside the reviewed diff" section; never put it in the ${toolNames.finishReview} summary:\n${unshowableFiles.map(f => `> - ${reviewedRepoRoot}/${f}`).join('\n')}`;
+  }
+
+  // [LAW:no-silent-failure] The reviewer is TOLD what was taken out of its view. Absence of a changed
+  // file is otherwise indistinguishable from nobody having changed it, and a model reasoning about "the
+  // diff" while holding a filtered SUBSET of it reports the gap as a defect — an [S4] "the build output
+  // was never regenerated" on a PR that regenerated it in every commit (zai-review-prompt-2tx). Every
+  // finding blocks, so a false one costs a human adjudication.
+  // [LAW:one-type-per-behavior] This is deliberately NOT merged with the unshowable-files note above,
+  // which they superficially resemble: an unshowable file is still REVIEWABLE (read it at its absolute
+  // path and record findings against it), an excluded one is out of bounds entirely. Same absence from
+  // the diff, opposite instruction — two types, not one with a flag.
+  // [LAW:dataflow-not-control-flow] A value: no paths removed ⇒ no block. Patterns that matched nothing
+  // hid nothing, so silence is the truth there, not an omission.
+  if (excluded.paths.length > 0) {
+    diffs += `\n\n> **Note:** EXCLUDE_PATTERNS (${excluded.patterns.join(', ')}) removed ${excluded.paths.length} changed file(s) from your view, so this diff is a filtered subset of the change. A path matching those patterns is absent by configuration, not by evidence — it may well have been changed, and changed correctly. Do not read those paths, and never record a finding asserting one of them was missed, not updated, or left inconsistent with the rest of the change, wherever you would anchor it.`;
   }
 
   if (dependencyDiffNote) {
@@ -407,18 +425,24 @@ function scoutOutputContract(toolNames, { assignFiles = false } = {}) {
 // The rules are written for a weak model — concrete, example-grounded, and free of any "is it big"
 // threshold: the scope COUNT falls out of grouping changed files by concern and following the import
 // edges the change actually crosses. [LAW:dataflow-not-control-flow]
-function buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot }) {
+function buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot, excluded = NO_EXCLUSIONS }) {
   // Rendered raw, and correctly so: changedPaths are diff filenames, and parseReviewableFiles refused
   // any that could break this list. Do not "harden" this with a flatten — these are paths the scout
   // assigns and a worker later opens, so collapsing one would name a file that does not exist.
   const fileList = changedPaths.map(p => `      - ${p}`).join('\n');
+  // The same confession the worker gets (buildReviewInput), aimed at the job this role actually does:
+  // the scout PLANS, so the failure it must not commit is scoping an invisible path or sending a worker
+  // to investigate an absence. One fact, two audiences — never re-derived, only re-aimed.
+  const exclusionNote = excluded.paths.length > 0
+    ? `\n\n    > **Note:** EXCLUDE_PATTERNS (${excluded.patterns.join(', ')}) removed ${excluded.paths.length} changed file(s) from the list above, so it is a filtered subset of the change. Never create a scope for, or aim a scope's focus at, a path matching those patterns, and never treat such a path's absence as a gap to investigate.`
+    : '';
   return {
     prompt: `
 Plan the review of a pull request. The repository under review is checked out at ${reviewedRepoRoot}; your working
     directory is intentionally outside it, so reach files by that absolute path with your Read, Grep, and Glob tools.
 
     This pull request changed these source files:
-${fileList}
+${fileList}${exclusionNote}
 
     Divide these changed files into review scopes by this ONE rule. Do not invent scopes for anything these files do not
     change.

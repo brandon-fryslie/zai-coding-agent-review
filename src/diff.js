@@ -16,11 +16,27 @@ function matchesPattern(filename, pattern) {
   return regex.test(filename) || regex.test(basename);
 }
 
+// [LAW:types-are-the-program] Nothing was excluded, as a VALUE — the honest material of a review no
+// pattern filtered (scripts/local-review.js, and the anchor-only prompt build). Frozen because it is
+// shared: a mutation here would rewrite what every other caller believes about its own run.
+const NO_EXCLUSIONS = Object.freeze({ patterns: [], paths: [] });
+
+// [LAW:types-are-the-program] Filtering produces TWO halves and one fact about the cut, so it returns
+// both: `reviewed` — what the review may see — and `excluded`, the patterns that fired paired with the
+// paths they removed. The pairing is the type's job, not a convention: no call site can hand one filter
+// run's patterns to another run's paths. [LAW:one-source-of-truth] the removed set is recorded HERE,
+// where it is known, so the prompt that must confess the gap (buildReviewInput) reads it as a value
+// rather than re-globbing the patterns — a second, drifting answer to "what did we hide?" — or
+// recovering a lossy count by subtracting list lengths, which is what run.js used to do.
 function filterFiles(files, excludePatterns) {
-  if (!excludePatterns || excludePatterns.length === 0) {
-    return files;
-  }
-  return files.filter(f => !excludePatterns.some(p => matchesPattern(f.filename, p)));
+  const isExcluded = f => excludePatterns.some(p => matchesPattern(f.filename, p));
+  return {
+    reviewed: files.filter(f => !isExcluded(f)),
+    // Every configured pattern, not only the ones that matched: the reviewer's question is "is this
+    // path's absence explained by configuration?", and a pattern that removed nothing still answers it
+    // for a file that simply never changed. `paths` alone decides whether anything was hidden at all.
+    excluded: { patterns: excludePatterns, paths: files.filter(isExcluded).map(f => f.filename) },
+  };
 }
 
 // [LAW:one-source-of-truth] The new-file line number is the one honest anchor for a
@@ -236,6 +252,7 @@ module.exports = {
   matchesPattern,
   parseReviewableFiles,
   filterFiles,
+  NO_EXCLUSIONS,
   patchLines,
   buildFileAnchors,
   buildReviewAnchors,

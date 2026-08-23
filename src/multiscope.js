@@ -5,6 +5,7 @@ const { defaultEffortProfile, maxTier } = require('./effort');
 const { dedupeFindings, dedupeAssessments, parseScopeValue } = require('./review');
 const { sumCost } = require('./usage');
 const { renderDependencyDiffNote } = require('./dependency-diff');
+const { NO_EXCLUSIONS } = require('./diff');
 const {
   buildReviewInput,
   buildRepoReviewInput,
@@ -457,7 +458,12 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
 // (fetchPriorPushbacks, src/transport.js). Every worker receives all of them — like the whole diff, which
 // each worker also sees — so a rebuttal about any file informs whichever worker owns it, and the scout
 // need not partition them. [] (a first round, or no replies) flows through unchanged. [LAW:dataflow-not-control-flow]
-function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySummaries = [], priorPushbacks = [] }) {
+// excluded is filterFiles' record of what EXCLUDE_PATTERNS took OUT of `files` ({patterns, paths}) — the
+// one fact neither the scout nor a worker can recover from the material it is handed, since both are
+// handed only what survived the filter. It reaches BOTH prompts because both reason about completeness:
+// the scout plans coverage of the changed set, a worker judges it. NO_EXCLUSIONS (an unfiltered run,
+// e.g. scripts/local-review.js) renders nothing in either. [LAW:dataflow-not-control-flow]
+function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySummaries = [], priorPushbacks = [], excluded = NO_EXCLUSIONS }) {
   const changedPaths = files.map(f => f.filename);
   const dependencyDiffNote = renderDependencyDiffNote(dependencySummaries);
   // Only a resolved bump has upstream context to judge; an unresolved one renders as a plain line in the
@@ -467,10 +473,10 @@ function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySumm
     // [LAW:types-are-the-program] The changed-file list is a first-class field of the material, not
     // recovered from the prompt: runMultiScopePass verifies the scout's plan covers it (planScopes).
     changedPaths,
-    buildScoutPrompt: (toolNames) => buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot }).prompt,
+    buildScoutPrompt: (toolNames) => buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot, excluded }).prompt,
     // priorFindings is the convergence-sweep value threaded per pass by runScopeWorker: [] on the
     // initial pass (byte-identical prompt), the cumulative found list on a sweep. [LAW:dataflow-not-control-flow]
-    buildWorkerPrompt: (focusText, toolNames, scopeFiles, priorFindings) => buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus: focusText, scopeFiles, dependencyDiffNote, dependencyBumps, priorPushbacks, priorFindings }).prompt,
+    buildWorkerPrompt: (focusText, toolNames, scopeFiles, priorFindings) => buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus: focusText, scopeFiles, dependencyDiffNote, dependencyBumps, priorPushbacks, priorFindings, excluded }).prompt,
   };
 }
 

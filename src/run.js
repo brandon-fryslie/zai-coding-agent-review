@@ -158,15 +158,18 @@ function warnBudgetExhausted(review) {
 // exactly once — the budget phase (when active) needs the diff BEFORE the round-cap gate to size the
 // review's cost, so it fetches here early and the downstream review reuses the result; when budget is
 // off, this runs in its original post-preflight position, unchanged. [LAW:one-source-of-truth]
+// [LAW:one-source-of-truth] `excluded` — what the filter removed — travels OUT of here as a value
+// alongside the files that survived, because it is a fact about the material the review is about to
+// judge and the reviewer cannot see it from the inside (buildPrMaterial confesses it in the prompt).
+// The operator log reads the same record rather than recovering a count by subtracting list lengths.
 async function fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatterns) {
   core.info(`Fetching changed files for PR #${pullNumber}...`);
   const transport = await selectTransport(octokit, owner, repo, pullNumber);
-  const filteredFiles = filterFiles(transport.files, excludePatterns);
-  if (excludePatterns.length > 0) {
-    const excluded = transport.files.length - filteredFiles.length;
-    if (excluded > 0) core.info(`Excluded ${excluded} file(s) matching EXCLUDE_PATTERNS.`);
+  const { reviewed, excluded } = filterFiles(transport.files, excludePatterns);
+  if (excluded.paths.length > 0) {
+    core.info(`Excluded ${excluded.paths.length} file(s) matching EXCLUDE_PATTERNS: ${excluded.paths.join(', ')}`);
   }
-  return { transport, filteredFiles };
+  return { transport, filteredFiles: reviewed, excluded };
 }
 
 // [LAW:dataflow-not-control-flow] Pure. The log fragment naming a RAISED reasoning tier — a value, empty
@@ -545,7 +548,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
 
   // [LAW:one-source-of-truth] The reviewed diff is fetched once: reuse the budget phase's fetch when the
   // gradient is active, otherwise fetch here in its original post-preflight position (off path unchanged).
-  const { transport, filteredFiles } = fetched
+  const { transport, filteredFiles, excluded } = fetched
     || await fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatterns);
 
   const patchableFiles = filteredFiles.filter(f => f.patch);
@@ -593,7 +596,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
       core.warning(`Failed to fetch prior-round pushbacks for PR #${pullNumber}: ${e.message}. Proceeding without pushback context.`);
     }
   }
-  const material = buildPrMaterial({ files: filteredFiles, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencySummaries, priorPushbacks });
+  const material = buildPrMaterial({ files: filteredFiles, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencySummaries, priorPushbacks, excluded });
 
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
