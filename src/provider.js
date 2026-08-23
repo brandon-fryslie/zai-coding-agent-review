@@ -82,7 +82,13 @@ const AUTH_FROM_INPUTS = {
 // concrete provider every client should currently use, so the maintainer can retarget all
 // clients pinned to PROVIDER=auto without them editing their workflow. [LAW:one-source-of-truth]
 // This single mapping is the one place to retarget it.
-const PROVIDER_ALIASES = { auto: 'deepseek' };
+// Retargeted deepseek → claude-subscription in 1.42.0. DeepSeek's 2026-08-16 repricing raised every
+// rate — cache hits, ~92% of a review's input, by 12x — and this reviewer was burning ~$90/day of real
+// money. A subscription review costs plan quota instead. A repo that supplies only DEEPSEEK_API_KEY
+// now fails at startup naming CLAUDE_CODE_OAUTH_TOKEN: loudly, before any spend, never by silently
+// falling back to a paid provider. That loud failure is exactly what makes retargeting every consumer
+// from one line safe to do. [LAW:no-silent-failure]
+const PROVIDER_ALIASES = { auto: 'claude-subscription' };
 
 // Every accepted PROVIDER input value: the concrete providers plus the aliases. The order
 // matters only for the "valid providers" message in the unknown-PROVIDER error.
