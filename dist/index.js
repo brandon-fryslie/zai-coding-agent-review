@@ -35805,7 +35805,7 @@ const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 
 const { filterFiles, buildReviewAnchors, diffChurn } = __nccwpck_require__(9898);
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, NOT_REVIEWED_REASONS, fetchPriorPushbacks, roundCapReached, parseMaxRounds } = __nccwpck_require__(7228);
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds } = __nccwpck_require__(7228);
 const { buildReviewInput } = __nccwpck_require__(3479);
 const { partitionFindings } = __nccwpck_require__(1565);
 const { buildAttributionFooter } = __nccwpck_require__(2887);
@@ -36186,25 +36186,11 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     return;
   }
   if (isFork) {
-    // [LAW:dataflow-not-control-flow] `latestArtifact: null` is not a missing value — it is the value
-    // that says "no key worth trusting here, post it", and this call site is where that is TRUE.
-    // The idempotency key is parsed out of review bodies, and on a fork PR any account with read access
-    // can write one: a forged `not-reviewed:fork` marker would read as our own prior notice and silence
-    // the real one, on exactly the untrusted PR this notice exists to flag. A PR we refuse to review
-    // because we do not trust it cannot also be a PR whose reviews we trust to tell us what we said.
-    // So the notice repeats on every push to a fork rather than being switch-off-able by its author —
-    // the deliberate trade named at announceNotReviewed: a repeated notice is noise, a missing one is
-    // the bug. The round-cap path keeps its key, since a same-repo PR's reviews come only from accounts
-    // with push access. (The general forgeable-marker problem is `zai-review-trust-6yp`; this closes the
-    // one place where the untrusted value could cause SILENCE rather than a miscount.)
+    // forkNotice owns everything that makes this path different — including that it consults NO
+    // idempotency key, since a fork PR's reviews are written by exactly the party who would want this
+    // warning gone. There is no key parameter here to get wrong. [LAW:types-are-the-program]
     await announceNotReviewed(reviewOctokit, {
-      owner, repo, pullNumber, commitId: headSha, reviewerName, latestArtifact: null,
-      notice: {
-        reason: NOT_REVIEWED_REASONS.FORK,
-        message: `PR #${pullNumber} is from a fork. Fork pull requests are not reviewed by this action — `
-          + "their diff is untrusted and reviewing it would spend the host repository's AI credits on an "
-          + 'outside contributor.',
-      },
+      owner, repo, pullNumber, commitId: headSha, reviewerName, notice: forkNotice(pullNumber),
     });
     return;
   }
@@ -36341,8 +36327,8 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
       : `PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
         + `the MAX_REVIEW_ROUNDS cap of ${effort.roundCap}. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.`;
     await announceNotReviewed(reviewOctokit, {
-      owner, repo, pullNumber, commitId: headSha, reviewerName, latestArtifact: prior.latestArtifact,
-      notice: { reason: NOT_REVIEWED_REASONS.ROUND_CAP, message },
+      owner, repo, pullNumber, commitId: headSha, reviewerName,
+      notice: roundCapNotice(message, prior.latestArtifact),
     });
     return;
   }
@@ -36811,7 +36797,12 @@ function parseAgentArtifact(rawBody) {
   const body = (typeof rawBody === 'string' ? rawBody : '').trimEnd();
   if (body.endsWith(REVIEW_MARKER)) return { kind: 'review' };
   const m = NOT_REVIEWED_MARKER_RE.exec(body);
-  return m ? { kind: 'not-reviewed', reason: m[1] } : null;
+  // The notice arm carries its BODY, because that is what announceNotReviewed de-duplicates on: "the
+  // newest artifact says byte-for-byte what I am about to say". Keying on the reason alone let a notice
+  // outlive its own content — a PR capped by MAX_REVIEW_ROUNDS keeps that notice when a later run is
+  // capped by the budget gradient instead, leaving the operator reading the wrong cap and the wrong
+  // remedy. The reason stays on the value for logging and for the enumeration, not for the key.
+  return m ? { kind: 'not-reviewed', reason: m[1], body } : null;
 }
 
 // [LAW:one-source-of-truth] A completed review round IS a posted review carrying REVIEW_MARKER, and its
@@ -37109,6 +37100,48 @@ function renderNotReviewedBody(reviewerName, notice) {
     + `reviewed.\n\n${NOT_REVIEWED_MARKER_PREFIX}${notice.reason} -->`;
 }
 
+// [LAW:types-are-the-program] The two notices are built HERE, by name, so no call site assembles one by
+// hand. Everything that differs between the two review-less exits rides on the value — the reason, the
+// message, the trust key, and the hint to print if the post fails — which means a caller cannot pair the
+// wrong key with the wrong reason, because there is no parameter to pair. `forkNotice` takes no key at
+// all, so the fork path cannot be edited back into consulting one without calling `roundCapNotice` at the
+// fork gate, which reads as the wrong name rather than as an invisible argument swap.
+//
+// The fork notice's key is `null` — a VALUE meaning "nothing here is worth trusting, post it" — because
+// its dedup key would be parsed out of review bodies on a PR whose author is, by definition, someone this
+// action refuses to trust. A forged `not-reviewed:fork` marker would otherwise let that author switch off
+// the warning about their own unreviewed PR. The round-cap notice keeps a key: its body is equally
+// forgeable (any account with READ access can post a review — "push access" is not the bar, on a public
+// repo there is effectively no bar), but the party who benefits from suppressing it is the PR's author,
+// who already holds push access and can do far worse, while a third party gains nothing by silencing a
+// notice on someone else's PR. The ticket's no-duplicate criterion is met at that stated risk;
+// `zai-review-trust-6yp` is what removes the risk rather than reasoning about it.
+function forkNotice(pullNumber) {
+  return {
+    reason: NOT_REVIEWED_REASONS.FORK,
+    message: `PR #${pullNumber} is from a fork. Fork pull requests are not reviewed by this action — `
+      + "their diff is untrusted and reviewing it would spend the host repository's AI credits on an "
+      + 'outside contributor.',
+    latestArtifact: null,
+    postFailureHint: 'A `pull_request` run from a fork receives NO repository secrets and a read-only '
+      + 'GITHUB_TOKEN, so neither token can comment — GITHUB_REVIEW_TOKEN is empty there too. Trigger on '
+      + 'workflow_run if the notice must land.',
+  };
+}
+
+function roundCapNotice(message, latestArtifact) {
+  return {
+    reason: NOT_REVIEWED_REASONS.ROUND_CAP,
+    message,
+    latestArtifact,
+    // A round cap is only ever reached on a same-repo PR — forks are gated out long before they can
+    // accumulate rounds — so the fork read-only-token diagnosis cannot apply here, and offering it would
+    // send the operator down a path that cannot be the cause. [LAW:no-silent-failure]
+    postFailureHint: 'A round cap is only reached on a same-repo PR, so this is not the fork '
+      + 'read-only-token case: check that the token carries `pull-requests: write` and that the PR is open.',
+  };
+}
+
 // [LAW:one-type-per-behavior] THE mechanism by which every review-less exit speaks at the sinks a
 // consumer actually reads. Both silent exits (a fork PR, a spent round cap) call this one function with
 // a different notice VALUE — never a second channel, and never a flag to opt into being told.
@@ -37125,8 +37158,13 @@ function renderNotReviewedBody(reviewerName, notice) {
 // fixes it. Reddening the run on that would red every fork PR forever, so the failure degrades to a loud
 // warning (still a visible run annotation) rather than a red check. On the trigger that can write
 // without exposing the fork's code (workflow_run) the notice lands.
-async function announceNotReviewed(octokit, { owner, repo, pullNumber, commitId, reviewerName, notice, latestArtifact }) {
+async function announceNotReviewed(octokit, { owner, repo, pullNumber, commitId, reviewerName, notice }) {
   core.info(`Skipping review: ${notice.message}`);
+  // [LAW:no-silent-failure] Rendered BEFORE the idempotency check and outside the try below, so the
+  // unknown-reason throw stays a loud run failure. Inside the try it would have been caught by the
+  // host-failure arm and reported as a permissions problem — a programming error wearing a transient
+  // error's costume, on a run that exits 0.
+  const body = renderNotReviewedBody(reviewerName, notice);
   // The idempotency key is "my own notice is still the last word on this PR", so a second push while
   // still capped adds nothing. See summarizePriorReviews' latestArtifact for why this is not a flag.
   //
@@ -37137,20 +37175,22 @@ async function announceNotReviewed(octokit, { owner, repo, pullNumber, commitId,
   // no compare-and-swap on reviews, a re-check would only narrow the window, and this race can only make
   // the action speak TWICE, never fall silent. Silence is the bug; a duplicate notice is cosmetic.
   //
-  // `latestArtifact: null` is a real value, not an omission: it says "no key worth trusting", and the
-  // caller decides that. A key parsed out of review bodies is only as trustworthy as the accounts that
-  // can post them, so the fork call site passes null — on an untrusted PR a forged marker would
-  // otherwise let the PR's own author silence this notice. That is the one place the trade below is
-  // load-bearing rather than incidental: when duplicate-avoidance and visibility conflict, visibility
-  // wins, and an unauthenticated duplicate-avoidance claim never gets to overrule it.
-  if (latestArtifact && latestArtifact.kind === 'not-reviewed' && latestArtifact.reason === notice.reason) {
-    core.info(`PR #${pullNumber} already carries a '${notice.reason}' not-reviewed notice; not posting a duplicate.`);
+  // The key is the BODY, not the reason: "the newest artifact already says byte-for-byte what I am about
+  // to say." Keying on the reason let a notice outlive its own content — a PR capped by MAX_REVIEW_ROUNDS
+  // kept that notice when a later run was capped by the budget gradient instead, so the operator read the
+  // wrong cap number and a remedy that would not have helped. Comparing bodies also makes the reason
+  // check redundant, since the body ends with the marker that carries it. [LAW:one-source-of-truth]
+  //
+  // If the host ever normalized whitespace on the round trip, this fails to match and the action speaks
+  // TWICE — the same safe direction every trade here takes, and why this is an exact compare rather than
+  // a digest embedded in the marker.
+  //
+  // `notice.latestArtifact === null` is a real value, not an omission: it says "nothing here is worth
+  // trusting, post it", and the notice constructors decide that per path (see forkNotice above).
+  if (notice.latestArtifact && notice.latestArtifact.kind === 'not-reviewed' && notice.latestArtifact.body === body) {
+    core.info(`PR #${pullNumber} already carries this exact '${notice.reason}' not-reviewed notice; not posting a duplicate.`);
     return 'already-posted';
   }
-  // [LAW:no-silent-failure] Rendered OUTSIDE the try, so the unknown-reason throw stays a loud run
-  // failure. Inside, it would have been caught by the host-failure arm below and reported as a
-  // permissions problem — a programming error wearing a transient error's costume, on a run that exits 0.
-  const body = renderNotReviewedBody(reviewerName, notice);
   try {
     await octokit.rest.pulls.createReview({
       owner,
@@ -37163,9 +37203,10 @@ async function announceNotReviewed(octokit, { owner, repo, pullNumber, commitId,
   } catch (e) {
     core.warning(
       `Could not post the '${notice.reason}' not-reviewed notice to PR #${pullNumber}: ${e.message}. `
-      + 'The run did NOT review this pull request; nothing on the PR says so. On a `pull_request` '
-      + 'trigger a fork PR gets a read-only token and cannot be commented on — trigger on workflow_run '
-      + 'if the notice must land.',
+      // [LAW:dataflow-not-control-flow] The remedy is carried BY the notice, not branched on here: this
+      // catch serves both callers, and the fork read-only-token diagnosis cannot apply to a round cap
+      // (only same-repo PRs ever reach one). A hint that names an impossible cause is worse than none.
+      + `The run did NOT review this pull request; nothing on the PR says so. ${notice.postFailureHint}`,
     );
     return 'failed';
   }
@@ -37217,6 +37258,8 @@ module.exports = {
   summarizePriorReviews,
   parseAgentArtifact,
   announceNotReviewed,
+  forkNotice,
+  roundCapNotice,
   renderNotReviewedBody,
   NOT_REVIEWED_MESSAGE,
   NOT_REVIEWED_REASONS,

@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { filterFiles, buildReviewAnchors, diffChurn } = require('./diff');
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, NOT_REVIEWED_REASONS, fetchPriorPushbacks, roundCapReached, parseMaxRounds } = require('./transport');
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds } = require('./transport');
 const { buildReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
@@ -386,25 +386,11 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     return;
   }
   if (isFork) {
-    // [LAW:dataflow-not-control-flow] `latestArtifact: null` is not a missing value — it is the value
-    // that says "no key worth trusting here, post it", and this call site is where that is TRUE.
-    // The idempotency key is parsed out of review bodies, and on a fork PR any account with read access
-    // can write one: a forged `not-reviewed:fork` marker would read as our own prior notice and silence
-    // the real one, on exactly the untrusted PR this notice exists to flag. A PR we refuse to review
-    // because we do not trust it cannot also be a PR whose reviews we trust to tell us what we said.
-    // So the notice repeats on every push to a fork rather than being switch-off-able by its author —
-    // the deliberate trade named at announceNotReviewed: a repeated notice is noise, a missing one is
-    // the bug. The round-cap path keeps its key, since a same-repo PR's reviews come only from accounts
-    // with push access. (The general forgeable-marker problem is `zai-review-trust-6yp`; this closes the
-    // one place where the untrusted value could cause SILENCE rather than a miscount.)
+    // forkNotice owns everything that makes this path different — including that it consults NO
+    // idempotency key, since a fork PR's reviews are written by exactly the party who would want this
+    // warning gone. There is no key parameter here to get wrong. [LAW:types-are-the-program]
     await announceNotReviewed(reviewOctokit, {
-      owner, repo, pullNumber, commitId: headSha, reviewerName, latestArtifact: null,
-      notice: {
-        reason: NOT_REVIEWED_REASONS.FORK,
-        message: `PR #${pullNumber} is from a fork. Fork pull requests are not reviewed by this action — `
-          + "their diff is untrusted and reviewing it would spend the host repository's AI credits on an "
-          + 'outside contributor.',
-      },
+      owner, repo, pullNumber, commitId: headSha, reviewerName, notice: forkNotice(pullNumber),
     });
     return;
   }
@@ -541,8 +527,8 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
       : `PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
         + `the MAX_REVIEW_ROUNDS cap of ${effort.roundCap}. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.`;
     await announceNotReviewed(reviewOctokit, {
-      owner, repo, pullNumber, commitId: headSha, reviewerName, latestArtifact: prior.latestArtifact,
-      notice: { reason: NOT_REVIEWED_REASONS.ROUND_CAP, message },
+      owner, repo, pullNumber, commitId: headSha, reviewerName,
+      notice: roundCapNotice(message, prior.latestArtifact),
     });
     return;
   }
