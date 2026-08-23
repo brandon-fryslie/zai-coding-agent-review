@@ -28,7 +28,11 @@ const NOT_REVIEWED_MARKER_PREFIX = '<!-- copirate-code-review-agent:not-reviewed
 // a fork PR (never reviewed, by design) and a spent round cap. The third candidate, a time budget that
 // expires before any scope completes, is deliberately NOT here: it already throws DeadlineExceededError
 // and reds the run (src/multiscope.js), so it is loud already and needs no notice.
-const NOT_REVIEWED_REASONS = ['fork', 'round-cap'];
+//
+// [LAW:one-source-of-truth] Reasons are reached BY NAME, never by re-typing the string or indexing the
+// list: `run.js` writes `NOT_REVIEWED_REASONS.FORK`, so a typo is `undefined` at the call site rather
+// than a string that survives to the marker boundary and fails there.
+const NOT_REVIEWED_REASONS = Object.freeze({ FORK: 'fork', ROUND_CAP: 'round-cap' });
 // The headline is fixed prose, identical for every reason, so a reader (or a grep) recognizes the state
 // before parsing the cause. It deliberately shares no vocabulary with APPROVED_MESSAGE.
 const NOT_REVIEWED_MESSAGE = '⚠️ **NOT REVIEWED** — this action did not review this pull request.';
@@ -155,10 +159,26 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
 // Matching the ENDING (not a loose `includes`) is inherited from the round-count gate for the same
 // reason: a human review that quotes a marker mid-body is not one of ours and must satisfy neither arm.
 // The review marker is tested first because it is the narrower literal; the two cannot both match.
+//
+// [LAW:one-source-of-truth] The pattern is BUILT from NOT_REVIEWED_MARKER_PREFIX, the same constant
+// renderNotReviewedBody writes with, so the writer and the reader cannot disagree about the marker.
+// Re-typing the literal here would have let a rename break recognition of the notice this very module
+// produces — `latestArtifact` would stop coming back as 'not-reviewed' and the notice would re-post on
+// every push, with nothing failing to say why.
+//
+// [LAW:no-silent-failure] The artifact is trusted from body content alone, NOT from the review's author
+// — so a forged marker from any account with read access is read as this action's own output. That is
+// the pre-existing trust model of every marker consumer here (count, cost, reviewIds), not a property of
+// this reader; forging a REVIEW_MARKER round is the strictly stronger version of the same attack.
+// Closing it needs ONE author gate covering all four values, which needs an identity mechanism that
+// must be measured under a real Actions token first: `zai-review-trust-6yp`.
+const NOT_REVIEWED_MARKER_RE = new RegExp(
+  `${NOT_REVIEWED_MARKER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([a-z-]+) -->$`,
+);
 function parseAgentArtifact(rawBody) {
   const body = (typeof rawBody === 'string' ? rawBody : '').trimEnd();
   if (body.endsWith(REVIEW_MARKER)) return { kind: 'review' };
-  const m = /<!-- copirate-code-review-agent:not-reviewed:([a-z-]+) -->$/.exec(body);
+  const m = NOT_REVIEWED_MARKER_RE.exec(body);
   return m ? { kind: 'not-reviewed', reason: m[1] } : null;
 }
 
@@ -186,9 +206,15 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
   // itself" has one definition. announceNotReviewed consumes it as its idempotency key: it stays quiet
   // only while its own notice is still the last word. That is deliberately not a per-PR "already told
   // them" flag, which would go permanently silent — if the cap is later raised and a real round posts,
-  // the notice is no longer newest and the next skip speaks again. listReviews pages ascend, so the
-  // last assignment wins. [LAW:no-silent-failure]
+  // the notice is no longer newest and the next skip speaks again. [LAW:no-silent-failure]
+  //
+  // [LAW:no-ambient-temporal-coupling] "Newest" is the HIGHEST REVIEW ID, not whichever artifact the
+  // loop happened to see last. Every other output of this function is an order-independent sum; reading
+  // the latest off arrival order would have made page ordering load-bearing on a guarantee nobody gave —
+  // GitHub documents chronological order, Gitea's `/pulls/{index}/reviews` does not, and this function
+  // serves both hosts. Keying on the id deletes the assumption rather than documenting it.
   let latestArtifact = null;
+  let latestArtifactId = -Infinity;
   let page = 1;
   while (true) {
     const { data } = await octokit.rest.pulls.listReviews({
@@ -205,7 +231,10 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
       // three can drift from the others or from what submitReview writes.
       const artifact = parseAgentArtifact(body);
       if (!artifact) continue; // a human's review, or a body this action did not write
-      latestArtifact = artifact;
+      if (r.id > latestArtifactId) {
+        latestArtifactId = r.id;
+        latestArtifact = artifact;
+      }
       // [LAW:dataflow-not-control-flow] The one branch is the artifact type's own discriminator. A
       // notice contributes to `latestArtifact` alone: it recorded no round and spent no money, so
       // counting it would push a PR past its cap using a review that never happened.
@@ -436,9 +465,10 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
 // An unknown reason is a programming error and throws; it can never reach the PR as a marker no reader
 // knows how to parse. [LAW:no-silent-failure]
 function renderNotReviewedBody(reviewerName, notice) {
-  if (!NOT_REVIEWED_REASONS.includes(notice.reason)) {
+  const reasons = Object.values(NOT_REVIEWED_REASONS);
+  if (!reasons.includes(notice.reason)) {
     throw new Error(
-      `Unknown not-reviewed reason "${notice.reason}"; expected one of ${NOT_REVIEWED_REASONS.join(', ')}.`,
+      `Unknown not-reviewed reason "${notice.reason}"; expected one of ${reasons.join(', ')}.`,
     );
   }
   return `## ${reviewerName}\n\n${NOT_REVIEWED_MESSAGE}\n\n${notice.message}\n\n`
@@ -461,16 +491,27 @@ function renderNotReviewedBody(reviewerName, notice) {
 // a `pull_request` trigger gets a read-only GITHUB_TOKEN — GitHub forbids write scopes there, whatever
 // the workflow's `permissions:` block says — so createReview 403s and there is no configuration that
 // fixes it. Reddening the run on that would red every fork PR forever, so the failure degrades to a loud
-// warning (still a visible run annotation) rather than a red check. On the triggers that CAN write
-// (pull_request_target, workflow_run) the notice lands.
+// warning (still a visible run annotation) rather than a red check. On the trigger that can write
+// without exposing the fork's code (workflow_run) the notice lands.
 async function announceNotReviewed(octokit, { owner, repo, pullNumber, commitId, reviewerName, notice, latestArtifact }) {
   core.info(`Skipping review: ${notice.message}`);
   // The idempotency key is "my own notice is still the last word on this PR", so a second push while
   // still capped adds nothing. See summarizePriorReviews' latestArtifact for why this is not a flag.
+  //
+  // Once per cause holds PER RUN, not across concurrent runs: the key is read before this function is
+  // called, so two runs racing on the same PR (two rapid pushes, or a re-run beside a fresh push) can
+  // both read "no notice yet" and both post. The workflow's `concurrency` group is what prevents that,
+  // and the README names it as the precondition. Deliberately not defended against here — GitHub offers
+  // no compare-and-swap on reviews, a re-check would only narrow the window, and this race can only make
+  // the action speak TWICE, never fall silent. Silence is the bug; a duplicate notice is cosmetic.
   if (latestArtifact && latestArtifact.kind === 'not-reviewed' && latestArtifact.reason === notice.reason) {
     core.info(`PR #${pullNumber} already carries a '${notice.reason}' not-reviewed notice; not posting a duplicate.`);
     return 'already-posted';
   }
+  // [LAW:no-silent-failure] Rendered OUTSIDE the try, so the unknown-reason throw stays a loud run
+  // failure. Inside, it would have been caught by the host-failure arm below and reported as a
+  // permissions problem — a programming error wearing a transient error's costume, on a run that exits 0.
+  const body = renderNotReviewedBody(reviewerName, notice);
   try {
     await octokit.rest.pulls.createReview({
       owner,
@@ -478,14 +519,14 @@ async function announceNotReviewed(octokit, { owner, repo, pullNumber, commitId,
       pull_number: pullNumber,
       commit_id: commitId,
       event: 'COMMENT',
-      body: renderNotReviewedBody(reviewerName, notice),
+      body,
     });
   } catch (e) {
     core.warning(
       `Could not post the '${notice.reason}' not-reviewed notice to PR #${pullNumber}: ${e.message}. `
       + 'The run did NOT review this pull request; nothing on the PR says so. On a `pull_request` '
-      + 'trigger a fork PR gets a read-only token and cannot be commented on — use pull_request_target '
-      + 'or workflow_run if the notice must land.',
+      + 'trigger a fork PR gets a read-only token and cannot be commented on — trigger on workflow_run '
+      + 'if the notice must land.',
     );
     return 'failed';
   }

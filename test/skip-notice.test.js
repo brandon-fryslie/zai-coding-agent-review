@@ -3,8 +3,9 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   announceNotReviewed, renderNotReviewedBody, parseAgentArtifact, summarizePriorReviews,
-  submitReview, gitHubTransport, NOT_REVIEWED_MESSAGE, REVIEW_MARKER,
+  submitReview, gitHubTransport, NOT_REVIEWED_MESSAGE, NOT_REVIEWED_REASONS, REVIEW_MARKER,
 } = require('../src/transport');
+const { latestArtifactBestEffort } = require('../src/run');
 
 // A fake pull request: createReview appends, listReviews serves back exactly what was posted, in order.
 // Driving the producer (announceNotReviewed / submitReview) and the reader (summarizePriorReviews)
@@ -28,11 +29,11 @@ function fakePr() {
 
 const PR = 7;
 const CAP_NOTICE = {
-  reason: 'round-cap',
+  reason: NOT_REVIEWED_REASONS.ROUND_CAP,
   message: `PR #${PR} has already been reviewed 5 time(s), reaching the MAX_REVIEW_ROUNDS cap of 5. `
     + 'Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.',
 };
-const FORK_NOTICE = { reason: 'fork', message: `PR #${PR} is from a fork.` };
+const FORK_NOTICE = { reason: NOT_REVIEWED_REASONS.FORK, message: `PR #${PR} is from a fork.` };
 
 // One capped push: read the PR's current state, then announce — exactly the sequence runPrReview runs.
 async function cappedPush(pr, commitId, notice = CAP_NOTICE) {
@@ -140,6 +141,66 @@ describe('a review-less run speaks at the PR', () => {
       () => renderNotReviewedBody('RA', { reason: 'whatever', message: 'x' }),
       /Unknown not-reviewed reason/,
     );
+  });
+
+  test('an unknown reason THROWS out of announceNotReviewed, never degrading to the host warning', async () => {
+    // A programming error must not wear a transient error's costume. Rendering inside the try would have
+    // caught this in the host-failure arm and reported a permissions problem on a run that exits 0.
+    const pr = fakePr();
+    await assert.rejects(
+      () => announceNotReviewed(pr.octokit, {
+        owner: 'o', repo: 'r', pullNumber: PR, commitId: 'sha', reviewerName: 'RA',
+        notice: { reason: 'typo-reason', message: 'x' }, latestArtifact: null,
+      }),
+      /Unknown not-reviewed reason/,
+    );
+    assert.equal(pr.reviews.length, 0);
+  });
+
+  test('the newest artifact is the highest review id, whatever order the pages arrive in', async () => {
+    // Every other output of summarizePriorReviews is an order-independent sum. Reading the latest off
+    // arrival order would rest on an ordering GitHub documents and Gitea does not.
+    const notice = renderNotReviewedBody('RA', CAP_NOTICE);
+    const round = `verdict\n\n${REVIEW_MARKER}`;
+    const descending = {
+      rest: {
+        pulls: {
+          listReviews: async ({ page }) => ({
+            data: page === 1 ? [{ id: 9, body: round }, { id: 4, body: notice }] : [],
+          }),
+        },
+      },
+    };
+    // The round has the higher id, so it is the newest agent artifact even though the notice came last.
+    const prior = await summarizePriorReviews(descending, 'o', 'r', PR);
+    assert.deepEqual(prior.latestArtifact, { kind: 'review' });
+  });
+});
+
+describe('the fork path never fails on its idempotency key', () => {
+  test('a listReviews failure warns and yields null, so the notice still posts', async () => {
+    // A fork PR is skipped from the `pr` object alone; nothing about that decision may depend on this
+    // call. Failing open costs a repeated notice — failing closed would red a run that cannot fail.
+    const octokit = {
+      rest: { pulls: { listReviews: async () => { throw new Error('secondary rate limit'); } } },
+    };
+    assert.equal(await latestArtifactBestEffort(octokit, 'o', 'r', PR), null);
+  });
+
+  test('a healthy fetch still yields the key, so the fork notice de-duplicates normally', async () => {
+    const pr = fakePr();
+    await announceNotReviewed(pr.octokit, {
+      owner: 'o', repo: 'r', pullNumber: PR, commitId: 'sha1', reviewerName: 'RA',
+      notice: FORK_NOTICE, latestArtifact: null,
+    });
+    const key = await latestArtifactBestEffort(pr.octokit, 'o', 'r', PR);
+    assert.deepEqual(key, { kind: 'not-reviewed', reason: 'fork' });
+    const outcome = await announceNotReviewed(pr.octokit, {
+      owner: 'o', repo: 'r', pullNumber: PR, commitId: 'sha2', reviewerName: 'RA',
+      notice: FORK_NOTICE, latestArtifact: key,
+    });
+    assert.equal(outcome, 'already-posted');
+    assert.equal(pr.reviews.length, 1);
   });
 });
 

@@ -150,13 +150,17 @@ Set `GITHUB_REVIEW_TOKEN` to an approval-capable user or GitHub App token to hav
 
 ## A skipped run says so on the PR
 
-Two things end a run without reviewing anything: a PR from a fork, and a PR that has spent its `MAX_REVIEW_ROUNDS`. Both are deliberate and both still exit 0 with green checks — and both post a `COMMENT` review that opens `⚠️ **NOT REVIEWED**` and names the cause and its remedy.
+Two things end a run without reviewing anything: a PR from a fork, and a PR that has spent its `MAX_REVIEW_ROUNDS`. Both are deliberate and both still exit 0 with green checks — and both post a `COMMENT` review that opens `⚠️ **NOT REVIEWED**` and names the cause and, where one exists, the remedy. (A round cap has one: raise it. A fork skip has none, by design.)
 
 Without that notice a skip is indistinguishable from a clean review: same successful workflow run, same zero findings, same absence of a posted review. Anything reading those signals — an automerge loop, a dashboard, a person glancing at the checks — sees approval. That is not hypothetical: on 2026-08-21 an automated loop came one step from merging a head commit nobody had reviewed, which a later review found 19 real issues in.
 
 The notice never fails the run and never requests changes — nothing was reviewed, so there is no finding to justify one. It posts once per cause rather than once per push: while it is still the newest thing the action has left on the PR, a further push adds nothing. Raise the cap, let a real review round land, and the next skip speaks again. There is no input to turn any of this on; a skip should never have been silent.
 
-One case cannot be delivered. On a `pull_request` trigger a fork PR gets a read-only `GITHUB_TOKEN` — GitHub grants no write scope there, whatever the workflow's `permissions:` block says — so the notice fails to post. The run warns loudly in its log and stays green; the PR itself says nothing. Trigger on `pull_request_target` or `workflow_run` if you need fork skips visible on the PR.
+**Once per cause assumes a `concurrency` group.** The Quickstart workflow sets one; keep it. Two runs racing on the same PR — two rapid pushes, or a re-run beside a fresh push — can both check for an existing notice before either has posted, and both post. The race can only make the action speak twice; it can never make it fall silent.
+
+**Fork skips need a trigger whose token can write.** On `pull_request` a fork PR gets a read-only `GITHUB_TOKEN` — GitHub grants no write scope there, whatever the workflow's `permissions:` block says — so the notice cannot post. The run warns loudly in its log and stays green; the PR itself says nothing. Trigger on `workflow_run` if you need fork skips visible.
+
+Do not reach for `pull_request_target` to solve this. It hands a write-scoped token and your secrets to a job running in the base branch's context — and the Quickstart above checks out `${{ github.event.pull_request.head.sha }}`, which on a fork PR is the contributor's code. Combining the two is the "pwn request" pattern: any step that builds, tests, or lints that checkout executes attacker-controlled code holding a token that can push to your repository. A fork skip staying invisible on the PR is a far smaller problem than that.
 
 ## Fork PRs are never reviewed
 

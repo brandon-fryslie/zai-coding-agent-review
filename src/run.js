@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { filterFiles, buildReviewAnchors, diffChurn } = require('./diff');
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, fetchPriorPushbacks, roundCapReached, parseMaxRounds } = require('./transport');
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, NOT_REVIEWED_REASONS, fetchPriorPushbacks, roundCapReached, parseMaxRounds } = require('./transport');
 const { buildReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
@@ -151,6 +151,26 @@ function warnBudgetExhausted(review) {
     ? `${review.unreviewedScopes.length} scope(s) went unreviewed (${review.unreviewedScopes.join(', ')})`
     : 'every scope was reviewed, but convergence sweeps were cut short';
   core.warning(`Review time budget exhausted: ${state}. The collected findings were still delivered. ${BUDGET_REMEDY}`);
+}
+
+// [LAW:no-silent-failure] The fork path's idempotency key, resolved best-effort. A fork PR is skipped
+// unconditionally from the `pr` object alone, so nothing about that decision may depend on this call —
+// it exists only to avoid re-posting the same notice on every push. A listReviews failure therefore
+// WARNS and yields null rather than reddening a run that was always going to be a clean no-op.
+//
+// null means "post it": when duplicate-avoidance and visibility conflict, visibility wins. A repeated
+// notice is noise; a missing one is the bug this whole mechanism exists to prevent. The degradation is
+// announced, never a silent `|| null`. [LAW:dataflow-not-control-flow]
+async function latestArtifactBestEffort(octokit, owner, repo, pullNumber) {
+  try {
+    return (await summarizePriorReviews(octokit, owner, repo, pullNumber)).latestArtifact;
+  } catch (e) {
+    core.warning(
+      `Could not read prior reviews for PR #${pullNumber} to de-duplicate its not-reviewed notice: `
+      + `${e.message}. Posting the notice anyway — it may repeat a notice already on the PR.`,
+    );
+    return null;
+  }
 }
 
 // [LAW:decomposition] The one fetch site for the reviewed diff: select the host transport, pull the
@@ -363,24 +383,6 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     return;
   }
 
-  // [LAW:no-silent-failure] Name the prior-review summary as the failure point, matching the PR fetch
-  // above — a bare throw would surface only the generic top-level message, hiding which step failed. A
-  // listReviews error fails the run loud rather than silently skipping the cap. ONE fetch feeds three
-  // consumers: the round cap (.count), the PR-total footer (.cost), and every skip notice's idempotency
-  // key (.latestArtifact). [LAW:one-source-of-truth]
-  //
-  // It runs BEFORE the fork gate because both skip paths below announce themselves on the PR and need
-  // that key to avoid re-posting on every push. This costs a fork PR one extra listReviews read and
-  // leaves the security invariant untouched: the fork gate's job is that no AI CREDENTIAL is read and
-  // no engine is spawned for an outside contributor, and neither happens here.
-  let prior;
-  try {
-    prior = await summarizePriorReviews(octokit, owner, repo, pullNumber);
-  } catch (e) {
-    core.setFailed(`Failed to summarize prior reviews for PR #${pullNumber}: ${e.message}`);
-    return;
-  }
-
   // [LAW:one-type-per-behavior] The two exits that end a run WITHOUT reviewing — a fork PR and a spent
   // round cap — differ only in the notice VALUE they hand to announceNotReviewed. Both are still clean
   // exit-0 no-ops with no engine spawned; what changed is that the PR now says so, because a run that
@@ -391,6 +393,11 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   // action never reviews a fork PR (its diff is untrusted and would spend the host's own AI credits
   // on outside contributors). Malformed PR data (no base repo) throws here and surfaces as a loud
   // failure, never a skip.
+  //
+  // This gate runs FIRST, deciding from the already-fetched `pr` alone, because "a fork PR is skipped,
+  // unconditionally" is only as strong as the weakest thing the decision depends on. Putting the
+  // paginated listReviews fetch in front of it would have made a transient API failure red a run that
+  // previously could not fail — trading a load-bearing guarantee for a spam-avoidance key.
   let isFork;
   try {
     isFork = prIsFromFork(pr);
@@ -400,14 +407,33 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   }
   if (isFork) {
     await announceNotReviewed(reviewOctokit, {
-      owner, repo, pullNumber, commitId: headSha, reviewerName, latestArtifact: prior.latestArtifact,
+      owner, repo, pullNumber, commitId: headSha, reviewerName,
+      latestArtifact: await latestArtifactBestEffort(octokit, owner, repo, pullNumber),
       notice: {
-        reason: 'fork',
+        reason: NOT_REVIEWED_REASONS.FORK,
         message: `PR #${pullNumber} is from a fork. Fork pull requests are not reviewed by this action — `
           + "their diff is untrusted and reviewing it would spend the host repository's AI credits on an "
           + 'outside contributor.',
       },
     });
+    return;
+  }
+
+  // [LAW:no-silent-failure] Name the prior-review summary as the failure point, matching the PR fetch
+  // above — a bare throw would surface only the generic top-level message, hiding which step failed. A
+  // listReviews error fails the run loud rather than silently skipping the cap. ONE fetch feeds three
+  // consumers: the round cap (.count), the PR-total footer (.cost), and the round-cap notice's
+  // idempotency key (.latestArtifact). [LAW:one-source-of-truth]
+  //
+  // Fatal HERE and best-effort on the fork path above, because the two callers need different things
+  // from the same fetch: this one's `count` gates spend, so an unknown count must stop the run rather
+  // than review a PR that has already exhausted its cap; the fork path's key only avoids a duplicate
+  // comment, and failing open there costs a repeated notice instead of a red run.
+  let prior;
+  try {
+    prior = await summarizePriorReviews(octokit, owner, repo, pullNumber);
+  } catch (e) {
+    core.setFailed(`Failed to summarize prior reviews for PR #${pullNumber}: ${e.message}`);
     return;
   }
 
@@ -526,7 +552,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
         + `the MAX_REVIEW_ROUNDS cap of ${effort.roundCap}. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.`;
     await announceNotReviewed(reviewOctokit, {
       owner, repo, pullNumber, commitId: headSha, reviewerName, latestArtifact: prior.latestArtifact,
-      notice: { reason: 'round-cap', message },
+      notice: { reason: NOT_REVIEWED_REASONS.ROUND_CAP, message },
     });
     return;
   }
@@ -738,4 +764,4 @@ async function run() {
   }
 }
 
-module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, MAX_DEPENDENCY_BUMPS_FETCHED };
+module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, latestArtifactBestEffort, MAX_DEPENDENCY_BUMPS_FETCHED };
