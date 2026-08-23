@@ -12,71 +12,118 @@ const DEEPSEEK_ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic';
 // a morning is worse than one that keeps running. Consumers override with the CLAUDE_MODEL input.
 const CLAUDE_SUBSCRIPTION_DEFAULT_MODEL = 'claude-sonnet-5';
 
+// Anthropic's own API — the only host a Claude Pro/Max subscription token is valid against.
+const ANTHROPIC_BASE_URL = 'https://api.anthropic.com';
+
+// ─── PRESETS: the known-good endpoint shapes, and the security boundary ──────────────────────
+//
+// [LAW:types-are-the-program] A resolved endpoint is three facts and no optional halves:
+//   { apiType, baseUrl, credential: { kind, value } }
+// Every endpoint has all three. There is no "subscription has no baseUrl" special case — a
+// subscription's baseUrl is simply Anthropic's, and a future non-Anthropic subscription names its own.
+//
+// THE SECURITY INVARIANT THIS TABLE CARRIES. An OAuth/subscription credential is long-lived and
+// broadly scoped — its blast radius dwarfs a per-service API key — so it must only ever be sent to
+// the host it was minted for. A row expresses that by which base-URL field it has, and the two are
+// mutually exclusive by construction:
+//
+//   baseUrl        PINNED     — no input and no config file can move it. REQUIRED for oauth.
+//   defaultBaseUrl OVERRIDABLE — an input or config file may replace it. api-key ONLY.
+//
+// So a row that pins cannot also offer an override (the field is absent), and a row that offers an
+// override cannot carry oauth (assertPresetsSafe below refuses it at module load, and a test asserts
+// the same over the table). The consequence is the property that matters: **no misconfiguration can
+// point a subscription token at an arbitrary host** — reaching that state requires adding a row here,
+// which is a reviewed code change, not a YAML typo. [LAW:no-silent-failure]
+const PRESETS = {
+  openai: { apiType: 'openai-responses', defaultBaseUrl: OPENAI_RESPONSES_BASE_URL, credentialKind: 'api-key' },
+  zai: { apiType: 'anthropic-messages', defaultBaseUrl: ZAI_ANTHROPIC_BASE_URL, credentialKind: 'api-key' },
+  deepseek: { apiType: 'anthropic-messages', defaultBaseUrl: DEEPSEEK_ANTHROPIC_BASE_URL, credentialKind: 'api-key' },
+  // Pinned + oauth. Deliberately a preset of its own rather than an "anthropic" preset with a token
+  // flavour: an api-key Anthropic endpoint would share this host and apiType and differ ONLY in
+  // credential kind, and keeping them separate rows with separate credential inputs is what stops a
+  // key meant for one from ever being read as the other.
+  'claude-subscription': { apiType: 'anthropic-messages', baseUrl: ANTHROPIC_BASE_URL, credentialKind: 'oauth' },
+};
+
+// [LAW:single-enforcer] The invariant is checked once, at module load, over the static table — not
+// re-derived per run (that would be a defensive guard on a constant) and not left to CI alone, so an
+// unsafe row cannot ship even if the test is deleted. A pinned row is identified by HAVING baseUrl.
+function assertPresetsSafe(presets) {
+  for (const [name, p] of Object.entries(presets)) {
+    const pinned = 'baseUrl' in p;
+    const overridable = 'defaultBaseUrl' in p;
+    if (pinned === overridable) {
+      throw new Error(`Preset '${name}': must declare exactly one of 'baseUrl' (pinned) or 'defaultBaseUrl' (overridable).`);
+    }
+    if (p.credentialKind === 'oauth' && !pinned) {
+      throw new Error(
+        `Preset '${name}': an 'oauth' credential requires a PINNED 'baseUrl'. An overridable base URL would let a ` +
+        'misconfiguration send a long-lived subscription token to an arbitrary host.',
+      );
+    }
+  }
+  return presets;
+}
+assertPresetsSafe(PRESETS);
+
 // [LAW:dataflow-not-control-flow] The provider is an explicit value, never inferred from
 // which credential happens to be set. [LAW:single-enforcer] This module is the one place
 // that turns the simple-mode (no CONFIG_FILE) action inputs into a typed ReviewConfig.
 //
-// [LAW:one-source-of-truth] Each provider spec names its engine, endpoint, auth method, credential
+// [LAW:one-source-of-truth] Each provider spec names its engine, its endpoint PRESET, credential
 // input, default model, and how to pull its fields from the flat action-input bag. Adding a provider
 // is one entry here — every consumer (validation, error messages, config synthesis) derives
 // from this table, so none of them branches on a hardcoded provider name.
+//
+// Each provider has its OWN credential input. That is the other half of the security invariant: the
+// PROVIDER value alone selects the row, credential presence never steers it, so a DeepSeek key can
+// never be read into the subscription's slot nor a subscription token into DeepSeek's.
 const PROVIDERS = {
   codex: {
     engine: 'codex',
-    endpointKind: 'openai-responses',
-    authMethod: 'api-key',
-    defaultBaseUrl: OPENAI_RESPONSES_BASE_URL,
+    preset: 'openai',
     credentialInput: 'OPENAI_API_KEY',
     defaultModel: 'gpt-5.4-mini',
     fields: i => ({ credential: i.openaiApiKey, model: i.openaiModel, reasoning: i.openaiReasoning, baseUrl: i.openaiBaseUrl }),
   },
   zai: {
     engine: 'claude-code',
-    endpointKind: 'anthropic-messages',
-    authMethod: 'api-key',
-    defaultBaseUrl: ZAI_ANTHROPIC_BASE_URL,
+    preset: 'zai',
     credentialInput: 'ZAI_API_KEY',
     defaultModel: 'glm-5.1',
     fields: i => ({ credential: i.zaiApiKey, model: i.zaiModel, systemPrompt: i.zaiSystemPrompt, baseUrl: i.zaiBaseUrl }),
   },
   deepseek: {
     engine: 'claude-code',
-    endpointKind: 'anthropic-messages',
-    authMethod: 'api-key',
-    defaultBaseUrl: DEEPSEEK_ANTHROPIC_BASE_URL,
+    preset: 'deepseek',
     credentialInput: 'DEEPSEEK_API_KEY',
     defaultModel: 'deepseek-v4-pro',
     fields: i => ({ credential: i.deepseekApiKey, model: i.deepseekModel, systemPrompt: i.deepseekSystemPrompt, baseUrl: i.deepseekBaseUrl }),
   },
-  // Claude Pro/Max subscription: the same claude-code engine as zai/deepseek, reached through a
-  // different credential channel rather than a different endpoint. The row carries NO defaultBaseUrl
-  // and reads NO base-URL input — a subscription token is only ever valid against Anthropic's own API,
-  // and offering a URL knob "for flexibility" would re-admit exactly the state the auth union deletes.
+  // Claude Pro/Max subscription: the same claude-code engine as zai/deepseek, reached with a
+  // long-lived OAuth token instead of an API key. `fields` reads NO base-URL input — there is no
+  // CLAUDE_BASE_URL for it to read — so the preset's pinned host stands.
   'claude-subscription': {
     engine: 'claude-code',
-    endpointKind: 'anthropic-messages',
-    authMethod: 'subscription',
+    preset: 'claude-subscription',
     credentialInput: 'CLAUDE_CODE_OAUTH_TOKEN',
     defaultModel: CLAUDE_SUBSCRIPTION_DEFAULT_MODEL,
     fields: i => ({ credential: i.claudeCodeOauthToken, model: i.claudeModel }),
   },
 };
 
-// [LAW:dataflow-not-control-flow] The auth method is a value that SELECTS a builder, not a branch
-// inside the synthesizer. Each builder produces only its own variant's fields, which is what keeps
-// `baseUrl` off the subscription value — an api-key endpoint and a subscription endpoint are two
-// shapes, not one shape with optional halves. [LAW:types-are-the-program]
-const AUTH_FROM_INPUTS = {
-  'api-key': (spec, f) => ({
-    method: 'api-key',
-    baseUrl: f.baseUrl || spec.defaultBaseUrl,
-    credential: f.credential,
-  }),
-  subscription: (_spec, f) => ({
-    method: 'subscription',
-    credential: f.credential,
-  }),
-};
+// [LAW:dataflow-not-control-flow] Resolve a preset plus the caller's overrides into the one endpoint
+// shape. A pinned preset ignores no input — it is handed none, because `fields` on a pinned row reads
+// no base URL. The `??` chain therefore has exactly one live source per row, never a silent priority
+// contest between a pin and an override.
+function resolveEndpoint(preset, { baseUrl, credential }) {
+  return {
+    apiType: preset.apiType,
+    baseUrl: preset.baseUrl ?? baseUrl ?? preset.defaultBaseUrl,
+    credential: { kind: preset.credentialKind, value: credential },
+  };
+}
 
 // [LAW:one-type-per-behavior] 'auto' has no behavior of its own — it forwards to whichever
 // concrete provider every client should currently use, so the maintainer can retarget all
@@ -87,7 +134,8 @@ const AUTH_FROM_INPUTS = {
 // money. A subscription review costs plan quota instead. A repo that supplies only DEEPSEEK_API_KEY
 // now fails at startup naming CLAUDE_CODE_OAUTH_TOKEN: loudly, before any spend, never by silently
 // falling back to a paid provider. That loud failure is exactly what makes retargeting every consumer
-// from one line safe to do. [LAW:no-silent-failure]
+// from one line safe to do. [LAW:no-silent-failure] The installer provisions both secrets, so a
+// workflow it wrote carries whichever credential 'auto' currently resolves to.
 const PROVIDER_ALIASES = { auto: 'claude-subscription' };
 
 // Every accepted PROVIDER input value: the concrete providers plus the aliases. The order
@@ -129,10 +177,7 @@ function synthesizeProviderConfig(inputs, reg) {
     name: requested === provider ? `${provider}-default` : `${requested}→${provider}`,
     engine: spec.engine,
     model: f.model || spec.defaultModel,
-    endpoint: {
-      kind: spec.endpointKind,
-      auth: AUTH_FROM_INPUTS[spec.authMethod](spec, f),
-    },
+    endpoint: resolveEndpoint(PRESETS[spec.preset], f),
   };
 
   if (f.reasoning) {
@@ -156,4 +201,15 @@ function synthesizeProviderConfig(inputs, reg) {
   return config;
 }
 
-module.exports = { synthesizeProviderConfig, PROVIDERS, PROVIDER_ALIASES, PROVIDER_NAMES, AUTH_FROM_INPUTS };
+module.exports = {
+  synthesizeProviderConfig,
+  PROVIDERS,
+  PROVIDER_ALIASES,
+  PROVIDER_NAMES,
+  // PRESETS + resolveEndpoint are shared with the config-file path (src/config.js): a config file's
+  // `preset:` form resolves through the SAME table, so the pinned-host guarantee cannot be bypassed
+  // by writing YAML instead of setting an input. [LAW:single-enforcer]
+  PRESETS,
+  resolveEndpoint,
+  assertPresetsSafe,
+};

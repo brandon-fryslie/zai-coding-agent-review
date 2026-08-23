@@ -24,9 +24,10 @@ describe('synthesizeProviderConfig — defaults', () => {
     const config = synthesizeProviderConfig({ provider: 'codex', openaiApiKey: 'sk-openai' }, MOCK_REGISTRY);
     assert.equal(config.engine, 'codex');
     assert.equal(config.model, 'gpt-5.4-mini');
-    assert.equal(config.endpoint.kind, 'openai-responses');
-    assert.deepEqual(config.endpoint.auth, {
-      method: 'api-key', baseUrl: 'https://api.openai.com/v1', credential: 'sk-openai',
+    assert.deepEqual(config.endpoint, {
+      apiType: 'openai-responses',
+      baseUrl: 'https://api.openai.com/v1',
+      credential: { kind: 'api-key', value: 'sk-openai' },
     });
     assert.equal(config.reasoning, undefined);
   });
@@ -35,9 +36,10 @@ describe('synthesizeProviderConfig — defaults', () => {
     const config = synthesizeProviderConfig({ provider: 'zai', zaiApiKey: 'zai-key' }, MOCK_REGISTRY);
     assert.equal(config.engine, 'claude-code');
     assert.equal(config.model, 'glm-5.1');
-    assert.equal(config.endpoint.kind, 'anthropic-messages');
-    assert.deepEqual(config.endpoint.auth, {
-      method: 'api-key', baseUrl: 'https://api.z.ai/api/anthropic', credential: 'zai-key',
+    assert.deepEqual(config.endpoint, {
+      apiType: 'anthropic-messages',
+      baseUrl: 'https://api.z.ai/api/anthropic',
+      credential: { kind: 'api-key', value: 'zai-key' },
     });
   });
 });
@@ -70,7 +72,7 @@ describe('synthesizeProviderConfig — provider is chosen only by PROVIDER, neve
       MOCK_REGISTRY,
     );
     assert.equal(config.engine, 'codex');
-    assert.equal(config.endpoint.auth.credential, 'sk-openai');
+    assert.equal(config.endpoint.credential.value, 'sk-openai');
   });
 });
 
@@ -85,7 +87,7 @@ describe('synthesizeProviderConfig — overrides', () => {
       { provider: 'codex', openaiApiKey: 'k', openaiBaseUrl: 'https://gateway.example/v1' },
       MOCK_REGISTRY,
     );
-    assert.equal(config.endpoint.auth.baseUrl, 'https://gateway.example/v1');
+    assert.equal(config.endpoint.baseUrl, 'https://gateway.example/v1');
   });
 
   test('valid reasoning effort passes through', () => {
@@ -115,9 +117,10 @@ describe('synthesizeProviderConfig — deepseek provider', () => {
     const config = synthesizeProviderConfig({ provider: 'deepseek', deepseekApiKey: 'sk-deepseek' }, MOCK_REGISTRY);
     assert.equal(config.engine, 'claude-code');
     assert.equal(config.model, 'deepseek-v4-pro');
-    assert.equal(config.endpoint.kind, 'anthropic-messages');
-    assert.deepEqual(config.endpoint.auth, {
-      method: 'api-key', baseUrl: 'https://api.deepseek.com/anthropic', credential: 'sk-deepseek',
+    assert.deepEqual(config.endpoint, {
+      apiType: 'anthropic-messages',
+      baseUrl: 'https://api.deepseek.com/anthropic',
+      credential: { kind: 'api-key', value: 'sk-deepseek' },
     });
     assert.equal(config.name, 'deepseek-default');
   });
@@ -138,7 +141,7 @@ describe('synthesizeProviderConfig — deepseek provider', () => {
       MOCK_REGISTRY,
     );
     assert.equal(config.model, 'deepseek-v4-flash');
-    assert.equal(config.endpoint.auth.baseUrl, 'https://gw.example/anthropic');
+    assert.equal(config.endpoint.baseUrl, 'https://gw.example/anthropic');
   });
 });
 
@@ -170,7 +173,7 @@ describe("synthesizeProviderConfig — 'auto' alias", () => {
   test('naming deepseek explicitly still works — the retarget only moves the default', () => {
     const config = synthesizeProviderConfig({ provider: 'deepseek', deepseekApiKey: 'sk-deepseek' }, MOCK_REGISTRY);
     assert.equal(config.name, 'deepseek-default');
-    assert.equal(config.endpoint.auth.credential, 'sk-deepseek');
+    assert.equal(config.endpoint.credential.value, 'sk-deepseek');
   });
 
   test("'auto', 'deepseek' and 'claude-subscription' are all listed among valid PROVIDER values", () => {
@@ -208,8 +211,12 @@ describe('synthesizeProviderConfig — claude-subscription provider', () => {
     assert.equal(config.engine, 'claude-code');
     assert.equal(config.model, 'claude-sonnet-5');
     assert.equal(config.name, 'claude-subscription-default');
-    assert.equal(config.endpoint.kind, 'anthropic-messages');
-    assert.deepEqual(config.endpoint.auth, { method: 'subscription', credential: 'sk-ant-oat01-live' });
+    // The PINNED Anthropic host, which no input can move — the security property as a value.
+    assert.deepEqual(config.endpoint, {
+      apiType: 'anthropic-messages',
+      baseUrl: 'https://api.anthropic.com',
+      credential: { kind: 'oauth', value: 'sk-ant-oat01-live' },
+    });
   });
 
   test('an explicit CLAUDE_MODEL overrides the default', () => {
@@ -232,7 +239,7 @@ describe('synthesizeProviderConfig — claude-subscription provider', () => {
 
   test('PROVIDER: auto resolves here — an unconfigured consumer gets the subscription', () => {
     const viaAuto = synthesizeProviderConfig({ provider: 'auto', claudeCodeOauthToken: 'k' }, MOCK_REGISTRY);
-    assert.equal(viaAuto.endpoint.auth.method, 'subscription');
+    assert.equal(viaAuto.endpoint.credential.kind, 'oauth');
     assert.equal(viaAuto.name, 'auto→claude-subscription');
   });
 });
@@ -244,23 +251,32 @@ describe('synthesizeProviderConfig — claude-subscription provider', () => {
 // prompt. [FRAMING:representation]
 describe('PROVIDERS rows agree with the real adapter capabilities', () => {
   const realRegistry = require('../src/engine/registry');
-  const { PROVIDERS, AUTH_FROM_INPUTS } = require('../src/provider');
+  const { PROVIDERS, PRESETS } = require('../src/provider');
 
   for (const [name, spec] of Object.entries(PROVIDERS)) {
-    test(`'${name}': engine '${spec.engine}' declares its endpointKind and authMethod`, () => {
+    test(`'${name}': its preset exists and the engine declares that apiType + credential kind`, () => {
+      const preset = PRESETS[spec.preset];
+      assert.ok(preset, `provider '${name}' names preset '${spec.preset}', which is not defined`);
       const caps = realRegistry.get(spec.engine).capabilities;
       assert.ok(
-        caps.endpointKinds.includes(spec.endpointKind),
-        `endpointKind '${spec.endpointKind}' not in [${caps.endpointKinds.join(', ')}]`,
+        caps.apiTypes.includes(preset.apiType),
+        `apiType '${preset.apiType}' not in [${caps.apiTypes.join(', ')}]`,
       );
       assert.ok(
-        caps.authMethods.includes(spec.authMethod),
-        `authMethod '${spec.authMethod}' not in [${caps.authMethods.join(', ')}]`,
+        caps.credentialKinds.includes(preset.credentialKind),
+        `credentialKind '${preset.credentialKind}' not in [${caps.credentialKinds.join(', ')}]`,
       );
     });
 
-    test(`'${name}': its auth method has a builder`, () => {
-      assert.equal(typeof AUTH_FROM_INPUTS[spec.authMethod], 'function');
+    // A provider whose preset PINS its base URL must not also read a base-URL input — that input
+    // would be silently ignored, which is how someone comes to believe they redirected an endpoint
+    // they did not. [LAW:no-silent-failure]
+    test(`'${name}': reads a base-URL input only if its preset allows an override`, () => {
+      const preset = PRESETS[spec.preset];
+      const reads = spec.fields({ openaiBaseUrl: 'X', zaiBaseUrl: 'X', deepseekBaseUrl: 'X' }).baseUrl;
+      if ('baseUrl' in preset) {
+        assert.equal(reads, undefined, `pinned preset '${spec.preset}' must not read a base-URL input`);
+      }
     });
   }
 });

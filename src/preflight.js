@@ -56,13 +56,13 @@ function classifyProbe({ status, networkError }) {
 // would reject a perfectly working subscription before the engine ever spawned — the exact false
 // failure this function's contract exists to avoid.
 function probeRequest(endpoint, model) {
-  if (endpoint.kind === 'anthropic-messages' && endpoint.auth.method === 'api-key') {
+  if (endpoint.apiType === 'anthropic-messages' && endpoint.credential.kind === 'api-key') {
     return {
-      url: `${endpoint.auth.baseUrl.replace(/\/+$/, '')}/v1/messages`,
+      url: `${endpoint.baseUrl.replace(/\/+$/, '')}/v1/messages`,
       init: {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${endpoint.auth.credential}`,
+          Authorization: `Bearer ${endpoint.credential.value}`,
           'anthropic-version': '2023-06-01',
           'content-type': 'application/json',
         },
@@ -84,7 +84,7 @@ async function probeConfig(config, fetchImpl = fetch) {
       skipped: true,
       // Name BOTH axes: 'anthropic-messages' alone IS probed under api-key auth, so reporting only the
       // kind would read as a contradiction to anyone who has seen the probe run. [LAW:no-silent-failure]
-      hint: `no preflight probe is implemented for endpoint kind '${config.endpoint.kind}' with auth method '${config.endpoint.auth.method}'`,
+      hint: `no preflight probe is implemented for apiType '${config.endpoint.apiType}' with credential kind '${config.endpoint.credential.kind}'`,
     };
   }
   const controller = new AbortController();

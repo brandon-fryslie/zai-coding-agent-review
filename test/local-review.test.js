@@ -57,7 +57,7 @@ test('parseArgs rejects bad input loudly', () => {
 
 test('formatReport surfaces the explore verdict, beyond-diff reads, findings, and cost', () => {
   const report = formatReport({
-    config: { name: 'auto→deepseek', engine: 'claude-code', model: 'deepseek-v4-pro', endpoint: { auth: { method: 'api-key', baseUrl: 'https://x/anthropic' } } },
+    config: { name: 'auto→deepseek', engine: 'claude-code', model: 'deepseek-v4-pro', endpoint: { baseUrl: 'https://x/anthropic', credential: { kind: 'api-key', value: 'k' } } },
     mode: 'pr',
     repo: '/repo',
     files: [{ filename: 'src/run.js' }],

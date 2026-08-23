@@ -30470,6 +30470,10 @@ module.exports = { COLLECTOR_SERVER_ARG, createReviewCollector, readCollectedRev
 const fs = __nccwpck_require__(9896);
 const yaml = __nccwpck_require__(8815);
 const defaultRegistry = __nccwpck_require__(25);
+// [LAW:single-enforcer] The SAME preset table simple mode resolves through. A config file's `preset:`
+// form cannot reach an endpoint shape the PROVIDER inputs could not, and in particular cannot pair an
+// oauth credential with a host of its own choosing.
+const { PRESETS, resolveEndpoint } = __nccwpck_require__(3676);
 
 // [LAW:types-are-the-program] The config file schema is the single type contract for
 // multi-engine configurations. Every illegal combination (unknown engine, unsupported
@@ -30479,18 +30483,82 @@ const defaultRegistry = __nccwpck_require__(25);
 
 const SUPPORTED_VERSIONS = [1];
 
-// [LAW:one-source-of-truth] What each auth variant CARRIES, declared once, in the pre-resolution
-// shape the file speaks (a credential is named by env var, never written into the file). Validation
-// reads this to demand exactly these fields and REJECT any other, and resolveChain reads it to copy
-// exactly these fields through — so an auth block cannot be validated as one shape and then resolved
-// as another. [LAW:types-are-the-program] YAML cannot express a discriminated union, so this table is
-// how the union is recovered at the boundary: an `auth` block is parsed into one variant or refused.
-const AUTH_FIELDS = {
-  'api-key': ['baseUrl', 'credentialEnv'],
-  // No baseUrl, deliberately: a subscription token is only ever valid against Anthropic's own API,
-  // so "subscription token pointed at z.ai" has no spelling here rather than being caught later.
-  subscription: ['credentialEnv'],
-};
+// ─── The two endpoint forms a config file may write ──────────────────────────────────────────
+//
+// [LAW:types-are-the-program] YAML cannot express a discriminated union, so the union is recovered
+// here at the boundary. An `endpoint` block is exactly one of two forms, discriminated by `preset`:
+//
+//   PRESET   { preset, credentialEnv }              — apiType, baseUrl and credentialKind all come
+//                                                     from src/provider.js PRESETS. May be oauth.
+//   MANUAL   { apiType, baseUrl, credentialEnv }    — total flexibility over the endpoint.
+//                                                     ALWAYS api-key; there is no `credentialKind`
+//                                                     field for this form to set.
+//
+// THAT ASYMMETRY IS THE SECURITY BOUNDARY, not an oversight. A long-lived subscription/OAuth token
+// must only ever reach the host it was minted for, so oauth is reachable only through a preset whose
+// baseUrl is pinned in code. The manual form keeps every degree of freedom that is safe to have —
+// any apiType, any baseUrl, any env var — and simply cannot name a high-blast-radius credential.
+// Reaching "oauth token at a host of my choosing" therefore requires adding a PRESET, which is a
+// reviewed code change rather than a YAML typo. [LAW:no-silent-failure]
+const MANUAL_FIELDS = ['apiType', 'baseUrl', 'credentialEnv'];
+const PRESET_FIELDS = ['preset', 'credentialEnv'];
+
+// [LAW:no-silent-failure] A key the chosen form does not take is an ERROR, never quietly ignored: a
+// `baseUrl` written beside a `preset` is someone believing they redirected a pinned endpoint, and
+// dropping it silently would leave that belief intact and wrong.
+function rejectForeignKeys(name, endpoint, allowed, formLabel) {
+  const extra = Object.keys(endpoint).filter(k => !allowed.includes(k));
+  if (extra.length > 0) {
+    throw new Error(
+      `Config '${name}': endpoint has field(s) ${extra.map(k => `'${k}'`).join(', ')} that the ${formLabel} form does not take. ` +
+      `Allowed: ${allowed.map(k => `'${k}'`).join(', ')}.`,
+    );
+  }
+}
+
+function requireFields(name, endpoint, fields) {
+  for (const field of fields) {
+    if (!endpoint[field]) {
+      throw new Error(`Config '${name}': missing required field 'endpoint.${field}'.`);
+    }
+  }
+}
+
+// [LAW:single-enforcer] Endpoint validity is owned by the adapter's capability declaration — the same
+// declaration simple mode's provider table is checked against — so both config paths reject
+// identically. Which form was written is a value read off the block, not a mode the caller picks.
+// [LAW:dataflow-not-control-flow]
+function validateEndpoint(name, engine, endpoint, capabilities) {
+  const supports = (what, value, allowed) => {
+    if (!allowed.includes(value)) {
+      throw new Error(
+        `Config '${name}': ${what} '${value}' is not supported by engine '${engine}'. Allowed: ${allowed.join(', ')}.`,
+      );
+    }
+  };
+
+  if (endpoint.preset !== undefined) {
+    rejectForeignKeys(name, endpoint, PRESET_FIELDS, 'preset');
+    requireFields(name, endpoint, PRESET_FIELDS);
+    const preset = PRESETS[endpoint.preset];
+    if (!preset) {
+      throw new Error(
+        `Config '${name}': endpoint.preset '${endpoint.preset}' is not a known preset. Defined: ${Object.keys(PRESETS).join(', ')}.`,
+      );
+    }
+    supports('endpoint.apiType', preset.apiType, capabilities.apiTypes);
+    supports('the credential kind', preset.credentialKind, capabilities.credentialKinds);
+    return;
+  }
+
+  rejectForeignKeys(name, endpoint, MANUAL_FIELDS, 'manual');
+  requireFields(name, endpoint, MANUAL_FIELDS);
+  supports('endpoint.apiType', endpoint.apiType, capabilities.apiTypes);
+  // The manual form is api-key by construction — it has no field that could say otherwise — so the
+  // engine must support api-key to be reachable this way at all. An engine that only ever took a
+  // subscription credential would be configurable solely through a preset, which is the intent.
+  supports('the credential kind', 'api-key', capabilities.credentialKinds);
+}
 
 // [LAW:effects-at-boundaries] Pure: validates raw parsed YAML against the adapter
 // registry. Throws with a message naming the config, field, and allowed values.
@@ -30528,15 +30596,10 @@ function validateFile(raw, registry) {
       throw new Error(`Config '${name}': ${e.message}`);
     }
 
-    if (!entry.endpoint || !entry.endpoint.kind) {
-      throw new Error(`Config '${name}': missing required field 'endpoint.kind'.`);
+    if (!entry.endpoint || typeof entry.endpoint !== 'object') {
+      throw new Error(`Config '${name}': missing required field 'endpoint'.`);
     }
-
-    if (!adapter.capabilities.endpointKinds.includes(entry.endpoint.kind)) {
-      throw new Error(
-        `Config '${name}': endpoint.kind '${entry.endpoint.kind}' is not supported by engine '${entry.engine}'. Allowed: ${adapter.capabilities.endpointKinds.join(', ')}.`,
-      );
-    }
+    validateEndpoint(name, entry.engine, entry.endpoint, adapter.capabilities);
 
     if (entry.reasoning !== undefined && entry.reasoning !== null) {
       if (adapter.capabilities.reasoningEfforts.length === 0) {
@@ -30551,40 +30614,6 @@ function validateFile(raw, registry) {
       }
     }
 
-    const auth = entry.endpoint.auth;
-    const allowedMethods = adapter.capabilities.authMethods;
-    if (!auth || typeof auth !== 'object' || !auth.method) {
-      throw new Error(
-        `Config '${name}': missing required field 'endpoint.auth.method'. Allowed for engine '${entry.engine}': ${allowedMethods.join(', ')}.`,
-      );
-    }
-
-    // [LAW:single-enforcer] Auth validity is owned by the adapter's capability declaration — the same
-    // source simple mode's provider table is tested against — so both config paths reject identically.
-    if (!allowedMethods.includes(auth.method)) {
-      throw new Error(
-        `Config '${name}': endpoint.auth.method '${auth.method}' is not supported by engine '${entry.engine}'. Allowed: ${allowedMethods.join(', ')}.`,
-      );
-    }
-
-    const authFields = AUTH_FIELDS[auth.method];
-    for (const field of authFields) {
-      if (!auth[field]) {
-        throw new Error(
-          `Config '${name}': missing required field 'endpoint.auth.${field}' (required by auth method '${auth.method}').`,
-        );
-      }
-    }
-
-    // [LAW:no-silent-failure] A field the variant does not have is an ERROR, not something quietly
-    // ignored: a `baseUrl` written under a subscription auth is someone believing they redirected the
-    // endpoint, and silently dropping it would leave that belief intact and wrong.
-    const extra = Object.keys(auth).filter(k => k !== 'method' && !authFields.includes(k));
-    if (extra.length > 0) {
-      throw new Error(
-        `Config '${name}': endpoint.auth has field(s) ${extra.map(k => `'${k}'`).join(', ')} that auth method '${auth.method}' does not take. Allowed: ${authFields.map(k => `'${k}'`).join(', ')}.`,
-      );
-    }
   }
 
   if (!raw.default) {
@@ -30611,6 +30640,16 @@ function validateFile(raw, registry) {
   }
 }
 
+// The manual form IS a preset written inline: always api-key, base URL exactly as given. Saying so
+// — rather than branching on the form downstream — is what lets ONE resolveEndpoint serve both, and
+// is why the manual form can never produce an oauth credential: this is the only place it could come
+// from, and it is hardcoded. [LAW:types-are-the-program]
+function presetFor(endpoint) {
+  return endpoint.preset !== undefined
+    ? PRESETS[endpoint.preset]
+    : { apiType: endpoint.apiType, baseUrl: endpoint.baseUrl, credentialKind: 'api-key' };
+}
+
 // [LAW:dataflow-not-control-flow] Chain is a value: [selected, ...fallback minus selected].
 // Pure: no env reads, no side effects.
 function resolveChain(raw, selectedName) {
@@ -30619,20 +30658,18 @@ function resolveChain(raw, selectedName) {
   const names = [chosen, ...fallback.filter(n => n !== chosen)];
   return names.map(name => {
     const entry = raw.configs[name];
-    // [LAW:one-source-of-truth] Copy exactly the fields the variant declares — never a spread of the
-    // raw block — so the resolved value carries the same shape validation just proved, and a stray
-    // key in the file can never ride along into a spawn spec.
-    const rawAuth = entry.endpoint.auth;
-    const auth = { method: rawAuth.method };
-    for (const field of AUTH_FIELDS[rawAuth.method]) auth[field] = rawAuth[field];
+    // [LAW:one-source-of-truth] Both forms produce their endpoint through the ONE resolveEndpoint, so
+    // a preset endpoint and a manual endpoint cannot drift in shape. Fields are read by name, never
+    // spread from the raw block, so a stray key can never ride along into a spawn spec.
+    const { apiType, baseUrl, credential } = resolveEndpoint(presetFor(entry.endpoint), {});
     const config = {
       name,
       engine: entry.engine,
       model: entry.model || '',
-      endpoint: {
-        kind: entry.endpoint.kind,
-        auth,
-      },
+      // Pre-resolution the credential carries its env var NAME; resolveSecrets swaps env → value.
+      // The kind travels with it from the first moment, so nothing downstream has to re-derive
+      // how dangerous this credential is.
+      endpoint: { apiType, baseUrl, credential: { kind: credential.kind, env: entry.endpoint.credentialEnv } },
     };
     if (entry.reasoning !== undefined && entry.reasoning !== null) {
       config.reasoning = entry.reasoning;
@@ -30642,22 +30679,23 @@ function resolveChain(raw, selectedName) {
 }
 
 // [LAW:effects-at-boundaries] Reads env (external state) but accepts it as a value for
-// isolation. Throws if any credentialEnv in the chain is absent or empty so startup fails
+// isolation. Throws if any credential env var in the chain is absent or empty so startup fails
 // fast rather than at failover time. [LAW:no-silent-failure]
-// [LAW:one-type-per-behavior] ONE swap covers every auth variant, because every variant names its
-// credential the same way — resolution is `credentialEnv → credential` and nothing else, so a new
-// variant is resolved correctly the day it is added, with no second code path to remember.
+// [LAW:one-type-per-behavior] ONE swap serves every auth mechanism: `env → value` inside the
+// credential, leaving its `kind` untouched. There is no per-mechanism code path here, so a mechanism
+// added later resolves correctly the day it is added — and, because the kind rides along rather than
+// being re-derived downstream, nothing later has to guess how dangerous this credential is.
 function resolveSecrets(chain, env) {
   return chain.map(config => {
-    const { credentialEnv, ...auth } = config.endpoint.auth;
-    const credential = env[credentialEnv];
-    if (!credential) {
+    const { kind, env: credentialEnv } = config.endpoint.credential;
+    const value = env[credentialEnv];
+    if (!value) {
       throw new Error(
         `Config '${config.name}': env var '${credentialEnv}' is not set or empty. ` +
         'Ensure the workflow maps a secret to this variable.',
       );
     }
-    return { ...config, endpoint: { ...config.endpoint, auth: { ...auth, credential } } };
+    return { ...config, endpoint: { ...config.endpoint, credential: { kind, value } } };
   });
 }
 
@@ -30715,7 +30753,7 @@ function peekConfigNames(filePath) {
   return { configNames, defaultName };
 }
 
-module.exports = { loadConfig, validateFile, resolveChain, resolveSecrets, peekConfigNames, AUTH_FIELDS };
+module.exports = { loadConfig, validateFile, resolveChain, resolveSecrets, peekConfigNames };
 
 
 /***/ }),
@@ -32049,36 +32087,44 @@ function materializeHome({ instructionsPath }) {
   return home;
 }
 
-// [LAW:dataflow-not-control-flow] The credential's DELIVERY MECHANISM is a value, not a branch: each
-// auth method maps to the env fragment that carries it, and buildCommand splices whichever fragment it
-// is handed without ever asking which one. A new method is one entry here and no new structure.
+// [LAW:dataflow-not-control-flow] The credential's DELIVERY CHANNEL is a value, not a branch: each
+// credential kind maps to the env fragment that carries it, and buildCommand splices whichever
+// fragment it is handed without ever asking which one. A new kind is one entry here, no new structure.
+// Keyed by the credential's KIND rather than by endpoint or provider, because that is the only thing
+// that decides the channel — an API key and an OAuth token speak the same wire protocol to the same
+// Messages API and differ solely in which env var the CLI reads them from.
 //
 // [LAW:types-are-the-program] The fragments are DISJOINT, and that is load-bearing rather than tidy.
 // The CLI's auth precedence is cloud-provider creds > ANTHROPIC_AUTH_TOKEN > ANTHROPIC_API_KEY >
 // apiKeyHelper > CLAUDE_CODE_OAUTH_TOKEN, and the first two win SILENTLY in non-interactive mode — so
 // a run that set both would quietly bill the API key while the operator believed the subscription paid
-// for it, with no error anywhere to notice. Making each method produce only its own vars means that
+// for it, with no error anywhere to notice. Making each kind produce only its own vars means that
 // state cannot be constructed. The explicit env allowlist below is the other half: no ambient
 // ANTHROPIC_API_KEY on the runner can reach the child and outrank the OAuth token either.
 const AUTH_ENV = {
-  'api-key': auth => ({ ANTHROPIC_AUTH_TOKEN: auth.credential, ANTHROPIC_BASE_URL: auth.baseUrl }),
-  // A subscription token IS Anthropic's own endpoint — there is no base URL to set, and setting one
-  // would be the "subscription token pointed at z.ai" state the auth union exists to delete.
-  subscription: auth => ({ CLAUDE_CODE_OAUTH_TOKEN: auth.credential }),
+  'api-key': ({ baseUrl, credential }) => ({
+    ANTHROPIC_AUTH_TOKEN: credential.value,
+    ANTHROPIC_BASE_URL: baseUrl,
+  }),
+  // No ANTHROPIC_BASE_URL: an OAuth credential is only reachable through a preset whose baseUrl is
+  // PINNED in code (src/provider.js), and that host is already the CLI's own default. Setting it would
+  // add a second, mutable path to a value the security model deliberately fixes.
+  oauth: ({ credential }) => ({ CLAUDE_CODE_OAUTH_TOKEN: credential.value }),
 };
 
 // [LAW:no-silent-failure] An unmapped method must never spawn an engine carrying NO credential — that
 // surfaces as an opaque 401 deep inside the CLI, minutes and one full prompt later. Config validation
 // rejects unknown methods upstream against the adapter's capability declaration; this names the gap
 // loudly if the enumeration and this map ever drift apart.
-function authEnv(auth) {
-  const fragment = AUTH_ENV[auth.method];
+function authEnv(endpoint) {
+  const fragment = AUTH_ENV[endpoint.credential.kind];
   if (!fragment) {
     throw new Error(
-      `claude-code: no auth env mapping for method '${auth.method}'. Known methods: ${Object.keys(AUTH_ENV).join(', ')}.`,
+      `claude-code: no auth env mapping for credential kind '${endpoint.credential.kind}'. ` +
+      `Known kinds: ${Object.keys(AUTH_ENV).join(', ')}.`,
     );
   }
-  return fragment(auth);
+  return fragment(endpoint);
 }
 
 // [LAW:effects-at-boundaries] Pure: returns a full spawn spec from a validated ReviewConfig.
@@ -32140,7 +32186,7 @@ function buildCommand({ config, collector, home }) {
     TMPDIR: process.env.TMPDIR,
     npm_config_cache: process.env.npm_config_cache,
     HOME: home,
-    ...authEnv(config.endpoint.auth),
+    ...authEnv(config.endpoint),
     ANTHROPIC_MODEL: config.model,
     API_TIMEOUT_MS: String(CLAUDE_TIMEOUT_MS),
     CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1',
@@ -32256,11 +32302,11 @@ const claudeCodeAdapter = makeCliAdapter({
     // for config validation in src/config.js (T4). Illegal combos are rejected at load
     // time via these declarations, never discovered at spawn time.
     reasoningEfforts: CLAUDE_REASONING_EFFORTS,
-    endpointKinds: ['anthropic-messages'],
-    // [LAW:one-source-of-truth] Derived from AUTH_ENV rather than restated: the methods this engine
-    // ADVERTISES are exactly the methods it can actually translate into a credential channel, so
-    // declaring one it cannot spawn is not a mistake that can be made.
-    authMethods: Object.keys(AUTH_ENV),
+    apiTypes: ['anthropic-messages'],
+    // [LAW:one-source-of-truth] Derived from AUTH_ENV rather than restated: the credential kinds this
+    // engine ADVERTISES are exactly the ones it can actually translate into a channel, so declaring
+    // one it cannot spawn is not a mistake that can be made.
+    credentialKinds: Object.keys(AUTH_ENV),
   },
   // [LAW:one-source-of-truth] Reference TOOL_NAMES — do not redeclare the strings here.
   toolNames: TOOL_NAMES,
@@ -32489,7 +32535,7 @@ function buildConfigToml(config, collectorSpawn) {
     '',
     `[model_providers.${INTERNAL_PROVIDER}]`,
     `name = ${q(INTERNAL_PROVIDER)}`,
-    `base_url = ${q(config.endpoint.auth.baseUrl)}`,
+    `base_url = ${q(config.endpoint.baseUrl)}`,
     // Explicitly opt the custom provider into OpenAI API-key auth so Codex uses the
     // auth.json credential, rather than relying on implicit fallback. [LAW:types-are-the-program]
     `requires_openai_auth = true`,
@@ -32518,7 +32564,7 @@ function materializeHome({ config, instructionsPath, collector }) {
   // The key name is Codex's fixed API-key slot, independent of the config's credentialEnv.
   fs.writeFileSync(
     path.join(home, 'auth.json'),
-    JSON.stringify({ OPENAI_API_KEY: config.endpoint.auth.credential }),
+    JSON.stringify({ OPENAI_API_KEY: config.endpoint.credential.value }),
     'utf8',
   );
 
@@ -32631,10 +32677,10 @@ const codexAdapter = makeCliAdapter({
     // for config validation in src/config.js. Illegal combos (e.g. anthropic-messages
     // endpoint with codex) are rejected at load time, never discovered at spawn time.
     reasoningEfforts: CODEX_REASONING_EFFORTS,
-    endpointKinds: ['openai-responses'],
-    // Codex authenticates only by API key (auth.json). A Claude subscription token is meaningless
+    apiTypes: ['openai-responses'],
+    // Codex authenticates only by API key (auth.json). An OAuth/subscription credential is meaningless
     // here, so config validation rejects it at load time rather than writing an unusable auth.json.
-    authMethods: ['api-key'],
+    credentialKinds: ['api-key'],
   },
   toolNames: TOOL_NAMES,
   materializeHome,
@@ -32730,8 +32776,8 @@ function buildOpencodeConfig(config, collectorSpawn, agentsPath) {
     provider: {
       [providerId]: {
         options: {
-          baseURL: config.endpoint.auth.baseUrl,
-          apiKey: config.endpoint.auth.credential,
+          baseURL: config.endpoint.baseUrl,
+          apiKey: config.endpoint.credential.value,
         },
       },
     },
@@ -32900,10 +32946,10 @@ const opencodeAdapter = makeCliAdapter({
     // an opencode config is rejected at load — never silently ignored. [LAW:no-silent-failure]
     reasoningEfforts: [],
     // The OpenAI/Anthropic-compatible provider protocols OpenCode can front via an endpoint override.
-    endpointKinds: ['openai-chat', 'openai-responses', 'anthropic-messages'],
-    // OpenCode authenticates a provider override by baseURL + apiKey; it has no channel for a Claude
-    // subscription token, so that method is rejected at load rather than written into opencode.json.
-    authMethods: ['api-key'],
+    apiTypes: ['openai-chat', 'openai-responses', 'anthropic-messages'],
+    // OpenCode authenticates a provider override by baseURL + apiKey; it has no channel for an OAuth
+    // credential, so that kind is rejected at load rather than written into opencode.json.
+    credentialKinds: ['api-key'],
   },
   // [LAW:one-source-of-truth] Reference TOOL_NAMES — do not redeclare the strings here.
   toolNames: TOOL_NAMES,
@@ -34246,13 +34292,13 @@ function classifyProbe({ status, networkError }) {
 // would reject a perfectly working subscription before the engine ever spawned — the exact false
 // failure this function's contract exists to avoid.
 function probeRequest(endpoint, model) {
-  if (endpoint.kind === 'anthropic-messages' && endpoint.auth.method === 'api-key') {
+  if (endpoint.apiType === 'anthropic-messages' && endpoint.credential.kind === 'api-key') {
     return {
-      url: `${endpoint.auth.baseUrl.replace(/\/+$/, '')}/v1/messages`,
+      url: `${endpoint.baseUrl.replace(/\/+$/, '')}/v1/messages`,
       init: {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${endpoint.auth.credential}`,
+          Authorization: `Bearer ${endpoint.credential.value}`,
           'anthropic-version': '2023-06-01',
           'content-type': 'application/json',
         },
@@ -34274,7 +34320,7 @@ async function probeConfig(config, fetchImpl = fetch) {
       skipped: true,
       // Name BOTH axes: 'anthropic-messages' alone IS probed under api-key auth, so reporting only the
       // kind would read as a contradiction to anyone who has seen the probe run. [LAW:no-silent-failure]
-      hint: `no preflight probe is implemented for endpoint kind '${config.endpoint.kind}' with auth method '${config.endpoint.auth.method}'`,
+      hint: `no preflight probe is implemented for apiType '${config.endpoint.apiType}' with credential kind '${config.endpoint.credential.kind}'`,
     };
   }
   const controller = new AbortController();
@@ -34799,71 +34845,118 @@ const DEEPSEEK_ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic';
 // a morning is worse than one that keeps running. Consumers override with the CLAUDE_MODEL input.
 const CLAUDE_SUBSCRIPTION_DEFAULT_MODEL = 'claude-sonnet-5';
 
+// Anthropic's own API — the only host a Claude Pro/Max subscription token is valid against.
+const ANTHROPIC_BASE_URL = 'https://api.anthropic.com';
+
+// ─── PRESETS: the known-good endpoint shapes, and the security boundary ──────────────────────
+//
+// [LAW:types-are-the-program] A resolved endpoint is three facts and no optional halves:
+//   { apiType, baseUrl, credential: { kind, value } }
+// Every endpoint has all three. There is no "subscription has no baseUrl" special case — a
+// subscription's baseUrl is simply Anthropic's, and a future non-Anthropic subscription names its own.
+//
+// THE SECURITY INVARIANT THIS TABLE CARRIES. An OAuth/subscription credential is long-lived and
+// broadly scoped — its blast radius dwarfs a per-service API key — so it must only ever be sent to
+// the host it was minted for. A row expresses that by which base-URL field it has, and the two are
+// mutually exclusive by construction:
+//
+//   baseUrl        PINNED     — no input and no config file can move it. REQUIRED for oauth.
+//   defaultBaseUrl OVERRIDABLE — an input or config file may replace it. api-key ONLY.
+//
+// So a row that pins cannot also offer an override (the field is absent), and a row that offers an
+// override cannot carry oauth (assertPresetsSafe below refuses it at module load, and a test asserts
+// the same over the table). The consequence is the property that matters: **no misconfiguration can
+// point a subscription token at an arbitrary host** — reaching that state requires adding a row here,
+// which is a reviewed code change, not a YAML typo. [LAW:no-silent-failure]
+const PRESETS = {
+  openai: { apiType: 'openai-responses', defaultBaseUrl: OPENAI_RESPONSES_BASE_URL, credentialKind: 'api-key' },
+  zai: { apiType: 'anthropic-messages', defaultBaseUrl: ZAI_ANTHROPIC_BASE_URL, credentialKind: 'api-key' },
+  deepseek: { apiType: 'anthropic-messages', defaultBaseUrl: DEEPSEEK_ANTHROPIC_BASE_URL, credentialKind: 'api-key' },
+  // Pinned + oauth. Deliberately a preset of its own rather than an "anthropic" preset with a token
+  // flavour: an api-key Anthropic endpoint would share this host and apiType and differ ONLY in
+  // credential kind, and keeping them separate rows with separate credential inputs is what stops a
+  // key meant for one from ever being read as the other.
+  'claude-subscription': { apiType: 'anthropic-messages', baseUrl: ANTHROPIC_BASE_URL, credentialKind: 'oauth' },
+};
+
+// [LAW:single-enforcer] The invariant is checked once, at module load, over the static table — not
+// re-derived per run (that would be a defensive guard on a constant) and not left to CI alone, so an
+// unsafe row cannot ship even if the test is deleted. A pinned row is identified by HAVING baseUrl.
+function assertPresetsSafe(presets) {
+  for (const [name, p] of Object.entries(presets)) {
+    const pinned = 'baseUrl' in p;
+    const overridable = 'defaultBaseUrl' in p;
+    if (pinned === overridable) {
+      throw new Error(`Preset '${name}': must declare exactly one of 'baseUrl' (pinned) or 'defaultBaseUrl' (overridable).`);
+    }
+    if (p.credentialKind === 'oauth' && !pinned) {
+      throw new Error(
+        `Preset '${name}': an 'oauth' credential requires a PINNED 'baseUrl'. An overridable base URL would let a ` +
+        'misconfiguration send a long-lived subscription token to an arbitrary host.',
+      );
+    }
+  }
+  return presets;
+}
+assertPresetsSafe(PRESETS);
+
 // [LAW:dataflow-not-control-flow] The provider is an explicit value, never inferred from
 // which credential happens to be set. [LAW:single-enforcer] This module is the one place
 // that turns the simple-mode (no CONFIG_FILE) action inputs into a typed ReviewConfig.
 //
-// [LAW:one-source-of-truth] Each provider spec names its engine, endpoint, auth method, credential
+// [LAW:one-source-of-truth] Each provider spec names its engine, its endpoint PRESET, credential
 // input, default model, and how to pull its fields from the flat action-input bag. Adding a provider
 // is one entry here — every consumer (validation, error messages, config synthesis) derives
 // from this table, so none of them branches on a hardcoded provider name.
+//
+// Each provider has its OWN credential input. That is the other half of the security invariant: the
+// PROVIDER value alone selects the row, credential presence never steers it, so a DeepSeek key can
+// never be read into the subscription's slot nor a subscription token into DeepSeek's.
 const PROVIDERS = {
   codex: {
     engine: 'codex',
-    endpointKind: 'openai-responses',
-    authMethod: 'api-key',
-    defaultBaseUrl: OPENAI_RESPONSES_BASE_URL,
+    preset: 'openai',
     credentialInput: 'OPENAI_API_KEY',
     defaultModel: 'gpt-5.4-mini',
     fields: i => ({ credential: i.openaiApiKey, model: i.openaiModel, reasoning: i.openaiReasoning, baseUrl: i.openaiBaseUrl }),
   },
   zai: {
     engine: 'claude-code',
-    endpointKind: 'anthropic-messages',
-    authMethod: 'api-key',
-    defaultBaseUrl: ZAI_ANTHROPIC_BASE_URL,
+    preset: 'zai',
     credentialInput: 'ZAI_API_KEY',
     defaultModel: 'glm-5.1',
     fields: i => ({ credential: i.zaiApiKey, model: i.zaiModel, systemPrompt: i.zaiSystemPrompt, baseUrl: i.zaiBaseUrl }),
   },
   deepseek: {
     engine: 'claude-code',
-    endpointKind: 'anthropic-messages',
-    authMethod: 'api-key',
-    defaultBaseUrl: DEEPSEEK_ANTHROPIC_BASE_URL,
+    preset: 'deepseek',
     credentialInput: 'DEEPSEEK_API_KEY',
     defaultModel: 'deepseek-v4-pro',
     fields: i => ({ credential: i.deepseekApiKey, model: i.deepseekModel, systemPrompt: i.deepseekSystemPrompt, baseUrl: i.deepseekBaseUrl }),
   },
-  // Claude Pro/Max subscription: the same claude-code engine as zai/deepseek, reached through a
-  // different credential channel rather than a different endpoint. The row carries NO defaultBaseUrl
-  // and reads NO base-URL input — a subscription token is only ever valid against Anthropic's own API,
-  // and offering a URL knob "for flexibility" would re-admit exactly the state the auth union deletes.
+  // Claude Pro/Max subscription: the same claude-code engine as zai/deepseek, reached with a
+  // long-lived OAuth token instead of an API key. `fields` reads NO base-URL input — there is no
+  // CLAUDE_BASE_URL for it to read — so the preset's pinned host stands.
   'claude-subscription': {
     engine: 'claude-code',
-    endpointKind: 'anthropic-messages',
-    authMethod: 'subscription',
+    preset: 'claude-subscription',
     credentialInput: 'CLAUDE_CODE_OAUTH_TOKEN',
     defaultModel: CLAUDE_SUBSCRIPTION_DEFAULT_MODEL,
     fields: i => ({ credential: i.claudeCodeOauthToken, model: i.claudeModel }),
   },
 };
 
-// [LAW:dataflow-not-control-flow] The auth method is a value that SELECTS a builder, not a branch
-// inside the synthesizer. Each builder produces only its own variant's fields, which is what keeps
-// `baseUrl` off the subscription value — an api-key endpoint and a subscription endpoint are two
-// shapes, not one shape with optional halves. [LAW:types-are-the-program]
-const AUTH_FROM_INPUTS = {
-  'api-key': (spec, f) => ({
-    method: 'api-key',
-    baseUrl: f.baseUrl || spec.defaultBaseUrl,
-    credential: f.credential,
-  }),
-  subscription: (_spec, f) => ({
-    method: 'subscription',
-    credential: f.credential,
-  }),
-};
+// [LAW:dataflow-not-control-flow] Resolve a preset plus the caller's overrides into the one endpoint
+// shape. A pinned preset ignores no input — it is handed none, because `fields` on a pinned row reads
+// no base URL. The `??` chain therefore has exactly one live source per row, never a silent priority
+// contest between a pin and an override.
+function resolveEndpoint(preset, { baseUrl, credential }) {
+  return {
+    apiType: preset.apiType,
+    baseUrl: preset.baseUrl ?? baseUrl ?? preset.defaultBaseUrl,
+    credential: { kind: preset.credentialKind, value: credential },
+  };
+}
 
 // [LAW:one-type-per-behavior] 'auto' has no behavior of its own — it forwards to whichever
 // concrete provider every client should currently use, so the maintainer can retarget all
@@ -34874,7 +34967,8 @@ const AUTH_FROM_INPUTS = {
 // money. A subscription review costs plan quota instead. A repo that supplies only DEEPSEEK_API_KEY
 // now fails at startup naming CLAUDE_CODE_OAUTH_TOKEN: loudly, before any spend, never by silently
 // falling back to a paid provider. That loud failure is exactly what makes retargeting every consumer
-// from one line safe to do. [LAW:no-silent-failure]
+// from one line safe to do. [LAW:no-silent-failure] The installer provisions both secrets, so a
+// workflow it wrote carries whichever credential 'auto' currently resolves to.
 const PROVIDER_ALIASES = { auto: 'claude-subscription' };
 
 // Every accepted PROVIDER input value: the concrete providers plus the aliases. The order
@@ -34916,10 +35010,7 @@ function synthesizeProviderConfig(inputs, reg) {
     name: requested === provider ? `${provider}-default` : `${requested}→${provider}`,
     engine: spec.engine,
     model: f.model || spec.defaultModel,
-    endpoint: {
-      kind: spec.endpointKind,
-      auth: AUTH_FROM_INPUTS[spec.authMethod](spec, f),
-    },
+    endpoint: resolveEndpoint(PRESETS[spec.preset], f),
   };
 
   if (f.reasoning) {
@@ -34943,7 +35034,18 @@ function synthesizeProviderConfig(inputs, reg) {
   return config;
 }
 
-module.exports = { synthesizeProviderConfig, PROVIDERS, PROVIDER_ALIASES, PROVIDER_NAMES, AUTH_FROM_INPUTS };
+module.exports = {
+  synthesizeProviderConfig,
+  PROVIDERS,
+  PROVIDER_ALIASES,
+  PROVIDER_NAMES,
+  // PRESETS + resolveEndpoint are shared with the config-file path (src/config.js): a config file's
+  // `preset:` form resolves through the SAME table, so the pinned-host guarantee cannot be bypassed
+  // by writing YAML instead of setting an input. [LAW:single-enforcer]
+  PRESETS,
+  resolveEndpoint,
+  assertPresetsSafe,
+};
 
 
 /***/ }),
@@ -35374,7 +35476,7 @@ function buildConfigChain(selection) {
     // [LAW:one-type-per-behavior] Every auth variant names its credential the same, so masking is one
     // read that covers all of them — a variant added later is masked by construction rather than by
     // someone remembering to extend a per-variant switch. [LAW:no-silent-failure]
-    chain.forEach(c => core.setSecret(c.endpoint.auth.credential));
+    chain.forEach(c => core.setSecret(c.endpoint.credential.value));
     return chain;
   }
 
@@ -35399,12 +35501,12 @@ function buildConfigChain(selection) {
     claudeCodeOauthToken: core.getInput('CLAUDE_CODE_OAUTH_TOKEN'),
     claudeModel: core.getInput('CLAUDE_MODEL'),
   });
-  core.setSecret(config.endpoint.auth.credential);
+  core.setSecret(config.endpoint.credential.value);
   core.info(
     `Using provider '${config.name}' (engine: ${config.engine}, model: ${config.model}, ` +
     // The auth method is operator news: it is how a run log answers "did this actually bill the
     // subscription, or did it quietly fall back to a paid key?" [LAW:no-silent-failure]
-    `auth: ${config.endpoint.auth.method}).`,
+    `auth: ${config.endpoint.credential.kind}).`,
   );
   return [config];
 }
@@ -36492,14 +36594,12 @@ function computeCostUsd({ inputTokens, outputTokens, cachedInputTokens = 0 }, mo
 // impostors: default to "not Anthropic" so every foreign endpoint is excluded by construction, not
 // one vendor at a time. An absent baseUrl means Claude Code's built-in default — Anthropic's own API.
 function isAnthropicEndpoint(config) {
-  const auth = (config.endpoint && config.endpoint.auth) || {};
-  // [LAW:types-are-the-program] A subscription token is minted against Anthropic and the variant
-  // carries no baseUrl to point elsewhere, so this question is answered by the type rather than by
-  // parsing a hostname. The sniff below exists only for the api-key variant, where a base URL exists
-  // and may belong to an Anthropic-COMPATIBLE vendor whose bill is not Anthropic's.
-  if (auth.method === 'subscription') return true;
-  const baseUrl = auth.baseUrl;
-  if (!baseUrl) return true;
+  // Every endpoint now carries a real baseUrl — an OAuth credential's is PINNED in the preset table
+  // rather than absent — so this is a plain hostname whitelist with no special case for a missing URL
+  // and none for a subscription. A pinned Anthropic host simply passes the same check every other
+  // endpoint takes. [LAW:one-type-per-behavior]
+  const baseUrl = config.endpoint && config.endpoint.baseUrl;
+  if (!baseUrl) return false;
   try {
     // [LAW:types-are-the-program] Match the anthropic.com domain exactly — the apex or a true
     // subdomain — never a bare `endsWith('anthropic.com')`, which a lookalike host like

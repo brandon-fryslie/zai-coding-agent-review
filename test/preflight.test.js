@@ -9,7 +9,7 @@ const anthropicConfig = (name, overrides = {}) => ({
   name,
   engine: 'claude-code',
   model: 'deepseek-v4-pro',
-  endpoint: { kind: 'anthropic-messages', auth: { method: 'api-key', baseUrl: 'https://api.example.com/anthropic', credential: 'k' }, ...overrides },
+  endpoint: { apiType: 'anthropic-messages', baseUrl: 'https://api.example.com/anthropic', credential: { kind: 'api-key', value: 'k' }, ...overrides },
 });
 
 // A fake fetch that yields a fixed status, or throws to simulate a network failure.
@@ -74,7 +74,7 @@ test('probeConfig: a thrown fetch becomes unreachable', async () => {
 test('probeConfig: an unobserved endpoint kind is skipped, never falsely probed', async () => {
   const config = {
     name: 'codex-default', engine: 'codex', model: 'gpt-5.4-mini',
-    endpoint: { kind: 'openai-responses', auth: { method: 'api-key', baseUrl: 'https://api.openai.com/v1', credential: 'k' } },
+    endpoint: { apiType: 'openai-responses', baseUrl: 'https://api.openai.com/v1', credential: { kind: 'api-key', value: 'k' } },
   };
   let called = false;
   const r = await probeConfig(config, async () => { called = true; return { status: 200 }; });
@@ -89,19 +89,19 @@ test('probeConfig: an unobserved endpoint kind is skipped, never falsely probed'
 test('probeConfig: a subscription auth is skipped loudly, never probed with a guessed request', async () => {
   const config = {
     name: 'claude-subscription-default', engine: 'claude-code', model: 'claude-sonnet-5',
-    endpoint: { kind: 'anthropic-messages', auth: { method: 'subscription', credential: 'sk-ant-oat01-x' } },
+    endpoint: { apiType: 'anthropic-messages', baseUrl: 'https://api.anthropic.com', credential: { kind: 'oauth', value: 'sk-ant-oat01-x' } },
   };
   let called = false;
   const r = await probeConfig(config, async () => { called = true; return { status: 401 }; });
   assert.equal(called, false, 'must not hit the network for an unobserved auth method');
   assert.equal(r.skipped, true);
-  assert.match(r.hint, /auth method 'subscription'/);
+  assert.match(r.hint, /credential kind 'oauth'/);
 });
 
 test('preflight: a subscription-only chain stays ok — an unprobed config never blocks the review', async () => {
   const chain = [{
     name: 'claude-subscription-default', engine: 'claude-code', model: 'claude-sonnet-5',
-    endpoint: { kind: 'anthropic-messages', auth: { method: 'subscription', credential: 'k' } },
+    endpoint: { apiType: 'anthropic-messages', baseUrl: 'https://api.anthropic.com', credential: { kind: 'oauth', value: 'k' } },
   }];
   const { ok, results } = await preflight(chain, async () => { throw new Error('must not be called'); });
   assert.equal(ok, true);
@@ -115,7 +115,7 @@ test('preflight: a skipped primary in front of a DEAD probed fallback still pass
   const chain = [
     {
       name: 'claude-subscription-default', engine: 'claude-code', model: 'claude-sonnet-5',
-      endpoint: { kind: 'anthropic-messages', auth: { method: 'subscription', credential: 'k' } },
+      endpoint: { apiType: 'anthropic-messages', baseUrl: 'https://api.anthropic.com', credential: { kind: 'oauth', value: 'k' } },
     },
     anthropicConfig('deepseek-fallback'),
   ];
@@ -152,7 +152,7 @@ test('preflight: chain fails only when every probed config is down', async () =>
 test('preflight: all-skipped chain stays ok (nothing was actually validated)', async () => {
   const chain = [{
     name: 'codex-default', engine: 'codex', model: 'm',
-    endpoint: { kind: 'openai-responses', auth: { method: 'api-key', baseUrl: 'https://x', credential: 'k' } },
+    endpoint: { apiType: 'openai-responses', baseUrl: 'https://x', credential: { kind: 'api-key', value: 'k' } },
   }];
   let called = false;
   const { ok, results } = await preflight(chain, async () => { called = true; return { status: 200 }; });

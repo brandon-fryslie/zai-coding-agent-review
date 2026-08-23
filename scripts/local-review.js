@@ -79,8 +79,8 @@ function parseArgs(argv) {
 // [LAW:dataflow-not-control-flow] How an auth variant READS is one entry per variant, so the report
 // never has to reach for a baseUrl the subscription variant does not carry.
 const AUTH_LABEL = {
-  'api-key': a => `api-key → ${a.baseUrl}`,
-  subscription: () => 'subscription → Anthropic (billed to plan quota, not per token)',
+  'api-key': e => `api-key → ${e.baseUrl}`,
+  oauth: e => `oauth (subscription) → ${e.baseUrl} — billed to plan quota, not per token`,
 };
 
 // [LAW:effects-at-boundaries] Pure: render the report string from values. Highlights the one signal
@@ -89,7 +89,7 @@ function formatReport({ config, mode, files, result, sessions, repo }) {
   const lines = [];
   lines.push('================ local-review report ================');
   lines.push(`config:   ${config.name}  (engine=${config.engine}, model=${config.model})`);
-  lines.push(`endpoint: ${AUTH_LABEL[config.endpoint.auth.method](config.endpoint.auth)}`);
+  lines.push(`endpoint: ${AUTH_LABEL[config.endpoint.credential.kind](config.endpoint)}`);
   lines.push(`mode:     ${mode}${mode === 'pr' ? `  (${files.length} changed file(s))` : ''}`);
   lines.push('');
 
