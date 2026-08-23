@@ -37169,9 +37169,10 @@ function roundCapNotice(message, latestArtifact) {
 //
 // The channel is a COMMENT review, the same one the reviewer already uses to say "✅ Approved" when it
 // holds no approval token. A skip has strictly more standing to speak than that does. The three shapes
-// the ticket ruled out are ruled out here too: the run still exits 0 (failing it would break a required
-// check over a deliberate cost control), the event is never REQUEST_CHANGES (nothing was reviewed, so
-// there is no finding to justify one), and there is no input to turn this on.
+// the ticket ruled out are ruled out here too: being SKIPPED still exits 0 (failing that would break a
+// required check over a deliberate cost control), the event is never REQUEST_CHANGES (nothing was
+// reviewed, so there is no finding to justify one), and there is no input to turn this on. Being unable
+// to SAY SO is a different fact and is not covered by that first clause — see the severity below.
 //
 // [LAW:no-silent-failure] Announcing is best-effort but never quiet, and how loudly a REFUSED post
 // speaks rides on the notice like everything else that differs between these two paths — a round cap
