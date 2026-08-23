@@ -53,6 +53,20 @@ test('parseArgs rejects bad input loudly', () => {
   assert.throws(() => parseArgs(['--nope', 'v']), /Unknown option/);
   assert.throws(() => parseArgs(['positional']), /Unexpected argument/);
   assert.throws(() => parseArgs(['--provider']), /requires a value/);
+  // [LAW:no-silent-failure] The subscription provider's host is pinned, so --base-url has nothing to
+  // act on. Accepting the flag and dropping it would leave the operator believing they had redirected
+  // an endpoint they had not.
+  assert.throws(
+    () => parseArgs(['--provider', 'claude-subscription', '--base-url', 'http://x']),
+    /--base-url does not apply to --provider claude-subscription/,
+  );
+});
+
+test('parseArgs still accepts --base-url for the api-key providers it applies to', () => {
+  for (const provider of ['deepseek', 'zai', 'codex']) {
+    const o = parseArgs(['--provider', provider, '--base-url', 'http://gw.example']);
+    assert.equal(o.baseUrl, 'http://gw.example', `--base-url must work for '${provider}'`);
+  }
 });
 
 test('formatReport surfaces the explore verdict, beyond-diff reads, findings, and cost', () => {
@@ -76,4 +90,29 @@ test('formatReport surfaces the explore verdict, beyond-diff reads, findings, an
   assert.doesNotMatch(report, /beyond diff:\s+src\/engine\/run\.js, src\/run\.js/); // changed file is NOT beyond
   assert.match(report, /src\/run\.js:52/);
   assert.match(report, /\$0\.0123 est\./);
+  assert.match(report, /endpoint: api-key → https:\/\/x\/anthropic/);
+});
+
+// Each credential kind gets its own label, so the report cannot reach for a field the other kind
+// carries — and so a subscription run says plainly that its cost is quota, not dollars.
+test('formatReport labels an oauth endpoint as subscription-billed', () => {
+  const report = formatReport({
+    config: {
+      name: 'auto→claude-subscription',
+      engine: 'claude-code',
+      model: 'claude-sonnet-5',
+      endpoint: {
+        apiType: 'anthropic-messages',
+        baseUrl: 'https://api.anthropic.com',
+        credential: { kind: 'oauth', value: 'sk-ant-oat01-x' },
+      },
+    },
+    mode: 'pr',
+    repo: '/repo',
+    files: [{ filename: 'src/run.js' }],
+    result: { findings: [], summary: 'clean', usage: null },
+    sessions: [],
+  });
+  assert.match(report, /endpoint: oauth \(subscription\) → https:\/\/api\.anthropic\.com/);
+  assert.match(report, /billed to plan quota, not per token/);
 });
