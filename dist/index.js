@@ -36549,14 +36549,18 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   const { transport, filteredFiles, excluded } = fetched
     || await fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatterns);
 
-  const patchableFiles = filteredFiles.filter(f => f.patch);
-
-  if (patchableFiles.length === 0) {
-    // [LAW:no-silent-failure] The refusals travel even on the nothing-to-review path — especially here.
-    // "Every changed file was refused" reaches this branch looking exactly like "the PR is empty", and
-    // approving it would be approving a PR nobody looked at.
+  // [LAW:single-enforcer] "reviewable" is defined ONCE, downstream in buildReviewInput, where a changed
+  // file GitHub returned without a patch (too large — roughly >400 changed lines — or binary) is a
+  // first-class review target: read in full at its absolute path, reported at its real line numbers.
+  // This gate holds no second, stricter definition. It rejects only what the engine genuinely cannot
+  // review — an empty changed-file set. Filtering on `f.patch` here APPROVED the exact case the engine
+  // handles, and did so most readily on the largest, riskiest changes.
+  // [LAW:no-silent-failure] The refusals travel even on the nothing-to-review path — especially here.
+  // "Every changed file was refused" reaches this branch looking exactly like "the PR is empty", and
+  // approving it would be approving a PR nobody looked at.
+  if (filteredFiles.length === 0) {
     await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, {
-      summary: 'No patchable changes found after filtering.',
+      summary: 'This pull request changed no reviewable files.',
       findings: [],
       unreviewedScopes: [],
       unreviewableFiles: transport.unreviewable,
@@ -36744,7 +36748,7 @@ async function run() {
   }
 }
 
-module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, MAX_DEPENDENCY_BUMPS_FETCHED };
+module.exports = { run, runPrReview, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, MAX_DEPENDENCY_BUMPS_FETCHED };
 
 
 /***/ }),
@@ -37083,9 +37087,12 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
     // artifact was in EXCLUDE_PATTERNS and there was genuinely nothing to review.
     //
     // Returning the unpatched files as a value hands the decision to the ONE place that can judge it:
-    // runPrReview filters by EXCLUDE_PATTERNS and, finding nothing patchable, submits a clean
-    // "No patchable changes found after filtering." review. Same treatment partitionFindings gives a
-    // mis-anchored finding — reconcile as a value, never abort the whole review over it.
+    // runPrReview REVIEWS them. A changed file with no patch is not unreviewable — buildReviewInput
+    // hands each to the worker as a read-in-full target at its absolute path, and an issue found there
+    // returns as an unanchored finding that still blocks the merge. Only an EMPTY changed set (nothing
+    // changed, or EXCLUDE_PATTERNS matched everything) short-circuits to a posted review with no engine
+    // spawned. Same treatment partitionFindings gives a mis-anchored finding — reconcile as a value,
+    // never abort the whole review over it.
     //
     // The refusals that travel with it are listFiles' own, not the diff's: this arm hands back the
     // listFiles rendering, so it must report exactly that rendering's coverage loss. [FRAMING:representation]

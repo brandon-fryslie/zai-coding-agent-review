@@ -590,14 +590,18 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   const { transport, filteredFiles, excluded } = fetched
     || await fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatterns);
 
-  const patchableFiles = filteredFiles.filter(f => f.patch);
-
-  if (patchableFiles.length === 0) {
-    // [LAW:no-silent-failure] The refusals travel even on the nothing-to-review path — especially here.
-    // "Every changed file was refused" reaches this branch looking exactly like "the PR is empty", and
-    // approving it would be approving a PR nobody looked at.
+  // [LAW:single-enforcer] "reviewable" is defined ONCE, downstream in buildReviewInput, where a changed
+  // file GitHub returned without a patch (too large — roughly >400 changed lines — or binary) is a
+  // first-class review target: read in full at its absolute path, reported at its real line numbers.
+  // This gate holds no second, stricter definition. It rejects only what the engine genuinely cannot
+  // review — an empty changed-file set. Filtering on `f.patch` here APPROVED the exact case the engine
+  // handles, and did so most readily on the largest, riskiest changes.
+  // [LAW:no-silent-failure] The refusals travel even on the nothing-to-review path — especially here.
+  // "Every changed file was refused" reaches this branch looking exactly like "the PR is empty", and
+  // approving it would be approving a PR nobody looked at.
+  if (filteredFiles.length === 0) {
     await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, {
-      summary: 'No patchable changes found after filtering.',
+      summary: 'This pull request changed no reviewable files.',
       findings: [],
       unreviewedScopes: [],
       unreviewableFiles: transport.unreviewable,
@@ -785,4 +789,4 @@ async function run() {
   }
 }
 
-module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, MAX_DEPENDENCY_BUMPS_FETCHED };
+module.exports = { run, runPrReview, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, MAX_DEPENDENCY_BUMPS_FETCHED };
