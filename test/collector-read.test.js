@@ -60,9 +60,9 @@ describe('readCollectedReview — finish gate', () => {
   it('preserves sibling findings across a double finish_review (nothing discarded)', () => {
     // The whole point of the fix: a duplicate finish must not throw away already-recorded findings.
     const p = writeRecords([
-      { type: 'request_change', finding: { path: 'a.js', line: 3, body: 'bug one', severity: 'blocking' } },
+      { type: 'request_change', finding: { path: 'a.js', line: 3, body: 'bug one', severity: 4 } },
       finish('first'),
-      { type: 'request_change', finding: { path: 'b.js', line: 9, body: 'bug two', severity: 'advisory' } },
+      { type: 'request_change', finding: { path: 'b.js', line: 9, body: 'bug two', severity: 3 } },
       finish('second'),
     ]);
     const review = readCollectedReview(p);
@@ -72,7 +72,7 @@ describe('readCollectedReview — finish gate', () => {
 
   it('zero finish entries throw a ProtocolError (recoverable, not a plain Error)', () => {
     const p = writeRecords([
-      { type: 'request_change', finding: { path: 'a.js', line: 1, body: 'orphan', severity: 'advisory' } },
+      { type: 'request_change', finding: { path: 'a.js', line: 1, body: 'orphan', severity: 2 } },
     ]);
     assert.throws(() => readCollectedReview(p), err => err instanceof ProtocolError);
     assert.equal(warnings.length, 0);
@@ -88,7 +88,7 @@ describe('readCollectedReview — dependency assessments', () => {
   it('collects assessment records as typed values alongside findings and the finish', () => {
     const p = writeRecords([
       { type: 'assessment', assessment: { module: 'github.com/a/b', impact: 'adds retries', affected: false, verdict: 'safe' } },
-      { type: 'request_change', finding: { path: 'a.js', line: 3, body: 'bug', severity: 'blocking' } },
+      { type: 'request_change', finding: { path: 'a.js', line: 3, body: 'bug', severity: 4 } },
       finish('done'),
     ]);
     const review = readCollectedReview(p);

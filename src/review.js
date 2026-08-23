@@ -1,5 +1,12 @@
 'use strict';
 
+// [LAW:one-source-of-truth] The legal severity range, spelled ONCE. The enforcing parser below and the
+// collector tool's advertised JSON schema (src/collector-server.js) both derive from these, so the
+// bound the model is told about and the bound the host actually enforces cannot drift apart — a drift
+// that would either reject a value the schema invited or accept one it forbade. [LAW:single-enforcer]
+const SEVERITY_MIN = 1;
+const SEVERITY_MAX = 5;
+
 // [LAW:decomposition] The single per-finding validator: one job — turn one raw record into a typed
 // finding or throw. Both entry points below call it, each supplying the `label` IT knows names the
 // finding's real position (the array index for a batch, the record index for a single finding), so an
@@ -21,15 +28,24 @@ function parseOneFinding(finding, label) {
   if (typeof body !== 'string' || body.trim().length === 0) {
     throw new Error(`${label} has an invalid body.`);
   }
-  // [LAW:types-are-the-program] severity is the discriminator that separates "worth surfacing" from
-  // "worth blocking a merge". Without it those two facts collapse into the model's private judgment and
-  // a non-blocking finding is silently withheld; as a required enum value it rides on the record and
-  // flows to the verdict computation instead. [LAW:no-silent-failure]
+  // [LAW:types-are-the-program] severity is a required integer priority label, 1 (the smallest thing
+  // that must still change — a comment stating a detail the code no longer has) to 5 (ships a defect).
+  // The floor is deliberately NOT "trivia that doesn't matter": every finding is required work, so a
+  // tier defined as harmless would ask the author to change something the review called fine. It is
+  // PRIORITY for the author, never a
+  // gate: the verdict counts findings, not severities — the blocking/advisory tier was deleted
+  // deliberately because the model's non-blocking judgment was not trustworthy, and this label must
+  // never grow back into one.
   const severity = finding.severity;
-  if (severity !== 'blocking' && severity !== 'advisory') {
-    throw new Error(`${label} has an invalid severity (expected 'blocking' or 'advisory').`);
+  if (!Number.isInteger(severity) || severity < SEVERITY_MIN || severity > SEVERITY_MAX) {
+    throw new Error(`${label} has an invalid severity (expected an integer ${SEVERITY_MIN}-${SEVERITY_MAX}).`);
   }
-  return { path: pathValue.trim(), line, body: body.trim(), severity };
+  // [LAW:parse-dont-validate] `path` is stamped single-line HERE, at the one boundary that produces a
+  // finding, so no sink downstream has to remember to flatten it. `body` is deliberately NOT stamped:
+  // it is genuinely block text (an inline PR comment renders paragraphs, and partitionFindings appends
+  // a "\n\n_(Anchored to line N…)_" note), so its line-structured sinks render it through
+  // findingLineText — the one place that flattens a body. [LAW:one-type-per-behavior]
+  return { path: flattenBody(pathValue), line, body: body.trim(), severity };
 }
 
 function parseReviewValue(parsed, context) {
@@ -40,7 +56,11 @@ function parseReviewValue(parsed, context) {
   if (typeof parsed.summary !== 'string' || parsed.summary.trim().length === 0) {
     throw new Error(`${context} must include a non-empty summary.`);
   }
-  const summary = parsed.summary.trim();
+  // [LAW:parse-dont-validate] A spawn's summary is a single-line value in every sink that consumes it —
+  // composeSummary's `**scope** — summary` line, and the scout's summary interpolated as a worker's
+  // structural context. Stamping it here is what makes those sinks safe by construction rather than by
+  // each remembering to flatten a model-authored string. [LAW:single-enforcer]
+  const summary = flattenBody(parsed.summary);
   if (!Array.isArray(parsed.findings)) {
     throw new Error(`${context} must include a findings array.`);
   }
@@ -77,10 +97,16 @@ function parseScopeValue(scope, index) {
   if (typeof focus !== 'string' || focus.trim().length === 0) {
     throw new Error(`Review collector scope ${index + 1} ('${name.trim()}') has an invalid focus.`);
   }
+  // [LAW:parse-dont-validate] name, focus and every file entry are stamped single-line here. All three
+  // reach line-structured sinks — the aggregated summary's scope list, the worker prompt's CONCENTRATE
+  // block (via workerFocusText), the read-targets line — and all three are MODEL-AUTHORED, so an
+  // unstamped one puts attacker-steerable text at column 0 of a prompt, where a continuation line reads
+  // as an instruction rather than as data. Stamping at the single boundary that produces a scope is what
+  // makes every one of those sinks safe without any of them checking. [LAW:single-enforcer]
   const files = Array.isArray(scope.files)
-    ? scope.files.filter(f => typeof f === 'string' && f.trim().length > 0).map(f => f.trim())
+    ? scope.files.filter(f => typeof f === 'string' && f.trim().length > 0).map(f => flattenBody(f))
     : [];
-  return { name: name.trim(), focus: focus.trim(), files };
+  return { name: flattenBody(name), focus: flattenBody(focus), files };
 }
 
 // [LAW:types-are-the-program] A dependency assessment is the same kind of typed, schema-validated
@@ -97,9 +123,8 @@ function parseScopeValue(scope, index) {
 //     affected is true it SHOULD be named; a missing one degrades to an explicit "(call site not named)"
 //     rather than failing the whole review. [LAW:no-defensive-null-guards]
 //   - verdict: the merge-risk call, a closed enum — it owns its glyph and action string at the one render
-//     site, exactly as a finding's severity owns its tag (severityTaggedBody). The verdict is PRESENTATION;
-//     the actual merge gate stays driven by blocking findings, so a lenient verdict can never silently
-//     downgrade a real blocker. [LAW:single-enforcer]
+//     site. The verdict is PRESENTATION; the actual merge gate stays driven by findings (every finding
+//     blocks), so a lenient verdict can never silently downgrade a real blocker. [LAW:single-enforcer]
 const ASSESSMENT_VERDICTS = ['safe', 'review', 'risky'];
 
 function parseAssessmentValue(assessment, index) {
@@ -124,9 +149,14 @@ function parseAssessmentValue(assessment, index) {
   // callSite is a genuine optional: absent/blank collapses to null (no call site to name), a value the
   // renderer handles — never a guard skipping work. [LAW:no-defensive-null-guards]
   const callSite = typeof assessment.callSite === 'string' && assessment.callSite.trim().length > 0
-    ? assessment.callSite.trim()
+    ? flattenBody(assessment.callSite)
     : null;
-  return { module: module.trim(), impact: impact.trim(), affected: assessment.affected, callSite, verdict };
+  // [LAW:parse-dont-validate] module, impact and callSite are stamped single-line here: every one of
+  // them renders as part of a bullet in the posted review's dependency section AND in the worker
+  // prompt's dependency note, both line-structured. dedupeAssessments also keys on `module`, so
+  // stamping it at the boundary keeps one module from splitting into two records over a stray
+  // separator. [LAW:single-enforcer]
+  return { module: flattenBody(module), impact: flattenBody(impact), affected: assessment.affected, callSite, verdict };
 }
 
 // [LAW:one-source-of-truth] "The same assessed module": keyed on the module path alone — a module is
@@ -134,9 +164,8 @@ function parseAssessmentValue(assessment, index) {
 // worker that owns the bumped go.mod (buildReviewInput), so single authorship is the common case; this is
 // the safety net for the multi-go.mod PR (several workers each own a go.mod) and any model over-eagerness.
 //
-// [LAW:one-type-per-behavior] Conflict resolution mirrors dedupeFindings' severity merge, which is the same
-// behavior on the other record kind: two workers assessing one module with different verdicts must not let
-// arrival order (nondeterministic under concurrency — [LAW:no-ambient-temporal-coupling]) pick the winner.
+// [LAW:no-ambient-temporal-coupling] Conflict resolution: two workers assessing one module with different
+// verdicts must not let arrival order (nondeterministic under concurrency) pick the winner.
 // The MORE CAUTIOUS verdict wins — a masked 'safe' over a real 'risky' would mislead the reader even though
 // the merge gate is findings-driven. ASSESSMENT_VERDICTS is ordered by ascending caution, so its index IS
 // the caution rank — no second table to drift. [LAW:one-source-of-truth] First-seen position is preserved
@@ -173,11 +202,18 @@ function normalizeBody(body) {
 // collapse, while any genuine difference in wording keeps two findings apart. Cross-worker paraphrases
 // of one issue surviving as near-duplicates is noise, not loss — the accepted direction to err.
 //
-// [LAW:no-silent-failure] Severity decides the merge gate, so a duplicate must never lose its severity
-// to arrival order: when two members share a key with different severities, the merged finding is
-// 'blocking' if ANY member is — the stronger severity wins, never the one that happened to arrive first.
-// A blocking finding can never be silently downgraded to the advisory that preceded it. First-seen
-// order is preserved (a Map keeps a key's original position when its value is replaced).
+// [LAW:no-silent-failure] Severity is the author's priority signal, so a duplicate must never lose it
+// to arrival order (nondeterministic under concurrent workers — [LAW:no-ambient-temporal-coupling]):
+// when two members share a key, the merged finding carries the HIGHEST severity of the group, never
+// the one that happened to arrive first. First-seen order is preserved (a Map keeps a key's original
+// position when its value is replaced).
+//
+// Which MEMBER survives is a separate preference: a candidate mid-anchoring may carry snappedFromLine
+// (partitionFindings scaffolding — the finding cited a line just outside the diff and was snapped).
+// An exact-anchored member (no snappedFromLine) outranks a snapped one regardless of arrival order,
+// so a finding also recorded exactly on the anchor line is never presented with a stale
+// "referenced line M, just outside the diff" note. Pre-anchor callers (multiscope) carry no
+// snappedFromLine on any member, so for them this preference is vacuously first-seen.
 function dedupeFindings(findings) {
   const byKey = new Map();
   for (const f of findings) {
@@ -185,9 +221,11 @@ function dedupeFindings(findings) {
     const existing = byKey.get(key);
     if (!existing) {
       byKey.set(key, f);
-    } else if (f.severity === 'blocking' && existing.severity !== 'blocking') {
-      byKey.set(key, f);
+      continue;
     }
+    const severity = Math.max(existing.severity, f.severity);
+    const exactBeatsSnapped = existing.snappedFromLine !== undefined && f.snappedFromLine === undefined;
+    byKey.set(key, exactBeatsSnapped ? { ...f, severity } : { ...existing, severity });
   }
   return [...byKey.values()];
 }
@@ -261,17 +299,81 @@ function partitionFindings(findings, anchors) {
   return { anchored, unanchored };
 }
 
-// [LAW:one-source-of-truth] Severity is a value on the finding; a human reader must be able to tell a
-// blocking request from an advisory note in EVERY sink (inline PR comment, the unanchored summary
-// section, the whole-repo report). GitHub has no "advisory" field on a review comment, so the only
-// channel is the body text — this is the one place that string is defined, and all three sinks derive
-// the presented body from here rather than each restating the tag. [LAW:single-enforcer]
-// [LAW:dataflow-not-control-flow] The tag is a rendering of the severity value, not a branch on
-// whether the finding is shown — every finding is shown; only its label varies.
-function severityTaggedBody(finding) {
-  return finding.severity === 'advisory'
-    ? `**Advisory (non-blocking):** ${finding.body}`
-    : finding.body;
+// [LAW:one-source-of-truth] The one rendering of a finding's severity label. Every sink that shows a
+// finding to a human (inline PR comment, the unanchored summary section, the whole-repo report, the
+// convergence-sweep prior list) derives the tag from here rather than restating it. The tag is
+// PRESENTATION of the priority value — it never feeds the verdict.
+function severityTag(finding) {
+  return `**[S${finding.severity}]**`;
 }
 
-module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTaggedBody };
+// [LAW:single-enforcer] The one rendering of a finding as a single line of text. A body is the one
+// model-authored field that is legitimately block text — an inline PR comment renders its paragraphs,
+// and partitionFindings appends a "\n\n_(Anchored to line N…)_" note — so it is the one field a
+// line-structured sink must still collapse. This is that collapse's single owner: the three
+// line-structured finding sinks (the posted review's unanchored section, the whole-repo report, the
+// convergence-sweep prior list) each compose their own prefix around this and none re-authors the
+// tag-plus-flattened-body rule.
+function findingLineText(finding) {
+  return `${severityTag(finding)} ${flattenBody(finding.body)}`;
+}
+
+// [LAW:one-source-of-truth] The one definition of "a vertical separator" — the characters that end a
+// line for a Markdown renderer or a prompt reader: \n, a lone \r (a CommonMark line ending,
+// reconstructable in a filename via unquoteCStylePath), and U+2028/U+2029. Both consumers below build
+// their regex from THIS string, so the set can never drift between the collapser and the detector.
+const VERTICAL_SEPARATORS = '\\n\\r\\u2028\\u2029';
+
+// [LAW:single-enforcer] The one rule for collapsing untrusted text to a single line: a continuation
+// line at column 0 detaches from its bullet/heading and renders as injected markup — or, in a prompt,
+// reads as a stray instruction. It collapses EVERY vertical separator — \n, a lone \r (a CommonMark
+// line ending, reconstructable in a filename via unquoteCStylePath), and U+2028/U+2029 — not just \n.
+//
+// [LAW:parse-dont-validate] This is applied at PARSE BOUNDARIES, not at sinks. Every model-authored
+// field whose domain is single-line (a scope's name/focus/files, a spawn's summary, a finding's path,
+// an assessment's module/impact/callSite) is stamped as it is parsed, so a sink cannot receive an
+// unflattened one and therefore has nothing to check. Sink-side flattening was the previous design and
+// it failed the way call-site discipline always fails: `focus` and a worker's `summary` reached
+// line-structured sinks raw because two of a dozen call sites were missed. The two remaining callers
+// are the ones whose input is NOT single-line by domain: findingLineText (a body is block text) and
+// the diff-path reject check (a path must stay byte-exact, so it is refused, never collapsed).
+function flattenBody(body) {
+  return body.replace(new RegExp(`\\s*[${VERTICAL_SEPARATORS}]\\s*`, 'g'), ' ').trim();
+}
+
+// [LAW:one-source-of-truth] The detector and the collapser read the SAME character class, so the set of
+// "what counts as a vertical separator" has one definition. A path is refused rather than collapsed
+// (see parseReviewableFiles in diff.js): collapsing a path yields a filename that does not exist, so
+// the worker told to open it reads nothing and the file's review coverage vanishes silently \u2014 the
+// failure this replaces. [LAW:no-silent-failure]
+function hasVerticalSeparator(text) {
+  return new RegExp(`[${VERTICAL_SEPARATORS}]`).test(text);
+}
+
+// [LAW:one-source-of-truth] The subject line of a block of text — everything before its first vertical
+// separator — built from the SAME separator class as the collapser and the detector. A hand-rolled
+// `.split('\n')[0]` is the same rule spelled a fourth time and a strictly weaker one: it keeps a lone
+// \r or a U+2028 and hands the sink a string that still breaks its line.
+function firstLine(text) {
+  return text.split(new RegExp(`[${VERTICAL_SEPARATORS}]`))[0].trim();
+}
+
+// [LAW:single-enforcer] The one rule for rendering untrusted text as a Markdown code span: the
+// backtick fence is sized longer than any backtick run inside the content, so the delimiter can never
+// be supplied by the data (a backtick-bearing filename or go.mod token cannot close the span early
+// and inject markdown). Backtick-fencing is ORTHOGONAL to line structure, which is why this is a
+// separate rule and not folded into the stamp.
+//
+// Content must already be newline-free — a code span cannot contain a blank line — but callers no
+// longer arrange that themselves: every value reaching a codeSpan today (a finding's path, a go.mod
+// module/version token) is single-line by the time it gets here, either stamped at its parse boundary
+// or refused at the diff boundary. Do not "restore" a flattenBody call at a call site; if a NEW caller
+// appears whose content is not already single-line, the fix is to stamp it where it is produced.
+function codeSpan(content) {
+  const longestRun = (content.match(/`+/g) || []).reduce((max, run) => Math.max(max, run.length), 0);
+  const fence = '`'.repeat(longestRun + 1);
+  const pad = longestRun > 0 ? ' ' : '';
+  return `${fence}${pad}${content}${pad}${fence}`;
+}
+
+module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, parseAssessmentValue, ASSESSMENT_VERDICTS, SEVERITY_MIN, SEVERITY_MAX, dedupeAssessments, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTag, findingLineText, flattenBody, hasVerticalSeparator, firstLine, codeSpan };

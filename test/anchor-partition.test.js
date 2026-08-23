@@ -2,7 +2,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { partitionFindings, nearestAnchorableLine, parseFindingValue, parseAssessmentValue, dedupeAssessments, severityTaggedBody } = require('../src/review');
+const { partitionFindings, nearestAnchorableLine, parseFindingValue, parseAssessmentValue, dedupeAssessments, flattenBody } = require('../src/review');
 const { submitReview, gitHubTransport, giteaTransport } = require('../src/transport');
 const { buildReviewAnchors } = require('../src/diff');
 
@@ -14,6 +14,19 @@ const { buildReviewAnchors } = require('../src/diff');
 function anchorsFor(entries) {
   return new Map(entries.map(([path, line]) => [`${path}:${line}`, { path, line }]));
 }
+
+// [LAW:single-enforcer] flattenBody is the ONE vertical-whitespace rule for line-structured sinks;
+// a lone \r is a CommonMark line ending (and reconstructable in a filename via unquoteCStylePath),
+// so it must collapse exactly as \n does.
+describe('flattenBody', () => {
+  test('collapses every vertical separator to one space, not just \\n', () => {
+    assert.equal(flattenBody('a\nb'), 'a b');
+    assert.equal(flattenBody('a\rb'), 'a b');          // lone CR
+    assert.equal(flattenBody('a\r\nb'), 'a b');
+    assert.equal(flattenBody('a\u2028b\u2029c'), 'a b c');
+    assert.equal(flattenBody('  a\n\n  b  '), 'a b');
+  });
+});
 
 describe('nearestAnchorableLine', () => {
   test('returns null for an empty or missing file-line list', () => {
@@ -144,10 +157,10 @@ describe('submitReview — unanchored findings', () => {
     const review = {
       summary: 'Summary text.',
       findings: [],
-      unanchored: [{ path: 's.astro', line: 79, body: 'stale doc comment', severity: 'blocking' }],
-      unreviewedScopes: [],
+      unanchored: [{ path: 's.astro', line: 79, body: 'stale doc comment', severity: 3 }],
+      unreviewedScopes: [], unreviewableFiles: [],
     };
-    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
     const arg = octokit.calls[0];
     assert.equal(arg.event, 'REQUEST_CHANGES');
     assert.equal(arg.comments, undefined); // no inline comments posted
@@ -157,15 +170,46 @@ describe('submitReview — unanchored findings', () => {
     assert.match(arg.body, /❌ Request Changes/);
   });
 
+  test('a backtick in an unanchored path cannot break out of its code span', async () => {
+    // The code-span fence is sized longer than any backtick run in the data, so a crafted or
+    // legal-but-weird filename can never close the span early and inject markdown into the body.
+    const octokit = fakeOctokit();
+    const review = {
+      summary: 's',
+      findings: [],
+      unanchored: [{ path: 'a`b`.js', line: 7, body: 'x', severity: 3 }],
+      unreviewedScopes: [], unreviewableFiles: [],
+    };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
+    assert.match(octokit.calls[0].body, /`` a`b`\.js:7 ``/);
+  });
+
+  test('a newline in an unanchored path cannot split the bullet — the span content is flattened before fencing', async () => {
+    // Built through the REAL boundary (parseFindingValue), because the contract under test is "a
+    // recorded path can never close the list item and inject markdown into the posted review" — not
+    // which layer removes the newline. A hand-built finding would pin the old sink-side flattening and
+    // keep passing even if the boundary stopped stamping. [LAW:behavior-not-structure]
+    const octokit = fakeOctokit();
+    const review = {
+      summary: 's',
+      findings: [],
+      unanchored: [parseFindingValue({ path: 'a.js\n\n# Fake heading', line: 7, body: 'x', severity: 3 }, 0)],
+      unreviewedScopes: [], unreviewableFiles: [],
+    };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
+    assert.match(octokit.calls[0].body, /`a\.js # Fake heading:7`/); // one span, one line
+    assert.doesNotMatch(octokit.calls[0].body, /\n# Fake heading/); // never a raw heading line
+  });
+
   test('anchored findings post inline and add no unanchored section', async () => {
     const octokit = fakeOctokit();
     const review = {
       summary: 'Summary.',
-      findings: [{ path: 'a.js', line: 10, body: 'fix', severity: 'blocking' }],
+      findings: [{ path: 'a.js', line: 10, body: 'fix', severity: 4 }],
       unanchored: [],
-      unreviewedScopes: [],
+      unreviewedScopes: [], unreviewableFiles: [],
     };
-    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
     const arg = octokit.calls[0];
     assert.equal(arg.event, 'REQUEST_CHANGES');
     assert.equal(arg.comments.length, 1);
@@ -175,8 +219,8 @@ describe('submitReview — unanchored findings', () => {
 
   test('no findings at all approves (canApprove) and posts no comments', async () => {
     const octokit = fakeOctokit();
-    const review = { summary: 'Clean.', findings: [], unanchored: [], unreviewedScopes: [] };
-    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    const review = { summary: 'Clean.', findings: [], unanchored: [], unreviewedScopes: [], unreviewableFiles: [] };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
     const arg = octokit.calls[0];
     assert.equal(arg.event, 'APPROVE');
     assert.equal(arg.comments, undefined);
@@ -185,8 +229,8 @@ describe('submitReview — unanchored findings', () => {
 
   test('review without an unanchored field behaves as before (back-compat)', async () => {
     const octokit = fakeOctokit();
-    const review = { summary: 'Clean.', findings: [], unreviewedScopes: [] }; // no `unanchored` key
-    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, false, gitHubTransport([]));
+    const review = { summary: 'Clean.', findings: [], unreviewedScopes: [], unreviewableFiles: [] }; // no `unanchored` key
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, false, gitHubTransport([], []));
     const arg = octokit.calls[0];
     assert.equal(arg.event, 'COMMENT'); // not approvable, no findings
     assert.doesNotMatch(arg.body, /Findings outside the reviewed diff/);
@@ -200,10 +244,10 @@ describe('submitReview — dependency section placement', () => {
       summary: 'The prose summary.',
       findings: [],
       unanchored: [],
-      unreviewedScopes: [],
+      unreviewedScopes: [], unreviewableFiles: [],
       dependencySection: '**Dependency review** — 1 module(s): 1 ✅ safe\n\n<details>...</details>',
     };
-    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
     const { body } = octokit.calls[0];
     assert.match(body, /\*\*Dependency review\*\* — 1 module\(s\): 1 ✅ safe/);
     assert.ok(body.indexOf('Dependency review') < body.indexOf('The prose summary.'), 'the dependency section leads the summary');
@@ -212,9 +256,9 @@ describe('submitReview — dependency section placement', () => {
   test('no dependencySection leaves the body byte-identical to a plain review', async () => {
     const withField = fakeOctokit();
     const without = fakeOctokit();
-    const base = { summary: 'S.', findings: [], unanchored: [], unreviewedScopes: [] };
-    await submitReview(withField, 'o', 'r', 1, 'sha', 'Reviewer', { ...base, dependencySection: '' }, true, gitHubTransport([]));
-    await submitReview(without, 'o', 'r', 1, 'sha', 'Reviewer', base, true, gitHubTransport([]));
+    const base = { summary: 'S.', findings: [], unanchored: [], unreviewedScopes: [], unreviewableFiles: [] };
+    await submitReview(withField, 'o', 'r', 1, 'sha', 'Reviewer', { ...base, dependencySection: '' }, true, gitHubTransport([], []));
+    await submitReview(without, 'o', 'r', 1, 'sha', 'Reviewer', base, true, gitHubTransport([], []));
     assert.equal(withField.calls[0].body, without.calls[0].body);
   });
 });
@@ -281,76 +325,51 @@ describe('dedupeAssessments', () => {
 describe('submitReview — approve event spelling is host-specific (home-copirate-review-9uj.12)', () => {
   test('gitHubTransport approves with GitHub\'s imperative spelling', async () => {
     const octokit = fakeOctokit();
-    const review = { summary: 'Clean.', findings: [], unanchored: [], unreviewedScopes: [] };
-    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    const review = { summary: 'Clean.', findings: [], unanchored: [], unreviewedScopes: [], unreviewableFiles: [] };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
     assert.equal(octokit.calls[0].event, 'APPROVE');
   });
 
   test('giteaTransport approves with Gitea\'s ReviewStateType spelling, not GitHub\'s', async () => {
     const octokit = fakeOctokit();
-    const review = { summary: 'Clean.', findings: [], unanchored: [], unreviewedScopes: [] };
-    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, giteaTransport([]));
+    const review = { summary: 'Clean.', findings: [], unanchored: [], unreviewedScopes: [], unreviewableFiles: [] };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, giteaTransport([], []));
     assert.equal(octokit.calls[0].event, 'APPROVED');
   });
 
   test('REQUEST_CHANGES is spelled identically across transports (no host-specific mapping needed)', async () => {
-    const review = { summary: 'Bad.', findings: [{ path: 'a.js', line: 1, body: 'x', severity: 'blocking' }], unanchored: [], unreviewedScopes: [] };
+    const review = { summary: 'Bad.', findings: [{ path: 'a.js', line: 1, body: 'x', severity: 4 }], unanchored: [], unreviewedScopes: [], unreviewableFiles: [] };
     const gh = fakeOctokit();
-    await submitReview(gh, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    await submitReview(gh, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
     const gt = fakeOctokit();
-    await submitReview(gt, 'o', 'r', 1, 'sha', 'Reviewer', review, true, giteaTransport([]));
+    await submitReview(gt, 'o', 'r', 1, 'sha', 'Reviewer', review, true, giteaTransport([], []));
     assert.equal(gh.calls[0].event, 'REQUEST_CHANGES');
     assert.equal(gt.calls[0].event, 'REQUEST_CHANGES');
   });
 });
 
-// ── severity: the discriminator that separates "worth surfacing" from "worth blocking" ────────────
-// [LAW:verifiable-goals] AC: recording a finding no longer forces REQUEST_CHANGES — an advisory
-// finding still posts and still counts, but the verdict blocks only on a 'blocking' finding.
+// ── severity: a 1-5 priority label, never a gate ──────────────────────────────────────────────────
+// [LAW:verifiable-goals] AC: the model makes no blocking/non-blocking call — every finding blocks —
+// but each finding carries a required integer 1-5 priority label for the author.
 
-describe('parseFindingValue — severity', () => {
-  test('accepts a blocking finding and carries severity through', () => {
+describe('parseFindingValue — severity is a required integer 1-5', () => {
+  test('parses a finding with its numeric severity', () => {
     assert.deepEqual(
-      parseFindingValue({ path: 'a.js', line: 3, body: 'bug', severity: 'blocking' }, 0),
-      { path: 'a.js', line: 3, body: 'bug', severity: 'blocking' },
+      parseFindingValue({ path: 'a.js', line: 3, body: 'bug', severity: 5 }, 0),
+      { path: 'a.js', line: 3, body: 'bug', severity: 5 },
     );
+    assert.equal(parseFindingValue({ path: 'a.js', line: 3, body: 'typo', severity: 1 }, 0).severity, 1);
   });
-  test('accepts an advisory finding', () => {
-    assert.equal(parseFindingValue({ path: 'a.js', line: 3, body: 'nit', severity: 'advisory' }, 0).severity, 'advisory');
-  });
-  test('rejects a missing severity — the field is required', () => {
-    assert.throws(() => parseFindingValue({ path: 'a.js', line: 3, body: 'x' }, 0), /invalid severity/);
-  });
-  test('rejects an unknown severity value', () => {
-    assert.throws(() => parseFindingValue({ path: 'a.js', line: 3, body: 'x', severity: 'critical' }, 0), /invalid severity/);
+  test('rejects a missing, out-of-range, or non-integer severity', () => {
+    for (const severity of [undefined, 0, 6, -1, 2.5, '3', 'blocking']) {
+      assert.throws(() => parseFindingValue({ path: 'a.js', line: 3, body: 'x', severity }, 0), /invalid severity/);
+    }
   });
   test('the error names the caller-supplied position, not always "finding 1"', () => {
-    // parseFindingValue(index=5) must report "finding 6" — the record's real position — so a bad
+    // parseFindingValue(index=2) must report "finding 3" — the record's real position — so a bad
     // finding deep in records.jsonl is locatable, not mislabeled as the first. [LAW:decomposition]
-    assert.throws(() => parseFindingValue({ path: 'a.js', line: 3, body: 'x', severity: 'nope' }, 5), /finding 6 has an invalid severity/);
-    assert.throws(() => parseFindingValue({ path: '', line: 3, body: 'x', severity: 'blocking' }, 2), /finding 3 has an invalid path/);
-  });
-});
-
-describe('severityTaggedBody', () => {
-  test('prefixes an advisory finding so a reader can tell it apart', () => {
-    assert.equal(severityTaggedBody({ body: 'missing test', severity: 'advisory' }), '**Advisory (non-blocking):** missing test');
-  });
-  test('leaves a blocking finding body untagged', () => {
-    assert.equal(severityTaggedBody({ body: 'off-by-one', severity: 'blocking' }), 'off-by-one');
-  });
-});
-
-describe('partitionFindings — severity carried through', () => {
-  test('severity survives an exact anchor and a snap', () => {
-    const anchors = anchorsFor([['a.js', 10], ['a.js', 12]]);
-    const findings = [
-      { path: 'a.js', line: 10, body: 'exact', severity: 'advisory' },
-      { path: 'a.js', line: 14, body: 'near', severity: 'blocking' }, // snaps to 12
-    ];
-    const { anchored } = partitionFindings(findings, anchors);
-    assert.equal(anchored[0].severity, 'advisory');
-    assert.equal(anchored[1].severity, 'blocking'); // snapped, severity intact
+    assert.throws(() => parseFindingValue({ path: '', line: 3, body: 'x', severity: 3 }, 2), /finding 3 has an invalid path/);
+    assert.throws(() => parseFindingValue({ path: 'a.js', line: 3, body: 'x', severity: 9 }, 5), /finding 6 has an invalid severity/);
   });
 });
 
@@ -362,8 +381,8 @@ describe('partitionFindings — collapses near-duplicates that snap onto one lin
   test('two findings on different pre-snap lines with equivalent bodies post once', () => {
     const anchors = anchorsFor([['a.js', 12]]);
     const findings = [
-      { path: 'a.js', line: 10, body: 'Bug: off-by-one in the loop' }, // snaps to 12
-      { path: 'a.js', line: 14, body: 'Bug: off-by-one in the loop' }, // snaps to 12
+      { path: 'a.js', line: 10, body: 'Bug: off-by-one in the loop', severity: 4 }, // snaps to 12
+      { path: 'a.js', line: 14, body: 'Bug: off-by-one in the loop', severity: 4 }, // snaps to 12
     ];
     const { anchored } = partitionFindings(findings, anchors);
     assert.equal(anchored.length, 1);
@@ -375,8 +394,8 @@ describe('partitionFindings — collapses near-duplicates that snap onto one lin
   test('two findings snapping to one line with DISTINCT bodies both post', () => {
     const anchors = anchorsFor([['a.js', 12]]);
     const findings = [
-      { path: 'a.js', line: 10, body: 'Bug: off-by-one in the loop' },
-      { path: 'a.js', line: 14, body: 'Edge case: empty input crashes' },
+      { path: 'a.js', line: 10, body: 'Bug: off-by-one in the loop', severity: 4 },
+      { path: 'a.js', line: 14, body: 'Edge case: empty input crashes', severity: 3 },
     ];
     const { anchored } = partitionFindings(findings, anchors);
     assert.equal(anchored.length, 2);
@@ -386,8 +405,8 @@ describe('partitionFindings — collapses near-duplicates that snap onto one lin
   test('collapse uses the SHARED normalization — bodies differing only in whitespace/case merge', () => {
     const anchors = anchorsFor([['a.js', 12]]);
     const findings = [
-      { path: 'a.js', line: 10, body: 'Fix   the   NULL check' },
-      { path: 'a.js', line: 14, body: 'fix the null check' },
+      { path: 'a.js', line: 10, body: 'Fix   the   NULL check', severity: 3 },
+      { path: 'a.js', line: 14, body: 'fix the null check', severity: 3 },
     ];
     const { anchored } = partitionFindings(findings, anchors);
     assert.equal(anchored.length, 1);
@@ -396,144 +415,123 @@ describe('partitionFindings — collapses near-duplicates that snap onto one lin
   test('an exact-anchor finding and an equivalent snapped one collapse; the on-grid survivor is unannotated', () => {
     const anchors = anchorsFor([['a.js', 12]]);
     const findings = [
-      { path: 'a.js', line: 12, body: 'Bug: race on shared map' }, // exact, first-seen
-      { path: 'a.js', line: 14, body: 'Bug: race on shared map' }, // snaps to 12, same key
+      { path: 'a.js', line: 12, body: 'Bug: race on shared map', severity: 4 }, // exact, first-seen
+      { path: 'a.js', line: 14, body: 'Bug: race on shared map', severity: 4 }, // snaps to 12, same key
     ];
     const { anchored } = partitionFindings(findings, anchors);
     assert.equal(anchored.length, 1);
-    assert.deepEqual(anchored[0], { path: 'a.js', line: 12, body: 'Bug: race on shared map' });
+    assert.deepEqual(anchored[0], { path: 'a.js', line: 12, body: 'Bug: race on shared map', severity: 4 });
   });
 
-  test('[LAW:no-silent-failure] collapse keeps the stronger severity regardless of arrival order', () => {
+  test('the exact-anchored member wins the collapse even when the snapped one arrived FIRST', () => {
+    // The convergence loop makes this real: pass 0 records the issue at a near-miss line, a sweep
+    // re-records it exactly on the anchor. The on-grid recording must never carry the stale
+    // "referenced line M, just outside the diff" note of the earlier snapped member.
     const anchors = anchorsFor([['a.js', 12]]);
     const findings = [
-      { path: 'a.js', line: 10, body: 'Bug: same issue', severity: 'advisory' },
-      { path: 'a.js', line: 14, body: 'Bug: same issue', severity: 'blocking' }, // arrives later
+      { path: 'a.js', line: 14, body: 'Bug: race on shared map', severity: 3 }, // snaps to 12, first-seen
+      { path: 'a.js', line: 12, body: 'Bug: race on shared map', severity: 3 }, // exact, later
     ];
     const { anchored } = partitionFindings(findings, anchors);
     assert.equal(anchored.length, 1);
-    assert.equal(anchored[0].severity, 'blocking');
+    assert.deepEqual(anchored[0], { path: 'a.js', line: 12, body: 'Bug: race on shared map', severity: 3 });
+    assert.doesNotMatch(anchored[0].body, /just outside the diff/);
   });
 
-  test('[LAW:no-silent-failure] severity-driven replacement swaps which candidate survives — the snapped blocking one wins AND is annotated', () => {
-    // The first-seen survivor is an EXACT-anchored advisory (no snap note); a later SNAPPED blocking
-    // finding with the same normalized body replaces it via blocking-wins. The survivor must flip both
-    // its severity (→ blocking) and its annotation state (→ carries the snap note of the snapped member).
+  test('[LAW:no-silent-failure] the collapse carries the HIGHEST severity of the group regardless of which member survives', () => {
     const anchors = anchorsFor([['a.js', 12]]);
     const findings = [
-      { path: 'a.js', line: 12, body: 'Bug: same issue', severity: 'advisory' }, // exact, first-seen
-      { path: 'a.js', line: 14, body: 'Bug: same issue', severity: 'blocking' }, // snaps to 12, replaces
+      { path: 'a.js', line: 14, body: 'Bug: same issue', severity: 5 }, // snapped member, higher severity
+      { path: 'a.js', line: 12, body: 'Bug: same issue', severity: 2 }, // exact member survives the collapse
     ];
     const { anchored } = partitionFindings(findings, anchors);
     assert.equal(anchored.length, 1);
     assert.equal(anchored[0].line, 12);
-    assert.equal(anchored[0].severity, 'blocking');
-    assert.match(anchored[0].body, /Anchored to line 12; the review referenced line 14/);
-    assert.equal('snappedFromLine' in anchored[0], false);
+    assert.equal(anchored[0].severity, 5); // exact-anchored presentation, strongest priority
+    assert.doesNotMatch(anchored[0].body, /just outside the diff/);
   });
 
   test('snappedFromLine scaffolding never leaks onto an anchored finding', () => {
     const anchors = anchorsFor([['a.js', 12]]);
-    const { anchored } = partitionFindings([{ path: 'a.js', line: 14, body: 'x' }], anchors);
+    const { anchored } = partitionFindings([{ path: 'a.js', line: 14, body: 'x', severity: 2 }], anchors);
     assert.equal(anchored.length, 1);
     assert.equal('snappedFromLine' in anchored[0], false);
   });
 });
 
-describe('submitReview — severity drives the verdict, never whether a finding is recorded', () => {
-  test('all-advisory findings APPROVE (canApprove) yet still post inline, tagged', async () => {
+describe('submitReview — every finding blocks', () => {
+  test('any finding forces REQUEST_CHANGES even with an approve-capable token, and posts verbatim', async () => {
     const octokit = fakeOctokit();
     const review = {
-      summary: 'Two non-blocking notes.',
+      summary: 'Two notes.',
       findings: [
-        { path: 'a.js', line: 10, body: 'add a test', severity: 'advisory' },
-        { path: 'b.js', line: 20, body: 'could be faster', severity: 'advisory' },
+        { path: 'a.js', line: 10, body: 'add a test', severity: 2 },
+        { path: 'b.js', line: 20, body: 'could be faster', severity: 3 },
       ],
       unanchored: [],
-      unreviewedScopes: [],
+      unreviewedScopes: [], unreviewableFiles: [],
     };
-    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
     const arg = octokit.calls[0];
-    assert.equal(arg.event, 'APPROVE'); // recording advisory findings does NOT block the merge
-    assert.match(arg.body, /✅ Approved/);
-    assert.equal(arg.comments.length, 2); // advisory findings still post inline
-    assert.match(arg.comments[0].body, /^\*\*Advisory \(non-blocking\):\*\* add a test/);
+    assert.equal(arg.event, 'REQUEST_CHANGES'); // no non-blocking tier: a recorded finding is a blocker
+    assert.match(arg.body, /❌ Request Changes/);
+    assert.equal(arg.comments.length, 2);
+    assert.equal(arg.comments[0].body, '**[S2]** add a test'); // the severity tag is presentation, prefixed once
   });
 
-  test('all-advisory findings post as COMMENT when the token cannot approve', async () => {
-    const octokit = fakeOctokit();
-    const review = { summary: 's', findings: [{ path: 'a.js', line: 1, body: 'nit', severity: 'advisory' }], unanchored: [], unreviewedScopes: [] };
-    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, false, gitHubTransport([]));
-    assert.equal(octokit.calls[0].event, 'COMMENT');
-  });
-
-  test('one blocking finding among advisories forces REQUEST_CHANGES', async () => {
+  test('severity never gates: a review of only severity-1 findings still REQUEST_CHANGES', async () => {
+    // [LAW:verifiable-goals] the 1-5 label is priority presentation; the verdict counts findings.
     const octokit = fakeOctokit();
     const review = {
       summary: 's',
-      findings: [
-        { path: 'a.js', line: 10, body: 'nit', severity: 'advisory' },
-        { path: 'b.js', line: 20, body: 'real bug', severity: 'blocking' },
-      ],
+      findings: [{ path: 'a.js', line: 10, body: 'Comment mismatch: typo in comment', severity: 1 }],
       unanchored: [],
-      unreviewedScopes: [],
+      unreviewedScopes: [], unreviewableFiles: [],
     };
-    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
     assert.equal(octokit.calls[0].event, 'REQUEST_CHANGES');
+    assert.match(octokit.calls[0].comments[0].body, /^\*\*\[S1\]\*\* /);
   });
 
-  test('a blocking UNANCHORED finding still blocks — a mis-anchored blocker cannot downgrade to APPROVE', async () => {
-    const octokit = fakeOctokit();
-    const review = {
-      summary: 's',
-      findings: [{ path: 'a.js', line: 10, body: 'nit', severity: 'advisory' }],
-      unanchored: [{ path: 'b.js', line: 999, body: 'real bug off-grid', severity: 'blocking' }],
-      unreviewedScopes: [],
-    };
-    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
-    const arg = octokit.calls[0];
-    assert.equal(arg.event, 'REQUEST_CHANGES');
-    assert.match(arg.body, /Findings outside the reviewed diff/);
-  });
-
-  test('an advisory unanchored finding is tagged in the summary section', async () => {
+  test('an UNANCHORED finding alone still blocks — a mis-anchored issue cannot downgrade to APPROVE', async () => {
     const octokit = fakeOctokit();
     const review = {
       summary: 's',
       findings: [],
-      unanchored: [{ path: 'b.js', line: 999, body: 'perf note off-grid', severity: 'advisory' }],
-      unreviewedScopes: [],
+      unanchored: [{ path: 'b.js', line: 999, body: 'real bug off-grid', severity: 5 }],
+      unreviewedScopes: [], unreviewableFiles: [],
     };
-    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
     const arg = octokit.calls[0];
-    assert.equal(arg.event, 'APPROVE'); // advisory-only, even unanchored, does not block
-    assert.match(arg.body, /\*\*Advisory \(non-blocking\):\*\* perf note off-grid/);
+    assert.equal(arg.event, 'REQUEST_CHANGES');
+    assert.match(arg.body, /Findings outside the reviewed diff/);
+    assert.match(arg.body, /real bug off-grid/);
   });
 });
 
 // ── partial coverage withholds approval (zai-timing-sn1) ──────────────────────────────────────────
 // A review whose time budget expired before every scope was reviewed has no standing to approve:
-// approval asserts the whole diff was judged. Blocking findings outrank the partial state.
+// approval asserts the whole diff was judged. Findings outrank the partial state.
 describe('submitReview — partial coverage (unreviewedScopes)', () => {
   test('clean-but-partial posts as COMMENT with the partial verdict, never Approved — even with an approve-capable token', async () => {
     const octokit = fakeOctokit();
-    const review = { summary: 'S.', findings: [], unanchored: [], unreviewedScopes: ['store', 'docs'] };
-    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    const review = { summary: 'S.', findings: [], unanchored: [], unreviewedScopes: ['store', 'docs'], unreviewableFiles: [] };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
     const arg = octokit.calls[0];
     assert.equal(arg.event, 'COMMENT');
     assert.match(arg.body, /⏳ Partial review/);
     assert.doesNotMatch(arg.body, /✅ Approved/);
   });
 
-  test('a blocking finding in a partial review still REQUEST_CHANGES — a blocker found in a half-reviewed diff is still a blocker', async () => {
+  test('a finding in a partial review still REQUEST_CHANGES — an issue found in a half-reviewed diff still blocks', async () => {
     const octokit = fakeOctokit();
     const review = {
       summary: 'S.',
-      findings: [{ path: 'a.js', line: 1, body: 'bug', severity: 'blocking' }],
+      findings: [{ path: 'a.js', line: 1, body: 'bug', severity: 5 }],
       unanchored: [],
-      unreviewedScopes: ['docs'],
+      unreviewedScopes: ['docs'], unreviewableFiles: [],
     };
-    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
     const arg = octokit.calls[0];
     assert.equal(arg.event, 'REQUEST_CHANGES');
     assert.match(arg.body, /❌ Request Changes/);
@@ -541,12 +539,93 @@ describe('submitReview — partial coverage (unreviewedScopes)', () => {
 
   test('a review that omits unreviewedScopes crashes loud — coverage is a required part of the review value', async () => {
     const octokit = fakeOctokit();
-    const review = { summary: 'S.', findings: [], unanchored: [] };
+    const review = { summary: 'S.', findings: [], unanchored: [], unreviewableFiles: [] };
     delete review.unreviewedScopes;
     await assert.rejects(
-      submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([])),
+      submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], [])),
       TypeError,
     );
     assert.equal(octokit.calls.length, 0, 'nothing was posted for an out-of-contract review value');
+  });
+});
+
+// ── a file refused at the diff boundary is coverage lost, not a log line ──────────────────────────
+// parseReviewableFiles refuses a path no prompt line or comment anchor can carry. That file is part of
+// the change and was never reviewed, so it must reach the SAME approval gate a clock-skipped scope does
+// — and be named on the PR, where the run log is not read.
+describe('submitReview — refused files (unreviewableFiles)', () => {
+  const refused = [{ filename: '"src/a\\nEVIL.js"', reason: 'path contains a line separator, so it cannot be named on a prompt line or anchored to a review comment' }];
+
+  test('a clean review with a refused file posts COMMENT + the partial verdict, never Approved', async () => {
+    const octokit = fakeOctokit();
+    const review = { summary: 'S.', findings: [], unanchored: [], unreviewedScopes: [], unreviewableFiles: refused };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
+    const arg = octokit.calls[0];
+    assert.equal(arg.event, 'COMMENT', 'a review that did not see every changed file may not approve');
+    assert.doesNotMatch(arg.body, /✅ Approved/);
+    assert.match(arg.body, /⏳ Partial review/);
+  });
+
+  test('the refused file is NAMED on the PR with its reason — the run log is not the reader', async () => {
+    const octokit = fakeOctokit();
+    const review = { summary: 'S.', findings: [], unanchored: [], unreviewedScopes: [], unreviewableFiles: refused };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
+    const { body } = octokit.calls[0];
+    assert.match(body, /Changed files NOT reviewed/);
+    assert.match(body, /src\/a\\nEVIL\.js/, 'the separator renders as an escape, never as a real line break');
+    assert.match(body, /line separator/);
+    assert.equal(body.split('\n').filter(l => l.includes('EVIL.js')).length, 1, 'the refused name occupies exactly one line');
+  });
+
+  test('the partial verdict names no CAUSE — one line cannot know which gap fired', async () => {
+    // The message once said "the time budget expired", which is the wrong cause for a path refusal.
+    const octokit = fakeOctokit();
+    const review = { summary: 'S.', findings: [], unanchored: [], unreviewedScopes: [], unreviewableFiles: refused };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
+    assert.doesNotMatch(octokit.calls[0].body, /time budget/);
+  });
+
+  test('a finding outranks the refusal — REQUEST_CHANGES, and the file is still named', async () => {
+    const octokit = fakeOctokit();
+    const review = {
+      summary: 'S.',
+      findings: [{ path: 'a.js', line: 1, body: 'bug', severity: 5 }],
+      unanchored: [],
+      unreviewedScopes: [],
+      unreviewableFiles: refused,
+    };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
+    assert.equal(octokit.calls[0].event, 'REQUEST_CHANGES');
+    assert.match(octokit.calls[0].body, /Changed files NOT reviewed/);
+  });
+
+  test('no refusals is byte-identical to before — the section is absent and approval stands', async () => {
+    const octokit = fakeOctokit();
+    const review = { summary: 'S.', findings: [], unanchored: [], unreviewedScopes: [], unreviewableFiles: [] };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
+    const arg = octokit.calls[0];
+    assert.equal(arg.event, 'APPROVE');
+    assert.match(arg.body, /✅ Approved/);
+    assert.doesNotMatch(arg.body, /Changed files NOT reviewed/);
+  });
+
+  test('a review that omits unreviewableFiles crashes loud, exactly like unreviewedScopes', async () => {
+    const octokit = fakeOctokit();
+    const review = { summary: 'S.', findings: [], unanchored: [], unreviewedScopes: [] };
+    await assert.rejects(
+      submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], [])),
+      TypeError,
+    );
+    assert.equal(octokit.calls.length, 0, 'nothing was posted for an out-of-contract review value');
+  });
+
+  test('a backtick-bearing refused name cannot close its code span', async () => {
+    const octokit = fakeOctokit();
+    const review = {
+      summary: 'S.', findings: [], unanchored: [], unreviewedScopes: [],
+      unreviewableFiles: [{ filename: '"src/`` a\\nb.js"', reason: 'path contains a line separator' }],
+    };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
+    assert.match(octokit.calls[0].body, /``` "src\/`` a\\nb\.js" ```/);
   });
 });

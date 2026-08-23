@@ -204,11 +204,17 @@ function extractTree(treePath, destDir) {
 }
 
 function loadDiffFiles(diffPath) {
-  const { parseUnifiedDiff } = require('../src/diff');
-  const { files, warnings } = parseUnifiedDiff(fs.readFileSync(diffPath, 'utf8'));
+  const { parseUnifiedDiff, parseReviewableFiles } = require('../src/diff');
+  const { files: parsed, warnings } = parseUnifiedDiff(fs.readFileSync(diffPath, 'utf8'));
   warnings.forEach(w => console.warn(w));
+  // The same boundary production crosses in selectTransport, and scripts/local-review.js with it. This
+  // harness is the instrument the recall/precision baselines are MEASURED on, so a file set it reviews
+  // but production refuses would make every number it reports a measurement of a different review.
+  // [LAW:single-enforcer]
+  const { files, unreviewable } = parseReviewableFiles(parsed);
+  unreviewable.forEach(u => console.warn(`Skipping ${u.filename} from the review: ${u.reason}.`));
   if (files.length === 0) {
-    throw new Error(`No changed files parsed from ${diffPath}. The frozen diff is empty or malformed.`);
+    throw new Error(`No reviewable changed files parsed from ${diffPath}. The frozen diff is empty, malformed, or names only unreviewable paths.`);
   }
   return files;
 }

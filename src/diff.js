@@ -1,4 +1,8 @@
 'use strict';
+// [LAW:one-way-deps] diff.js depends on review.js for the ONE definition of a vertical separator and
+// the ONE collapser built from it; review.js requires nothing, so the arrow points downhill and no
+// cycle exists.
+const { hasVerticalSeparator, flattenBody } = require('./review');
 
 function matchesPattern(filename, pattern) {
   const escaped = pattern
@@ -175,8 +179,62 @@ function parseUnifiedDiff(diff) {
   return { files, warnings };
 }
 
+// [LAW:parse-dont-validate] The boundary that turns a raw host/diff file list into REVIEWABLE files.
+// A changed path can legally embed a vertical separator — git C-quotes it in the diff header and
+// unquoteCStylePath faithfully reconstructs it — but every representation downstream of here is
+// line-structured: a `### path` prompt heading, a `> - path` read-target bullet, a report bullet, a
+// GitHub comment anchor. There is no lossless way to put such a path on one of those lines.
+//
+// The previous design collapsed the separator at each sink, which is strictly worse than refusing it:
+// the collapsed path names a file that does not exist, so the worker instructed to open it reads
+// nothing and that file's review coverage disappears with no error anywhere. [LAW:no-silent-failure]
+// So the path is REFUSED here instead, once, and surfaced as a typed `unreviewable` entry the caller
+// reports. Every file that survives this boundary provably renders on one line, which is why no sink
+// downstream flattens a filename.
+// The accept/reject table this boundary implements — written before the predicate, because a predicate
+// written first rejects the shape its author had in mind and silently ADMITS every shape they did not:
+//   "src/a.js"          -> reviewable
+//   "src/my file.js"    -> reviewable (interior spaces are fine; only VERTICAL separators break a line)
+//   "src/a\nEVIL.js"    -> refused (separator: \n, lone \r, U+2028/U+2029)
+//   ""  /  "   "        -> refused (no path to open or anchor to)
+//   undefined/null/42   -> refused (a non-string has no path at all — it renders as "undefined")
+// The last row is not hypothetical pedantry: hasVerticalSeparator(undefined) coerces to the STRING
+// "undefined", finds no separator, and would wave it through as a reviewable file.
+function reviewablePathRefusal(filename) {
+  if (typeof filename !== 'string') return `path is ${filename === null ? 'null' : typeof filename}, not a string`;
+  if (filename.trim().length === 0) return 'path is blank';
+  if (hasVerticalSeparator(filename)) return 'path contains a line separator, so it cannot be named on a prompt line or anchored to a review comment';
+  return null;
+}
+
+// [LAW:parse-dont-validate] A refusal record names the refused path in the ONE form every sink can
+// render: JSON-quoted — so a non-string, a blank, and an embedded \n are each visible and distinct
+// rather than collapsing into a plausible-looking path — then flattened, because JSON.stringify leaves
+// U+2028/U+2029 raw and those are line separators too. The RAW value is deliberately not carried: it is
+// refused precisely because nothing downstream can open it, anchor to it, or print it, so a displayable
+// name is the only honest thing to hand a sink. [LAW:one-source-of-truth] one stamp here, so the run-log
+// warning and the posted review body cannot render the same refusal two different ways.
+function refusedPathLabel(filename) {
+  return flattenBody(JSON.stringify(String(filename)));
+}
+
+function parseReviewableFiles(files) {
+  const reviewable = [];
+  const unreviewable = [];
+  for (const file of files) {
+    const refusal = reviewablePathRefusal(file.filename);
+    if (refusal === null) {
+      reviewable.push(file);
+      continue;
+    }
+    unreviewable.push({ filename: refusedPathLabel(file.filename), reason: refusal });
+  }
+  return { files: reviewable, unreviewable };
+}
+
 module.exports = {
   matchesPattern,
+  parseReviewableFiles,
   filterFiles,
   patchLines,
   buildFileAnchors,

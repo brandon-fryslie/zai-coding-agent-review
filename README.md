@@ -1,6 +1,6 @@
 # CoPirate Code Review
 
-A GitHub Action that runs an AI coding agent as a **read-only** code reviewer. It reviews a pull request diff and submits an inline GitHub review — `REQUEST_CHANGES` when it finds blocking issues, otherwise `APPROVE` (or a "⏳ Partial review" `COMMENT` when the [time budget](#inputs) ran out before every scope was reviewed — a partial review never approves). It can also do an on-demand whole-repo review (`MODE: repo`).
+A GitHub Action that runs an AI coding agent as a **read-only** code reviewer. It reviews a pull request diff and submits an inline GitHub review — `REQUEST_CHANGES` when it finds issues, otherwise an approval (a formal `APPROVE` when `GITHUB_REVIEW_TOKEN` is set; logged-only otherwise — see [Approvals](#approvals)) (or a "⏳ Partial review" `COMMENT` when part of the change went unreviewed — a partial review never approves). It can also do an on-demand whole-repo review (`MODE: repo`).
 
 The review engine is chosen by `PROVIDER`, which defaults to `auto` (today: Claude Code against Anthropic, billed to your **Claude Pro/Max subscription** rather than per token). You can also run Claude Code against Z.ai, or Codex against OpenAI. The engine reviews read-only — it cannot push to GitHub itself; findings flow through a private collector and are submitted by the action.
 
@@ -134,16 +134,19 @@ The action installs its bundled reviewer instructions as the engine's user-globa
 
 ## Approvals
 
-Each finding carries a **severity** — `blocking` (must change before merge) or `advisory` (a genuine issue worth surfacing that need not block the merge, e.g. a missing test, a perf concern, or a maintainability nit). Only a `blocking` finding requests changes; a review whose findings are all advisory is not a merge gate. Advisory findings still post as inline comments, tagged so the author can tell them apart.
+**Every finding blocks.** The reviewer makes no blocking/advisory call — a recorded finding is one the code must address, and any finding submits a `REQUEST_CHANGES` review. Each finding carries a **severity label, `1`–`5`** (rendered as `[S1]`–`[S5]` on the comment): pure priority information for the author — `5` ships a defect, `1` is reserved for trivia like a comment typo. Severity never changes the verdict; there is no non-blocking tier.
 
 The default `GITHUB_TOKEN` cannot approve PRs. With no `GITHUB_REVIEW_TOKEN`:
 
-- A `blocking` finding is submitted as a `REQUEST_CHANGES` review with inline threads.
-- A review with no blocking findings (clean, or advisory-only) just logs `✅ Approved` — advisory findings still post as inline comments — with no formal approval submitted.
+- Any finding is submitted as a `REQUEST_CHANGES` review — anchored findings as inline threads, unanchored ones (an off-grid line or an unshowable file) in the review body's "Findings outside the reviewed diff" section.
+- A clean review posts a `COMMENT` review whose body reads `✅ Approved`. The message lands on the PR either way; what the missing token costs you is only the *formal* `APPROVE` state, never the visible result.
 
-Set `GITHUB_REVIEW_TOKEN` to an approval-capable user or GitHub App token to have non-blocking reviews submit a formal `APPROVE`. When a blocking finding exists the action requests changes — resolve the threads and dismiss the review to proceed.
+Set `GITHUB_REVIEW_TOKEN` to an approval-capable user or GitHub App token to have clean reviews submit a formal `APPROVE`. When a finding exists the action requests changes — resolve the threads and dismiss the review to proceed.
 
-**The partial exception:** a review whose [time budget](#inputs) expired before every scope was reviewed never approves, however clean — with or without `GITHUB_REVIEW_TOKEN` it posts a `COMMENT` review whose verdict reads `⏳ Partial review`, naming the unreviewed scopes in the summary. Approval asserts the whole diff was judged, and a partial review has no standing to assert it.
+**The partial exception:** a review that did not cover the whole change never approves, however clean — with or without `GITHUB_REVIEW_TOKEN` it posts a `COMMENT` review whose verdict reads `⏳ Partial review`, and the body names exactly what was missed. Approval asserts the whole diff was judged, and a partial review has no standing to assert it. Two things can leave a gap:
+
+- The [time budget](#inputs) expired before every scope was reviewed — the unreviewed scopes are named in the summary.
+- A changed file's path cannot be reviewed (it embeds a line separator, so no prompt line can name it and no review comment can anchor to it) — those files are listed under **Changed files NOT reviewed** with the reason.
 
 ## Fork PRs are never reviewed
 

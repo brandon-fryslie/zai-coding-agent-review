@@ -15,7 +15,7 @@ const { parseDailyBudgetUsd, defaultBudgetCandidates, chooseProfile, effectiveRo
 const { assessDifficulty } = require('./difficulty');
 const { difficultyCandidates, parseDifficultyScaling } = require('./difficulty-policy');
 const { readSpentToday, appendCost } = require('./ledger');
-const { parseDependencyDiffFlag, parseGoModBumps, fetchUpstreamChangeSummary, renderDependencyReviewSection } = require('./dependency-diff');
+const { parseDependencyDiffFlag, parseGoModBumps, fetchUpstreamChangeSummary, unresolvedSummary, renderDependencyReviewSection } = require('./dependency-diff');
 const { renderCostLine, costWarning, costMarker } = require('./usage');
 const { renderRepoReport } = require('./report');
 const registry = require('./engine/registry');
@@ -279,9 +279,12 @@ async function resolveDependencySummaries(octokit, filteredFiles, dependencyDiff
   const bumps = goMods.flatMap(f => parseGoModBumps(f.patch));
   if (bumps.length === 0) return [];
   const toFetch = bumps.slice(0, MAX_DEPENDENCY_BUMPS_FETCHED);
-  const skipped = bumps.slice(MAX_DEPENDENCY_BUMPS_FETCHED).map(b => ({
-    ...b, resolved: false, reason: `upstream context not fetched — this PR bumps more than ${MAX_DEPENDENCY_BUMPS_FETCHED} modules`,
-  }));
+  // [LAW:single-enforcer] Built through unresolvedSummary like every other unresolved bump, so this is
+  // not a second construction site for the same typed value. Today's reason is host-authored text with
+  // only a number in it and could not carry a separator; routing it through the constructor is what
+  // keeps that true when someone later interpolates the module path or an error message into it.
+  const skipped = bumps.slice(MAX_DEPENDENCY_BUMPS_FETCHED).map(b =>
+    unresolvedSummary(b, `upstream context not fetched — this PR bumps more than ${MAX_DEPENDENCY_BUMPS_FETCHED} modules`));
   core.info(`Dependency diff: fetching upstream context for ${toFetch.length} go.mod bump(s)`
     + `${skipped.length > 0 ? ` (${skipped.length} more skipped — over the ${MAX_DEPENDENCY_BUMPS_FETCHED}-module cap)` : ''}...`);
   const fetched = await Promise.all(toFetch.map(b => fetchUpstreamChangeSummary(octokit, b)));
@@ -502,10 +505,14 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   const patchableFiles = filteredFiles.filter(f => f.patch);
 
   if (patchableFiles.length === 0) {
+    // [LAW:no-silent-failure] The refusals travel even on the nothing-to-review path — especially here.
+    // "Every changed file was refused" reaches this branch looking exactly like "the PR is empty", and
+    // approving it would be approving a PR nobody looked at.
     await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, {
       summary: 'No patchable changes found after filtering.',
       findings: [],
       unreviewedScopes: [],
+      unreviewableFiles: transport.unreviewable,
     }, Boolean(reviewToken), transport);
     return;
   }
@@ -566,7 +573,10 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   const footer = buildReviewFooter(review.usage, configUsed, prior.cost);
   await submitReview(
     reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
-    { summary: review.summary, findings: anchored, unanchored, dependencySection, unreviewedScopes: review.unreviewedScopes },
+    // [LAW:dataflow-not-control-flow] Coverage is stated, never inferred: the engine's own gap
+    // (unreviewedScopes) and the diff boundary's (transport.unreviewable) both reach the sink as values,
+    // and the sink alone decides what they mean for approval.
+    { summary: review.summary, findings: anchored, unanchored, dependencySection, unreviewedScopes: review.unreviewedScopes, unreviewableFiles: transport.unreviewable },
     Boolean(reviewToken), transport, footer,
   );
 

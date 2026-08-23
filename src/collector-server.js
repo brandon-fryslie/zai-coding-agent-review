@@ -1,6 +1,9 @@
 'use strict';
 const fs = require('fs');
-const { parseFindingValue, parseScopeValue, parseAssessmentValue } = require('./review');
+// [LAW:one-source-of-truth] The advertised schema derives its severity bounds and verdict value set
+// from review.js — the module that ENFORCES them — so what the model is told is legal and what the
+// host actually accepts are one fact, not two that drift.
+const { parseFindingValue, parseScopeValue, parseAssessmentValue, ASSESSMENT_VERDICTS, SEVERITY_MIN, SEVERITY_MAX } = require('./review');
 
 function writeJsonRpcResponse(id, result) {
   process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, result })}\n`);
@@ -22,14 +25,19 @@ function collectorTools() {
   return [
     {
       name: 'request_change',
-      description: "Record a code issue anchored to a visible diff line. Set severity 'blocking' if it must change before merge, 'advisory' if it is a genuine issue worth surfacing but need not block the merge (e.g. a missing test, a perf concern, a maintainability problem, or a finding you are only moderately sure of). Record EVERY genuine issue you find at the right severity — do not withhold one because it is non-blocking. Do not use for praise, neutral observations, or pure style/naming preferences.",
+      // [LAW:one-source-of-truth] The severity ladder the model reads HERE and the one it reads in the
+      // review charter (buildReviewCharter, src/prompt.js) describe the same five values, so they state
+      // the same rule for 1: the smallest thing that must still change. The prior wording here and there
+      // — "trivia that doesn't impair meaning" — told the model to require a change it had just called
+      // harmless, on a host where every recorded finding is required work.
+      description: "Record a code issue. Every recorded issue is one the code must address — you do not decide its consequence; that is the host's. severity is a priority label for the author, 1-5: 1 is the smallest thing that must still change (a comment stating a detail the code no longer has); 5 ships a defect. It never changes whether the issue must be addressed. Something that reads correctly as written is not an issue — do not record it at any severity. Record EVERY genuine issue you find, including one you are only moderately sure of (state what you are unsure of in the body). Do not use for praise, neutral observations, or pure style/naming preferences.",
       inputSchema: {
         type: 'object',
         properties: {
-          path: { type: 'string' },
-          line: { type: 'integer' },
-          body: { type: 'string' },
-          severity: { type: 'string', enum: ['blocking', 'advisory'] },
+          path: { type: 'string', minLength: 1, pattern: '\\S' },
+          line: { type: 'integer', minimum: 1 },
+          body: { type: 'string', minLength: 1, pattern: '\\S' },
+          severity: { type: 'integer', minimum: SEVERITY_MIN, maximum: SEVERITY_MAX },
         },
         required: ['path', 'line', 'body', 'severity'],
         additionalProperties: false,
@@ -41,8 +49,8 @@ function collectorTools() {
       inputSchema: {
         type: 'object',
         properties: {
-          name: { type: 'string' },
-          focus: { type: 'string' },
+          name: { type: 'string', minLength: 1, pattern: '\\S' },
+          focus: { type: 'string', minLength: 1, pattern: '\\S' },
           files: { type: 'array', items: { type: 'string' } },
         },
         required: ['name', 'focus'],
@@ -55,11 +63,11 @@ function collectorTools() {
       inputSchema: {
         type: 'object',
         properties: {
-          module: { type: 'string' },
-          impact: { type: 'string' },
+          module: { type: 'string', minLength: 1, pattern: '\\S' },
+          impact: { type: 'string', minLength: 1, pattern: '\\S' },
           affected: { type: 'boolean' },
           callSite: { type: 'string' },
-          verdict: { type: 'string', enum: ['safe', 'review', 'risky'] },
+          verdict: { type: 'string', enum: ASSESSMENT_VERDICTS },
         },
         required: ['module', 'impact', 'affected', 'verdict'],
         additionalProperties: false,
@@ -71,7 +79,7 @@ function collectorTools() {
       inputSchema: {
         type: 'object',
         properties: {
-          summary: { type: 'string' },
+          summary: { type: 'string', minLength: 1, pattern: '\\S' },
         },
         required: ['summary'],
         additionalProperties: false,
@@ -158,4 +166,6 @@ function runReviewCollectorServer() {
   });
 }
 
-module.exports = { runReviewCollectorServer };
+// collectorTools is exported for tests only (the consumer contract is action.yml + dist), so the
+// advertised schema can be asserted against the values review.js enforces. [LAW:one-source-of-truth]
+module.exports = { runReviewCollectorServer, collectorTools };

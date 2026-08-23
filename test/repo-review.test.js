@@ -60,6 +60,16 @@ describe('buildRepoReviewInput', () => {
     const result = buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
     assert.deepEqual(Object.keys(result), ['prompt']);
   });
+
+  // [LAW:no-silent-failure] the summary must never be a findings channel: in repo mode any real line is
+  // valid, so every issue goes through request_change — a summary-only issue would render as prose the
+  // report cannot itemize. The deleted escape ("state that problem here rather than drop it") must not return.
+  test('the summary is not a findings channel — every issue routes through request_change', () => {
+    const { prompt } = buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
+    assert.match(prompt, /NOT a channel for findings/);
+    assert.match(prompt, /any real line is valid/);
+    assert.doesNotMatch(prompt, /state that problem here rather than drop it/);
+  });
 });
 
 // --- buildReviewInput (the PR-diff MATERIAL) — repo-root anchoring ---
@@ -79,9 +89,9 @@ describe('buildReviewInput repo-root anchoring', () => {
 const REVIEW_WITH_FINDINGS = {
   summary: 'Two issues across the data layer.',
   findings: [
-    { path: 'src/b.js', line: 5, body: 'first b finding', severity: 'blocking' },
-    { path: 'src/a.js', line: 40, body: 'late a finding', severity: 'blocking' },
-    { path: 'src/a.js', line: 10, body: 'early a finding', severity: 'blocking' },
+    { path: 'src/b.js', line: 5, body: 'first b finding', severity: 4 },
+    { path: 'src/a.js', line: 40, body: 'late a finding', severity: 3 },
+    { path: 'src/a.js', line: 10, body: 'early a finding', severity: 5 },
   ],
 };
 
@@ -95,7 +105,7 @@ describe('renderRepoReport', () => {
     const aIdx = report.indexOf('#### src/a.js');
     assert.ok(bIdx > -1 && aIdx > -1 && bIdx < aIdx, 'b group before a group');
     assert.ok(report.indexOf('early a finding') < report.indexOf('late a finding'), 'lines ascending within a file');
-    assert.match(report, /- \*\*line 10:\*\* early a finding/);
+    assert.match(report, /- \*\*line 10:\*\* \*\*\[S5\]\*\* early a finding/);
   });
 
   test('renders the scope line from a non-empty scope', () => {
@@ -123,22 +133,23 @@ describe('renderRepoReport', () => {
   });
 
   test('flattens multi-line finding bodies to a single scannable line', () => {
-    const review = { summary: 's', findings: [{ path: 'f.js', line: 1, body: 'line one\n  line two\nline three', severity: 'blocking' }] };
+    const review = { summary: 's', findings: [{ path: 'f.js', line: 1, body: 'line one\n  line two\nline three', severity: 3 }] };
     const report = renderRepoReport({ reviewerName: 'R', scope: '', review, footer: '' });
-    assert.match(report, /- \*\*line 1:\*\* line one line two line three/);
+    assert.match(report, /- \*\*line 1:\*\* \*\*\[S3\]\*\* line one line two line three/);
   });
 
-  test('tags an advisory finding so the reader can tell it from a blocking one', () => {
+  test('renders each finding with its severity tag — a priority label, not a verdict', () => {
     const review = {
       summary: 's',
       findings: [
-        { path: 'f.js', line: 1, body: 'must fix', severity: 'blocking' },
-        { path: 'f.js', line: 2, body: 'nice to have', severity: 'advisory' },
+        { path: 'f.js', line: 1, body: 'must fix', severity: 5 },
+        { path: 'f.js', line: 2, body: 'comment typo', severity: 1 },
       ],
     };
     const report = renderRepoReport({ reviewerName: 'R', scope: '', review, footer: '' });
-    assert.match(report, /- \*\*line 2:\*\* \*\*Advisory \(non-blocking\):\*\* nice to have/);
-    assert.match(report, /- \*\*line 1:\*\* must fix/); // blocking stays untagged
+    assert.match(report, /- \*\*line 1:\*\* \*\*\[S5\]\*\* must fix/);
+    assert.match(report, /- \*\*line 2:\*\* \*\*\[S1\]\*\* comment typo/);
+    assert.doesNotMatch(report, /Advisory/);
   });
 });
 
