@@ -143,7 +143,7 @@ function loadDiffFiles(opts) {
   // run matches a production run for the same inputs, so it must not skip a boundary that changes which
   // files get reviewed. [LAW:single-enforcer]
   const { files, unreviewable } = parseReviewableFiles(parsed);
-  unreviewable.forEach(u => console.warn(`Skipping ${JSON.stringify(u.filename)} from the review: ${u.reason}.`));
+  unreviewable.forEach(u => console.warn(`Skipping ${u.filename} from the review: ${u.reason}.`));
   if (files.length === 0) {
     throw new Error(`No changed files in the diff (${opts.diff || `git diff ${opts.range}`}). Pick a range with changes, or use --mode repo.`);
   }

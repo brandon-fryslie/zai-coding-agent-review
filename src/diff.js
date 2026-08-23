@@ -1,7 +1,8 @@
 'use strict';
-// [LAW:one-way-deps] diff.js depends on review.js for the ONE definition of a vertical separator;
-// review.js requires nothing, so the arrow points downhill and no cycle exists.
-const { hasVerticalSeparator } = require('./review');
+// [LAW:one-way-deps] diff.js depends on review.js for the ONE definition of a vertical separator and
+// the ONE collapser built from it; review.js requires nothing, so the arrow points downhill and no
+// cycle exists.
+const { hasVerticalSeparator, flattenBody } = require('./review');
 
 function matchesPattern(filename, pattern) {
   const escaped = pattern
@@ -206,6 +207,17 @@ function reviewablePathRefusal(filename) {
   return null;
 }
 
+// [LAW:parse-dont-validate] A refusal record names the refused path in the ONE form every sink can
+// render: JSON-quoted — so a non-string, a blank, and an embedded \n are each visible and distinct
+// rather than collapsing into a plausible-looking path — then flattened, because JSON.stringify leaves
+// U+2028/U+2029 raw and those are line separators too. The RAW value is deliberately not carried: it is
+// refused precisely because nothing downstream can open it, anchor to it, or print it, so a displayable
+// name is the only honest thing to hand a sink. [LAW:one-source-of-truth] one stamp here, so the run-log
+// warning and the posted review body cannot render the same refusal two different ways.
+function refusedPathLabel(filename) {
+  return flattenBody(JSON.stringify(String(filename)));
+}
+
 function parseReviewableFiles(files) {
   const reviewable = [];
   const unreviewable = [];
@@ -215,7 +227,7 @@ function parseReviewableFiles(files) {
       reviewable.push(file);
       continue;
     }
-    unreviewable.push({ filename: file.filename, reason: refusal });
+    unreviewable.push({ filename: refusedPathLabel(file.filename), reason: refusal });
   }
   return { files: reviewable, unreviewable };
 }

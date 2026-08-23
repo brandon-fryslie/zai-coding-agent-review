@@ -785,24 +785,43 @@ describe('buildPrMaterial', () => {
   });
 
   // The comment/code-mismatch hunt + the 1-5 severity scale are charter content, shared by both
-  // materials. Stronger-contract-wins and one-finding-per-occurrence are the owner's explicit rules.
-  test('the charter directs comment/code mismatch review — stronger contract wins, one finding per occurrence', () => {
+  // materials. Stronger-contract-wins is the owner's explicit rule.
+  test('the charter directs comment/code mismatch review — stronger contract wins, one finding per divergence', () => {
     const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, []);
     assert.match(prompt, /review every comment against the code it describes/);
     assert.match(prompt, /STRONGER of the two contracts wins/);
     assert.match(prompt, /aligning the weaker side to the stronger one/);
-    assert.match(prompt, /ONE\s+finding per mismatched comment\+code occurrence/);
+    assert.match(prompt, /per DIVERGENCE, not per line/);
+  });
+
+  // [LAW:one-source-of-truth] The batching rule has ONE statement in the charter ("one comment per
+  // distinct issue"); the mismatch category defines what DISTINCT means there rather than restating it.
+  // The prior wording — "one finding per mismatched comment+code occurrence; never batch" — was a second,
+  // already-drifted copy: it demanded five findings where the general rule demanded one, and with every
+  // finding required work, the two readings differ by four required changes on the same review.
+  test('the charter states the batching rule ONCE — the mismatch category never contradicts it', () => {
+    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, []);
+    assert.match(prompt, /One comment per distinct issue/);
+    assert.match(prompt, /five comments repeating one stale claim are one\s+finding naming the pattern/);
+    assert.doesNotMatch(prompt, /never batch/);
+    assert.doesNotMatch(prompt, /per mismatched comment\+code occurrence/);
   });
 
   test('the charter defines severity as a 1-5 priority label that never decides the review outcome', () => {
     const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, []);
     assert.match(prompt, /integer 1-5 priority label for the author/);
     assert.match(prompt, /never\s+decides what happens to the review/);
-    // 1 is reserved for trivia; nothing behavioral may hide there.
-    assert.match(prompt, /ONLY trivia on the level of a typo in a comment/);
+    // 1 is the LOWEST-STAKES thing that must still change — never a licence to record something the
+    // code should keep. Every finding is required work, so a tier defined as "trivia that doesn't
+    // impair meaning" (the prior wording) directed the model to require a change it had just called
+    // harmless. Nothing behavioral may hide in 1 either.
+    assert.match(prompt, /the smallest thing that must still change/);
     assert.match(prompt, /Nothing with behavioral consequence is ever a 1/);
-    // and the consequence rule is mode-neutral — no merge-gate claim in shared charter text
+    assert.doesNotMatch(prompt, /trivia on the level of/, 'a tier described as trivia invites findings that need no change');
+    // and the consequence rule is mode-neutral — no merge-gate claim in shared charter text, because
+    // repo mode has no PR and no merge. It still states the stake: every finding is required work.
     assert.match(prompt, /You do NOT decide the consequence of a finding/);
+    assert.match(prompt, /treats EVERY finding you\s+record as required work/);
     assert.doesNotMatch(prompt, /requests changes whenever any finding exists/);
   });
 

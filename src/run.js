@@ -493,10 +493,14 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   const patchableFiles = filteredFiles.filter(f => f.patch);
 
   if (patchableFiles.length === 0) {
+    // [LAW:no-silent-failure] The refusals travel even on the nothing-to-review path — especially here.
+    // "Every changed file was refused" reaches this branch looking exactly like "the PR is empty", and
+    // approving it would be approving a PR nobody looked at.
     await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, {
       summary: 'No patchable changes found after filtering.',
       findings: [],
       unreviewedScopes: [],
+      unreviewableFiles: transport.unreviewable,
     }, Boolean(reviewToken), transport);
     return;
   }
@@ -557,7 +561,10 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   const footer = buildReviewFooter(review.usage, configUsed, prior.cost);
   await submitReview(
     reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
-    { summary: review.summary, findings: anchored, unanchored, dependencySection, unreviewedScopes: review.unreviewedScopes },
+    // [LAW:dataflow-not-control-flow] Coverage is stated, never inferred: the engine's own gap
+    // (unreviewedScopes) and the diff boundary's (transport.unreviewable) both reach the sink as values,
+    // and the sink alone decides what they mean for approval.
+    { summary: review.summary, findings: anchored, unanchored, dependencySection, unreviewedScopes: review.unreviewedScopes, unreviewableFiles: transport.unreviewable },
     Boolean(reviewToken), transport, footer,
   );
 

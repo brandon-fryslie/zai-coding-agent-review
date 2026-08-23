@@ -100,8 +100,31 @@ describe('parseReviewableFiles — a path is refused, never collapsed', () => {
     ]);
     assert.deepEqual(files.map(f => f.filename), ['src/ok.js']);
     assert.equal(unreviewable.length, 1);
-    assert.equal(unreviewable[0].filename, 'src/evil\n## Injected.js');
+    // The refusal carries a DISPLAYABLE name, not the raw path: the raw value is refused precisely
+    // because no sink can render it, and both sinks that report it (the run log and the posted review
+    // body) are line-structured.
+    assert.equal(unreviewable[0].filename, '"src/evil\\n## Injected.js"');
     assert.match(unreviewable[0].reason, /line separator/);
+  });
+
+  it('stamps every refused name single-line and non-empty, whatever shape it arrived as', () => {
+    // The enumeration this closes: JSON.stringify escapes \n, \r and control chars but emits U+2028 and
+    // U+2029 RAW, and returns the value `undefined` (not a string) for undefined — so neither the JSON
+    // quoting nor the flatten alone is sufficient, and the label is built from both.
+    const shapes = [
+      'a\nb.js', 'a\rb.js', 'a\r\nb.js', 'a\u2028b.js', 'a\u2029b.js',
+      undefined, null, 42, '', '   ',
+    ];
+    const { files, unreviewable } = parseReviewableFiles(shapes.map(filename => ({ filename })));
+    assert.equal(files.length, 0, 'no shape in this list is reviewable');
+    assert.equal(unreviewable.length, shapes.length);
+    for (const u of unreviewable) {
+      assert.equal(typeof u.filename, 'string', 'every refusal renders as a string');
+      assert.ok(u.filename.length > 0, 'a refusal is never nameless');
+      assert.doesNotMatch(u.filename, /[\n\r\u2028\u2029]/, `${JSON.stringify(u.filename)} still breaks its line`);
+    }
+    assert.equal(unreviewable[0].filename, '"a\\nb.js"', 'a newline shows as an escape, not a break');
+    assert.equal(unreviewable[5].filename, '"undefined"', 'a non-string is still named');
   });
 
   it('refuses every non-path shape, not just the one with a separator', () => {

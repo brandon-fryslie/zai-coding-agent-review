@@ -30221,7 +30221,12 @@ function collectorTools() {
   return [
     {
       name: 'request_change',
-      description: "Record a code issue. Every recorded issue is one the code must address — you do not decide its consequence; that is the host's. severity is a priority label for the author, 1-5: 1 is ONLY trivia on the level of a comment typo that doesn't impair meaning; 5 ships a defect. It never changes whether the issue must be addressed. Record EVERY genuine issue you find, including one you are only moderately sure of (state what you are unsure of in the body). Do not use for praise, neutral observations, or pure style/naming preferences.",
+      // [LAW:one-source-of-truth] The severity ladder the model reads HERE and the one it reads in the
+      // review charter (buildReviewCharter, src/prompt.js) describe the same five values, so they state
+      // the same rule for 1: the smallest thing that must still change. The prior wording here and there
+      // — "trivia that doesn't impair meaning" — told the model to require a change it had just called
+      // harmless, on a host where every recorded finding is required work.
+      description: "Record a code issue. Every recorded issue is one the code must address — you do not decide its consequence; that is the host's. severity is a priority label for the author, 1-5: 1 is the smallest thing that must still change (a comment stating a detail the code no longer has); 5 ships a defect. It never changes whether the issue must be addressed. Something that reads correctly as written is not an issue — do not record it at any severity. Record EVERY genuine issue you find, including one you are only moderately sure of (state what you are unsure of in the body). Do not use for praise, neutral observations, or pure style/naming preferences.",
       inputSchema: {
         type: 'object',
         properties: {
@@ -31304,9 +31309,10 @@ module.exports = {
 
 "use strict";
 
-// [LAW:one-way-deps] diff.js depends on review.js for the ONE definition of a vertical separator;
-// review.js requires nothing, so the arrow points downhill and no cycle exists.
-const { hasVerticalSeparator } = __nccwpck_require__(1565);
+// [LAW:one-way-deps] diff.js depends on review.js for the ONE definition of a vertical separator and
+// the ONE collapser built from it; review.js requires nothing, so the arrow points downhill and no
+// cycle exists.
+const { hasVerticalSeparator, flattenBody } = __nccwpck_require__(1565);
 
 function matchesPattern(filename, pattern) {
   const escaped = pattern
@@ -31511,6 +31517,17 @@ function reviewablePathRefusal(filename) {
   return null;
 }
 
+// [LAW:parse-dont-validate] A refusal record names the refused path in the ONE form every sink can
+// render: JSON-quoted — so a non-string, a blank, and an embedded \n are each visible and distinct
+// rather than collapsing into a plausible-looking path — then flattened, because JSON.stringify leaves
+// U+2028/U+2029 raw and those are line separators too. The RAW value is deliberately not carried: it is
+// refused precisely because nothing downstream can open it, anchor to it, or print it, so a displayable
+// name is the only honest thing to hand a sink. [LAW:one-source-of-truth] one stamp here, so the run-log
+// warning and the posted review body cannot render the same refusal two different ways.
+function refusedPathLabel(filename) {
+  return flattenBody(JSON.stringify(String(filename)));
+}
+
 function parseReviewableFiles(files) {
   const reviewable = [];
   const unreviewable = [];
@@ -31520,7 +31537,7 @@ function parseReviewableFiles(files) {
       reviewable.push(file);
       continue;
     }
-    unreviewable.push({ filename: file.filename, reason: refusal });
+    unreviewable.push({ filename: refusedPathLabel(file.filename), reason: refusal });
   }
   return { files: reviewable, unreviewable };
 }
@@ -34345,8 +34362,10 @@ function reviewCharter(toolNames) {
     8. Comment/code mismatch — review every comment against the code it describes, and the code against
        its comments. When they diverge, the STRONGER of the two contracts wins: name which side carries
        the stronger guarantee — a comment promising more than the code delivers, or code enforcing more
-       than the comment admits — and direct aligning the weaker side to the stronger one. Record ONE
-       finding per mismatched comment+code occurrence; never batch several mismatches into one comment.
+       than the comment admits — and direct aligning the weaker side to the stronger one. Distinctness
+       in this category is per DIVERGENCE, not per line: five comments repeating one stale claim are one
+       finding naming the pattern, while two comments misleading about two different things are two
+       findings even when they fail the same way.
     9. Missing tests for risky logic — new non-trivial behavior with no test over its failure modes, or
        a test that asserts implementation instead of behavior. [LAW:behavior-not-structure]
     10. Performance on real paths — accidental O(n²), N+1 queries, work repeated in a loop that could be
@@ -34357,10 +34376,12 @@ function reviewCharter(toolNames) {
        in your guidance; cite the token when one fits. These are real, but they rank BELOW "will this
        ship a bug" — spend your attention on the categories above first.
 
-    You do NOT decide the consequence of a finding — the host does. Every recorded finding is one the
-    code must actually address, so record a finding only when the code should change, and record EVERY
-    such issue; never soften or withhold one because it feels minor, and never inflate a style
-    preference into a finding to fill a review.
+    You do NOT decide the consequence of a finding — the host does, and it treats EVERY finding you
+    record as required work. There is no advisory tier: nothing you record lands as a mere suggestion.
+    So record a finding only when the code must actually change, and record EVERY such issue; never
+    soften or withhold one because it feels minor, and never inflate a style preference into a finding
+    to fill a review. Something that reads correctly as written is not a finding at all — leaving it
+    unrecorded is the correct outcome, not a miss.
 
     Set each finding's severity: an integer 1-5 priority label for the author, nothing more — it never
     decides what happens to the review; it tells the reader where to look first.
@@ -34369,10 +34390,12 @@ function reviewCharter(toolNames) {
       3 — a real risk or gap: silent failure, a resource leak, missing tests on risky logic, a
           performance problem on a real path.
       2 — structural/maintainability: a genuine [LAW:*] violation that will cost maintainers.
-      1 — ONLY trivia on the level of a typo in a comment that doesn't impair meaning or
-          comprehension. Nothing with behavioral consequence is ever a 1.
-    A comment/code mismatch rates by what it hides: one masking a real bug takes that bug's severity;
-    a stale-but-harmless comment rates low; a pure comment typo is the canonical 1.
+      1 — the smallest thing that must still change: a comment stating a detail the code no longer
+          has, a stale name in a doc string. Nothing with behavioral consequence is ever a 1 — and
+          nothing a reader would still read correctly belongs here, or anywhere in the review.
+    A comment/code mismatch rates by what it hides: one masking a real bug takes that bug's severity; a
+    comment that misstates a harmless detail is the canonical 1. A typo that changes nothing a reader
+    understands is not a mismatch and not a finding.
 
     Each ${toolNames.requestChange} body has three parts, in order: (1) a short tag naming the kind —
     Bug, Edge case, Breaking, Security, Race, Silent failure, Resource leak, Comment mismatch, Perf, or
@@ -35028,8 +35051,11 @@ function parseOneFinding(finding, label) {
   if (typeof body !== 'string' || body.trim().length === 0) {
     throw new Error(`${label} has an invalid body.`);
   }
-  // [LAW:types-are-the-program] severity is a required integer priority label, 1 (trivial — a comment
-  // typo that doesn't impair meaning) to 5 (ships a defect). It is PRIORITY for the author, never a
+  // [LAW:types-are-the-program] severity is a required integer priority label, 1 (the smallest thing
+  // that must still change — a comment stating a detail the code no longer has) to 5 (ships a defect).
+  // The floor is deliberately NOT "trivia that doesn't matter": every finding is required work, so a
+  // tier defined as harmless would ask the author to change something the review called fine. It is
+  // PRIORITY for the author, never a
   // gate: the verdict counts findings, not severities — the blocking/advisory tier was deleted
   // deliberately because the model's non-blocking judgment was not trustworthy, and this label must
   // never grow back into one.
@@ -35877,10 +35903,14 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   const patchableFiles = filteredFiles.filter(f => f.patch);
 
   if (patchableFiles.length === 0) {
+    // [LAW:no-silent-failure] The refusals travel even on the nothing-to-review path — especially here.
+    // "Every changed file was refused" reaches this branch looking exactly like "the PR is empty", and
+    // approving it would be approving a PR nobody looked at.
     await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, {
       summary: 'No patchable changes found after filtering.',
       findings: [],
       unreviewedScopes: [],
+      unreviewableFiles: transport.unreviewable,
     }, Boolean(reviewToken), transport);
     return;
   }
@@ -35941,7 +35971,10 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   const footer = buildReviewFooter(review.usage, configUsed, prior.cost);
   await submitReview(
     reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
-    { summary: review.summary, findings: anchored, unanchored, dependencySection, unreviewedScopes: review.unreviewedScopes },
+    // [LAW:dataflow-not-control-flow] Coverage is stated, never inferred: the engine's own gap
+    // (unreviewedScopes) and the diff boundary's (transport.unreviewable) both reach the sink as values,
+    // and the sink alone decides what they mean for approval.
+    { summary: review.summary, findings: anchored, unanchored, dependencySection, unreviewedScopes: review.unreviewedScopes, unreviewableFiles: transport.unreviewable },
     Boolean(reviewToken), transport, footer,
   );
 
@@ -36146,10 +36179,15 @@ const { parseCostMarker } = __nccwpck_require__(9614);
 const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
 const APPROVED_MESSAGE = '✅ Approved';
 const REQUEST_CHANGES_MESSAGE = '❌ Request Changes';
-// The time-budget verdict: scopes went unreviewed and no findings surfaced in the ones that
-// were. Deliberately NOT the approve message — approval asserts the whole diff was judged, and a
-// partial review has no standing to assert it. [LAW:no-silent-failure]
-const PARTIAL_MESSAGE = '⏳ Partial review — the time budget expired before every scope was reviewed; no findings in the scopes that were reviewed.';
+// The incomplete-coverage verdict: part of the change was never judged, and nothing surfaced in the
+// part that was. Deliberately NOT the approve message — approval asserts the whole diff was judged, and
+// a partial review has no standing to assert it. [LAW:no-silent-failure]
+//
+// It names no CAUSE, because there is more than one and this one line cannot know which fired: a scope
+// skipped by the time budget (named in the summary by composeSummary) or a file whose path could not be
+// reviewed (named by renderUnreviewableSection). Naming the time budget here — as this line once did —
+// would report the wrong cause for a path refusal. [FRAMING:representation]
+const PARTIAL_MESSAGE = '⏳ Partial review — part of this change was not reviewed (see above); nothing found in the part that was.';
 
 async function listAllFiles(octokit, owner, repo, pullNumber) {
   const files = [];
@@ -36183,30 +36221,41 @@ async function listAllFiles(octokit, owner, repo, pullNumber) {
 // Gitea produced a 200 response with the review silently stuck at state=PENDING forever, with
 // no error anywhere in the chain (verified against Gitea v1.27.1 source and reproduced live:
 // home-copirate-review-9uj.12).
-function gitHubTransport(files) {
-  return { files, toComment: f => ({ path: f.path, line: f.line, side: 'RIGHT', body: f.body }), approveEvent: 'APPROVE' };
+//
+// [LAW:types-are-the-program] `unreviewable` is a REQUIRED part of a transport, not an optional extra:
+// a transport states BOTH what it can hand a reviewer and what it had to refuse, so the coverage loss
+// travels as a value to the sink that gates approval on it. Carrying only `files` is what let a refused
+// file cost review coverage while the approval gate never heard about it.
+function gitHubTransport(files, unreviewable) {
+  return { files, unreviewable, toComment: f => ({ path: f.path, line: f.line, side: 'RIGHT', body: f.body }), approveEvent: 'APPROVE' };
 }
 
-function giteaTransport(files) {
-  return { files, toComment: f => ({ path: f.path, new_position: f.line, body: f.body }), approveEvent: 'APPROVED' };
+function giteaTransport(files, unreviewable) {
+  return { files, unreviewable, toComment: f => ({ path: f.path, new_position: f.line, body: f.body }), approveEvent: 'APPROVED' };
+}
+
+// [LAW:no-silent-failure] A refused path is warned with its reason at the one place a transport is
+// built, so it appears once in the run log regardless of which host branch produced the file list —
+// and the record it warns from is the same one that reaches the posted review, never a second rendering.
+function announce(transport) {
+  transport.unreviewable.forEach(u => core.warning(
+    `Skipping ${u.filename} from the review: ${u.reason}. It is reported on the PR and withholds approval.`));
+  return transport;
 }
 
 // [LAW:single-enforcer] Every changed-file list — GitHub's listFiles and Gitea's parsed unified diff
 // alike — crosses parseReviewableFiles exactly once, here, before any consumer sees it. Refusing an
 // unrenderable path at the one boundary is what lets every sink downstream name a filename without
-// flattening it. [LAW:no-silent-failure] a refused path is WARNED with its reason, never dropped
-// quietly: a file vanishing from a review must be visible in the run log.
-function admitReviewableFiles(files) {
-  const { files: reviewable, unreviewable } = parseReviewableFiles(files);
-  unreviewable.forEach(u => core.warning(
-    `Skipping ${JSON.stringify(u.filename)} from the review: ${u.reason}.`));
-  return reviewable;
-}
-
+// flattening it.
+//
+// The boundary runs BEFORE EXCLUDE_PATTERNS (filterFiles, applied by the caller), deliberately: a path
+// we cannot even name is refused outright rather than silently matched against a glob, so an excluded
+// unrenderable path still withholds approval. That is the safe direction — the alternative is a pattern
+// deciding the fate of a string nothing can render.
 async function selectTransport(octokit, owner, repo, pullNumber) {
-  const files = admitReviewableFiles(await listAllFiles(octokit, owner, repo, pullNumber));
+  const { files, unreviewable } = parseReviewableFiles(await listAllFiles(octokit, owner, repo, pullNumber));
   if (files.length === 0 || files.some(f => typeof f.patch === 'string')) {
-    return gitHubTransport(files);
+    return announce(gitHubTransport(files, unreviewable));
   }
   // [LAW:no-silent-failure] Gitea omits per-file patch; its unified .diff carries the hunks.
   const { data } = await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}.diff', {
@@ -36216,11 +36265,14 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
   });
   const { files: rawParsed, warnings } = parseUnifiedDiff(typeof data === 'string' ? data : String(data));
   warnings.forEach(w => core.warning(w));
-  const parsed = admitReviewableFiles(rawParsed);
-  if (parsed.length === 0) {
+  // The listFiles refusals are NOT carried forward: the unified diff is a second, complete rendering of
+  // the same change, so every path it names crosses this boundary on its own terms. Merging both lists
+  // would double-report each refusal. [LAW:one-source-of-truth]
+  const parsed = parseReviewableFiles(rawParsed);
+  if (parsed.files.length === 0) {
     throw new Error(`No reviewable diff for PR #${pullNumber}: listFiles returned no patch and the unified diff was empty.`);
   }
-  return giteaTransport(parsed);
+  return announce(giteaTransport(parsed.files, parsed.unreviewable));
 }
 
 // [LAW:one-source-of-truth] A completed review round IS a posted review carrying REVIEW_MARKER, and its
@@ -36410,6 +36462,21 @@ function renderUnanchoredSection(unanchored) {
   return `\n\n### Findings outside the reviewed diff\nThese reference lines not present in this PR's diff, so they could not be posted as inline comments:\n\n${items}`;
 }
 
+// [LAW:effects-at-boundaries] Pure: render the changed files that never reached a reviewer. This is a
+// COVERAGE report, not a findings report — it is what the PR page owes a reader whose file was dropped,
+// and the same list that withholds approval below, so the visible reason and the withheld verdict come
+// from one value. [LAW:no-silent-failure] the run-log warning is not enough: the person reading the PR
+// never sees the run log.
+//
+// The name needs no flattening here — parseReviewableFiles stamped it single-line at the boundary that
+// refused it — but it is still fenced through codeSpan, because backticks are orthogonal to line
+// structure and a backtick-bearing name must not close the span early. [LAW:single-enforcer]
+function renderUnreviewableSection(unreviewable) {
+  if (unreviewable.length === 0) return '';
+  const items = unreviewable.map(u => `- ${codeSpan(u.filename)} — ${u.reason}`).join('\n');
+  return `\n\n### Changed files NOT reviewed\nThese files are part of this change but could not be reviewed, so this review does not cover them:\n\n${items}`;
+}
+
 async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review, canApprove, transport, attributionFooter) {
   // [LAW:one-source-of-truth] One boolean drives both the GitHub event and the rendered
   // verdict, so they cannot disagree. The model never states the verdict.
@@ -36419,13 +36486,21 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   // never silently downgrade the verdict to APPROVE. [LAW:no-silent-failure]
   const unanchored = review.unanchored || [];
   const requestsChanges = review.findings.length > 0 || unanchored.length > 0;
-  // [LAW:types-are-the-program] unreviewedScopes is a REQUIRED field of the review value, exactly
-  // like findings — every producer states its coverage ([] = complete), and a caller that omits it
-  // crashes loud here rather than approving a partial review by accident. Approvability is the
-  // conjunction of the token's capability and full coverage: a review that did not see every scope
-  // may report and request changes, but it may never approve. Findings outrank the
-  // partial state — an issue found in a half-reviewed diff still blocks.
-  const complete = review.unreviewedScopes.length === 0;
+  // [LAW:types-are-the-program] unreviewedScopes and unreviewableFiles are REQUIRED fields of the review
+  // value, exactly like findings — every producer states its coverage ([] = complete), and a caller that
+  // omits either crashes loud here rather than approving a partial review by accident.
+  //
+  // They stay TWO fields because they are two different facts with two different causes and two
+  // different renderings: a scope the clock cut short, versus a file whose path no prompt line or
+  // comment anchor can carry. [LAW:single-enforcer] exactly one expression derives approvability from
+  // them — here — so a new coverage gap is added to this conjunction and nowhere else, and the two can
+  // never disagree about whether the review is complete.
+  //
+  // Approvability is the conjunction of the token's capability and full coverage: a review that did not
+  // see every scope and every file may report and request changes, but it may never approve. Findings
+  // outrank the partial state — an issue found in a half-reviewed diff still blocks.
+  const unreviewableFiles = review.unreviewableFiles;
+  const complete = review.unreviewedScopes.length === 0 && unreviewableFiles.length === 0;
   const event = reviewEvent(requestsChanges, canApprove && complete, transport);
   const verdict = requestsChanges ? REQUEST_CHANGES_MESSAGE : (complete ? APPROVED_MESSAGE : PARTIAL_MESSAGE);
   const footer = attributionFooter ? `\n\n${attributionFooter}` : '';
@@ -36434,7 +36509,7 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   // '' and the body is byte-identical to before. The section is assembled host-side in run.js (from the
   // structured summaries + the model's assessments); this sink only places it. [LAW:single-enforcer]
   const dependencySection = review.dependencySection ? `${review.dependencySection}\n\n` : '';
-  const body = `## ${reviewerName}\n\n${dependencySection}${review.summary}${renderUnanchoredSection(unanchored)}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
+  const body = `## ${reviewerName}\n\n${dependencySection}${review.summary}${renderUnanchoredSection(unanchored)}${renderUnreviewableSection(unreviewableFiles)}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
   const comments = review.findings.map(finding => transport.toComment({ ...finding, body: `${severityTag(finding)} ${finding.body}` }));
 
   // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.

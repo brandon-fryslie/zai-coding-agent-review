@@ -25,7 +25,12 @@ function collectorTools() {
   return [
     {
       name: 'request_change',
-      description: "Record a code issue. Every recorded issue is one the code must address — you do not decide its consequence; that is the host's. severity is a priority label for the author, 1-5: 1 is ONLY trivia on the level of a comment typo that doesn't impair meaning; 5 ships a defect. It never changes whether the issue must be addressed. Record EVERY genuine issue you find, including one you are only moderately sure of (state what you are unsure of in the body). Do not use for praise, neutral observations, or pure style/naming preferences.",
+      // [LAW:one-source-of-truth] The severity ladder the model reads HERE and the one it reads in the
+      // review charter (buildReviewCharter, src/prompt.js) describe the same five values, so they state
+      // the same rule for 1: the smallest thing that must still change. The prior wording here and there
+      // — "trivia that doesn't impair meaning" — told the model to require a change it had just called
+      // harmless, on a host where every recorded finding is required work.
+      description: "Record a code issue. Every recorded issue is one the code must address — you do not decide its consequence; that is the host's. severity is a priority label for the author, 1-5: 1 is the smallest thing that must still change (a comment stating a detail the code no longer has); 5 ships a defect. It never changes whether the issue must be addressed. Something that reads correctly as written is not an issue — do not record it at any severity. Record EVERY genuine issue you find, including one you are only moderately sure of (state what you are unsure of in the body). Do not use for praise, neutral observations, or pure style/naming preferences.",
       inputSchema: {
         type: 'object',
         properties: {

@@ -28,8 +28,11 @@ function parseOneFinding(finding, label) {
   if (typeof body !== 'string' || body.trim().length === 0) {
     throw new Error(`${label} has an invalid body.`);
   }
-  // [LAW:types-are-the-program] severity is a required integer priority label, 1 (trivial — a comment
-  // typo that doesn't impair meaning) to 5 (ships a defect). It is PRIORITY for the author, never a
+  // [LAW:types-are-the-program] severity is a required integer priority label, 1 (the smallest thing
+  // that must still change — a comment stating a detail the code no longer has) to 5 (ships a defect).
+  // The floor is deliberately NOT "trivia that doesn't matter": every finding is required work, so a
+  // tier defined as harmless would ask the author to change something the review called fine. It is
+  // PRIORITY for the author, never a
   // gate: the verdict counts findings, not severities — the blocking/advisory tier was deleted
   // deliberately because the model's non-blocking judgment was not trustworthy, and this label must
   // never grow back into one.

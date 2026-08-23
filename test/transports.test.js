@@ -6,13 +6,13 @@ const { costMarker } = require('../src/usage');
 
 describe('gitHubTransport.toComment', () => {
   test('maps finding to GitHub inline comment shape', () => {
-    const transport = gitHubTransport([]);
+    const transport = gitHubTransport([], []);
     const comment = transport.toComment({ path: 'src/foo.js', line: 42, body: 'fix this' });
     assert.deepEqual(comment, { path: 'src/foo.js', line: 42, side: 'RIGHT', body: 'fix this' });
   });
 
   test('uses RIGHT side always', () => {
-    const transport = gitHubTransport([]);
+    const transport = gitHubTransport([], []);
     const comment = transport.toComment({ path: 'a.js', line: 1, body: 'x' });
     assert.equal(comment.side, 'RIGHT');
   });
@@ -20,25 +20,25 @@ describe('gitHubTransport.toComment', () => {
   // [LAW:verifiable-goals] AC (home-copirate-review-9uj.12): GitHub's create-review `event`
   // takes the imperative 'APPROVE'.
   test('approveEvent is GitHub\'s imperative spelling', () => {
-    assert.equal(gitHubTransport([]).approveEvent, 'APPROVE');
+    assert.equal(gitHubTransport([], []).approveEvent, 'APPROVE');
   });
 });
 
 describe('giteaTransport.toComment', () => {
   test('maps finding to Gitea new_position comment shape', () => {
-    const transport = giteaTransport([]);
+    const transport = giteaTransport([], []);
     const comment = transport.toComment({ path: 'src/bar.js', line: 7, body: 'fix that' });
     assert.deepEqual(comment, { path: 'src/bar.js', new_position: 7, body: 'fix that' });
   });
 
   test('has no side field', () => {
-    const transport = giteaTransport([]);
+    const transport = giteaTransport([], []);
     const comment = transport.toComment({ path: 'f.js', line: 1, body: 'x' });
     assert.equal('side' in comment, false);
   });
 
   test('has no line field (uses new_position instead)', () => {
-    const transport = giteaTransport([]);
+    const transport = giteaTransport([], []);
     const comment = transport.toComment({ path: 'f.js', line: 5, body: 'x' });
     assert.equal('line' in comment, false);
     assert.equal(comment.new_position, 5);
@@ -48,7 +48,7 @@ describe('giteaTransport.toComment', () => {
   // approval 'APPROVED' (past tense) — sending GitHub's 'APPROVE' silently falls through to
   // Gitea's default ReviewTypePending branch with no error, verified live against Gitea v1.27.1.
   test('approveEvent is Gitea\'s ReviewStateType spelling, not GitHub\'s', () => {
-    assert.equal(giteaTransport([]).approveEvent, 'APPROVED');
+    assert.equal(giteaTransport([], []).approveEvent, 'APPROVED');
   });
 });
 
@@ -386,5 +386,68 @@ describe('resolveReviewTarget', () => {
     const result = resolveReviewTarget('5', '', payload);
     assert.equal(result.pullNumber, 5);
     assert.equal(result.headSha, 'fromPayload');
+  });
+});
+
+// ── selectTransport carries the coverage it lost ─────────────────────────────────────────────────
+// A path refused by parseReviewableFiles is a changed file that will never be reviewed. Before this,
+// the transport handed on only the survivors, so "one file was dropped" and "the PR has no such file"
+// were the same value to every consumer — and the approval gate could not tell them apart.
+const { selectTransport } = require('../src/transport');
+
+function fakeHost(files, diffText) {
+  return {
+    rest: { pulls: { listFiles: async () => ({ data: files }) } },
+    request: async () => ({ data: diffText }),
+  };
+}
+
+describe('selectTransport — refused paths reach the caller as data', () => {
+  test('a refused path is carried on the transport, not just logged', async () => {
+    const t = await selectTransport(fakeHost([
+      { filename: 'src/ok.js', status: 'modified', patch: '@@ -1 +1 @@' },
+      { filename: 'src/a\nEVIL.js', status: 'modified', patch: '@@ -1 +1 @@' },
+    ]), 'o', 'r', 1);
+    assert.deepEqual(t.files.map(f => f.filename), ['src/ok.js']);
+    assert.equal(t.unreviewable.length, 1);
+    assert.match(t.unreviewable[0].reason, /line separator/);
+  });
+
+  test('EVERY file refused still yields a transport that says so — this is not an empty PR', async () => {
+    // The path that used to approve a PR nobody looked at: zero surviving files reads exactly like
+    // "no patchable changes", and run.js posts+approves on that branch.
+    const t = await selectTransport(fakeHost([
+      { filename: 'src/a\nEVIL.js', status: 'modified', patch: '@@' },
+      { filename: undefined, status: 'modified', patch: '@@' },
+    ]), 'o', 'r', 1);
+    assert.equal(t.files.length, 0);
+    assert.equal(t.unreviewable.length, 2, 'the loss must survive the empty file list');
+  });
+
+  test('a clean PR carries an empty refusal list, never undefined', async () => {
+    const t = await selectTransport(fakeHost([{ filename: 'src/ok.js', patch: '@@' }]), 'o', 'r', 1);
+    assert.deepEqual(t.unreviewable, []);
+  });
+
+  test('the Gitea path refuses on its own parsed diff, and reports only those refusals', async () => {
+    // No file carries a patch, so the transport falls back to the unified diff — a second, complete
+    // rendering of the same change. Merging the listFiles refusals in would double-report each one.
+    const diff = [
+      'diff --git a/src/ok.js b/src/ok.js',
+      'index 111..222 100644',
+      '--- a/src/ok.js',
+      '+++ b/src/ok.js',
+      '@@ -1 +1 @@',
+      '-old',
+      '+new',
+      '',
+    ].join('\n');
+    const t = await selectTransport(fakeHost([
+      { filename: 'src/ok.js', status: 'modified' },
+      { filename: 'src/a\nEVIL.js', status: 'modified' },
+    ], diff), 'o', 'r', 1);
+    assert.equal(t.approveEvent, 'APPROVED', 'no per-file patch means the Gitea transport');
+    assert.deepEqual(t.files.map(f => f.filename), ['src/ok.js']);
+    assert.deepEqual(t.unreviewable, [], 'the listFiles refusal is not re-reported over the diff\'s own');
   });
 });
