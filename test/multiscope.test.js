@@ -145,31 +145,44 @@ describe('dedupeFindings', () => {
 // ── sumUsage — cost is uniform because every spawn shares one config ──────────────────────────────
 
 describe('sumUsage', () => {
-  test('sums tokens and available cost across spawns', () => {
+  test('sums tokens and priced cost across spawns', () => {
     const total = sumUsage([
-      { inputTokens: 10, outputTokens: 5, cost: { available: true, usd: 0.1 } },
-      { inputTokens: 20, outputTokens: 7, cost: { available: true, usd: 0.2 } },
+      { inputTokens: 10, outputTokens: 5, cost: { basis: 'dollars', usd: 0.1 } },
+      { inputTokens: 20, outputTokens: 7, cost: { basis: 'dollars', usd: 0.2 } },
     ]);
     assert.equal(total.inputTokens, 30);
     assert.equal(total.outputTokens, 12);
-    assert.equal(total.cost.available, true);
+    assert.equal(total.cost.basis, 'dollars');
     assert.ok(Math.abs(total.cost.usd - 0.3) < 1e-9);
   });
 
-  test('any unavailable cost makes the total unavailable, carrying its reason', () => {
+  test('any unpriced spawn makes the total unpriced, carrying its reason', () => {
     const total = sumUsage([
-      { inputTokens: 10, outputTokens: 5, cost: { available: true, usd: 0.1 } },
-      { inputTokens: 20, outputTokens: 7, cost: { available: false, reason: 'no-price' } },
+      { inputTokens: 10, outputTokens: 5, cost: { basis: 'dollars', usd: 0.1 } },
+      { inputTokens: 20, outputTokens: 7, cost: { basis: 'unpriced', reason: 'no-price' } },
     ]);
-    assert.equal(total.cost.available, false);
+    assert.equal(total.cost.basis, 'unpriced');
     assert.equal(total.cost.reason, 'no-price');
     assert.equal(total.inputTokens, 30); // tokens still sum
   });
 
   test('excludes null usages but still sums the present ones', () => {
-    const total = sumUsage([null, { inputTokens: 4, outputTokens: 2, cost: { available: true, usd: 0.05 } }]);
+    const total = sumUsage([null, { inputTokens: 4, outputTokens: 2, cost: { basis: 'dollars', usd: 0.05 } }]);
     assert.equal(total.inputTokens, 4);
     assert.equal(total.cost.usd, 0.05);
+  });
+
+  // A multi-scope pass on a subscription config: the scout and every worker share one basis, so the
+  // pass total is notional too — and carries no `usd` field for a spend fold to reach for.
+  test('a subscription pass sums to a notional total, never a spend total', () => {
+    const total = sumUsage([
+      { inputTokens: 10, outputTokens: 5, cost: { basis: 'subscription', notionalUsd: 18.86 } },
+      { inputTokens: 20, outputTokens: 7, cost: { basis: 'subscription', notionalUsd: 7.28 } },
+    ]);
+    assert.equal(total.inputTokens, 30);
+    assert.equal(total.cost.basis, 'subscription');
+    assert.ok(Math.abs(total.cost.notionalUsd - 26.14) < 1e-9);
+    assert.equal('usd' in total.cost, false);
   });
 
   test('returns null when no spawn reported usage', () => {
@@ -681,7 +694,7 @@ describe('runMultiScopePass — convergence sweeps', () => {
   });
 
   test('usage sums across every sweep spawn — the footer covers the whole convergence loop', async () => {
-    const usage = { inputTokens: 10, outputTokens: 1, cost: { available: true, usd: 0.01 } };
+    const usage = { inputTokens: 10, outputTokens: 1, cost: { basis: 'dollars', usd: 0.01 } };
     const { registry } = sweepRegistry((name) => oneBug(name), usage);
     const review = await runMultiScopePass(args(registry, 3));
     // 1 scout + 2 scopes × 2 layers (initial + the converging sweep) = 5 spawns.

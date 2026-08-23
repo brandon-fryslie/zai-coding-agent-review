@@ -205,24 +205,24 @@ describe('extractUsage', () => {
     assert.equal(usage.outputTokens, 1303);
   });
 
-  test('cost is the summed self-reported USD and marked available', () => {
+  test('cost is the summed self-reported USD on a dollars basis', () => {
     const stdout = [
       '{"type":"step_finish","part":{"reason":"tool-calls","cost":0.012,"tokens":{"input":100,"output":10}}}',
       '{"type":"step_finish","part":{"reason":"stop","cost":0.004,"tokens":{"input":20,"output":5}}}',
     ].join('\n');
     const usage = extractUsage(stdout);
-    assert.equal(usage.cost.available, true);
+    assert.equal(usage.cost.basis, 'dollars');
     assert.ok(Math.abs(usage.cost.usd - 0.016) < 1e-9, `expected ~0.016, got ${usage.cost.usd}`);
   });
 
-  test('a subscription/unpriced run reports cost available with usd 0 (engine self-report)', () => {
+  test('a provider OpenCode does not price reports a real dollars-basis usd 0 (engine self-report)', () => {
     const stdout = '{"type":"step_finish","part":{"reason":"stop","cost":0,"tokens":{"input":100,"output":10}}}';
     const usage = extractUsage(stdout);
-    assert.equal(usage.cost.available, true);
+    assert.equal(usage.cost.basis, 'dollars');
     assert.equal(usage.cost.usd, 0);
   });
 
-  test('reports cost unavailable (not a fabricated $0.00) when tokens are present but no cost field was ever observed', () => {
+  test('reports cost unpriced (not a fabricated $0.00) when tokens are present but no cost field was ever observed', () => {
     const stdout = [
       '{"type":"step_finish","part":{"reason":"tool-calls","tokens":{"input":100,"output":10}}}',
       '{"type":"step_finish","part":{"reason":"stop","tokens":{"input":20,"output":5}}}',
@@ -230,7 +230,7 @@ describe('extractUsage', () => {
     const usage = extractUsage(stdout);
     assert.equal(usage.inputTokens, 120);
     assert.equal(usage.outputTokens, 15);
-    assert.equal(usage.cost.available, false);
+    assert.equal(usage.cost.basis, 'unpriced');
     assert.equal(usage.cost.reason, 'not-reported');
   });
 

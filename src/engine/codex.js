@@ -177,7 +177,7 @@ function assertSucceeded(stdout) {
 // [LAW:effects-at-boundaries] Pure: reads usage from the engine's own JSONL output and returns
 // a Usage value, or null when no usage was reported. Codex emits NO USD — 'actual USD' is
 // tokens x the centralized price table (computeCostUsd); a model absent from the
-// table yields cost {available:false, reason:'no-price'}, never a fabricated zero. [LAW:no-silent-failure]
+// table yields cost {basis:'unpriced', reason:'no-price'}, never a fabricated zero. [LAW:no-silent-failure]
 // The cumulative turn usage rides on the final turn.completed event; later events overwrite
 // earlier ones so the last wins. An absent/empty usage object (no token fields) is reported as
 // no usage (null), not as a $0.00 run. [LAW:dataflow-not-control-flow]
@@ -198,7 +198,9 @@ function extractUsage(stdout, config) {
   // [LAW:types-are-the-program] cost is a discriminated value. Codex reports no USD, so a null
   // here means exactly one thing — the model is absent from the price table — and the adapter
   // declares that reason at the point it knows it, rather than the boundary re-deriving it.
-  const cost = costUsd == null ? { available: false, reason: 'no-price' } : { available: true, usd: costUsd };
+  // The basis is always 'dollars': codex declares credentialKinds ['api-key'], so no codex run can
+  // ever be billed to a subscription and this adapter has no notional arm to reach.
+  const cost = costUsd == null ? { basis: 'unpriced', reason: 'no-price' } : { basis: 'dollars', usd: costUsd };
   return { inputTokens, outputTokens, cost };
 }
 

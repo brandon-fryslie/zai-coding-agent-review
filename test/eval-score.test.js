@@ -93,8 +93,8 @@ test('parseProduced accepts the raw merged-findings shape and rejects malformed'
 });
 
 test('parseUsage passes cost through and tolerates missing fields', () => {
-  assert.deepEqual(parseUsage(JSON.stringify({ inputTokens: 100, outputTokens: 20, cost: { available: true, usd: 0.01 } }), 'u'),
-    { inputTokens: 100, outputTokens: 20, cost: { available: true, usd: 0.01 } });
+  assert.deepEqual(parseUsage(JSON.stringify({ inputTokens: 100, outputTokens: 20, cost: { basis: 'dollars', usd: 0.01 } }), 'u'),
+    { inputTokens: 100, outputTokens: 20, cost: { basis: 'dollars', usd: 0.01 } });
   assert.deepEqual(parseUsage('{}', 'u'), { inputTokens: null, outputTokens: null, cost: null });
   // A wrong-typed usage.json is rejected loudly, never silently treated as {} (all-null).
   assert.throws(() => parseUsage('123', 'u'), /not a JSON object/);
@@ -220,7 +220,7 @@ test('scoreRun produces a timestamp-free, re-runnable scorecard', async () => {
     { path: 'a.ts', line: 10, body: 'null pointer at close()', severity: 'blocking' },
     { path: 'q.ts', line: 1, body: 'novel unrelated thing', severity: 'advisory' },
   ]), 'f');
-  const args = { expected: EXPECTED_V, produced, usage: { inputTokens: 1, outputTokens: 2, cost: { available: true, usd: 0.5 } }, meta: { case: 'demo', config: { model: 'm' } }, judge: keywordJudge, matcherLabel: 'fake' };
+  const args = { expected: EXPECTED_V, produced, usage: { inputTokens: 1, outputTokens: 2, cost: { basis: 'dollars', usd: 0.5 } }, meta: { case: 'demo', config: { model: 'm' } }, judge: keywordJudge, matcherLabel: 'fake' };
   const a = await scoreRun(args);
   const b = await scoreRun(args);
   assert.deepEqual(a, b); // deterministic given the same judge
@@ -241,7 +241,7 @@ test('aggregateRuns forms a mean/min/max band and skips null recalls', () => {
     niceToFind: { found: 0, total: 0, recall: null },
     inventoryNiceToFind: { found: 1, total: 2, recall: 0.5 },
     noise: { count: noise },
-    usage: { cost: { available: true, usd } },
+    usage: { cost: { basis: 'dollars', usd } },
   });
   const s = aggregateRuns('demo', [mk(7, 7, 8, 9, 2, 0.01), mk(5, 7, 5, 9, 4, 0.02), mk(6, 7, 6, 9, 3, 0.03)]);
   assert.equal(s.runs, 3);
@@ -261,6 +261,34 @@ test('aggregateRuns forms a mean/min/max band and skips null recalls', () => {
   assert.ok(Math.abs(s.costUsd.mean - 0.02) < 1e-9);
   assert.ok(renderTable(s).includes('must-find recall'));
   assert.ok(renderTable(s).includes('inventory recall'));
+});
+
+// The eval scorer is a spend fold like any other, so it obeys the same rule: only a DOLLARS-basis run
+// contributes to the cost band. A subscription run's notional list price is Anthropic's sticker for
+// tokens nobody was charged for — folding it in would make one baseline compare list price against
+// money, the exact miscount ($63.59 of notional read as spend) this change exists to kill. A notional
+// run drops out of the band entirely rather than landing in it as a zero, which would drag the mean.
+test('aggregateRuns costs only dollars-basis runs — notional and unpriced drop out of the band', () => {
+  const mk = cost => ({
+    matcher: 'fake',
+    mustFind: { found: 1, total: 1, recall: 1 },
+    inventoryMustFind: { found: 1, total: 1, recall: 1 },
+    niceToFind: { found: 0, total: 0, recall: null },
+    inventoryNiceToFind: { found: 0, total: 0, recall: null },
+    noise: { count: 0 },
+    usage: cost === null ? null : { cost },
+  });
+  const s = aggregateRuns('demo', [
+    mk({ basis: 'dollars', usd: 0.10 }),
+    mk({ basis: 'subscription', notionalUsd: 63.59 }),
+    mk({ basis: 'unpriced', reason: 'no-price' }),
+    mk(null),
+    mk({ basis: 'dollars', usd: 0.30 }),
+  ]);
+  assert.equal(s.runs, 5);
+  assert.equal(s.costUsd.n, 2, 'only the two dollars runs are costed');
+  assert.ok(Math.abs(s.costUsd.mean - 0.20) < 1e-9, 'the notional 63.59 never reaches the mean');
+  assert.equal(s.costUsd.max, 0.30);
 });
 
 // ── lexical judge (the offline fallback) ─────────────────────────────────────────────────────────────

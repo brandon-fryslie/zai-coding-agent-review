@@ -32129,7 +32129,7 @@ const os = __nccwpck_require__(857);
 const { parseRetryAfterMs, classifyTransient } = __nccwpck_require__(2887);
 const { parseJsonEnvelope, formatOutputTail } = __nccwpck_require__(8861);
 const { makeCliAdapter } = __nccwpck_require__(2890);
-const { isAnthropicEndpoint, computeCostUsd } = __nccwpck_require__(9614);
+const { isAnthropicEndpoint, isSubscription, computeCostUsd } = __nccwpck_require__(9614);
 const { resolveReasoningTier } = __nccwpck_require__(4652);
 
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
@@ -32360,23 +32360,38 @@ function extractUsage(stdout, config) {
   return { inputTokens, outputTokens, cost };
 }
 
-// [LAW:types-are-the-program] cost is a discriminated value, resolved by the one fact that decides
-// the cost basis: is the endpoint genuinely Anthropic? If so, total_cost_usd is Claude Code's own
-// Anthropic-priced estimate (or 'not-reported' when absent). If not (z.ai, deepseek, …), that figure
-// is the wrong vendor's, so it is ignored entirely and the cost is computed from the provider's own
-// entry in the price table — 'no-price' when the model is not yet listed. [LAW:no-silent-failure]
+// [LAW:types-are-the-program] cost is a discriminated value (see THE COST VALUE in src/usage.js),
+// and this is the ONE place its basis is resolved — every consumer downstream reads the basis rather
+// than re-deriving it from the config. Two facts decide it, in this order:
+//
+//   1. Does this config pay in plan QUOTA? An oauth credential is pinned to Anthropic's own baseUrl
+//      by PRESETS, so the run is genuinely Anthropic and total_cost_usd is the right Anthropic-priced
+//      number — but it is a LIST PRICE for tokens nobody was charged for. Tag it notional; never
+//      recompute it, and never let it reach a spend fold. Asking this first is what keeps
+//      isAnthropicEndpoint a plain hostname whitelist with no subscription special case.
+//   2. Otherwise, is the endpoint genuinely Anthropic? If so total_cost_usd is real spend (or
+//      'not-reported' when absent). If not (z.ai, deepseek, …) that figure is the WRONG VENDOR's, so
+//      it is ignored entirely and the cost comes from the provider's own price-table entry —
+//      'no-price' when the model is not yet listed. [LAW:no-silent-failure]
+//
+// [LAW:types-are-the-program] Every figure this returns is checked with Number.isFinite, not
+// typeof==='number' (which accepts NaN), so a garbage total_cost_usd becomes an unreported figure and
+// never a NaN that later renders "$NaN" or poisons a total. The invariant is enforced here at the
+// source so no downstream consumer needs its own guard.
 function costFromEnvelope(env, config, buckets) {
+  if (isSubscription(config)) {
+    return {
+      basis: 'subscription',
+      notionalUsd: Number.isFinite(env.total_cost_usd) ? env.total_cost_usd : null,
+    };
+  }
   if (isAnthropicEndpoint(config)) {
-    // [LAW:types-are-the-program] available:true must carry a FINITE usd — Number.isFinite, not
-    // typeof==='number' (which accepts NaN), so a garbage total_cost_usd is 'not-reported', never a
-    // NaN that later renders "$NaN" or poisons a PR cost total. The invariant is enforced here at the
-    // source so no downstream consumer needs its own guard.
     return Number.isFinite(env.total_cost_usd)
-      ? { available: true, usd: env.total_cost_usd }
-      : { available: false, reason: 'not-reported' };
+      ? { basis: 'dollars', usd: env.total_cost_usd }
+      : { basis: 'unpriced', reason: 'not-reported' };
   }
   const usd = computeCostUsd(buckets, config.model);
-  return usd == null ? { available: false, reason: 'no-price' } : { available: true, usd };
+  return usd == null ? { basis: 'unpriced', reason: 'no-price' } : { basis: 'dollars', usd };
 }
 
 // [LAW:single-enforcer] Classification of the shared transient vocabulary (429/529/network drop) lives
@@ -32727,7 +32742,7 @@ function assertSucceeded(stdout) {
 // [LAW:effects-at-boundaries] Pure: reads usage from the engine's own JSONL output and returns
 // a Usage value, or null when no usage was reported. Codex emits NO USD — 'actual USD' is
 // tokens x the centralized price table (computeCostUsd); a model absent from the
-// table yields cost {available:false, reason:'no-price'}, never a fabricated zero. [LAW:no-silent-failure]
+// table yields cost {basis:'unpriced', reason:'no-price'}, never a fabricated zero. [LAW:no-silent-failure]
 // The cumulative turn usage rides on the final turn.completed event; later events overwrite
 // earlier ones so the last wins. An absent/empty usage object (no token fields) is reported as
 // no usage (null), not as a $0.00 run. [LAW:dataflow-not-control-flow]
@@ -32748,7 +32763,9 @@ function extractUsage(stdout, config) {
   // [LAW:types-are-the-program] cost is a discriminated value. Codex reports no USD, so a null
   // here means exactly one thing — the model is absent from the price table — and the adapter
   // declares that reason at the point it knows it, rather than the boundary re-deriving it.
-  const cost = costUsd == null ? { available: false, reason: 'no-price' } : { available: true, usd: costUsd };
+  // The basis is always 'dollars': codex declares credentialKinds ['api-key'], so no codex run can
+  // ever be billed to a subscription and this adapter has no notional arm to reach.
+  const cost = costUsd == null ? { basis: 'unpriced', reason: 'no-price' } : { basis: 'dollars', usd: costUsd };
   return { inputTokens, outputTokens, cost };
 }
 
@@ -32977,11 +32994,13 @@ function assertSucceeded(stdout) {
 // like claude-code and unlike codex — so cost needs no local price table. Cost is available only
 // when a numeric cost field was actually observed; a run that emitted no token counts at all is
 // reported as no usage (null), and a run with tokens but no cost field yields cost
-// {available:false, reason:'not-reported'} — never a fabricated $0.00. [LAW:no-silent-failure]
-// This gates availability on an OBSERVED cost exactly as claude-code gates on a present
+// {basis:'unpriced', reason:'not-reported'} — never a fabricated $0.00. [LAW:no-silent-failure]
+// This gates the figure on an OBSERVED cost exactly as claude-code gates on a present
 // total_cost_usd, so a missing figure surfaces "unknown" loudly. [LAW:one-type-per-behavior]
-// An observed numeric 0 (subscription/unpriced provider) is a real available:true usd:0; the
+// An observed numeric 0 (a provider OpenCode does not price) is a real {basis:'dollars', usd:0}; the
 // reported USD is OpenCode's estimate, so the renderer marks every cost line "est." [FRAMING:representation]
+// The basis is always 'dollars': opencode declares credentialKinds ['api-key'], so no opencode run
+// can be billed to a subscription and this adapter has no notional arm to reach.
 function extractUsage(stdout) {
   let sawTokens = false;
   let sawCost = false;
@@ -33012,8 +33031,8 @@ function extractUsage(stdout) {
   }
   if (!sawTokens) return null;
   const cost = sawCost
-    ? { available: true, usd }
-    : { available: false, reason: 'not-reported' };
+    ? { basis: 'dollars', usd }
+    : { basis: 'unpriced', reason: 'not-reported' };
   return { inputTokens, outputTokens, cost };
 }
 
@@ -33706,7 +33725,7 @@ module.exports = {
 
 "use strict";
 
-const { costMarker, parseCostMarker } = __nccwpck_require__(9614);
+const { costMarker, parseCost, emptyTallies, tallyCost } = __nccwpck_require__(9614);
 
 // The append-only daily cost ledger: the persistent cross-run store of actual review spend, scoped to
 // one repo-day, that the budget gradient (zai-budget-qzm) reads before deciding this review's effort.
@@ -33738,9 +33757,13 @@ const { costMarker, parseCostMarker } = __nccwpck_require__(9614);
 const LEDGER_MARKER = '<!-- agent-review-cost-ledger-entry -->';
 
 // [LAW:effects-at-boundaries] Pure: the body of one ledger entry — the sentinel then the reused cost
-// marker. `cost` is the same discriminated value costMarker already consumes ({available, usd, reason}),
-// so an unavailable cost writes an honest `unknown` marker: the entry still exists (a review happened),
-// its cost is simply counted as unknown on read, never fabricated as zero. [LAW:no-silent-failure]
+// marker. `cost` is the same discriminated value costMarker already consumes (see THE COST VALUE in
+// src/usage.js), so an unpriced cost writes an honest `unknown` marker: the entry still exists (a
+// review happened), its cost is simply counted as unknown on read, never fabricated as zero.
+// [LAW:dataflow-not-control-flow] The append is UNCONDITIONAL for every basis — a subscription review
+// records an entry like any other, and its exclusion from the day's dollars is the marker NAME
+// costMarker chose, never a caller that skips appendCost. A skipped append would make the
+// subscription's consumption invisible instead of merely unbilled. [LAW:no-silent-failure]
 function ledgerEntryBody(cost) {
   return `${LEDGER_MARKER}\n${costMarker(cost)}`;
 }
@@ -33754,27 +33777,31 @@ function utcDay(dateish) {
   return new Date(dateish).toISOString().slice(0, 10);
 }
 
-// [LAW:effects-at-boundaries] Pure: sum the cost of the ledger entries dated today (UTC of `now`).
-// [LAW:single-enforcer] ONE definition of "a today ledger entry" gates the sum: a comment that LEADS
+// [LAW:effects-at-boundaries] Pure: tally the cost of the ledger entries dated today (UTC of `now`).
+// [LAW:single-enforcer] ONE definition of "a today ledger entry" gates the tally: a comment that LEADS
 // with LEDGER_MARKER and whose created_at falls on today's UTC date. A comment failing either test —
 // a human note, a quoted marker mid-prose, yesterday's entry — contributes nothing.
-// [LAW:no-silent-failure] An entry inside the gate whose marker is 'unknown' or unparseable is counted
-// as an unknownEntry, never dropped, so the caller can report the day's spend as an honest lower bound
-// rather than a silently-partial sum — the same shape summarizePriorReviews returns for a PR.
+// [LAW:parse-dont-validate] Each gated body is parsed back into the same Cost value costMarker wrote
+// and folded by tallyCost, so this module never re-decides what a raw marker string means.
+// [LAW:no-silent-failure] An entry whose figure is 'unknown' or unparseable raises unknownCount,
+// never dropped, so the caller reports the day's spend as an honest lower bound rather than a
+// silently-partial sum — the same shape summarizePriorReviews returns for a PR.
+//
+// THE SPEND EXCLUSION, IN PRACTICE. A subscription review's entry carries the NOTIONAL marker, so it
+// lands in the `notional` tally and contributes nothing to `billed` — the day's dollar spend excludes
+// it BY CONSTRUCTION, not by a guard, and no `usd` field exists on its cost for this fold to read.
+// It is equally NOT an unknown billed entry: its spend is known exactly, and it is zero. The
+// subscription's consumption stays visible in `notional` rather than becoming invisible.
 function sumCostToday(comments, now) {
   const today = utcDay(now);
-  let usd = 0;
-  let knownEntries = 0;
-  let unknownEntries = 0;
+  const tallies = emptyTallies();
   for (const c of comments) {
     const body = typeof c.body === 'string' ? c.body : '';
     if (!body.trimStart().startsWith(LEDGER_MARKER)) continue;
     if (utcDay(c.created_at) !== today) continue;
-    const cost = parseCostMarker(body);
-    if (typeof cost === 'number') { usd += cost; knownEntries++; }
-    else unknownEntries++;
+    tallyCost(tallies, parseCost(body));
   }
-  return { usd, knownEntries, unknownEntries };
+  return tallies;
 }
 
 // [LAW:effects-at-boundaries] Effect: read the ledger issue's comments and return today's summed spend
@@ -33832,6 +33859,7 @@ const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS } =
 const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = __nccwpck_require__(6757);
 const { defaultEffortProfile, maxTier } = __nccwpck_require__(4652);
 const { dedupeFindings, dedupeAssessments, parseScopeValue } = __nccwpck_require__(1565);
+const { sumCost } = __nccwpck_require__(9614);
 const { renderDependencyDiffNote } = __nccwpck_require__(9838);
 const {
   buildReviewInput,
@@ -33888,9 +33916,12 @@ function workerFocusText(scope, context) {
 // in partitionFindings share one key. [LAW:single-enforcer]
 
 // [LAW:effects-at-boundaries] Pure: sum the per-spawn Usage values into one. Token counts always add.
-// Cost is uniform by construction — every spawn in a pass runs on ONE config, so all costs share the
-// same model and the same availability — so the sum is available iff every spawn's cost is, carrying
-// the same unavailable reason otherwise. [LAW:no-silent-failure] no spawn's cost is silently dropped.
+// [LAW:single-enforcer] Summing COSTS is delegated to sumCost (src/usage.js), the one owner of the
+// "never add across bases" rule — this module knows how to add tokens, not what a dollar means.
+// The cost basis is uniform by construction here (every spawn in a pass runs on ONE config), so all
+// costs share the same model and the same basis; sumCost still resolves the mixed case as a value.
+// [LAW:no-silent-failure] no spawn's cost is silently dropped: one unpriced spawn makes the whole
+// sum unpriced, carrying that spawn's reason.
 // usage === null (an engine reported nothing) is excluded; all-null sums to null, matching the
 // single-spawn behavior the cost renderer already handles.
 function sumUsage(usages) {
@@ -33898,10 +33929,7 @@ function sumUsage(usages) {
   if (present.length === 0) return null;
   const inputTokens = present.reduce((sum, u) => sum + u.inputTokens, 0);
   const outputTokens = present.reduce((sum, u) => sum + u.outputTokens, 0);
-  const cost = present.every(u => u.cost.available)
-    ? { available: true, usd: present.reduce((sum, u) => sum + u.cost.usd, 0) }
-    : { available: false, reason: present.find(u => !u.cost.available).cost.reason };
-  return { inputTokens, outputTokens, cost };
+  return { inputTokens, outputTokens, cost: sumCost(present.map(u => u.cost)) };
 }
 
 // [LAW:effects-at-boundaries] Pure: the aggregated review summary. It names every scope reviewed and
@@ -35903,11 +35931,34 @@ async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, c
   let spentToday = 0;
   try {
     const ledger = await readSpentToday(octokit, owner, repo, issueNumber, now);
-    spentToday = ledger.usd;
-    if (ledger.unknownEntries > 0) {
+    // [LAW:types-are-the-program] The gradient rations DOLLARS, so it reads the `billed` tally and
+    // nothing else. Subscription rounds are tallied separately under `notional` and have no `usd`
+    // field here to pick up — they cannot throttle a budget against money that was never spent.
+    spentToday = ledger.billed.usd;
+    if (ledger.billed.unknownCount > 0) {
       core.warning(
-        `Budget: ledger issue #${issueNumber} has ${ledger.unknownEntries} entr(ies) with unknown cost — `
+        `Budget: ledger issue #${issueNumber} has ${ledger.billed.unknownCount} entr(ies) with unknown cost — `
         + `today's spend ($${spentToday.toFixed(4)}) is a LOWER bound; the gradient rations at least this cautiously.`,
+      );
+    }
+    // [LAW:no-silent-failure] Subscription consumption is reported, not hidden: the operator sees what
+    // the day's quota-billed reviews would have cost at list price, stated as the separate figure it
+    // is. It is emitted here and summed into nothing.
+    const notionalRounds = ledger.notional.count + ledger.notional.unknownCount;
+    if (notionalRounds > 0) {
+      // [LAW:no-silent-failure] The rounds counted and the dollars summed come from DIFFERENT
+      // populations: every notional round is counted, but only the ones that reported a list price
+      // are summed. Printing the figure bare would pass a partial total off as complete — the exact
+      // accounting lie this change exists to kill — so an unreported remainder is named, the same
+      // honesty the billed tally gets above. [LAW:dataflow-not-control-flow] the remainder selects a
+      // string; one unconditional render consumes it.
+      const unreported = ledger.notional.unknownCount > 0
+        ? `, a LOWER bound — ${ledger.notional.unknownCount} of them reported no list price`
+        : '';
+      core.info(
+        `Budget: ${notionalRounds} of today's review(s) were billed to Claude subscription quota, not `
+        + `dollars — $${ledger.notional.usd.toFixed(4)} at Anthropic list price${unreported}. It is `
+        + "excluded from the day's dollar spend and summed into nothing.",
       );
     }
   } catch (e) {
@@ -36491,7 +36542,7 @@ const { parseUnifiedDiff, parseReviewableFiles } = __nccwpck_require__(9898);
 // flattenBody is imported for the pairPushbacks BOUNDARY (stamping author-written comment text), not
 // for any sink in this file — the sinks below receive values already stamped. [LAW:parse-dont-validate]
 const { severityTag, findingLineText, flattenBody, codeSpan } = __nccwpck_require__(1565);
-const { parseCostMarker } = __nccwpck_require__(9614);
+const { parseCost, emptyTallies, tallyCost } = __nccwpck_require__(9614);
 
 const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
 const APPROVED_MESSAGE = '✅ Approved';
@@ -36619,9 +36670,11 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
 // pagination is exhausted so a PR with many reviews is summarized in full, never truncated.
 async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
   let count = 0;
-  let usd = 0;
-  let knownRounds = 0;
-  let unknownRounds = 0;
+  // [LAW:one-type-per-behavior] Two tallies of one shape — dollars actually spent, and Anthropic
+  // list price for the rounds billed to subscription quota. They are reported side by side and
+  // NEVER added: a PR whose early rounds ran on a paid API and whose later rounds ran on the
+  // subscription must not report one blended number that is true of neither.
+  const tallies = emptyTallies();
   // [LAW:one-source-of-truth] The IDs of the marker-bearing (RA) reviews, collected inside the SAME
   // marker gate that drives count/cost — so "which reviews are RA's" is defined exactly once here, never
   // re-derived downstream. fetchPriorPushbacks consumes this to tell an RA finding's inline comment
@@ -36645,18 +36698,18 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
       if (!body.trimEnd().endsWith(REVIEW_MARKER)) continue;
       count++;
       reviewIds.push(r.id);
-      // [LAW:no-silent-failure] An agent round with a numeric cost marker is summed; any other case —
-      // an explicit 'unknown' marker, a pre-feature review with no marker, or a malformed value that
-      // won't parse — is a round whose cost we don't have, counted as unknown so the PR total is an
-      // honest lower bound (+), never silently omitted.
-      const cost = parseCostMarker(body);
-      if (typeof cost === 'number') { usd += cost; knownRounds++; }
-      else unknownRounds++;
+      // [LAW:parse-dont-validate] The body's marker is parsed back into the Cost value that wrote it,
+      // then folded by the one tally rule — this module never re-decides what a marker string means.
+      // [LAW:no-silent-failure] An agent round with a numeric figure is summed into its own basis;
+      // any other case — an explicit 'unknown' marker, a pre-feature review with no marker, or a
+      // malformed value that won't parse — is a round whose cost we don't have, counted as unknown so
+      // that basis's total is an honest lower bound (+), never silently omitted.
+      tallyCost(tallies, parseCost(body));
     }
     if (data.length < 100) break;
     page++;
   }
-  return { count, cost: { usd, knownRounds, unknownRounds }, reviewIds };
+  return { count, cost: tallies, reviewIds };
 }
 
 // [LAW:effects-at-boundaries] Pure, split from the fetch below so it is testable without a fake API:
@@ -36969,6 +37022,35 @@ function computeCostUsd({ inputTokens, outputTokens, cachedInputTokens = 0 }, mo
   return Number.isFinite(usd) ? usd : null;
 }
 
+// [LAW:types-are-the-program] THE COST VALUE. A review's cost is discriminated by its BASIS — the
+// question "was this paid in dollars at all?" — because a subscription run's figure is a real,
+// exactly-known number that is nonetheless NOT spend:
+//
+//   { basis: 'dollars',      usd }                                 real money; the ONLY arm a spend fold reads
+//   { basis: 'subscription', notionalUsd: number | null }          plan quota; Anthropic LIST PRICE, never spend
+//   { basis: 'unpriced',     reason: 'no-price'|'not-reported' }   dollars, but the figure is unrecoverable
+//
+// The old two-arm shape ({available:true,usd} | {available:false,reason}) could not express a
+// subscription run at all: `available:false` says "we do not know", when in fact we know the number
+// exactly and it simply is not a charge — so the figure landed in `usd` and every fold downstream
+// (PR total, daily ledger, the DAILY_BUDGET_USD gate) added notional dollars to real spend.
+//
+// The exclusion is STRUCTURAL, not a rule. The notional figure lives under a DIFFERENT NAME on a
+// DIFFERENT arm, so a spend fold has no `usd` to read on a subscription cost and cannot pick it up
+// even by mistake. One `usd` field shared by both bases plus "remember to check the basis first"
+// would be a rule, and a rule gets forgotten exactly once, silently, inside a total.
+// [LAW:no-silent-failure] `notionalUsd: null` is the honest fourth state — billed to quota, list
+// price not reported — never a fabricated 0.00, which would read as "this was free AND we know it".
+
+// [LAW:single-enforcer] The one predicate answering "does this config pay in plan quota rather than
+// dollars?", derived from the credential KIND — never from the hostname. PRESETS pins every oauth
+// credential to Anthropic's own baseUrl (assertPresetsSafe, src/provider.js), so an oauth run IS an
+// Anthropic run by construction; that is why this decides the basis BEFORE isAnthropicEndpoint's
+// whitelist rather than beside it, and why the whitelist below needs no subscription special case.
+function isSubscription(config) {
+  return config.endpoint?.credential?.kind === 'oauth';
+}
+
 // Claude Code self-reports total_cost_usd using Anthropic's price table, so that figure is this
 // run's billing basis ONLY when the engine truly talks to Anthropic. Against an Anthropic-COMPATIBLE
 // endpoint (z.ai, deepseek, …) it is priced for the wrong vendor and is not a usable cost.
@@ -37002,12 +37084,6 @@ function reviewerTag(config) {
   return `${config.engine}/${config.model || '(default model)'}`;
 }
 
-// [LAW:effects-at-boundaries] Pure: render the cost footer line from a Usage value, or '' when
-// there is no usage to report. The "loud" warning for missing usage/price is an effect and
-// belongs at the run boundary (src/run.js); costWarning below produces its text, also purely.
-// [LAW:dataflow-not-control-flow] usage === null and an unavailable cost are distinct values with
-// distinct renderings, not branches that skip work: no usage -> no line; cost unavailable ->
-// tokens with cost "unknown".
 // [LAW:types-are-the-program] A machine-readable cost record embedded in each review body, so a later
 // round sums prior rounds from a typed value — never by re-parsing the rendered "Cost: $X" prose, which
 // would be a representation re-parsing itself. Rendered as an HTML comment (invisible, like REVIEW_MARKER)
@@ -37018,75 +37094,249 @@ function reviewerTag(config) {
 // or '123..456', all of which Number() turns into NaN. Cost is non-negative by construction, so no
 // leading '-'; no exponent, so no Infinity. The producer (costMarker) always emits toFixed(6), which
 // satisfies this; the strict pattern rejects a corrupted marker at the boundary.
-const COST_MARKER_RE = /<!-- agent-review-cost-usd:([0-9]+(?:\.[0-9]+)?|unknown) -->/g;
-function costMarker(cost) {
-  // [LAW:types-are-the-program] The marker never carries a non-number: a finite available cost renders
-  // as a decimal, everything else (unavailable, or a non-finite usd from a broken upstream) as 'unknown'
-  // — symmetric with parseCostMarker's finiteness guard, so the round-trip can never smuggle a NaN.
-  const value = cost && cost.available && Number.isFinite(cost.usd) ? cost.usd.toFixed(6) : 'unknown';
-  return `<!-- agent-review-cost-usd:${value} -->`;
+// [LAW:one-source-of-truth] ONE value grammar, shared by both marker names below, so a marker that
+// the notional reader accepts can never be one the spend reader would have rejected.
+const MARKER_VALUE = '([0-9]+(?:\\.[0-9]+)?|unknown)';
+
+// [LAW:types-are-the-program] THE SPEND EXCLUSION, MADE STRUCTURAL. A subscription review writes a
+// DIFFERENTLY NAMED marker, so every spend reader — parseCostMarker here, sumCostToday in ledger.js,
+// summarizePriorReviews in transport.js — has literally nothing to match in its body. The notional
+// dollars are kept out of the daily spend by the regex, not by a guard someone must remember to
+// write, and a future reader who adds a fourth spend fold inherits the exclusion for free.
+const COST_MARKER_RE = new RegExp(`<!-- agent-review-cost-usd:${MARKER_VALUE} -->`, 'g');
+
+// [LAW:one-source-of-truth] ONE table of what each basis IS, for accounting purposes: which marker
+// name carries it, which tally bucket it lands in, and where its figure lives. A separate table per
+// consumer could drift — a basis marked notional by the writer and billed by the tally would put
+// notional dollars straight back into spend, which is the whole bug. One row, one answer.
+// [LAW:dataflow-not-control-flow] The basis selects data (a name, a key, an accessor); the same
+// render and the same fold then run for every basis. No arm skips writing a marker, so every review
+// round stays countable — a subscription round is a round whose SPEND is known to be zero, not a
+// missing one. An absent cost (no usage at all) is accounted as an unpriced one.
+const BASIS = {
+  dollars: { marker: 'agent-review-cost-usd', bucket: 'billed', figure: c => c.usd },
+  subscription: { marker: 'agent-review-notional-usd', bucket: 'notional', figure: c => c.notionalUsd },
+  unpriced: { marker: 'agent-review-cost-usd', bucket: 'billed', figure: () => null },
+};
+
+function basisOf(cost) {
+  return BASIS[cost && cost.basis] || BASIS.unpriced;
 }
-function parseCostMarker(body) {
+
+// [LAW:one-source-of-truth] Both marker names in ONE alternation, built from the BASIS table the
+// writer picks them from — so the reader can never recognize a name the writer stopped emitting.
+// One scan over both names is what makes the last-match rule hold ACROSS them: asking "is there a
+// notional marker anywhere?" before looking at the spend marker reintroduced exactly the bug
+// lastMatch exists to prevent — a dollars review whose prose quoted a notional marker was read as a
+// subscription review, and its real spend silently left every fold. Position decides, not precedence.
+const ANY_MARKER_RE = new RegExp(
+  `<!-- (${BASIS.dollars.marker}|${BASIS.subscription.marker}):${MARKER_VALUE} -->`, 'g');
+
+// [LAW:types-are-the-program] The marker never carries a non-number: a finite figure renders as a
+// decimal, everything else (an unpriced cost, an unreported notional, or a non-finite number from a
+// broken upstream) as 'unknown' — symmetric with parseMarker's finiteness guard below, so the
+// round-trip can never smuggle a NaN.
+function costMarker(cost) {
+  const basis = basisOf(cost);
+  const figure = basis.figure(cost);
+  return `<!-- ${basis.marker}:${Number.isFinite(figure) ? figure.toFixed(6) : 'unknown'} -->`;
+}
+
+// [LAW:single-enforcer] ONE rule for which marker in a body is authoritative: the LAST one. It lives
+// in the footer, after all summary/finding prose, so a review that QUOTES a marker in its prose (e.g.
+// a review OF this feature) cannot hijack the reading. Every marker reader below scans through here,
+// so none of them can hold a different opinion about which match wins.
+function lastMatch(body, re) {
   if (typeof body !== 'string') return null; // not a marker-bearing body (human review, old review)
-  // [LAW:one-source-of-truth] The authoritative marker is the LAST one in the body — it lives in the
-  // footer, after all summary/finding prose. A review that QUOTES a marker in its prose (e.g. a review
-  // OF this feature) would otherwise let a first-match grab the wrong one. Take the final match.
-  const matches = [...body.matchAll(COST_MARKER_RE)];
-  if (matches.length === 0) return null;
-  const value = matches[matches.length - 1][1];
-  if (value === 'unknown') return 'unknown';
-  const n = Number(value);
+  const matches = [...body.matchAll(re)];
+  return matches.length === 0 ? null : matches[matches.length - 1];
+}
+
+// [LAW:one-source-of-truth] ONE coercion from a captured marker value to the value the folds consume,
+// shared by every reader, so a body one reader scores as 'unknown' can never be a number to another.
+function markerValue(raw) {
+  if (raw === 'unknown') return 'unknown';
+  const n = Number(raw);
   // [LAW:no-silent-failure] belt to the strict regex: a value that does not parse to a finite number
   // is null (→ counted as an unknown-cost round), never a NaN summed into and poisoning the PR total.
   return Number.isFinite(n) ? n : null;
 }
 
-// [LAW:effects-at-boundaries] Pure: the " · PR total ..." clause appended to the cost line, or '' when
-// there are no prior rounds (the first review — its single-round line stands alone, unchanged). The
-// clause is a VALUE keyed on the prior-round count, not a second footer format. [LAW:no-silent-failure]
-// a round with unknown cost is NOT dropped from the count — the total carries a '+' and names how many
-// rounds are unpriced, so the PR total is honestly a lower bound rather than a silently-partial sum.
-function renderPrTotal(thisCost, priorCost) {
-  if (!priorCost) return '';
-  const priorRounds = priorCost.knownRounds + priorCost.unknownRounds;
-  if (priorRounds === 0) return '';
-  const totalUsd = priorCost.usd + (thisCost.available ? thisCost.usd : 0);
-  const unknownRounds = priorCost.unknownRounds + (thisCost.available ? 0 : 1);
-  const rounds = priorRounds + 1;
-  const approx = unknownRounds > 0 ? '+' : '';
-  const note = unknownRounds > 0 ? `, ${unknownRounds} with unknown cost` : '';
-  return ` · PR total $${totalUsd.toFixed(4)}${approx} across ${rounds} rounds${note}`;
+function parseMarker(body, re) {
+  const m = lastMatch(body, re);
+  return m === null ? null : markerValue(m[1]);
 }
 
+// The spend reader. Matches ONLY the dollars/unpriced marker name, so a subscription review is
+// invisible to it by construction — see THE SPEND EXCLUSION above.
+function parseCostMarker(body) {
+  return parseMarker(body, COST_MARKER_RE);
+}
+
+// [LAW:parse-dont-validate] Read a review body's marker back into the SAME Cost value costMarker
+// wrote, so the two folds that consume markers (the daily ledger, the PR total) tally a typed value
+// instead of each re-deciding what a raw marker string means. Returns null for a body carrying no
+// marker at all — a pre-feature review round, whose cost is genuinely unknown rather than zero.
+function parseCost(body) {
+  const m = lastMatch(body, ANY_MARKER_RE);
+  if (m === null) return null;
+  const [, name, raw] = m;
+  const value = markerValue(raw);
+  if (name === BASIS.subscription.marker) {
+    return { basis: 'subscription', notionalUsd: typeof value === 'number' ? value : null };
+  }
+  return typeof value === 'number' ? { basis: 'dollars', usd: value } : { basis: 'unpriced', reason: 'not-reported' };
+}
+
+// [LAW:one-source-of-truth] SUMMING IS THE ONE PLACE the "never add across bases" rule lives. A
+// dollar of spend and a notional list-price dollar are different UNITS; adding them yields a number
+// that means nothing, which is exactly the bug this ticket exists to kill. [LAW:no-silent-failure]
+// A mixed-basis sum resolves to 'unpriced' — an honest "we cannot give you one number" — never a
+// silent blend. Within one multi-scope pass the basis is uniform by construction (every spawn runs
+// on ONE config), so the mixed arm is unreachable there; it is resolved as a VALUE anyway rather
+// than assumed away, because the sum is a pure function and must total whatever it is handed.
+// One unpriced spawn makes the whole sum unpriced, carrying THAT spawn's reason, exactly as before.
+// A subscription sum with any unreported notional is wholly unreported: a partial list price summed
+// as if it were the total would understate the run, which is the same lie in a smaller font.
+function sumCost(costs) {
+  const unpriced = costs.find(c => c.basis === 'unpriced');
+  if (unpriced) return unpriced;
+  const bases = new Set(costs.map(c => c.basis));
+  if (bases.size !== 1) return { basis: 'unpriced', reason: 'not-reported' };
+  if (costs[0].basis === 'subscription') {
+    const notionals = costs.map(c => c.notionalUsd);
+    return {
+      basis: 'subscription',
+      notionalUsd: notionals.every(n => Number.isFinite(n)) ? notionals.reduce((sum, n) => sum + n, 0) : null,
+    };
+  }
+  return { basis: 'dollars', usd: costs.reduce((sum, c) => sum + c.usd, 0) };
+}
+
+// [LAW:one-type-per-behavior] A per-basis TALLY — {usd, count, unknownCount} — is one accounting
+// shape instantiated twice, over different units, and the two instances are never added together.
+// Both marker folds (the PR total in transport.js, the daily ledger in ledger.js) tally into this,
+// so "how do you count a round whose figure is missing" is answered once for both.
+// [LAW:no-silent-failure] A cost whose figure is absent raises unknownCount rather than vanishing,
+// so each total is honestly reported as a lower bound (rendered with a '+') instead of a partial
+// sum passed off as complete. A body with no marker at all (a pre-feature round) is a dollars-basis
+// round of unknown cost — never a free one.
+function emptyTallies() {
+  return {
+    billed: { usd: 0, count: 0, unknownCount: 0 },
+    notional: { usd: 0, count: 0, unknownCount: 0 },
+  };
+}
+
+function tallyCost(tallies, cost) {
+  const basis = basisOf(cost);
+  const tally = tallies[basis.bucket];
+  const figure = basis.figure(cost);
+  if (Number.isFinite(figure)) {
+    tally.usd += figure;
+    tally.count++;
+  } else {
+    tally.unknownCount++;
+  }
+  return tallies;
+}
+
+function tallyRounds(tally) {
+  return tally.count + tally.unknownCount;
+}
+
+// [LAW:effects-at-boundaries] Pure: render one basis's running total, or null when that basis saw no
+// rounds — so a PR that only ever ran on dollars renders exactly one clause, byte-identical to before
+// this feature existed, and a PR that only ever ran on the subscription renders exactly one too.
+function renderTally(label, tally) {
+  const rounds = tallyRounds(tally);
+  if (rounds === 0) return null;
+  const approx = tally.unknownCount > 0 ? '+' : '';
+  const note = tally.unknownCount > 0 ? `, ${tally.unknownCount} with unknown cost` : '';
+  return `PR ${label} $${tally.usd.toFixed(4)}${approx} across ${rounds} rounds${note}`;
+}
+
+// [LAW:effects-at-boundaries] Pure: the " · PR total ..." clause appended to the cost line, or '' when
+// there are no prior rounds (the first review — its single-round line stands alone, unchanged). The
+// clause is a VALUE keyed on the prior-round count, not a second footer format.
+// The two bases are rendered SIDE BY SIDE and never added: a PR whose early rounds ran on a paid API
+// and whose later rounds ran on the subscription reports "$1.20 across 2 rounds · $40.00 list price
+// across 2 subscription rounds", not a meaningless $41.20.
+function renderPrTotal(thisCost, priorCost) {
+  if (!priorCost) return '';
+  const priorRounds = tallyRounds(priorCost.billed) + tallyRounds(priorCost.notional);
+  if (priorRounds === 0) return '';
+  const totals = tallyCost(
+    {
+      billed: { ...priorCost.billed },
+      notional: { ...priorCost.notional },
+    },
+    thisCost,
+  );
+  const clauses = [
+    renderTally('total', totals.billed),
+    renderTally('list-price total', totals.notional),
+  ].filter(Boolean);
+  return clauses.length === 0 ? '' : ` · ${clauses.join(' · ')}`;
+}
+
+// [LAW:dataflow-not-control-flow] The basis selects a PHRASE; every cost line is then assembled by
+// the same expression. There is no arm that renders a different line shape.
+// [FRAMING:representation] Every figure this action renders is an ESTIMATE, never a billed charge: a
+// table-priced provider (codex, deepseek, z.ai) is price-table × tokens; a genuine Anthropic run is
+// Claude Code's own client-side total_cost_usd. So every priced line is marked "est.".
+// The subscription phrase leads with what is TRUE — the review was not billed — and then reports the
+// list price as the separate, clearly-labelled thing it is. That figure is the deliverable, not the
+// hazard: it is how "is the subscription cheaper than the API bill, and how much of the plan am I
+// using?" gets answered. It is emitted everywhere a cost is emitted, and summed into nothing.
+const COST_PHRASE = {
+  dollars: c => `Cost: $${c.usd.toFixed(4)}`,
+  subscription: c => Number.isFinite(c.notionalUsd)
+    ? `Not billed (Claude subscription) · $${c.notionalUsd.toFixed(4)} at Anthropic list price`
+    : 'Not billed (Claude subscription) · list price not reported',
+  unpriced: () => 'Cost: unknown',
+};
+
+// 'est.' qualifies a figure, so it rides with the bases that HAVE one. An unpriced line has nothing
+// to qualify, and its absence of the marker is the pre-existing behavior, preserved.
+const COST_IS_ESTIMATE = { dollars: true, subscription: true, unpriced: false };
+
+// [LAW:effects-at-boundaries] Pure: render the cost footer line from a Usage value, or '' when
+// there is no usage to report. The "loud" warning for missing usage/price is an effect and belongs
+// at the run boundary (src/run.js); costWarning below produces its text, also purely.
+// [LAW:dataflow-not-control-flow] usage === null and each cost basis are distinct VALUES with
+// distinct renderings, not branches that skip work: no usage -> no line; every basis -> one line
+// assembled by the same expression, differing only in the phrase its basis selected.
 function renderCostLine(usage, config, priorCost = null) {
   if (!usage) return '';
   const tag = reviewerTag(config);
   const tokens = `${formatTokenCount(usage.inputTokens)} in / ${formatTokenCount(usage.outputTokens)} out tokens`;
   const prTotal = renderPrTotal(usage.cost, priorCost);
-  if (!usage.cost.available) {
-    return `_Cost: unknown · ${tokens} · ${tag}${prTotal}_`;
-  }
-  // [FRAMING:representation] Every available cost this action renders is an ESTIMATE, never a billed
-  // charge: a table-priced provider (codex, deepseek, z.ai) is price-table × tokens; a genuine
-  // Anthropic run is Claude Code's own client-side total_cost_usd. So every line is marked "est."
-  // rather than implying exactness.
-  return `_Cost: $${usage.cost.usd.toFixed(4)} · ${tokens} · ${tag} · est.${prTotal}_`;
+  const estimate = COST_IS_ESTIMATE[usage.cost.basis] ? ' · est.' : '';
+  return `_${COST_PHRASE[usage.cost.basis](usage.cost)} · ${tokens} · ${tag}${estimate}${prTotal}_`;
 }
 
 // [LAW:effects-at-boundaries] Pure: the text of the "cost unavailable" warning, or null when cost
 // is fully reported. [LAW:no-silent-failure] the message names the ACTUAL cause, dispatched on the
-// reason VALUE the adapter carried — never re-derived by branching on engine at the boundary. This
-// is why the reason lives in usage.cost: run.js stays ignorant of which engines are table-priced.
+// basis and reason VALUES the adapter carried — never re-derived by branching on engine at the
+// boundary. This is why they live in usage.cost: run.js stays ignorant of which engines are
+// table-priced. A subscription run whose notional is missing still warns: its SPEND is known to be
+// zero either way, but losing the list price loses the one number that judges the subscription.
+const COST_WARNING = {
+  dollars: () => null,
+  subscription: (cost, tag, config) => Number.isFinite(cost.notionalUsd) ? null
+    : `${config.engine} reported no cost for ${tag}; this review was billed to Claude subscription `
+      + 'quota (so it cost $0 either way), but its Anthropic list-price figure is unavailable.',
+  unpriced: (cost, tag, config) => cost.reason === 'no-price'
+    ? `No price-table entry for ${tag}; the review footer shows cost as "unknown". `
+      + 'Add the model to PRICES_PER_MILLION in src/usage.js.'
+    : `${config.engine} reported no cost (no USD in its output) for ${tag}; `
+      + 'the review footer shows cost as "unknown".',
+};
+
 function costWarning(usage, config) {
   if (!usage) return 'Engine reported no token usage; the review footer omits the cost line.';
-  if (usage.cost.available) return null;
-  const tag = reviewerTag(config);
-  if (usage.cost.reason === 'no-price') {
-    return `No price-table entry for ${tag}; the review footer shows cost as "unknown". `
-      + 'Add the model to PRICES_PER_MILLION in src/usage.js.';
-  }
-  return `${config.engine} reported no cost (no USD in its output) for ${tag}; `
-    + 'the review footer shows cost as "unknown".';
+  return COST_WARNING[usage.cost.basis](usage.cost, reviewerTag(config), config);
 }
 
 module.exports = {
@@ -37096,9 +37346,14 @@ module.exports = {
   renderPrTotal,
   costMarker,
   parseCostMarker,
+  parseCost,
+  sumCost,
+  emptyTallies,
+  tallyCost,
   costWarning,
   formatTokenCount,
   isAnthropicEndpoint,
+  isSubscription,
 };
 
 

@@ -105,6 +105,7 @@ const AUTH_LABEL = {
 // [LAW:effects-at-boundaries] Pure: render the report string from values. Highlights the one signal
 // this tool exists for — explore-or-not, and whether exploration reached beyond the changed files.
 function formatReport({ config, mode, files, result, sessions, repo }) {
+  const { renderCostLine } = require('../src/usage');
   const lines = [];
   lines.push('================ local-review report ================');
   lines.push(`config:   ${config.name}  (engine=${config.engine}, model=${config.model})`);
@@ -141,13 +142,11 @@ function formatReport({ config, mode, files, result, sessions, repo }) {
   lines.push(`  ${(result.summary || '').replace(/\n/g, '\n  ')}`);
   lines.push('');
 
-  if (result.usage) {
-    const u = result.usage;
-    const cost = u.cost && u.cost.available ? `$${u.cost.usd.toFixed(4)} est.` : `unavailable (${u.cost ? u.cost.reason : 'no-usage'})`;
-    lines.push(`usage: in=${u.inputTokens} out=${u.outputTokens} cost=${cost}`);
-  } else {
-    lines.push('usage: not reported');
-  }
+  // [LAW:one-source-of-truth] The action's OWN cost renderer, not a second rendering of the same
+  // value — so a subscription run reads here exactly as it will read in the posted footer, and this
+  // diagnostic cannot drift into disagreeing with production about what a run cost.
+  const costLine = renderCostLine(result.usage, config);
+  lines.push(costLine ? `usage: ${costLine.replace(/^_|_$/g, '')}` : 'usage: not reported');
   lines.push('=====================================================');
   return lines.join('\n');
 }

@@ -142,8 +142,10 @@ describe('summarizePriorReviews', () => {
   const fakeOctokit = (pages) => ({
     rest: { pulls: { listReviews: async ({ page }) => ({ data: pages[page - 1] || [] }) } },
   });
-  const withCost = (usd) => `verdict\n\n${costMarker({ available: true, usd })}\n\n${REVIEW_MARKER}`;
+  const withCost = (usd) => `verdict\n\n${costMarker({ basis: 'dollars', usd })}\n\n${REVIEW_MARKER}`;
   const unknownCost = () => `verdict\n\n${costMarker(null)}\n\n${REVIEW_MARKER}`;
+  const withNotionalCost = (notionalUsd) => `verdict\n\n${costMarker({ basis: 'subscription', notionalUsd })}\n\n${REVIEW_MARKER}`;
+  const ZERO_TALLIES = { billed: { usd: 0, count: 0, unknownCount: 0 }, notional: { usd: 0, count: 0, unknownCount: 0 } };
 
   test('counts only reviews whose body ENDS with the marker (the trailing sentinel)', async () => {
     const octokit = fakeOctokit([[
@@ -172,20 +174,20 @@ describe('summarizePriorReviews', () => {
     ]]);
     const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1);
     assert.equal(count, 3); // three marker-bearing reviews
-    assert.equal(Number(cost.usd.toFixed(2)), 0.08);
-    assert.equal(cost.knownRounds, 2);
-    assert.equal(cost.unknownRounds, 1);
+    assert.equal(Number(cost.billed.usd.toFixed(2)), 0.08);
+    assert.equal(cost.billed.count, 2);
+    assert.equal(cost.billed.unknownCount, 1);
   });
 
   test('a human review that QUOTES a cost marker is excluded from BOTH count and cost (one gate)', async () => {
     const octokit = fakeOctokit([[
-      { body: `here is what the bot posts: ${costMarker({ available: true, usd: 999 })} — my own note` }, // no REVIEW_MARKER
+      { body: `here is what the bot posts: ${costMarker({ basis: 'dollars', usd: 999 })} — my own note` }, // no REVIEW_MARKER
       { body: withCost(0.04) },
     ]]);
     const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1);
     assert.equal(count, 1);                 // only the real agent round
-    assert.equal(Number(cost.usd.toFixed(2)), 0.04); // the human's $999 marker is NOT summed
-    assert.equal(cost.knownRounds, 1);
+    assert.equal(Number(cost.billed.usd.toFixed(2)), 0.04); // the human's $999 marker is NOT summed
+    assert.equal(cost.billed.count, 1);
   });
 
   test('an agent round with no cost marker (pre-feature review) counts as unknown, not omitted', async () => {
@@ -195,14 +197,33 @@ describe('summarizePriorReviews', () => {
     ]]);
     const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1);
     assert.equal(count, 2);
-    assert.equal(cost.knownRounds, 1);
-    assert.equal(cost.unknownRounds, 1); // the markerless agent round is an honest unknown
+    assert.equal(cost.billed.count, 1);
+    assert.equal(cost.billed.unknownCount, 1); // the markerless agent round is an honest unknown
+  });
+
+  // [LAW:verifiable-goals] AC for zai-billing-xl0.2: the PR total must refuse to add across bases.
+  // Reviewing PR #113 reported "$63.59 across 4 rounds" as though it were spend; every dollar was
+  // Anthropic list price for tokens billed to plan quota. Both rounds are still COUNTED — the
+  // subscription's consumption stays visible — but the two figures never merge into one.
+  test('subscription rounds tally as notional and never enter the billed total', async () => {
+    const octokit = fakeOctokit([[
+      { body: withCost(1.20) },
+      { body: withNotionalCost(40) },
+      { body: withNotionalCost(23.59) },
+    ]]);
+    const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1);
+    assert.equal(count, 3);                                  // every round counted, whatever paid for it
+    assert.equal(Number(cost.billed.usd.toFixed(2)), 1.20);  // the $63.59 of list price is NOT in here
+    assert.equal(cost.billed.count, 1);
+    assert.equal(cost.billed.unknownCount, 0);               // notional rounds are not "unknown" spend
+    assert.equal(Number(cost.notional.usd.toFixed(2)), 63.59);
+    assert.equal(cost.notional.count, 2);
   });
 
   test('returns zeroes when the PR has no reviews', async () => {
     const { count, cost, reviewIds } = await summarizePriorReviews(fakeOctokit([[]]), 'o', 'r', 1);
     assert.equal(count, 0);
-    assert.deepEqual(cost, { usd: 0, knownRounds: 0, unknownRounds: 0 });
+    assert.deepEqual(cost, ZERO_TALLIES);
     assert.deepEqual(reviewIds, []);
   });
 
@@ -223,8 +244,8 @@ describe('summarizePriorReviews', () => {
     const octokit = fakeOctokit([full, [{ body: withCost(0.01) }, { body: 'no marker' }]]);
     const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1);
     assert.equal(count, 101);
-    assert.equal(cost.knownRounds, 101);              // cost summed across BOTH pages, not just page 1
-    assert.equal(Number(cost.usd.toFixed(2)), 1.01);  // 101 × $0.01
+    assert.equal(cost.billed.count, 101);              // cost summed across BOTH pages, not just page 1
+    assert.equal(Number(cost.billed.usd.toFixed(2)), 1.01);  // 101 × $0.01
   });
 });
 

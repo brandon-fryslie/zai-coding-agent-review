@@ -188,11 +188,34 @@ async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, c
   let spentToday = 0;
   try {
     const ledger = await readSpentToday(octokit, owner, repo, issueNumber, now);
-    spentToday = ledger.usd;
-    if (ledger.unknownEntries > 0) {
+    // [LAW:types-are-the-program] The gradient rations DOLLARS, so it reads the `billed` tally and
+    // nothing else. Subscription rounds are tallied separately under `notional` and have no `usd`
+    // field here to pick up — they cannot throttle a budget against money that was never spent.
+    spentToday = ledger.billed.usd;
+    if (ledger.billed.unknownCount > 0) {
       core.warning(
-        `Budget: ledger issue #${issueNumber} has ${ledger.unknownEntries} entr(ies) with unknown cost — `
+        `Budget: ledger issue #${issueNumber} has ${ledger.billed.unknownCount} entr(ies) with unknown cost — `
         + `today's spend ($${spentToday.toFixed(4)}) is a LOWER bound; the gradient rations at least this cautiously.`,
+      );
+    }
+    // [LAW:no-silent-failure] Subscription consumption is reported, not hidden: the operator sees what
+    // the day's quota-billed reviews would have cost at list price, stated as the separate figure it
+    // is. It is emitted here and summed into nothing.
+    const notionalRounds = ledger.notional.count + ledger.notional.unknownCount;
+    if (notionalRounds > 0) {
+      // [LAW:no-silent-failure] The rounds counted and the dollars summed come from DIFFERENT
+      // populations: every notional round is counted, but only the ones that reported a list price
+      // are summed. Printing the figure bare would pass a partial total off as complete — the exact
+      // accounting lie this change exists to kill — so an unreported remainder is named, the same
+      // honesty the billed tally gets above. [LAW:dataflow-not-control-flow] the remainder selects a
+      // string; one unconditional render consumes it.
+      const unreported = ledger.notional.unknownCount > 0
+        ? `, a LOWER bound — ${ledger.notional.unknownCount} of them reported no list price`
+        : '';
+      core.info(
+        `Budget: ${notionalRounds} of today's review(s) were billed to Claude subscription quota, not `
+        + `dollars — $${ledger.notional.usd.toFixed(4)} at Anthropic list price${unreported}. It is `
+        + "excluded from the day's dollar spend and summed into nothing.",
       );
     }
   } catch (e) {
