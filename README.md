@@ -170,7 +170,9 @@ Do not reach for `pull_request_target` to solve this. It hands a write-scoped to
 
 ## Fork PRs are never reviewed
 
-PRs opened from a fork (head repo ≠ base repo) are skipped cleanly — logged, exit 0, no engine spawned — *before any credential is read*. This is unconditional with no opt-in, so an outside contributor's PR can never spend the host's AI credits or meet a secret. Your own branches (head and base in the same repo) review normally. The skip [announces itself on the PR](#a-skipped-run-says-so-on-the-pr) when the trigger's token can write.
+PRs opened from a fork (head repo ≠ base repo) are skipped cleanly — logged, exit 0, no engine spawned — *before any AI credential is read*. This is unconditional with no opt-in, so an outside contributor's PR can never spend the host's AI credits or put its diff in front of a model. Your own branches (head and base in the same repo) review normally.
+
+The skip [announces itself on the PR](#a-skipped-run-says-so-on-the-pr) when the trigger's token can write, and that notice is the one GitHub call the path makes beyond detecting the fork. It uses the GitHub token, never a provider credential, and its body is composed entirely from values the action owns — the fork's diff is never read, by the notice or by anything else.
 
 ## Daily budget
 

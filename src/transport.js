@@ -505,9 +505,17 @@ function forkNotice(pullNumber) {
       + "their diff is untrusted and reviewing it would spend the host repository's AI credits on an "
       + 'outside contributor.',
     latestArtifact: null,
-    postFailureHint: 'A `pull_request` run from a fork receives NO repository secrets and a read-only '
-      + 'GITHUB_TOKEN, so neither token can comment — GITHUB_REVIEW_TOKEN is empty there too. Trigger on '
-      + 'workflow_run if the notice must land.',
+    // A hint NAMES what the reader can check; it never asserts a cause the code cannot know. The fork
+    // path is trigger-independent (prIsFromFork reads the PR's repos, not the event), so it is reached
+    // under workflow_run too — where secrets ARE available and the secrets diagnosis would be false,
+    // telling a maintainer who already took that advice to take it again. Both branches are named and
+    // the reader resolves them instantly from their own workflow; consulting GITHUB_EVENT_NAME here
+    // would answer it slower, from ambient environment, inside a transport. [LAW:no-silent-failure]
+    postFailureHint: 'If this ran on a `pull_request` trigger, that IS the cause and no configuration '
+      + 'fixes it: a fork PR receives no repository secrets and a read-only GITHUB_TOKEN, so '
+      + 'GITHUB_REVIEW_TOKEN is empty too — trigger on workflow_run instead. If you are already on '
+      + 'workflow_run, secrets were available and the cause is elsewhere: the token needs '
+      + '`pull-requests: write`, and the PR must be open.',
   };
 }
 

@@ -194,9 +194,18 @@ describe('the notice value carries what differs, so no call site can pair it wro
   test('each notice carries its own post-failure remedy, and neither names the other\'s cause', () => {
     // A round cap is only ever reached on a same-repo PR — forks are gated out before they can
     // accumulate rounds — so fork advice on that failure names a cause that cannot apply.
-    assert.match(forkNotice(PR).postFailureHint, /workflow_run/);
     assert.doesNotMatch(roundCapNotice(CAP_MESSAGE, null).postFailureHint, /workflow_run|fork PR/);
     assert.match(roundCapNotice(CAP_MESSAGE, null).postFailureHint, /pull-requests: write/);
+  });
+
+  test('the fork remedy names the trigger it depends on rather than asserting one', () => {
+    // prIsFromFork reads the PR's repos, not the event, so this path is reached under workflow_run
+    // too — where secrets ARE available. A hint that asserted the secrets cause would tell a
+    // maintainer already on workflow_run to switch to workflow_run.
+    const hint = forkNotice(PR).postFailureHint;
+    assert.match(hint, /If this ran on a `pull_request` trigger/);
+    assert.match(hint, /If you are already on workflow_run/);
+    assert.match(hint, /pull-requests: write/); // the other branch stays actionable
   });
 });
 
