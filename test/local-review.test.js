@@ -3,6 +3,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { summarizeSession } = require('../scripts/session-stats');
 const { parseArgs, formatReport } = require('../scripts/local-review');
+const { PRESETS } = require('../src/provider');
 
 // A claude-code stream-json transcript fragment: header line (non-JSON, skipped) + tool_use events.
 const STREAM = [
@@ -44,7 +45,9 @@ test('parseArgs applies defaults and both flag forms', () => {
   assert.equal(o.scope, 'auth');
   assert.equal(o.range, 'HEAD~1 HEAD');
   assert.equal(parseArgs([]).provider, 'auto');
-  assert.equal(parseArgs(['--base-url=http://x']).baseUrl, 'http://x');
+  // Named against an override-capable provider: bare `--base-url` now takes the DEFAULT provider,
+  // which is 'auto' → the pinned subscription, and is rejected (see the aliased-pinned test below).
+  assert.equal(parseArgs(['--provider=deepseek', '--base-url=http://x']).baseUrl, 'http://x');
   assert.equal(parseArgs(['--help']).help, true);
 });
 
@@ -58,8 +61,28 @@ test('parseArgs rejects bad input loudly', () => {
   // an endpoint they had not.
   assert.throws(
     () => parseArgs(['--provider', 'claude-subscription', '--base-url', 'http://x']),
-    /--base-url does not apply to --provider claude-subscription/,
+    /--base-url does not apply to --provider 'claude-subscription': its endpoint is PINNED/,
   );
+});
+
+// The default provider is 'auto', which ALIASES to a pinned provider — so the no-`--provider`
+// invocation is the COMMON way to reach the pinned case, not an exotic one. A guard that matched the
+// concrete name only would wave this through and silently drop the flag: the same silent failure,
+// reached through the default instead of the explicit name.
+test('parseArgs rejects --base-url for an aliased pinned provider, naming both names', () => {
+  for (const argv of [['--base-url', 'http://x'], ['--provider', 'auto', '--base-url', 'http://x']]) {
+    assert.throws(
+      () => parseArgs(argv),
+      /--base-url does not apply to --provider 'auto' \(→ 'claude-subscription'\): its endpoint is PINNED to https:\/\/api\.anthropic\.com/,
+      `argv ${JSON.stringify(argv)} must be rejected`,
+    );
+  }
+});
+
+// An unknown provider is synthesizeProviderConfig's to reject, naming every valid value. parseArgs
+// must not grow a second enforcer of that rule — it passes the name through untouched.
+test('parseArgs leaves an unknown provider to the config synthesizer', () => {
+  assert.equal(parseArgs(['--provider', 'nope', '--base-url', 'http://x']).provider, 'nope');
 });
 
 test('parseArgs still accepts --base-url for the api-key providers it applies to', () => {
@@ -115,4 +138,22 @@ test('formatReport labels an oauth endpoint as subscription-billed', () => {
   });
   assert.match(report, /endpoint: oauth \(subscription\) → https:\/\/api\.anthropic\.com/);
   assert.match(report, /billed to plan quota, not per token/);
+});
+
+// [LAW:one-source-of-truth] formatReport looks a credential kind up in a label table, and PRESETS is
+// the one place a kind can come from. Pinning the coverage HERE — at build time, over both static
+// tables — is what makes an unmapped kind unreachable, so the lookup needs no runtime guard against a
+// state CI refuses to let ship. Add a kind to PRESETS without a label and this fails, naming it.
+test('formatReport renders every credential kind PRESETS can produce', () => {
+  for (const kind of new Set(Object.values(PRESETS).map(p => p.credentialKind))) {
+    const report = formatReport({
+      config: {
+        name: 'x', engine: 'claude-code', model: 'm',
+        endpoint: { apiType: 'anthropic-messages', baseUrl: 'https://h.example', credential: { kind, value: 'k' } },
+      },
+      mode: 'pr', repo: '/repo', files: [], sessions: [],
+      result: { findings: [], summary: '', usage: null },
+    });
+    assert.match(report, new RegExp(`endpoint: ${kind}[^\\n]*https://h\\.example`), `credential kind '${kind}' has no AUTH_LABEL entry`);
+  }
 });

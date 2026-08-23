@@ -204,11 +204,13 @@ describe('claudeExtractUsage', () => {
     assert.deepEqual(claudeExtractUsage(stdout, sub).cost, { available: true, usd: 0.5 });
   });
 
-  // [LAW:verifiable-goals] AC for zai-billing-xl0.1: a subscription run is Anthropic BY CONSTRUCTION —
-  // the variant carries no baseUrl to sniff, so the classification comes from the type, not a hostname.
+  // [LAW:verifiable-goals] AC for zai-billing-xl0.1: a subscription run reaches Anthropic's billing
+  // basis the ORDINARY way — its pinned baseUrl is Anthropic's, so the same hostname whitelist every
+  // other endpoint takes returns true. There is no type-based shortcut for oauth, and this test is
+  // what would fail if one were added back.
   // NOTE: the figure it yields is Anthropic LIST price for a run billed to plan quota, so it is
   // notional, not spend. Discriminating that is zai-billing-xl0.2's job, ranked immediately after.
-  test('a subscription run is Anthropic by construction, with no baseUrl to inspect', () => {
+  test('a subscription run is priced as Anthropic via its pinned host, not a special case', () => {
     const stdout = JSON.stringify({ type: 'result', total_cost_usd: 0.42, usage: { input_tokens: 10, output_tokens: 5 } });
     const subscription = {
       engine: 'claude-code',

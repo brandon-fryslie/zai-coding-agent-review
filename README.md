@@ -309,7 +309,7 @@ An `endpoint` is exactly one of two forms:
 
 Every field is validated **once, at startup** against the engine's capabilities. An illegal combination (codex with an `anthropic-messages` endpoint, an `oauth` preset on an engine that cannot use one, a `baseUrl` written beside a `preset`, a `credentialKind` in the manual form, an unknown preset, a `reasoning` on opencode, an unknown engine, a `default`/`fallback` naming an undefined config, or a `credentialEnv` whose variable is unset) fails the run with a message naming the config, field, and allowed values.
 
-> **Schema change in 1.43.0.** `endpoint.kind` is now `endpoint.apiType`, `apiKeyEnv` is now `credentialEnv`, and an endpoint is written as either the **preset** or **manual** form above. Existing config files need updating — the old shape fails at load with a message naming the field.
+> **Schema change in 1.43.0.** `endpoint.kind` is now `endpoint.apiType`, the `endpoint.auth.{method, …}` block is gone, and an endpoint is written as either the **preset** or **manual** form above. (`apiKeyEnv` became `credentialEnv` earlier, in 1.41.0 — unchanged here.) Existing config files need updating — the old shape fails at load with a message naming the field.
 
 ### Engine capability matrix
 

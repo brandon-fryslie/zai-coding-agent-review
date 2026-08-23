@@ -66,10 +66,29 @@ function parseArgs(argv) {
     opts[name === 'base-url' ? 'baseUrl' : name] = value;
   }
   if (opts.mode !== 'pr' && opts.mode !== 'repo') throw new Error(`--mode must be 'pr' or 'repo' (got '${opts.mode}').`);
-  // [LAW:no-silent-failure] The subscription provider reads no base URL — accepting the flag and
-  // quietly dropping it would leave the operator believing they had redirected the endpoint.
-  if (opts.baseUrl && opts.provider === 'claude-subscription') {
-    throw new Error("--base-url does not apply to --provider claude-subscription: a subscription token is only valid against Anthropic's own API.");
+  // [LAW:no-silent-failure] A pinned provider reads no base URL — accepting the flag and quietly
+  // dropping it would leave the operator believing they had redirected the endpoint.
+  // [LAW:one-source-of-truth] WHICH providers those are is not a name to hardcode: it is the preset's
+  // pinned `baseUrl`, read from the same table src/provider.js resolves every endpoint from, so a
+  // future pinned provider is covered the day its row lands. The require is lazy to keep module load
+  // free of the engine stack (see the header); parseArgs stays pure — a require performs no IO here.
+  if (opts.baseUrl) {
+    const { PROVIDERS, PRESETS, PROVIDER_ALIASES } = require('../src/provider');
+    // Resolve the alias FIRST. The default provider is 'auto', which forwards to a concrete row — ask
+    // before resolving and the common no-`--provider` invocation slips past this guard entirely.
+    const requested = opts.provider;
+    const provider = PROVIDER_ALIASES[requested] || requested;
+    // An unknown provider is not this guard's business: synthesizeProviderConfig rejects it loudly,
+    // naming every valid value. Duplicating that here would be a second enforcer of one rule.
+    const spec = PROVIDERS[provider];
+    const pinned = spec && PRESETS[spec.preset].baseUrl;
+    if (pinned) {
+      const label = requested === provider ? `'${provider}'` : `'${requested}' (→ '${provider}')`;
+      throw new Error(
+        `--base-url does not apply to --provider ${label}: its endpoint is PINNED to ${pinned} in code, ` +
+        'because its credential is only valid against that host.',
+      );
+    }
   }
   opts.workers = parseInt(opts.workers, 10);
   if (isNaN(opts.workers) || opts.workers < 1) throw new Error('--workers must be a positive integer.');

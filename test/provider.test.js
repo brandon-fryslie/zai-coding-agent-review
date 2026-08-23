@@ -90,6 +90,19 @@ describe('synthesizeProviderConfig — overrides', () => {
     assert.equal(config.endpoint.baseUrl, 'https://gateway.example/v1');
   });
 
+  // core.getInput yields '' for an input the workflow left unset — or interpolated from an empty
+  // `${{ vars.X }}`, or written blank in a copy-pasted workflow. An '' that WON the override chain
+  // would spawn the engine against an empty base URL: a broken endpoint produced by a blank field.
+  // Falsy therefore means "not set". [LAW:no-silent-failure]
+  test('an empty baseUrl input is not an override — it falls back to the preset default', () => {
+    for (const baseUrl of ['', undefined]) {
+      const config = synthesizeProviderConfig(
+        { provider: 'codex', openaiApiKey: 'k', openaiBaseUrl: baseUrl }, MOCK_REGISTRY,
+      );
+      assert.equal(config.endpoint.baseUrl, 'https://api.openai.com/v1', `baseUrl input ${JSON.stringify(baseUrl)}`);
+    }
+  });
+
   test('valid reasoning effort passes through', () => {
     const config = synthesizeProviderConfig({ provider: 'codex', openaiApiKey: 'k', openaiReasoning: 'high' }, MOCK_REGISTRY);
     assert.equal(config.reasoning, 'high');
@@ -201,9 +214,9 @@ describe('synthesizeProviderConfig — unknown provider', () => {
 });
 
 // [LAW:verifiable-goals] AC for zai-billing-xl0.1: the subscription provider synthesizes an endpoint
-// with no base URL anywhere in it, on the same claude-code engine the paid providers use.
+// whose base URL is PINNED to Anthropic's host, on the same claude-code engine the paid providers use.
 describe('synthesizeProviderConfig — claude-subscription provider', () => {
-  test('an OAuth token alone yields a subscription endpoint carrying NO baseUrl', () => {
+  test("an OAuth token alone yields a subscription endpoint pinned to Anthropic's host", () => {
     const config = synthesizeProviderConfig(
       { provider: 'claude-subscription', claudeCodeOauthToken: 'sk-ant-oat01-live' },
       MOCK_REGISTRY,
@@ -249,6 +262,35 @@ describe('synthesizeProviderConfig — claude-subscription provider', () => {
 // re-checks the static table, so this is the check: a row naming an endpoint kind or auth method its
 // engine does not declare would fail only at spawn time, on a real PR, having already paid for the
 // prompt. [FRAMING:representation]
+// action.yml supplying `default: "https://api.deepseek.com/anthropic"` for DEEPSEEK_BASE_URL is a
+// SECOND map of a fact src/provider.js already owns, and the one that wins: core.getInput hands the
+// action.yml default over, so the preset's own default becomes unreachable and a change to it does
+// nothing. Two clocks, and the wrong one is authoritative. This is the machine that keeps the copy
+// from coming back. [LAW:one-source-of-truth]
+describe('action.yml does not restate a default that src/provider.js owns', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const yaml = require('yaml');
+  const { PROVIDERS, PRESETS } = require('../src/provider');
+
+  const owned = new Map();
+  for (const [n, p] of Object.entries(PRESETS)) owned.set(p.baseUrl || p.defaultBaseUrl, `PRESETS.${n}`);
+  for (const [n, s] of Object.entries(PROVIDERS)) owned.set(s.defaultModel, `PROVIDERS.${n}.defaultModel`);
+
+  const inputs = yaml.parse(fs.readFileSync(path.resolve(__dirname, '..', 'action.yml'), 'utf8')).inputs;
+
+  for (const [name, spec] of Object.entries(inputs)) {
+    test(`'${name}' declares no default that duplicates the provider tables`, () => {
+      const source = owned.get(spec.default);
+      assert.ok(
+        source === undefined,
+        `action.yml input '${name}' hardcodes ${JSON.stringify(spec.default)}, which ${source} already owns. ` +
+        'Drop the `default:` — an unset input arrives as "" and the resolver reads that as "not set".',
+      );
+    });
+  }
+});
+
 describe('PROVIDERS rows agree with the real adapter capabilities', () => {
   const realRegistry = require('../src/engine/registry');
   const { PROVIDERS, PRESETS } = require('../src/provider');

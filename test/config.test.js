@@ -662,4 +662,36 @@ describe('PRESETS: an oauth credential is always pinned to its host', () => {
       ok: { apiType: 'openai-chat', defaultBaseUrl: 'https://api.example', credentialKind: 'api-key' },
     }));
   });
+
+  // A load-time check over a MUTABLE table proves only what the table was at import. Freezing is what
+  // makes the pinned host a property of the object rather than of one past moment — otherwise any
+  // later code holding the exported reference could repoint a subscription token with an assignment.
+  test('the shipped table and its rows are frozen, so a pinned host cannot be repointed at runtime', () => {
+    assert.ok(Object.isFrozen(PRESETS), 'PRESETS itself must be frozen');
+    for (const [name, p] of Object.entries(PRESETS)) {
+      assert.ok(Object.isFrozen(p), `preset row '${name}' must be frozen`);
+    }
+    assert.throws(
+      () => { 'use strict'; PRESETS['claude-subscription'].baseUrl = 'https://evil.example'; },
+      TypeError,
+    );
+    assert.equal(PRESETS['claude-subscription'].baseUrl, 'https://api.anthropic.com');
+  });
+
+  // resolveEndpoint reads a falsy base URL as "not set" with a single `||`. That is only sound while
+  // no preset can itself declare a falsy URL — so the emptiness check lives beside the pinning rules,
+  // in the one enforcer, rather than as a second guard at the resolve site. [LAW:parse-dont-validate]
+  test('assertPresetsSafe REFUSES a preset whose declared base URL is empty or not a string', () => {
+    for (const bad of [
+      { apiType: 'anthropic-messages', baseUrl: '', credentialKind: 'oauth' },
+      { apiType: 'anthropic-messages', defaultBaseUrl: '', credentialKind: 'api-key' },
+      { apiType: 'anthropic-messages', defaultBaseUrl: 42, credentialKind: 'api-key' },
+    ]) {
+      assert.throws(
+        () => assertPresetsSafe({ bad }),
+        { message: /must be a non-empty string/ },
+        `accepted a preset with an unusable base URL: ${JSON.stringify(bad)}`,
+      );
+    }
+  });
 });

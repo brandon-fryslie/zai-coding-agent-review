@@ -30529,10 +30529,15 @@ function requireFields(name, endpoint, fields) {
 // identically. Which form was written is a value read off the block, not a mode the caller picks.
 // [LAW:dataflow-not-control-flow]
 function validateEndpoint(name, engine, endpoint, capabilities) {
-  const supports = (what, value, allowed) => {
+  // [FRAMING:representation] `subject` names what the AUTHOR WROTE, not what we resolved it to. A
+  // preset-form config never typed `endpoint.apiType`, so an error naming that field asks the author
+  // to go find a line that isn't in their file; it must name `endpoint.preset` and mention the apiType
+  // the preset implies. The value stays a separate argument so the check can never test one thing and
+  // report another.
+  const supports = (subject, value, allowed) => {
     if (!allowed.includes(value)) {
       throw new Error(
-        `Config '${name}': ${what} '${value}' is not supported by engine '${engine}'. Allowed: ${allowed.join(', ')}.`,
+        `Config '${name}': ${subject} is not supported by engine '${engine}'. Allowed: ${allowed.join(', ')}.`,
       );
     }
   };
@@ -30546,18 +30551,19 @@ function validateEndpoint(name, engine, endpoint, capabilities) {
         `Config '${name}': endpoint.preset '${endpoint.preset}' is not a known preset. Defined: ${Object.keys(PRESETS).join(', ')}.`,
       );
     }
-    supports('endpoint.apiType', preset.apiType, capabilities.apiTypes);
-    supports('the credential kind', preset.credentialKind, capabilities.credentialKinds);
+    const wrote = `endpoint.preset '${endpoint.preset}'`;
+    supports(`${wrote} (apiType '${preset.apiType}')`, preset.apiType, capabilities.apiTypes);
+    supports(`${wrote} (credential kind '${preset.credentialKind}')`, preset.credentialKind, capabilities.credentialKinds);
     return;
   }
 
   rejectForeignKeys(name, endpoint, MANUAL_FIELDS, 'manual');
   requireFields(name, endpoint, MANUAL_FIELDS);
-  supports('endpoint.apiType', endpoint.apiType, capabilities.apiTypes);
+  supports(`endpoint.apiType '${endpoint.apiType}'`, endpoint.apiType, capabilities.apiTypes);
   // The manual form is api-key by construction — it has no field that could say otherwise — so the
   // engine must support api-key to be reachable this way at all. An engine that only ever took a
   // subscription credential would be configurable solely through a preset, which is the intent.
-  supports('the credential kind', 'api-key', capabilities.credentialKinds);
+  supports("the manual endpoint form's credential kind 'api-key'", 'api-key', capabilities.credentialKinds);
 }
 
 // [LAW:effects-at-boundaries] Pure: validates raw parsed YAML against the adapter
@@ -34882,6 +34888,12 @@ const PRESETS = {
 // [LAW:single-enforcer] The invariant is checked once, at module load, over the static table — not
 // re-derived per run (that would be a defensive guard on a constant) and not left to CI alone, so an
 // unsafe row cannot ship even if the test is deleted. A pinned row is identified by HAVING baseUrl.
+//
+// It then FREEZES what it validated. A load-time check over a mutable object proves only what the
+// table was at import; freezing makes it what the table IS, so `PRESETS['claude-subscription']
+// .baseUrl = 'https://evil.example'` from any later code throws instead of silently repointing a
+// subscription token. Validation and freezing live together because the guarantee is "validated AND
+// unchanged since" — one fact, one enforcer. [LAW:types-are-the-program]
 function assertPresetsSafe(presets) {
   for (const [name, p] of Object.entries(presets)) {
     const pinned = 'baseUrl' in p;
@@ -34889,14 +34901,24 @@ function assertPresetsSafe(presets) {
     if (pinned === overridable) {
       throw new Error(`Preset '${name}': must declare exactly one of 'baseUrl' (pinned) or 'defaultBaseUrl' (overridable).`);
     }
+    // The declared URL must be a real one. This is what lets resolveEndpoint treat every falsy base
+    // URL as "not set" with a single `||`, rather than mixing `??` and `||` and having to reason
+    // about which of three sources may legally be empty. [LAW:parse-dont-validate]
+    const declared = pinned ? p.baseUrl : p.defaultBaseUrl;
+    if (typeof declared !== 'string' || declared === '') {
+      throw new Error(
+        `Preset '${name}': '${pinned ? 'baseUrl' : 'defaultBaseUrl'}' must be a non-empty string (got ${JSON.stringify(declared)}).`,
+      );
+    }
     if (p.credentialKind === 'oauth' && !pinned) {
       throw new Error(
         `Preset '${name}': an 'oauth' credential requires a PINNED 'baseUrl'. An overridable base URL would let a ` +
         'misconfiguration send a long-lived subscription token to an arbitrary host.',
       );
     }
+    Object.freeze(p);
   }
-  return presets;
+  return Object.freeze(presets);
 }
 assertPresetsSafe(PRESETS);
 
@@ -34948,12 +34970,19 @@ const PROVIDERS = {
 
 // [LAW:dataflow-not-control-flow] Resolve a preset plus the caller's overrides into the one endpoint
 // shape. A pinned preset ignores no input — it is handed none, because `fields` on a pinned row reads
-// no base URL. The `??` chain therefore has exactly one live source per row, never a silent priority
+// no base URL. The chain therefore has exactly one live source per row, never a silent priority
 // contest between a pin and an override.
+//
+// `||`, not `??`, and deliberately: the override arrives from `core.getInput`, which yields '' for an
+// input the workflow left unset or interpolated from an empty `${{ vars.X }}`. Under `??` that ''
+// wins the chain and the run spawns against an EMPTY base URL — a broken endpoint produced by a
+// blank field, which is precisely the silent failure this module exists to prevent. Falsy therefore
+// means "not set" for all three sources; assertPresetsSafe guarantees a preset's own URL is never
+// falsy, so `||` and `??` differ only on the case that must not win. [LAW:no-silent-failure]
 function resolveEndpoint(preset, { baseUrl, credential }) {
   return {
     apiType: preset.apiType,
-    baseUrl: preset.baseUrl ?? baseUrl ?? preset.defaultBaseUrl,
+    baseUrl: preset.baseUrl || baseUrl || preset.defaultBaseUrl,
     credential: { kind: preset.credentialKind, value: credential },
   };
 }
@@ -36592,7 +36621,8 @@ function computeCostUsd({ inputTokens, outputTokens, cachedInputTokens = 0 }, mo
 // endpoint (z.ai, deepseek, …) it is priced for the wrong vendor and is not a usable cost.
 // [LAW:types-are-the-program] Whitelist the genuine endpoint rather than blacklisting known
 // impostors: default to "not Anthropic" so every foreign endpoint is excluded by construction, not
-// one vendor at a time. An absent baseUrl means Claude Code's built-in default — Anthropic's own API.
+// one vendor at a time — which is also why an absent baseUrl answers NO: a config that cannot say
+// where it points has not earned Anthropic's billing basis.
 function isAnthropicEndpoint(config) {
   // Every endpoint now carries a real baseUrl — an OAuth credential's is PINNED in the preset table
   // rather than absent — so this is a plain hostname whitelist with no special case for a missing URL

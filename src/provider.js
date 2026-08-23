@@ -49,6 +49,12 @@ const PRESETS = {
 // [LAW:single-enforcer] The invariant is checked once, at module load, over the static table — not
 // re-derived per run (that would be a defensive guard on a constant) and not left to CI alone, so an
 // unsafe row cannot ship even if the test is deleted. A pinned row is identified by HAVING baseUrl.
+//
+// It then FREEZES what it validated. A load-time check over a mutable object proves only what the
+// table was at import; freezing makes it what the table IS, so `PRESETS['claude-subscription']
+// .baseUrl = 'https://evil.example'` from any later code throws instead of silently repointing a
+// subscription token. Validation and freezing live together because the guarantee is "validated AND
+// unchanged since" — one fact, one enforcer. [LAW:types-are-the-program]
 function assertPresetsSafe(presets) {
   for (const [name, p] of Object.entries(presets)) {
     const pinned = 'baseUrl' in p;
@@ -56,14 +62,24 @@ function assertPresetsSafe(presets) {
     if (pinned === overridable) {
       throw new Error(`Preset '${name}': must declare exactly one of 'baseUrl' (pinned) or 'defaultBaseUrl' (overridable).`);
     }
+    // The declared URL must be a real one. This is what lets resolveEndpoint treat every falsy base
+    // URL as "not set" with a single `||`, rather than mixing `??` and `||` and having to reason
+    // about which of three sources may legally be empty. [LAW:parse-dont-validate]
+    const declared = pinned ? p.baseUrl : p.defaultBaseUrl;
+    if (typeof declared !== 'string' || declared === '') {
+      throw new Error(
+        `Preset '${name}': '${pinned ? 'baseUrl' : 'defaultBaseUrl'}' must be a non-empty string (got ${JSON.stringify(declared)}).`,
+      );
+    }
     if (p.credentialKind === 'oauth' && !pinned) {
       throw new Error(
         `Preset '${name}': an 'oauth' credential requires a PINNED 'baseUrl'. An overridable base URL would let a ` +
         'misconfiguration send a long-lived subscription token to an arbitrary host.',
       );
     }
+    Object.freeze(p);
   }
-  return presets;
+  return Object.freeze(presets);
 }
 assertPresetsSafe(PRESETS);
 
@@ -115,12 +131,19 @@ const PROVIDERS = {
 
 // [LAW:dataflow-not-control-flow] Resolve a preset plus the caller's overrides into the one endpoint
 // shape. A pinned preset ignores no input — it is handed none, because `fields` on a pinned row reads
-// no base URL. The `??` chain therefore has exactly one live source per row, never a silent priority
+// no base URL. The chain therefore has exactly one live source per row, never a silent priority
 // contest between a pin and an override.
+//
+// `||`, not `??`, and deliberately: the override arrives from `core.getInput`, which yields '' for an
+// input the workflow left unset or interpolated from an empty `${{ vars.X }}`. Under `??` that ''
+// wins the chain and the run spawns against an EMPTY base URL — a broken endpoint produced by a
+// blank field, which is precisely the silent failure this module exists to prevent. Falsy therefore
+// means "not set" for all three sources; assertPresetsSafe guarantees a preset's own URL is never
+// falsy, so `||` and `??` differ only on the case that must not win. [LAW:no-silent-failure]
 function resolveEndpoint(preset, { baseUrl, credential }) {
   return {
     apiType: preset.apiType,
-    baseUrl: preset.baseUrl ?? baseUrl ?? preset.defaultBaseUrl,
+    baseUrl: preset.baseUrl || baseUrl || preset.defaultBaseUrl,
     credential: { kind: preset.credentialKind, value: credential },
   };
 }

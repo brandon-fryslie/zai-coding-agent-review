@@ -56,7 +56,8 @@ function computeCostUsd({ inputTokens, outputTokens, cachedInputTokens = 0 }, mo
 // endpoint (z.ai, deepseek, …) it is priced for the wrong vendor and is not a usable cost.
 // [LAW:types-are-the-program] Whitelist the genuine endpoint rather than blacklisting known
 // impostors: default to "not Anthropic" so every foreign endpoint is excluded by construction, not
-// one vendor at a time. An absent baseUrl means Claude Code's built-in default — Anthropic's own API.
+// one vendor at a time — which is also why an absent baseUrl answers NO: a config that cannot say
+// where it points has not earned Anthropic's billing basis.
 function isAnthropicEndpoint(config) {
   // Every endpoint now carries a real baseUrl — an OAuth credential's is PINNED in the preset table
   // rather than absent — so this is a plain hostname whitelist with no special case for a missing URL

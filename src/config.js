@@ -61,10 +61,15 @@ function requireFields(name, endpoint, fields) {
 // identically. Which form was written is a value read off the block, not a mode the caller picks.
 // [LAW:dataflow-not-control-flow]
 function validateEndpoint(name, engine, endpoint, capabilities) {
-  const supports = (what, value, allowed) => {
+  // [FRAMING:representation] `subject` names what the AUTHOR WROTE, not what we resolved it to. A
+  // preset-form config never typed `endpoint.apiType`, so an error naming that field asks the author
+  // to go find a line that isn't in their file; it must name `endpoint.preset` and mention the apiType
+  // the preset implies. The value stays a separate argument so the check can never test one thing and
+  // report another.
+  const supports = (subject, value, allowed) => {
     if (!allowed.includes(value)) {
       throw new Error(
-        `Config '${name}': ${what} '${value}' is not supported by engine '${engine}'. Allowed: ${allowed.join(', ')}.`,
+        `Config '${name}': ${subject} is not supported by engine '${engine}'. Allowed: ${allowed.join(', ')}.`,
       );
     }
   };
@@ -78,18 +83,19 @@ function validateEndpoint(name, engine, endpoint, capabilities) {
         `Config '${name}': endpoint.preset '${endpoint.preset}' is not a known preset. Defined: ${Object.keys(PRESETS).join(', ')}.`,
       );
     }
-    supports('endpoint.apiType', preset.apiType, capabilities.apiTypes);
-    supports('the credential kind', preset.credentialKind, capabilities.credentialKinds);
+    const wrote = `endpoint.preset '${endpoint.preset}'`;
+    supports(`${wrote} (apiType '${preset.apiType}')`, preset.apiType, capabilities.apiTypes);
+    supports(`${wrote} (credential kind '${preset.credentialKind}')`, preset.credentialKind, capabilities.credentialKinds);
     return;
   }
 
   rejectForeignKeys(name, endpoint, MANUAL_FIELDS, 'manual');
   requireFields(name, endpoint, MANUAL_FIELDS);
-  supports('endpoint.apiType', endpoint.apiType, capabilities.apiTypes);
+  supports(`endpoint.apiType '${endpoint.apiType}'`, endpoint.apiType, capabilities.apiTypes);
   // The manual form is api-key by construction — it has no field that could say otherwise — so the
   // engine must support api-key to be reachable this way at all. An engine that only ever took a
   // subscription credential would be configurable solely through a preset, which is the intent.
-  supports('the credential kind', 'api-key', capabilities.credentialKinds);
+  supports("the manual endpoint form's credential kind 'api-key'", 'api-key', capabilities.credentialKinds);
 }
 
 // [LAW:effects-at-boundaries] Pure: validates raw parsed YAML against the adapter
