@@ -8,7 +8,6 @@ const { makeCliAdapter } = require('./cli');
 const { isAnthropicEndpoint, computeCostUsd } = require('../usage');
 const { resolveReasoningTier } = require('../effort');
 
-const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
 // [LAW:no-ambient-temporal-coupling] Pin the CLI version — never '@latest'. '@latest' makes every
 // run depend on whatever npm serves at execution time: an unowned, time-varying input no one in this
@@ -65,36 +64,44 @@ function materializeHome({ instructionsPath }) {
   return home;
 }
 
-// [LAW:dataflow-not-control-flow] The credential's DELIVERY MECHANISM is a value, not a branch: each
-// auth method maps to the env fragment that carries it, and buildCommand splices whichever fragment it
-// is handed without ever asking which one. A new method is one entry here and no new structure.
+// [LAW:dataflow-not-control-flow] The credential's DELIVERY CHANNEL is a value, not a branch: each
+// credential kind maps to the env fragment that carries it, and buildCommand splices whichever
+// fragment it is handed without ever asking which one. A new kind is one entry here, no new structure.
+// Keyed by the credential's KIND rather than by endpoint or provider, because that is the only thing
+// that decides the channel — an API key and an OAuth token speak the same wire protocol to the same
+// Messages API and differ solely in which env var the CLI reads them from.
 //
 // [LAW:types-are-the-program] The fragments are DISJOINT, and that is load-bearing rather than tidy.
 // The CLI's auth precedence is cloud-provider creds > ANTHROPIC_AUTH_TOKEN > ANTHROPIC_API_KEY >
 // apiKeyHelper > CLAUDE_CODE_OAUTH_TOKEN, and the first two win SILENTLY in non-interactive mode — so
 // a run that set both would quietly bill the API key while the operator believed the subscription paid
-// for it, with no error anywhere to notice. Making each method produce only its own vars means that
+// for it, with no error anywhere to notice. Making each kind produce only its own vars means that
 // state cannot be constructed. The explicit env allowlist below is the other half: no ambient
 // ANTHROPIC_API_KEY on the runner can reach the child and outrank the OAuth token either.
 const AUTH_ENV = {
-  'api-key': auth => ({ ANTHROPIC_AUTH_TOKEN: auth.credential, ANTHROPIC_BASE_URL: auth.baseUrl }),
-  // A subscription token IS Anthropic's own endpoint — there is no base URL to set, and setting one
-  // would be the "subscription token pointed at z.ai" state the auth union exists to delete.
-  subscription: auth => ({ CLAUDE_CODE_OAUTH_TOKEN: auth.credential }),
+  'api-key': ({ baseUrl, credential }) => ({
+    ANTHROPIC_AUTH_TOKEN: credential.value,
+    ANTHROPIC_BASE_URL: baseUrl,
+  }),
+  // No ANTHROPIC_BASE_URL: an OAuth credential is only reachable through a preset whose baseUrl is
+  // PINNED in code (src/provider.js), and that host is already the CLI's own default. Setting it would
+  // add a second, mutable path to a value the security model deliberately fixes.
+  oauth: ({ credential }) => ({ CLAUDE_CODE_OAUTH_TOKEN: credential.value }),
 };
 
 // [LAW:no-silent-failure] An unmapped method must never spawn an engine carrying NO credential — that
 // surfaces as an opaque 401 deep inside the CLI, minutes and one full prompt later. Config validation
 // rejects unknown methods upstream against the adapter's capability declaration; this names the gap
 // loudly if the enumeration and this map ever drift apart.
-function authEnv(auth) {
-  const fragment = AUTH_ENV[auth.method];
+function authEnv(endpoint) {
+  const fragment = AUTH_ENV[endpoint.credential.kind];
   if (!fragment) {
     throw new Error(
-      `claude-code: no auth env mapping for method '${auth.method}'. Known methods: ${Object.keys(AUTH_ENV).join(', ')}.`,
+      `claude-code: no auth env mapping for credential kind '${endpoint.credential.kind}'. ` +
+      `Known kinds: ${Object.keys(AUTH_ENV).join(', ')}.`,
     );
   }
-  return fragment(auth);
+  return fragment(endpoint);
 }
 
 // [LAW:effects-at-boundaries] Pure: returns a full spawn spec from a validated ReviewConfig.
@@ -156,7 +163,7 @@ function buildCommand({ config, collector, home }) {
     TMPDIR: process.env.TMPDIR,
     npm_config_cache: process.env.npm_config_cache,
     HOME: home,
-    ...authEnv(config.endpoint.auth),
+    ...authEnv(config.endpoint),
     ANTHROPIC_MODEL: config.model,
     API_TIMEOUT_MS: String(CLAUDE_TIMEOUT_MS),
     CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1',
@@ -272,11 +279,11 @@ const claudeCodeAdapter = makeCliAdapter({
     // for config validation in src/config.js (T4). Illegal combos are rejected at load
     // time via these declarations, never discovered at spawn time.
     reasoningEfforts: CLAUDE_REASONING_EFFORTS,
-    endpointKinds: ['anthropic-messages'],
-    // [LAW:one-source-of-truth] Derived from AUTH_ENV rather than restated: the methods this engine
-    // ADVERTISES are exactly the methods it can actually translate into a credential channel, so
-    // declaring one it cannot spawn is not a mistake that can be made.
-    authMethods: Object.keys(AUTH_ENV),
+    apiTypes: ['anthropic-messages'],
+    // [LAW:one-source-of-truth] Derived from AUTH_ENV rather than restated: the credential kinds this
+    // engine ADVERTISES are exactly the ones it can actually translate into a channel, so declaring
+    // one it cannot spawn is not a mistake that can be made.
+    credentialKinds: Object.keys(AUTH_ENV),
   },
   // [LAW:one-source-of-truth] Reference TOOL_NAMES — do not redeclare the strings here.
   toolNames: TOOL_NAMES,
@@ -291,7 +298,6 @@ const claudeCodeAdapter = makeCliAdapter({
 // (byte-identical args/env, error classification, usage parsing) — they are NOT part of the public
 // adapter interface. [LAW:behavior-not-structure]
 module.exports = {
-  ZAI_ANTHROPIC_BASE_URL,
   CLAUDE_TIMEOUT_MS,
   classifyClaudeError,
   claudeCodeAdapter,

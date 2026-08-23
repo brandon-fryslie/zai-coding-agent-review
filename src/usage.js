@@ -56,16 +56,15 @@ function computeCostUsd({ inputTokens, outputTokens, cachedInputTokens = 0 }, mo
 // endpoint (z.ai, deepseek, …) it is priced for the wrong vendor and is not a usable cost.
 // [LAW:types-are-the-program] Whitelist the genuine endpoint rather than blacklisting known
 // impostors: default to "not Anthropic" so every foreign endpoint is excluded by construction, not
-// one vendor at a time. An absent baseUrl means Claude Code's built-in default — Anthropic's own API.
+// one vendor at a time — which is also why an absent baseUrl answers NO: a config that cannot say
+// where it points has not earned Anthropic's billing basis.
 function isAnthropicEndpoint(config) {
-  const auth = (config.endpoint && config.endpoint.auth) || {};
-  // [LAW:types-are-the-program] A subscription token is minted against Anthropic and the variant
-  // carries no baseUrl to point elsewhere, so this question is answered by the type rather than by
-  // parsing a hostname. The sniff below exists only for the api-key variant, where a base URL exists
-  // and may belong to an Anthropic-COMPATIBLE vendor whose bill is not Anthropic's.
-  if (auth.method === 'subscription') return true;
-  const baseUrl = auth.baseUrl;
-  if (!baseUrl) return true;
+  // Every endpoint now carries a real baseUrl — an OAuth credential's is PINNED in the preset table
+  // rather than absent — so this is a plain hostname whitelist with no special case for a missing URL
+  // and none for a subscription. A pinned Anthropic host simply passes the same check every other
+  // endpoint takes. [LAW:one-type-per-behavior]
+  const baseUrl = config.endpoint && config.endpoint.baseUrl;
+  if (!baseUrl) return false;
   try {
     // [LAW:types-are-the-program] Match the anthropic.com domain exactly — the apex or a true
     // subdomain — never a bare `endsWith('anthropic.com')`, which a lookalike host like

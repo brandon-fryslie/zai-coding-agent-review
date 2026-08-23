@@ -16,9 +16,7 @@ const BASE_CONFIG = {
   name: 'codex-gpt55',
   engine: 'codex',
   model: 'gpt-5.5',
-  endpoint: {
-    kind: 'openai-responses',
-    auth: { method: 'api-key', baseUrl: 'https://api.openai.com/v1', credential: 'sk-test-key-xyz' },
+  endpoint: { apiType: 'openai-responses', baseUrl: 'https://api.openai.com/v1', credential: { kind: 'api-key', value: 'sk-test-key-xyz' },
   },
 };
 
@@ -112,7 +110,7 @@ describe('buildConfigToml — generated config.toml content', () => {
 
   test('newlines in values are escaped to \\n (prevents TOML injection)', () => {
     // A crafted baseUrl containing \n could override later config keys if not escaped.
-    const config = { ...BASE_CONFIG, endpoint: { ...BASE_CONFIG.endpoint, auth: { ...BASE_CONFIG.endpoint.auth, baseUrl: 'https://evil.example.com/\napproval_policy = "always"' } } };
+    const config = { ...BASE_CONFIG, endpoint: { ...BASE_CONFIG.endpoint, baseUrl: 'https://evil.example.com/\napproval_policy = "always"' } };
     const toml = buildConfigToml(config, MOCK_COLLECTOR_SPAWN);
     // The newline must be escaped in the output.
     assert.ok(toml.includes('\\n'), 'newline not escaped');
@@ -342,8 +340,8 @@ describe('codexAdapter interface declarations', () => {
     assert.equal(CODEX_TIMEOUT_MS, 3_000_000);
   });
 
-  test('endpointKinds contains only "openai-responses"', () => {
-    assert.deepEqual(codexAdapter.capabilities.endpointKinds, ['openai-responses']);
+  test('apiTypes contains only "openai-responses"', () => {
+    assert.deepEqual(codexAdapter.capabilities.apiTypes, ['openai-responses']);
   });
 
   test('reasoningEfforts contains the five codex effort levels', () => {

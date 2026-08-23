@@ -20,11 +20,6 @@ const CODEX_TIMEOUT_MS = 3_000_000;
 // nearest-rung clamp relies on.
 const CODEX_REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'];
 
-// [LAW:one-source-of-truth] The OpenAI Responses base URL the default 'codex' provider
-// targets. Declared here next to the adapter; src/provider.js references this constant
-// rather than re-spelling the URL, mirroring ZAI_ANTHROPIC_BASE_URL in claude-code.js.
-const OPENAI_RESPONSES_BASE_URL = 'https://api.openai.com/v1';
-
 // Internal provider name used in config.toml. Codex requires an explicit 'name' field
 // inside each [model_providers.<key>] section — without it, config load fails with
 // "provider name must not be empty". Must be alphanumeric, no underscores or hyphens.
@@ -57,7 +52,7 @@ function buildConfigToml(config, collectorSpawn) {
   // control characters. Raw \n/\r in a single-line basic string breaks TOML parsing and
   // could allow injection (e.g., a crafted baseUrl containing \napproval_policy = "always"
   // overrides a hardened setting). [LAW:effects-at-boundaries] values from external sources
-  // (baseUrl, apiKeyEnv, recordsPath) must be sanitized at this trust boundary.
+  // (baseUrl, the credential value, recordsPath) must be sanitized at this trust boundary.
   const q = v => `"${String(v)
     .replace(/\\/g, '\\\\')
     .replace(/"/g, '\\"')
@@ -85,7 +80,7 @@ function buildConfigToml(config, collectorSpawn) {
     '',
     `[model_providers.${INTERNAL_PROVIDER}]`,
     `name = ${q(INTERNAL_PROVIDER)}`,
-    `base_url = ${q(config.endpoint.auth.baseUrl)}`,
+    `base_url = ${q(config.endpoint.baseUrl)}`,
     // Explicitly opt the custom provider into OpenAI API-key auth so Codex uses the
     // auth.json credential, rather than relying on implicit fallback. [LAW:types-are-the-program]
     `requires_openai_auth = true`,
@@ -114,7 +109,7 @@ function materializeHome({ config, instructionsPath, collector }) {
   // The key name is Codex's fixed API-key slot, independent of the config's credentialEnv.
   fs.writeFileSync(
     path.join(home, 'auth.json'),
-    JSON.stringify({ OPENAI_API_KEY: config.endpoint.auth.credential }),
+    JSON.stringify({ OPENAI_API_KEY: config.endpoint.credential.value }),
     'utf8',
   );
 
@@ -227,10 +222,10 @@ const codexAdapter = makeCliAdapter({
     // for config validation in src/config.js. Illegal combos (e.g. anthropic-messages
     // endpoint with codex) are rejected at load time, never discovered at spawn time.
     reasoningEfforts: CODEX_REASONING_EFFORTS,
-    endpointKinds: ['openai-responses'],
-    // Codex authenticates only by API key (auth.json). A Claude subscription token is meaningless
+    apiTypes: ['openai-responses'],
+    // Codex authenticates only by API key (auth.json). An OAuth/subscription credential is meaningless
     // here, so config validation rejects it at load time rather than writing an unusable auth.json.
-    authMethods: ['api-key'],
+    credentialKinds: ['api-key'],
   },
   toolNames: TOOL_NAMES,
   materializeHome,
@@ -251,5 +246,4 @@ module.exports = {
   assertSucceeded,
   classifyError,
   extractUsage,
-  OPENAI_RESPONSES_BASE_URL,
 };

@@ -3,7 +3,6 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   claudeCodeAdapter,
-  ZAI_ANTHROPIC_BASE_URL,
   CLAUDE_TIMEOUT_MS,
   buildCommand,
   classifyError,
@@ -11,6 +10,9 @@ const {
   extractUsage,
   parseResultEnvelope,
 } = require('../src/engine/claude-code');
+// The vendor URL lives in PRESETS now — a fact about z.ai, not about the claude-code CLI.
+const { PRESETS } = require('../src/provider');
+const ZAI_ANTHROPIC_BASE_URL = PRESETS.zai.defaultBaseUrl;
 
 // [LAW:verifiable-goals] AC for T3: existing ZAI_* inputs produce a byte-identical
 // claude invocation (args + env) to the pre-refactor runClaudeCode + buildClaudeArgs.
@@ -22,9 +24,7 @@ const BASE_CONFIG = {
   name: 'zai-compat',
   engine: 'claude-code',
   model: 'claude-sonnet-4-6',
-  endpoint: {
-    kind: 'anthropic-messages',
-    auth: { method: 'api-key', baseUrl: ZAI_ANTHROPIC_BASE_URL, credential: 'test-api-key-xyz' },
+  endpoint: { apiType: 'anthropic-messages', baseUrl: ZAI_ANTHROPIC_BASE_URL, credential: { kind: 'api-key', value: 'test-api-key-xyz' },
   },
 };
 
@@ -34,9 +34,7 @@ const SUBSCRIPTION_CONFIG = {
   name: 'claude-subscription-default',
   engine: 'claude-code',
   model: 'claude-sonnet-5',
-  endpoint: {
-    kind: 'anthropic-messages',
-    auth: { method: 'subscription', credential: 'sk-ant-oat01-test-token' },
+  endpoint: { apiType: 'anthropic-messages', baseUrl: 'https://api.anthropic.com', credential: { kind: 'oauth', value: 'sk-ant-oat01-test-token' },
   },
 };
 
@@ -329,14 +327,21 @@ describe('buildCommand — the auth variant decides the credential channel, byte
     }
   });
 
-  test('an unknown auth method fails loudly instead of spawning with no credential', () => {
+  test('an unknown credential kind fails loudly instead of spawning with no credential', () => {
     assert.throws(
       () => buildCommand({
-        config: { ...BASE_CONFIG, endpoint: { kind: 'anthropic-messages', auth: { method: 'oauth-device-flow', credential: 'x' } } },
+        config: {
+          ...BASE_CONFIG,
+          endpoint: {
+            apiType: 'anthropic-messages',
+            baseUrl: 'https://api.anthropic.com',
+            credential: { kind: 'device-flow', value: 'x' },
+          },
+        },
         collector: MOCK_COLLECTOR,
         home: MOCK_HOME,
       }),
-      { message: /no auth env mapping for method 'oauth-device-flow'.*api-key, subscription/ },
+      { message: /no auth env mapping for credential kind 'device-flow'.*api-key, oauth/ },
     );
   });
 });
@@ -350,16 +355,16 @@ describe('claudeCodeAdapter interface declarations', () => {
     assert.equal(CLAUDE_TIMEOUT_MS, 3_000_000);
   });
 
-  test('endpointKinds contains only "anthropic-messages"', () => {
-    assert.deepEqual(claudeCodeAdapter.capabilities.endpointKinds, ['anthropic-messages']);
+  test('apiTypes contains only "anthropic-messages"', () => {
+    assert.deepEqual(claudeCodeAdapter.capabilities.apiTypes, ['anthropic-messages']);
   });
 
   test('reasoningEfforts contains the four claude effort levels', () => {
     assert.deepEqual(claudeCodeAdapter.capabilities.reasoningEfforts, ['low', 'medium', 'high', 'max']);
   });
 
-  test('authMethods declares both credential channels this engine can actually spawn', () => {
-    assert.deepEqual(claudeCodeAdapter.capabilities.authMethods, ['api-key', 'subscription']);
+  test('credentialKinds declares both channels this engine can actually spawn', () => {
+    assert.deepEqual(claudeCodeAdapter.capabilities.credentialKinds, ['api-key', 'oauth']);
   });
 
   test('toolNames reference mcp__review_collector__ prefix', () => {

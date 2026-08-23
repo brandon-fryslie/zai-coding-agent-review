@@ -75,7 +75,7 @@ To run Codex instead:
 
 ### Reviewing on a Claude Pro/Max subscription
 
-`PROVIDER: claude-subscription` runs the same Claude Code engine against Anthropic's own API using your **subscription**, so a review consumes plan quota instead of billing per token. Since 1.42.0 this is what the default `PROVIDER: auto` resolves to, so an unconfigured consumer gets it.
+`PROVIDER: claude-subscription` runs the same Claude Code engine against Anthropic's own API using your **subscription**, so a review consumes plan quota instead of billing per token. Its endpoint is **pinned to `https://api.anthropic.com`** — there is deliberately no `CLAUDE_BASE_URL`, and no input or config file can move it, because a subscription token is long-lived and broadly scoped and must never be sendable to a host chosen by configuration. Since 1.42.0 this is what the default `PROVIDER: auto` resolves to, so an unconfigured consumer gets it.
 
 Mint the token once, locally — it is valid for a year:
 
@@ -90,7 +90,7 @@ claude setup-token          # prints the token; store it as a repo secret
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 ```
 
-There is deliberately no base-URL input for this provider: the token is only valid against Anthropic's own API, so pointing it elsewhere is not something the config can express. The preflight probe is skipped for subscription auth (and says so in the log) rather than guessing a request shape that could reject a working token.
+The same pin applies however you configure it — see [the two endpoint forms](#multi-engine-configuration). The preflight probe is skipped for an OAuth credential (and says so in the log) rather than guessing a request shape that could reject a working token.
 
 For a failover chain or per-PR engine selection, use the [config file](#multi-engine-configuration) instead.
 
@@ -102,7 +102,7 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | `DEEPSEEK_API_KEY` | — | Required for `deepseek`. |
 | `DEEPSEEK_MODEL` | `deepseek-v4-pro` | Model for the `deepseek` provider. |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/anthropic` | Anthropic-compatible endpoint for `deepseek`. |
-| `CLAUDE_CODE_OAUTH_TOKEN` | — | Required for `auto`/`claude-subscription`. A Claude Pro/Max token from `claude setup-token` (valid one year); the review is billed to the subscription's quota, not per token. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | — | Required for `auto`/`claude-subscription`. A Claude Pro/Max token from `claude setup-token` (valid one year); the review is billed to the subscription's quota, not per token. Its endpoint is pinned to `https://api.anthropic.com` and there is no base-URL input for it. |
 | `CLAUDE_MODEL` | `claude-sonnet-5` | Model for the `claude-subscription` provider. |
 | `ZAI_API_KEY` | — | Required for `zai`. |
 | `ZAI_MODEL` | `glm-5.1` | Model for the `zai` provider. |
@@ -272,51 +272,52 @@ fallback:                        # optional ordered failover chain
   - codex-gpt55
 
 configs:
-  deepseek:
+  deepseek:                      # MANUAL form — any apiType, any baseUrl, always an API key
     engine: claude-code          # claude-code | codex | opencode
     model: deepseek-v4-pro
     reasoning: high              # validated against the engine's declared efforts
     endpoint:
-      kind: anthropic-messages
-      auth:
-        method: api-key
-        baseUrl: https://api.deepseek.com/anthropic
-        credentialEnv: DEEPSEEK_API_KEY  # the NAME of an env var — never a secret value
+      apiType: anthropic-messages
+      baseUrl: https://api.deepseek.com/anthropic
+      credentialEnv: DEEPSEEK_API_KEY  # the NAME of an env var — never a secret value
 
-  claude-sub:                    # runs on a Claude Pro/Max subscription, not a paid API key
+  claude-sub:                    # PRESET form — the only way to reach a subscription token
     engine: claude-code
     model: claude-sonnet-5
     endpoint:
-      kind: anthropic-messages
-      auth:
-        method: subscription
-        credentialEnv: CLAUDE_CODE_OAUTH_TOKEN
-        # No baseUrl: a subscription token is only valid against Anthropic's own API, and
-        # writing one here is a load-time error rather than a setting that gets ignored.
+      preset: claude-subscription      # apiType + baseUrl + credential kind all pinned in code
+      credentialEnv: CLAUDE_CODE_OAUTH_TOKEN
 
   codex-gpt55:
     engine: codex
     model: gpt-5.5
     reasoning: xhigh
     endpoint:
-      kind: openai-responses
-      auth:
-        method: api-key
-        baseUrl: https://api.openai.com/v1
-        credentialEnv: OPENAI_API_KEY
+      apiType: openai-responses
+      baseUrl: https://api.openai.com/v1
+      credentialEnv: OPENAI_API_KEY
 ```
 
-Every field is validated **once, at startup** against the engine's capabilities. An illegal combination (codex with an `anthropic-messages` endpoint, a `subscription` auth on an engine that cannot use one, a `baseUrl` under a `subscription` auth, a `reasoning` on opencode, an unknown engine, a `default`/`fallback` naming an undefined config, or a `credentialEnv` whose variable is unset) fails the run with a message naming the config, field, and allowed values.
+An `endpoint` is exactly one of two forms:
 
-> **Schema change in 1.41.0.** `endpoint.baseUrl` / `endpoint.apiKeyEnv` moved under `endpoint.auth` and `apiKeyEnv` was renamed `credentialEnv`, so the credential's *delivery mechanism* is part of the type: an api-key endpoint has a base URL, a subscription does not. Existing config files need the nesting above — the old flat form fails at load with a message naming the missing field.
+| form | fields | credential |
+|---|---|---|
+| **preset** | `preset`, `credentialEnv` | whatever the preset pins — **the only way to get `oauth`** |
+| **manual** | `apiType`, `baseUrl`, `credentialEnv` | always `api-key` |
+
+**That asymmetry is a security boundary, not an omission.** A subscription/OAuth token is long-lived and broadly scoped — its blast radius dwarfs a per-service API key — so it may only ever be sent to a host pinned in code. The manual form keeps every degree of freedom that is safe to have (any API shape, any URL, any env var) and simply cannot name a high-blast-radius credential. Reaching "OAuth token at a host of my choosing" therefore takes a code change to the preset table, reviewed like any other — not a YAML typo.
+
+Every field is validated **once, at startup** against the engine's capabilities. An illegal combination (codex with an `anthropic-messages` endpoint, an `oauth` preset on an engine that cannot use one, a `baseUrl` written beside a `preset`, a `credentialKind` in the manual form, an unknown preset, a `reasoning` on opencode, an unknown engine, a `default`/`fallback` naming an undefined config, or a `credentialEnv` whose variable is unset) fails the run with a message naming the config, field, and allowed values.
+
+> **Schema change in 1.43.0.** `endpoint.kind` is now `endpoint.apiType`, the `endpoint.auth.{method, …}` block is gone, and an endpoint is written as either the **preset** or **manual** form above. (`apiKeyEnv` became `credentialEnv` earlier, in 1.41.0 — unchanged here.) Existing config files need updating — the old shape fails at load with a message naming the field.
 
 ### Engine capability matrix
 
-A config is rejected at load unless its `endpoint.kind`, `endpoint.auth.method`, and `reasoning` are valid for its `engine`:
+A config is rejected at load unless its `endpoint.apiType`, its credential kind, and its `reasoning` are valid for its `engine`:
 
-| Engine | `endpoint.kind` | `auth.method` | `reasoning` efforts |
+| Engine | `endpoint.apiType` | credential kinds | `reasoning` efforts |
 |---|---|---|---|
-| `claude-code` | `anthropic-messages` | `api-key`, `subscription` | `low`, `medium`, `high`, `max` |
+| `claude-code` | `anthropic-messages` | `api-key`, `oauth` | `low`, `medium`, `high`, `max` |
 | `codex` | `openai-responses` | `api-key` | `minimal`, `low`, `medium`, `high`, `xhigh` |
 | `opencode` | `openai-chat`, `openai-responses`, `anthropic-messages` | `api-key` | *(none — setting `reasoning` is a config error)* |
 
