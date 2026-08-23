@@ -33605,7 +33605,10 @@ async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepF
   const PER_CONFIG_LIMIT = 3;
 
   for (let sweep = 1; sweep <= MAX_CHAIN_SWEEPS; sweep++) {
-    for (const config of chain) {
+    // The index is what makes "last config" a POSITIONAL fact rather than object identity: a chain
+    // may legitimately hold two references to equal configs, and `config === chain.at(-1)` would
+    // then call the wrong rung final. [LAW:types-are-the-program]
+    for (const [configIndex, config] of chain.entries()) {
       for (let attempt = 1; attempt <= PER_CONFIG_LIMIT; attempt++) {
         totalAttempts++;
         try {
@@ -33629,10 +33632,18 @@ async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepF
             );
             await sleepFn(delay);
           } else {
-            // All per-config attempts exhausted: advance to next config immediately.
+            // All per-config attempts exhausted. [LAW:one-source-of-truth] The sentence names what
+            // ACTUALLY happens next, derived from the same two facts the loops terminate on, rather
+            // than asserting a fixed "Advancing…" that the very next statement can falsify. Capping
+            // the sweeps is what made that rung reachable: while the loop was unbounded, the last
+            // config of a sweep really did advance — to chain[0] on the sweep after. A run whose
+            // whole purpose is an accurate diagnosis must not sign off with a lie.
+            const isFinalRung = sweep === MAX_CHAIN_SWEEPS && configIndex === chain.length - 1;
             core.warning(
               `Transient error on '${config.name}' (${config.engine}/${config.model}) — all ${PER_CONFIG_LIMIT} attempts exhausted: ${err.message}. ` +
-              `Advancing to next config.`,
+              (isFinalRung
+                ? `Retry ladder spent (${MAX_CHAIN_SWEEPS} sweep(s) × ${chain.length} config(s)); surfacing this error as the run's cause.`
+                : 'Advancing to next config.'),
             );
           }
         }

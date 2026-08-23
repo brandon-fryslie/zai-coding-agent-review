@@ -563,6 +563,34 @@ describe('produceReview — the chain-sweep circuit breaker', () => {
     });
   }
 
+  // Review round 1 (#116): capping the sweeps made one rung reachable where "Advancing to next
+  // config." is false — the last config of the last sweep advances to nothing, it ends the run.
+  // While the loop was unbounded that sentence was always eventually true (chain[0] on the next
+  // sweep), so the cap is what turned it into a lie, in the one message an operator reads when the
+  // ladder gives up. A PR whose whole point is an accurate diagnosis cannot sign off with one.
+  it('the final rung says the ladder is spent, never that it is advancing to a config that follows', async () => {
+    const core = require('@actions/core');
+    const chain = [cfg('a'), cfg('b')];
+    const original = core.warning;
+    const warnings = [];
+    core.warning = m => warnings.push(m);
+    try {
+      await assert.rejects(() => produceReview(
+        chain, null, null, async () => { throw wall(); }, NO_SLEEP, GENEROUS_BUDGET_MS, frozenClock,
+      ));
+    } finally {
+      core.warning = original;
+    }
+
+    const exhausted = warnings.filter(w => /attempts exhausted/.test(w));
+    // One per config per sweep; only the very last of them ends the run.
+    assert.equal(exhausted.length, chain.length * MAX_CHAIN_SWEEPS);
+    assert.match(exhausted.at(-1), /Retry ladder spent/);
+    assert.doesNotMatch(exhausted.at(-1), /Advancing to next config/);
+    // Every earlier rung genuinely does advance, and still says so.
+    for (const w of exhausted.slice(0, -1)) assert.match(w, /Advancing to next config/);
+  });
+
   // The breaker must bound futile retrying WITHOUT cutting off a provider that recovers inside the
   // bound — otherwise it would trade a 25-minute burn for a review lost to one long blip.
   it('still returns a review when the provider clears on the very last allowed attempt', async () => {
