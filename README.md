@@ -75,7 +75,7 @@ To run Codex instead:
 
 ### Reviewing on a Claude Pro/Max subscription
 
-`PROVIDER: claude-subscription` runs the same Claude Code engine against Anthropic's own API using your **subscription**, so a review consumes plan quota instead of billing per token. Since 1.42.0 this is what the default `PROVIDER: auto` resolves to, so an unconfigured consumer gets it.
+`PROVIDER: claude-subscription` runs the same Claude Code engine against Anthropic's own API using your **subscription**, so a review consumes plan quota instead of billing per token. Its endpoint is **pinned to `https://api.anthropic.com`** — there is deliberately no `CLAUDE_BASE_URL`, and no input or config file can move it, because a subscription token is long-lived and broadly scoped and must never be sendable to a host chosen by configuration. Since 1.42.0 this is what the default `PROVIDER: auto` resolves to, so an unconfigured consumer gets it.
 
 Mint the token once, locally — it is valid for a year:
 
@@ -90,7 +90,7 @@ claude setup-token          # prints the token; store it as a repo secret
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 ```
 
-There is deliberately no base-URL input for this provider. Its endpoint is **pinned in code** to Anthropic's own API, because an OAuth credential must never be sendable to a host chosen by configuration — see [the two endpoint forms](#multi-engine-configuration). The preflight probe is skipped for an OAuth credential (and says so in the log) rather than guessing a request shape that could reject a working token.
+The same pin applies however you configure it — see [the two endpoint forms](#multi-engine-configuration). The preflight probe is skipped for an OAuth credential (and says so in the log) rather than guessing a request shape that could reject a working token.
 
 For a failover chain or per-PR engine selection, use the [config file](#multi-engine-configuration) instead.
 
@@ -102,7 +102,7 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | `DEEPSEEK_API_KEY` | — | Required for `deepseek`. |
 | `DEEPSEEK_MODEL` | `deepseek-v4-pro` | Model for the `deepseek` provider. |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/anthropic` | Anthropic-compatible endpoint for `deepseek`. |
-| `CLAUDE_CODE_OAUTH_TOKEN` | — | Required for `auto`/`claude-subscription`. A Claude Pro/Max token from `claude setup-token` (valid one year); the review is billed to the subscription's quota, not per token. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | — | Required for `auto`/`claude-subscription`. A Claude Pro/Max token from `claude setup-token` (valid one year); the review is billed to the subscription's quota, not per token. Its endpoint is pinned to `https://api.anthropic.com` and there is no base-URL input for it. |
 | `CLAUDE_MODEL` | `claude-sonnet-5` | Model for the `claude-subscription` provider. |
 | `ZAI_API_KEY` | — | Required for `zai`. |
 | `ZAI_MODEL` | `glm-5.1` | Model for the `zai` provider. |

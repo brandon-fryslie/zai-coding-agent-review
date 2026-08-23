@@ -8,7 +8,6 @@ const { makeCliAdapter } = require('./cli');
 const { isAnthropicEndpoint, computeCostUsd } = require('../usage');
 const { resolveReasoningTier } = require('../effort');
 
-const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
 // [LAW:no-ambient-temporal-coupling] Pin the CLI version — never '@latest'. '@latest' makes every
 // run depend on whatever npm serves at execution time: an unowned, time-varying input no one in this
@@ -299,7 +298,6 @@ const claudeCodeAdapter = makeCliAdapter({
 // (byte-identical args/env, error classification, usage parsing) — they are NOT part of the public
 // adapter interface. [LAW:behavior-not-structure]
 module.exports = {
-  ZAI_ANTHROPIC_BASE_URL,
   CLAUDE_TIMEOUT_MS,
   classifyClaudeError,
   claudeCodeAdapter,

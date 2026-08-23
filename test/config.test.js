@@ -678,6 +678,25 @@ describe('PRESETS: an oauth credential is always pinned to its host', () => {
     assert.equal(PRESETS['claude-subscription'].baseUrl, 'https://api.anthropic.com');
   });
 
+  // PROVIDERS is the OTHER half of the same routing: `preset` picks the endpoint row a credential is
+  // sent to, so leaving it mutable would make the PRESETS freeze half a guarantee.
+  test('PROVIDERS and PROVIDER_ALIASES are frozen too — the routing cannot be repointed either', () => {
+    const { PROVIDERS, PROVIDER_ALIASES, assertProvidersSafe } = require('../src/provider');
+    assert.ok(Object.isFrozen(PROVIDERS) && Object.isFrozen(PROVIDER_ALIASES));
+    for (const [name, spec] of Object.entries(PROVIDERS)) {
+      assert.ok(Object.isFrozen(spec), `provider row '${name}' must be frozen`);
+    }
+    assert.throws(() => { 'use strict'; PROVIDERS['claude-subscription'].preset = 'openai'; }, TypeError);
+    assert.throws(() => { 'use strict'; PROVIDER_ALIASES.auto = 'deepseek'; }, TypeError);
+    assert.equal(PROVIDERS['claude-subscription'].preset, 'claude-subscription');
+
+    // And a row naming a preset that does not exist is refused at load, not at review time.
+    assert.throws(
+      () => assertProvidersSafe({ bogus: { preset: 'nope' } }, PRESETS),
+      { message: /names preset 'nope', which is not defined/ },
+    );
+  });
+
   // resolveEndpoint reads a falsy base URL as "not set" with a single `||`. That is only sound while
   // no preset can itself declare a falsy URL — so the emptiness check lives beside the pinning rules,
   // in the one enforcer, rather than as a second guard at the resolve site. [LAW:parse-dont-validate]

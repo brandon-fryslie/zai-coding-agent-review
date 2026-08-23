@@ -3,7 +3,6 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   claudeCodeAdapter,
-  ZAI_ANTHROPIC_BASE_URL,
   CLAUDE_TIMEOUT_MS,
   buildCommand,
   classifyError,
@@ -11,6 +10,9 @@ const {
   extractUsage,
   parseResultEnvelope,
 } = require('../src/engine/claude-code');
+// The vendor URL lives in PRESETS now — a fact about z.ai, not about the claude-code CLI.
+const { PRESETS } = require('../src/provider');
+const ZAI_ANTHROPIC_BASE_URL = PRESETS.zai.defaultBaseUrl;
 
 // [LAW:verifiable-goals] AC for T3: existing ZAI_* inputs produce a byte-identical
 // claude invocation (args + env) to the pre-refactor runClaudeCode + buildClaudeArgs.

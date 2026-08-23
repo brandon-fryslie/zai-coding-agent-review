@@ -289,6 +289,20 @@ describe('action.yml does not restate a default that src/provider.js owns', () =
       );
     });
   }
+
+  // The README is the other copy, and it CANNOT be deleted — a consumer reading the inputs table
+  // needs the literal value. So the invariant flips direction: the README must not document a
+  // default the code no longer produces. Change `deepseek-v4-pro` in PROVIDERS and this fails until
+  // the docs follow, which is the drift the action.yml half can't see. [FRAMING:representation]
+  const readme = fs.readFileSync(path.resolve(__dirname, '..', 'README.md'), 'utf8');
+  for (const [value, source] of owned) {
+    test(`README documents the current value of ${source}`, () => {
+      assert.ok(
+        readme.includes(value),
+        `${source} is '${value}', which appears nowhere in README.md — the docs still describe an older default.`,
+      );
+    });
+  }
 });
 
 describe('PROVIDERS rows agree with the real adapter capabilities', () => {

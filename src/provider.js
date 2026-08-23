@@ -1,11 +1,18 @@
 'use strict';
-const { ZAI_ANTHROPIC_BASE_URL } = require('./engine/claude-code');
-const { OPENAI_RESPONSES_BASE_URL } = require('./engine/codex');
-const defaultRegistry = require('./engine/registry');
 
-// DeepSeek exposes an Anthropic-compatible endpoint, so it runs on the claude-code engine
-// exactly like z.ai — same auth translation, different base URL. [LAW:one-type-per-behavior]
+// [LAW:one-way-deps] This module requires NO engine module. The vendor base URLs below used to be
+// declared in the adapters and imported back here — but neither adapter ever USED its own constant;
+// each only exported one for PRESETS to read. So the table of endpoint shapes was dragging in the
+// whole engine stack (registry → three adapters → cli/run/collector/failover/usage) to learn a
+// string it is itself the table of. A vendor's URL is a fact about the vendor, not about the CLI
+// that dials it. They live here now, where PRESETS can be imported for the price of the data.
+// [LAW:decomposition]
+
+// DeepSeek and z.ai both expose Anthropic-compatible endpoints, so they run on the claude-code
+// engine — same auth translation, different base URL. [LAW:one-type-per-behavior]
 const DEEPSEEK_ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic';
+const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
+const OPENAI_RESPONSES_BASE_URL = 'https://api.openai.com/v1';
 
 // The default model for a Claude Pro/Max subscription run. Sonnet, not Opus: the constraint under a
 // subscription is quota rather than dollars, and a reviewer that exhausts the plan's Opus allowance in
@@ -129,6 +136,25 @@ const PROVIDERS = {
   },
 };
 
+// [LAW:single-enforcer] PROVIDERS carries the SAME security-critical routing as PRESETS: `preset`
+// picks which endpoint row a credential is sent to, and `fields` is the closure that pulls that
+// credential out of the input bag. Freezing one table and not the other would leave the invariant
+// half-held — `PROVIDERS['claude-subscription'].preset = 'openai'` is as good as repointing the
+// pinned host. It validates first, for the same reason assertPresetsSafe does: the guarantee is
+// "validated AND unchanged since", which is one fact and wants one enforcer.
+function assertProvidersSafe(providers, presets) {
+  for (const [name, spec] of Object.entries(providers)) {
+    if (!presets[spec.preset]) {
+      throw new Error(
+        `Provider '${name}': names preset '${spec.preset}', which is not defined. Defined: ${Object.keys(presets).join(', ')}.`,
+      );
+    }
+    Object.freeze(spec);
+  }
+  return Object.freeze(providers);
+}
+assertProvidersSafe(PROVIDERS, PRESETS);
+
 // [LAW:dataflow-not-control-flow] Resolve a preset plus the caller's overrides into the one endpoint
 // shape. A pinned preset ignores no input — it is handed none, because `fields` on a pinned row reads
 // no base URL. The chain therefore has exactly one live source per row, never a silent priority
@@ -159,7 +185,9 @@ function resolveEndpoint(preset, { baseUrl, credential }) {
 // falling back to a paid provider. That loud failure is exactly what makes retargeting every consumer
 // from one line safe to do. [LAW:no-silent-failure] The installer provisions both secrets, so a
 // workflow it wrote carries whichever credential 'auto' currently resolves to.
-const PROVIDER_ALIASES = { auto: 'claude-subscription' };
+// Frozen with the two tables it steers between: reassigning `auto` reroutes every consumer that
+// named no provider, which is the same blast radius as repointing a row.
+const PROVIDER_ALIASES = Object.freeze({ auto: 'claude-subscription' });
 
 // Every accepted PROVIDER input value: the concrete providers plus the aliases. The order
 // matters only for the "valid providers" message in the unknown-PROVIDER error.
@@ -168,9 +196,9 @@ const PROVIDER_NAMES = [...Object.keys(PROVIDERS), ...Object.keys(PROVIDER_ALIAS
 // [LAW:effects-at-boundaries] Pure: maps inputs to a ReviewConfig, touches nothing external.
 // [LAW:no-silent-failure] Throws — naming the input to fix — when the provider is unknown,
 // the selected provider's credential is absent, or the reasoning effort is unsupported.
-// reg is injectable for testing; defaults to the real adapter registry.
+// reg is injectable for testing; defaults to the real adapter registry, required at the ONE point
+// that needs it (see the one-way-deps note at the top) so importing this module stays data-cheap.
 function synthesizeProviderConfig(inputs, reg) {
-  const registry = reg || defaultRegistry;
   const requested = inputs.provider;
   // [LAW:dataflow-not-control-flow] Resolve the alias to a concrete provider value before any
   // synthesis; everything downstream sees only a real provider, never the alias.
@@ -207,6 +235,7 @@ function synthesizeProviderConfig(inputs, reg) {
     // [LAW:single-enforcer] Reasoning validity is owned by the adapter's capability
     // declaration — the same source the CONFIG_FILE path validates against — so simple
     // mode and config-file mode reject the same illegal values.
+    const registry = reg || require('./engine/registry');
     const allowed = registry.get(spec.engine).capabilities.reasoningEfforts;
     if (!allowed.includes(f.reasoning)) {
       throw new Error(
@@ -235,4 +264,5 @@ module.exports = {
   PRESETS,
   resolveEndpoint,
   assertPresetsSafe,
+  assertProvidersSafe,
 };
