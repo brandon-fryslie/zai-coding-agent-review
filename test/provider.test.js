@@ -143,29 +143,40 @@ describe('synthesizeProviderConfig — deepseek provider', () => {
 });
 
 describe("synthesizeProviderConfig — 'auto' alias", () => {
-  test('auto resolves to deepseek and runs identically, with the resolution shown in the config name', () => {
-    const viaAuto = synthesizeProviderConfig({ provider: 'auto', deepseekApiKey: 'k' }, MOCK_REGISTRY);
-    const viaDeepseek = synthesizeProviderConfig({ provider: 'deepseek', deepseekApiKey: 'k' }, MOCK_REGISTRY);
-    assert.equal(viaAuto.engine, viaDeepseek.engine);
-    assert.equal(viaAuto.model, viaDeepseek.model);
-    assert.deepEqual(viaAuto.endpoint, viaDeepseek.endpoint);
-    assert.equal(viaAuto.name, 'auto→deepseek');
+  test('auto resolves to claude-subscription and runs identically, with the resolution shown in the config name', () => {
+    const viaAuto = synthesizeProviderConfig({ provider: 'auto', claudeCodeOauthToken: 'k' }, MOCK_REGISTRY);
+    const viaSub = synthesizeProviderConfig({ provider: 'claude-subscription', claudeCodeOauthToken: 'k' }, MOCK_REGISTRY);
+    assert.equal(viaAuto.engine, viaSub.engine);
+    assert.equal(viaAuto.model, viaSub.model);
+    assert.deepEqual(viaAuto.endpoint, viaSub.endpoint);
+    assert.equal(viaAuto.name, 'auto→claude-subscription');
   });
 
-  test('auto with no DeepSeek key fails naming the resolved provider and its input', () => {
+  // [LAW:no-silent-failure] The property that makes retargeting every 'auto' consumer from one line
+  // safe: a repo still supplying only the OLD target's credential stops with a message naming the new
+  // input, before any engine spawns. It must never quietly fall back to the paid provider whose key
+  // happens to be present — that would spend real money on a run the operator thinks is free.
+  test('auto with only the old DeepSeek key fails naming the resolution and the input to set', () => {
     assert.throws(
-      () => synthesizeProviderConfig({ provider: 'auto', openaiApiKey: 'sk-openai' }, MOCK_REGISTRY),
+      () => synthesizeProviderConfig({ provider: 'auto', deepseekApiKey: 'sk-deepseek' }, MOCK_REGISTRY),
       err => {
-        assert.ok(/DEEPSEEK_API_KEY/.test(err.message), err.message);
-        assert.ok(/auto.*deepseek/.test(err.message), `expected auto→deepseek in: ${err.message}`);
+        assert.ok(/CLAUDE_CODE_OAUTH_TOKEN/.test(err.message), err.message);
+        assert.ok(/auto.*claude-subscription/.test(err.message), `expected auto→claude-subscription in: ${err.message}`);
         return true;
       },
     );
   });
 
-  test("'auto' and 'deepseek' are both listed among valid PROVIDER values", () => {
+  test('naming deepseek explicitly still works — the retarget only moves the default', () => {
+    const config = synthesizeProviderConfig({ provider: 'deepseek', deepseekApiKey: 'sk-deepseek' }, MOCK_REGISTRY);
+    assert.equal(config.name, 'deepseek-default');
+    assert.equal(config.endpoint.auth.credential, 'sk-deepseek');
+  });
+
+  test("'auto', 'deepseek' and 'claude-subscription' are all listed among valid PROVIDER values", () => {
     assert.ok(PROVIDER_NAMES.includes('auto'));
     assert.ok(PROVIDER_NAMES.includes('deepseek'));
+    assert.ok(PROVIDER_NAMES.includes('claude-subscription'));
   });
 });
 
@@ -219,14 +230,10 @@ describe('synthesizeProviderConfig — claude-subscription provider', () => {
     );
   });
 
-  test("PROVIDER: auto still resolves to deepseek — the subscription is opt-in", () => {
-    const viaAuto = synthesizeProviderConfig({ provider: 'auto', deepseekApiKey: 'k' }, MOCK_REGISTRY);
-    assert.equal(viaAuto.endpoint.auth.method, 'api-key');
-    assert.equal(viaAuto.name, 'auto→deepseek');
-  });
-
-  test('claude-subscription is listed among valid PROVIDER values', () => {
-    assert.ok(PROVIDER_NAMES.includes('claude-subscription'));
+  test('PROVIDER: auto resolves here — an unconfigured consumer gets the subscription', () => {
+    const viaAuto = synthesizeProviderConfig({ provider: 'auto', claudeCodeOauthToken: 'k' }, MOCK_REGISTRY);
+    assert.equal(viaAuto.endpoint.auth.method, 'subscription');
+    assert.equal(viaAuto.name, 'auto→claude-subscription');
   });
 });
 

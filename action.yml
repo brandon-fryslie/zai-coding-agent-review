@@ -17,7 +17,7 @@ inputs:
     description: "Named config to select from the config file."
     required: false
   PROVIDER:
-    description: "auto|deepseek|codex|zai|claude-subscription (default: auto)"
+    description: "auto|deepseek|codex|zai|claude-subscription (default: auto, which resolves to claude-subscription)"
     required: false
     default: "auto"
   OPENAI_API_KEY:

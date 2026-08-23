@@ -2,15 +2,18 @@
 
 A GitHub Action that runs an AI coding agent as a **read-only** code reviewer. It reviews a pull request diff and submits an inline GitHub review — `REQUEST_CHANGES` when it finds blocking issues, otherwise `APPROVE` (or a "⏳ Partial review" `COMMENT` when the [time budget](#inputs) ran out before every scope was reviewed — a partial review never approves). It can also do an on-demand whole-repo review (`MODE: repo`).
 
-The review engine is chosen by `PROVIDER`, which defaults to `auto` (today: Claude Code against DeepSeek). You can also run Claude Code against Z.ai, or Codex against OpenAI. The engine reviews read-only — it cannot push to GitHub itself; findings flow through a private collector and are submitted by the action.
+The review engine is chosen by `PROVIDER`, which defaults to `auto` (today: Claude Code against Anthropic, billed to your **Claude Pro/Max subscription** rather than per token). You can also run Claude Code against Z.ai, or Codex against OpenAI. The engine reviews read-only — it cannot push to GitHub itself; findings flow through a private collector and are submitted by the action.
 
 ## Quickstart
 
-1. Add a `DEEPSEEK_API_KEY` repository secret (**Settings → Secrets and variables → Actions**), or via the CLI:
+1. Mint a subscription token once, locally — `claude setup-token` prints one valid for a year — and add it as a `CLAUDE_CODE_OAUTH_TOKEN` repository secret (**Settings → Secrets and variables → Actions**), or via the CLI:
 
    ```bash
-   gh secret set DEEPSEEK_API_KEY --body "$DEEPSEEK_API_KEY"
+   claude setup-token                    # prints the token
+   gh secret set CLAUDE_CODE_OAUTH_TOKEN # paste it at the prompt
    ```
+
+   Prefer paying per token? Set that provider's key and name it explicitly with `PROVIDER:` — see [Providers](#providers).
 
 2. Add `.github/workflows/code-review.yml`:
 
@@ -42,7 +45,7 @@ The review engine is chosen by `PROVIDER`, which defaults to `auto` (today: Clau
 
          - uses: promptctl/copirate-code-review-agent@v1
            with:
-             DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+             CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
    ```
 
 That's it. Open a PR and the action reviews it. The checkout is optional context for the reviewer — the review itself is fetched and posted through the GitHub API, so it works even without checking out the code.
@@ -53,13 +56,13 @@ That's it. Open a PR and the action reviews it. The checkout is optional context
 
 | `PROVIDER` | Engine | Credential | Billing | Default model |
 |---|---|---|---|---|
-| `auto` *(default)* | Claude Code → DeepSeek | `DEEPSEEK_API_KEY` | per token | `deepseek-v4-pro` |
+| `auto` *(default)* | Claude Code → Anthropic | `CLAUDE_CODE_OAUTH_TOKEN` | your Claude Pro/Max plan | `claude-sonnet-5` |
 | `deepseek` | Claude Code → DeepSeek | `DEEPSEEK_API_KEY` | per token | `deepseek-v4-pro` |
 | `zai` | Claude Code → Z.ai | `ZAI_API_KEY` | per token | `glm-5.1` |
 | `codex` | Codex → OpenAI | `OPENAI_API_KEY` | per token | `gpt-5.4-mini` |
 | `claude-subscription` | Claude Code → Anthropic | `CLAUDE_CODE_OAUTH_TOKEN` | your Claude Pro/Max plan | `claude-sonnet-5` |
 
-`auto` resolves to whichever provider the action currently points at (DeepSeek today). Pinning `auto` lets the maintainer retarget every consumer with a release, without anyone editing their workflow — supply the key for whatever `auto` currently resolves to.
+`auto` resolves to whichever provider the action currently points at — **`claude-subscription` since 1.42.0**, DeepSeek before that. Pinning `auto` lets the maintainer retarget every consumer with a release, without anyone editing their workflow; supply the credential for whatever `auto` currently resolves to, or supply several and let the retarget be free. A repo missing the current target's credential **fails at startup naming the input to set** — loudly, before any spend — never by silently falling back to another provider whose key happens to be present.
 
 To run Codex instead:
 
@@ -72,7 +75,7 @@ To run Codex instead:
 
 ### Reviewing on a Claude Pro/Max subscription
 
-`PROVIDER: claude-subscription` runs the same Claude Code engine against Anthropic's own API using your **subscription**, so a review consumes plan quota instead of billing per token.
+`PROVIDER: claude-subscription` runs the same Claude Code engine against Anthropic's own API using your **subscription**, so a review consumes plan quota instead of billing per token. Since 1.42.0 this is what the default `PROVIDER: auto` resolves to, so an unconfigured consumer gets it.
 
 Mint the token once, locally — it is valid for a year:
 
@@ -96,10 +99,10 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | Input | Default | Description |
 |---|---|---|
 | `PROVIDER` | `auto` | Engine: `auto`, `deepseek`, `zai`, `codex`, or `claude-subscription`. Ignored when a `CONFIG_FILE` exists. |
-| `DEEPSEEK_API_KEY` | — | Required for `auto`/`deepseek`. |
+| `DEEPSEEK_API_KEY` | — | Required for `deepseek`. |
 | `DEEPSEEK_MODEL` | `deepseek-v4-pro` | Model for the `deepseek` provider. |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/anthropic` | Anthropic-compatible endpoint for `deepseek`. |
-| `CLAUDE_CODE_OAUTH_TOKEN` | — | Required for `claude-subscription`. A Claude Pro/Max token from `claude setup-token` (valid one year); the review is billed to the subscription's quota, not per token. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | — | Required for `auto`/`claude-subscription`. A Claude Pro/Max token from `claude setup-token` (valid one year); the review is billed to the subscription's quota, not per token. |
 | `CLAUDE_MODEL` | `claude-sonnet-5` | Model for the `claude-subscription` provider. |
 | `ZAI_API_KEY` | — | Required for `zai`. |
 | `ZAI_MODEL` | `glm-5.1` | Model for the `zai` provider. |
