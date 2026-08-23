@@ -95,6 +95,26 @@ function transientBackoffMs(attempt) {
 // Matches produceReview's PER_CONFIG_LIMIT, but is a DIFFERENT axis (see retryTransientSpawn).
 const TRANSIENT_SPAWN_ATTEMPTS = 3;
 
+// The circuit breaker on the retry ladder. Every OTHER layer is already a counted value —
+// retryTransientSpawn's 3 spawns, produceReview's 3 attempts per config — but the sweep that restarts
+// chain[0] was unbounded, exiting only when the wall clock ran out. That is survivable for a blip and
+// catastrophic for a WALL: a Claude subscription whose quota is spent answers every spawn in ~500ms
+// with `"error":"rate_limit"`, which classifyTransient types as transient (correctly — from the text
+// alone a spent quota and a 429 of backpressure are the same words). Run 32641456876 therefore burned
+// the ENTIRE TIME_BUDGET_MINUTES on 138 spawns it could never have won, then blamed the wrong knob:
+// the deadline kill overwrote the rate-limit cause with "raise TIME_BUDGET_MINUTES", so the remedy on
+// screen would have doubled the waste rather than ending it. [FRAMING:representation]
+//
+// Bounding the sweeps is deliberately the GENERAL fix rather than typing the quota wall: recognizing
+// it means matching a vendor's own error prose, which leaves us permanently one message revision
+// behind, while a bound needs to recognize nothing at all — a hard wall we have never seen (a
+// suspended account, a spent prepay balance) costs seconds instead of the budget.
+// [LAW:single-enforcer] It bounds the EXISTING ladder rather than adding a second retry counter
+// beside PER_CONFIG_LIMIT, which would be a rival owner of "when do we stop" and drift from it.
+// Two sweeps keeps exactly one full chain restart — real value when a brief outage outlasts the
+// first pass — while capping a single-config chain at 6 attempts, tens of seconds, not 25 minutes.
+const MAX_CHAIN_SWEEPS = 2;
+
 // [LAW:decomposition] Spawn-level transient recovery — a DIFFERENT axis from produceReview's config
 // failover. produceReview walks a chain of CONFIGS with a global budget; this retries ONE flaky
 // engine request in place, so a single blip in one of N concurrent scope workers is absorbed there
@@ -163,7 +183,9 @@ async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sl
 // Per-config retry limit: 3 total attempts (1 initial + 2 retries), honoring Retry-After.
 // After 3 transient failures on one config: advance to next config IMMEDIATELY — different
 // provider, waiting buys nothing. Chain exhausted → exponential backoff (cap 60s) by sweep
-// count, restart from chain[0], until the 60-min budget is spent.
+// count, restart from chain[0] — for MAX_CHAIN_SWEEPS sweeps, then surface the last transient.
+// The budget still clamps every sleep, but it is no longer what ENDS the ladder: a wall that
+// fails instantly can otherwise spend the whole budget without ever making progress.
 // [LAW:effects-at-boundaries] budgetMs is injectable so tests can set a zero/tiny budget
 // to cover the 'deadline exceeded mid-retry' throw path without real 60-min waits.
 // [LAW:no-ambient-temporal-coupling] `now` is the injected clock, the SAME seam the multi-scope
@@ -177,7 +199,7 @@ async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepF
   let lastErr;
   const PER_CONFIG_LIMIT = 3;
 
-  for (let sweep = 1; ; sweep++) {
+  for (let sweep = 1; sweep <= MAX_CHAIN_SWEEPS; sweep++) {
     for (const config of chain) {
       for (let attempt = 1; attempt <= PER_CONFIG_LIMIT; attempt++) {
         totalAttempts++;
@@ -212,6 +234,13 @@ async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepF
       }
     }
 
+    // [LAW:no-silent-failure] The ladder is spent — every config failed PER_CONFIG_LIMIT times on
+    // every sweep — so the last transient IS the run's cause and surfaces as itself. Breaking HERE,
+    // before the backoff, is what keeps that diagnosis: sleeping on into a budget that will not buy
+    // another attempt is how the deadline kill used to fire last and overwrite the rate-limit cause
+    // with a complaint about TIME_BUDGET_MINUTES. The final sweep also has no restart to wait for.
+    if (sweep === MAX_CHAIN_SWEEPS) break;
+
     // All configs exhausted for this sweep. Back off before restarting chain[0].
     // Honor lastErr.retryAfterMs if the last failure carried a Retry-After hint —
     // the per-config path does the same; omitting it here would make the sweep
@@ -228,6 +257,10 @@ async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepF
     );
     await sleepFn(delay);
   }
+  // [LAW:no-silent-failure] Every sweep is spent. lastErr is necessarily assigned — the only path
+  // that reaches the loop's end is the catch that assigned it — so the breaker reports the provider's
+  // own last word, never an opaque `throw undefined` and never a success-shaped empty review.
+  throw lastErr;
 }
 
 // Build the review attribution footer appended to every submitted review.
@@ -246,6 +279,7 @@ function buildAttributionFooter(config) {
 module.exports = {
   TRANSIENT_RETRY_BUDGET_MS,
   TRANSIENT_SPAWN_ATTEMPTS,
+  MAX_CHAIN_SWEEPS,
   TransientError,
   ProtocolError,
   isRetryableSpawnError,

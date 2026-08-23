@@ -12,6 +12,7 @@ const {
   retryTransientSpawn,
   classifyTransient,
   TRANSIENT_SPAWN_ATTEMPTS,
+  MAX_CHAIN_SWEEPS,
 } = require('../src/failover');
 
 // Stub config factory — minimal ReviewConfig values needed by the policy and footer.
@@ -527,5 +528,57 @@ describe('retryTransientSpawn — backoff branch clamped by the deadline', () =>
       { sleepFn: async ms => { slept.push(ms); }, deadline: 500, now: () => 0 },
     );
     assert.deepEqual(slept, [500]);
+  });
+});
+
+// ── the chain-sweep circuit breaker ───────────────────────────────────────────────────────────────
+// A spent Claude subscription answers every spawn in ~500ms with `"error":"rate_limit"` — the same
+// words as a 429 of backpressure, so it is classified transient and always will be. What must not
+// follow is an unbounded retry: run 32641456876 spent the whole 25-minute budget on 138 such spawns
+// and then reported the deadline, not the quota, as the cause. These tests pin the contract that
+// makes both impossible — the ladder ends by COUNT, and it ends carrying the provider's own words.
+describe('produceReview — the chain-sweep circuit breaker', () => {
+  // produceReview's own per-config attempt policy (1 initial + 2 retries).
+  const PER_CONFIG_LIMIT = 3;
+  const wall = () => new TransientError("rate-limited: You've hit your limit · resets 1pm (UTC)");
+
+  // The clock NEVER advances here, so the budget can never expire. Anything that ends the run is
+  // therefore the breaker and nothing else — the distinction the 25-minute failure blurred.
+  const frozenClock = () => 0;
+  const GENEROUS_BUDGET_MS = 25 * 60 * 1000;
+
+  for (const chain of [[cfg('only')], [cfg('a'), cfg('b')]]) {
+    it(`a wall that never clears ends after a counted number of attempts (${chain.length}-config chain)`, async () => {
+      let attempts = 0;
+      const produceOnce = async () => { attempts++; throw wall(); };
+
+      await assert.rejects(
+        () => produceReview(chain, null, null, produceOnce, NO_SLEEP, GENEROUS_BUDGET_MS, frozenClock),
+        // [LAW:no-silent-failure] The provider's own last word survives as the run's reported cause,
+        // rather than being overwritten by whatever bound happened to fire last.
+        err => err instanceof TransientError && /hit your limit/.test(err.message),
+      );
+
+      assert.equal(attempts, PER_CONFIG_LIMIT * chain.length * MAX_CHAIN_SWEEPS);
+    });
+  }
+
+  // The breaker must bound futile retrying WITHOUT cutting off a provider that recovers inside the
+  // bound — otherwise it would trade a 25-minute burn for a review lost to one long blip.
+  it('still returns a review when the provider clears on the very last allowed attempt', async () => {
+    const chain = [cfg('only')];
+    const budgetedAttempts = PER_CONFIG_LIMIT * chain.length * MAX_CHAIN_SWEEPS;
+    let attempts = 0;
+    const produceOnce = async () => {
+      attempts++;
+      if (attempts < budgetedAttempts) throw wall();
+      return FAKE_REVIEW;
+    };
+
+    const { review, attempts: reported } = await produceReview(
+      chain, null, null, produceOnce, NO_SLEEP, GENEROUS_BUDGET_MS, frozenClock,
+    );
+    assert.equal(review, FAKE_REVIEW);
+    assert.equal(reported, budgetedAttempts);
   });
 });
