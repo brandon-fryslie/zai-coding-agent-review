@@ -373,29 +373,27 @@ describe('produceReview — budget exhaustion', () => {
     );
   });
 
-  it('terminates chain-restart loop via sleepFn sentinel; each config gets full per-config retries', async () => {
-    // Chain of two configs, both always transient. Sweep 1 produces:
-    //   per-config sleeps: aa×2 + bb×2 = 4 (2 retries each; 3rd attempt just warns, no sleep)
-    //   sweep-restart sleep:               1  → call 5 → SENTINEL
-    // All sleepFn calls are fast async no-ops; SENTINEL propagates before sweep 2 starts.
+  // [LAW:behavior-not-structure] This test used to need a sentinel thrown from sleepFn to escape an
+  // otherwise infinite chain-restart loop — scaffolding that existed only to survive the structure,
+  // not to assert the contract. With the sweep axis removed the ladder terminates on its own, so the
+  // sentinel is gone and its absence is itself the assertion: the rejection is now the provider's own
+  // error, which under the old shape was unreachable without a budget expiring.
+  it('every config gets its full per-config retries, and the ladder ends on its own', async () => {
     const chain = [cfg('aa'), cfg('bb')];
     const transient = new TransientError('never available');
-    const SENTINEL = new Error('test-stop-sentinel');
     let sleepCallCount = 0;
-    const sleepFn = async () => {
-      sleepCallCount++;
-      if (sleepCallCount >= 5) throw SENTINEL;
-    };
+    const sleepFn = async () => { sleepCallCount++; };
     let callCount = 0;
     const stub = async () => { callCount++; throw transient; };
     await assert.rejects(
       () => produceReview(chain, () => 'p', {}, stub, sleepFn),
-      err => err === SENTINEL,
+      err => err === transient,
     );
-    // Both configs ran 3 attempts each in sweep 1 (6 total).
-    // sleepFn was called exactly 5 times (4 per-config retries + 1 sweep restart = SENTINEL).
+    // 3 attempts on each of 2 configs — one walk of the chain, no sweep multiplier.
     assert.equal(callCount, 6);
-    assert.equal(sleepCallCount, 5);
+    // 2 retry sleeps per config; the 3rd attempt warns and advances without sleeping. The 5th sleep
+    // the old shape made — the sweep restart — no longer exists.
+    assert.equal(sleepCallCount, 4);
   });
 });
 
@@ -411,6 +409,44 @@ describe('produceReview — single-config chain', () => {
     const result = await produceReview(chain, () => 'p', {}, stub, NO_SLEEP);
     assert.equal(result.configUsed.name, 'solo');
     assert.equal(result.attempts, 3);
+  });
+
+  // The COMPOSED ladder — both axes at once, which no other test in this file exercises. Every test
+  // above measures one axis in isolation (produceReview's attempts, or retryTransientSpawn's), and
+  // that gap is not academic: a reviewer reading only the per-config limit computed the wall's total
+  // cost as "3 attempts, 2 sleeps, a few seconds" — off by 4× — because the two axes MULTIPLY. The
+  // whole point of this PR is a specific bound on what a spent quota costs, so the bound is asserted
+  // here as a number rather than left as a sentence in CLAUDE.md that a human must remember to redraw.
+  // [FRAMING:representation] [LAW:behavior-not-structure] this asserts the observable retry policy —
+  // spawns issued and time waited — not how either loop is written.
+  it('the two nested axes multiply: a single-config chain costs 9 spawns and ~12-24s, not 3 and ~5s', async () => {
+    const chain = [cfg('auto')];
+    const wall = new TransientError('rate-limited: quota wall');
+    let spawns = 0;
+    const sleeps = [];
+    const sleepFn = async ms => { sleeps.push(ms); };
+    const frozenNow = () => 1_000_000; // clock never advances: isolate the COUNT bound from the clock
+
+    // One produceOnce is a whole scout->workers pass, whose every spawn goes through the spawn-level
+    // axis — exactly how runMultiScopePass composes them (src/multiscope.js).
+    const produceOnce = () => retryTransientSpawn(
+      () => { spawns++; return Promise.reject(wall); },
+      { sleepFn, deadline: null, now: frozenNow },
+    );
+
+    await assert.rejects(
+      () => produceReview(chain, () => 'p', {}, produceOnce, sleepFn, 60 * 60 * 1000, frozenNow),
+      err => err === wall, // the provider's own error is the run's cause, never a deadline complaint
+    );
+
+    // PER_CONFIG_LIMIT (3) × TRANSIENT_SPAWN_ATTEMPTS (3), one walk of a 1-config chain.
+    assert.equal(spawns, 3 * TRANSIENT_SPAWN_ATTEMPTS);
+    // Each axis sleeps on all but its final attempt: 3 passes × 2 + 2 = 8.
+    assert.equal(sleeps.length, 8);
+    // Jittered backoff of 1-2s then 2-4s per axis-run, so the total is bounded on BOTH sides —
+    // a lower bound too, because a ladder that stopped waiting at all would also "pass" an upper one.
+    const totalMs = sleeps.reduce((a, b) => a + b, 0);
+    assert.ok(totalMs >= 12_000 && totalMs <= 24_000, `total backoff ${totalMs}ms outside 12000-24000ms`);
   });
 });
 
@@ -527,5 +563,93 @@ describe('retryTransientSpawn — backoff branch clamped by the deadline', () =>
       { sleepFn: async ms => { slept.push(ms); }, deadline: 500, now: () => 0 },
     );
     assert.deepEqual(slept, [500]);
+  });
+});
+
+// ── the ladder is bounded by COUNT, and the chain is walked exactly once ──────────────────────────
+// A spent Claude subscription answers every spawn in ~500ms with `"error":"rate_limit"` — the same
+// words as a 429 of backpressure, so it is classified transient and always will be. What must not
+// follow is an unbounded retry: run 32641456876 spent the whole 25-minute budget on 138 such spawns
+// and then reported the deadline, not the quota, as the cause. These tests pin the contract that
+// makes both impossible — the ladder ends by COUNT, and it ends carrying the provider's own words.
+//
+// The count is PER_CONFIG_LIMIT × chain.length, with NO outer sweep multiplying it — the load-bearing
+// assertion here, since a second sweep would re-run identical work (same config, endpoint, credential
+// and prompt) for the one-config chain that is the default. [LAW:one-type-per-behavior]
+describe('produceReview — the ladder is bounded by count', () => {
+  // produceReview's own per-config attempt policy (1 initial + 2 retries).
+  const PER_CONFIG_LIMIT = 3;
+  const wall = () => new TransientError("rate-limited: You've hit your limit · resets 1pm (UTC)");
+
+  // The clock NEVER advances here, so the budget can never expire. Anything that ends the run is
+  // therefore the breaker and nothing else — the distinction the 25-minute failure blurred.
+  const frozenClock = () => 0;
+  const GENEROUS_BUDGET_MS = 25 * 60 * 1000;
+
+  for (const chain of [[cfg('only')], [cfg('a'), cfg('b')]]) {
+    it(`a wall that never clears ends after a counted number of attempts (${chain.length}-config chain)`, async () => {
+      let attempts = 0;
+      const produceOnce = async () => { attempts++; throw wall(); };
+
+      await assert.rejects(
+        () => produceReview(chain, null, null, produceOnce, NO_SLEEP, GENEROUS_BUDGET_MS, frozenClock),
+        // [LAW:no-silent-failure] The provider's own last word survives as the run's reported cause,
+        // rather than being overwritten by whatever bound happened to fire last.
+        err => err instanceof TransientError && /hit your limit/.test(err.message),
+      );
+
+      // Exactly one walk of the chain — no sweep multiplier. A regression that reintroduced an outer
+      // sweep would show up here as a multiple of this number, which is the point of asserting an
+      // exact count rather than merely "it terminated".
+      assert.equal(attempts, PER_CONFIG_LIMIT * chain.length);
+    });
+  }
+
+  // Review round 1 (#116): ending the ladder at the chain's end makes one rung reachable where
+  // "Advancing to next config." is false — the LAST config advances to nothing, it ends the run.
+  // While an outer sweep existed that sentence was always eventually true (chain[0] on the next
+  // sweep), so removing the sweep is what turned it into a lie, in the one message an operator reads
+  // when the ladder gives up. A change whose whole point is an accurate diagnosis cannot sign off
+  // with an inaccurate one.
+  it('the last config says the chain is spent, never that it is advancing to a config that follows', async () => {
+    const core = require('@actions/core');
+    const chain = [cfg('a'), cfg('b')];
+    const original = core.warning;
+    const warnings = [];
+    core.warning = m => warnings.push(m);
+    try {
+      await assert.rejects(() => produceReview(
+        chain, null, null, async () => { throw wall(); }, NO_SLEEP, GENEROUS_BUDGET_MS, frozenClock,
+      ));
+    } finally {
+      core.warning = original;
+    }
+
+    const exhausted = warnings.filter(w => /attempts exhausted/.test(w));
+    // Exactly one per config — the chain is walked once — and only the last of them ends the run.
+    assert.equal(exhausted.length, chain.length);
+    assert.match(exhausted.at(-1), /Chain spent/);
+    assert.doesNotMatch(exhausted.at(-1), /Advancing to next config/);
+    // Every earlier config genuinely does advance, and still says so.
+    for (const w of exhausted.slice(0, -1)) assert.match(w, /Advancing to next config/);
+  });
+
+  // The bound must stop futile retrying WITHOUT cutting off a provider that recovers inside it —
+  // otherwise it would trade a 25-minute burn for a review lost to one long blip.
+  it('still returns a review when the provider clears on the very last allowed attempt', async () => {
+    const chain = [cfg('only')];
+    const budgetedAttempts = PER_CONFIG_LIMIT * chain.length;
+    let attempts = 0;
+    const produceOnce = async () => {
+      attempts++;
+      if (attempts < budgetedAttempts) throw wall();
+      return FAKE_REVIEW;
+    };
+
+    const { review, attempts: reported } = await produceReview(
+      chain, null, null, produceOnce, NO_SLEEP, GENEROUS_BUDGET_MS, frozenClock,
+    );
+    assert.equal(review, FAKE_REVIEW);
+    assert.equal(reported, budgetedAttempts);
   });
 });
