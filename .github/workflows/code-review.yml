@@ -44,6 +44,12 @@ jobs:
           PROVIDER: auto
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          # Deliberately left wired to a repo variable that is NOT set, so every PR here is live
+          # coverage of the blank-input path: this interpolates to "", which the action resolves to
+          # its own default name (parseReviewerName). Before 1.47.1 that "" defeated the default and
+          # every artifact this repo posted opened with a dangling "## ". Setting the variable renames
+          # the reviewer without editing this file; leaving it unset must stay indistinguishable from
+          # omitting the input.
           ZAI_REVIEWER_NAME: ${{ vars.ZAI_REVIEWER_NAME }}
           # dist/** is committed BUNDLED output (ncc): every feature PR changes it, and reviewing
           # the 1.5 MB bundle in full costs ~700K input tokens for zero signal — CI already verifies
