@@ -353,7 +353,7 @@ describe('claudeCodeAdapter interface declarations', () => {
     assert.equal(CLAUDE_TIMEOUT_MS, 3_000_000);
   });
 
-  test('endpointKinds contains only "anthropic-messages"', () => {
+  test('apiTypes contains only "anthropic-messages"', () => {
     assert.deepEqual(claudeCodeAdapter.capabilities.apiTypes, ['anthropic-messages']);
   });
 

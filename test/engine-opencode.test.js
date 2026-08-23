@@ -93,7 +93,7 @@ describe('buildOpencodeConfig — generated opencode.json content', () => {
   });
 
   test('provider id tracks the model prefix for a non-openai provider', () => {
-    const config = { ...BASE_CONFIG, model: 'anthropic/claude-x', endpoint: { ...BASE_CONFIG.endpoint, kind: 'anthropic-messages' } };
+    const config = { ...BASE_CONFIG, model: 'anthropic/claude-x', endpoint: { ...BASE_CONFIG.endpoint, apiType: 'anthropic-messages' } };
     const provider = buildOpencodeConfig(config, MOCK_COLLECTOR_SPAWN, MOCK_AGENTS_PATH).provider;
     assert.deepEqual(Object.keys(provider), ['anthropic']);
   });
@@ -290,7 +290,7 @@ describe('opencodeAdapter interface declarations', () => {
     assert.deepEqual(opencodeAdapter.capabilities.reasoningEfforts, []);
   });
 
-  test('endpointKinds are the provider protocols opencode can front', () => {
+  test('apiTypes are the provider protocols opencode can front', () => {
     assert.deepEqual(
       opencodeAdapter.capabilities.apiTypes,
       ['openai-chat', 'openai-responses', 'anthropic-messages'],

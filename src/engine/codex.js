@@ -57,7 +57,7 @@ function buildConfigToml(config, collectorSpawn) {
   // control characters. Raw \n/\r in a single-line basic string breaks TOML parsing and
   // could allow injection (e.g., a crafted baseUrl containing \napproval_policy = "always"
   // overrides a hardened setting). [LAW:effects-at-boundaries] values from external sources
-  // (baseUrl, apiKeyEnv, recordsPath) must be sanitized at this trust boundary.
+  // (baseUrl, the credential value, recordsPath) must be sanitized at this trust boundary.
   const q = v => `"${String(v)
     .replace(/\\/g, '\\\\')
     .replace(/"/g, '\\"')

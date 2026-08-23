@@ -340,7 +340,7 @@ describe('codexAdapter interface declarations', () => {
     assert.equal(CODEX_TIMEOUT_MS, 3_000_000);
   });
 
-  test('endpointKinds contains only "openai-responses"', () => {
+  test('apiTypes contains only "openai-responses"', () => {
     assert.deepEqual(codexAdapter.capabilities.apiTypes, ['openai-responses']);
   });
 
