@@ -280,7 +280,13 @@ function withoutWithheldFiles(scopes, withheldPaths) {
     // Spread rather than parseScopeValue: every field here already crossed that boundary when the scout
     // recorded the scope, and `files` is a SUBSET of an already-stamped list — removing elements cannot
     // introduce an unstamped one. [LAW:single-enforcer] holds; there is no new value to parse.
-    if (files.length > 0) kept.push(files.length === scope.files.length ? scope : { ...scope, files });
+    // EMPTIED BY THE STRIP, not merely empty. A scope the scout left unlisted arrives with files: []
+    // straight from parseScopeValue (src/review.js) — a legal Scope this mechanism never touched — and
+    // dropping it would make one scope's survival depend on whether some UNRELATED scope named a withheld
+    // path, since `kept` is only returned when something was stripped at all. A strip must be inert on
+    // everything it did not strip. [LAW:dataflow-not-control-flow]
+    const emptiedByStrip = files.length === 0 && scope.files.length > 0;
+    if (!emptiedByStrip) kept.push(files.length === scope.files.length ? scope : { ...scope, files });
   }
   // No path removed ⇒ no scope rewritten and none dropped, so `kept` is element-for-element `scopes`;
   // return the INPUT rather than the copy that merely matches it.

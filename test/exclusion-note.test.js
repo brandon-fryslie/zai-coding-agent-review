@@ -3,7 +3,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { filterFiles, NO_EXCLUSIONS, excludedPathList } = require('../src/diff');
-const { buildPrMaterial, buildRepoMaterial, planScopes } = require('../src/multiscope');
+const { buildPrMaterial, buildRepoMaterial, planScopes, runMultiScopePass } = require('../src/multiscope');
 
 // EXCLUDE_PATTERNS removes changed files from the reviewed diff, and the reviewer used to be told
 // nothing about it — so a file it EXPECTED to change was absent, and absence-by-configuration was
@@ -147,6 +147,20 @@ describe('the plan boundary strips what the prompt merely forbids', () => {
     assert.deepEqual(scopes[scopes.length - 1].files, ['src/b.js']);
   });
 
+  // The strip must be inert on what it did not strip. A scope the scout left unlisted arrives with
+  // files: [] from parseScopeValue — a legal Scope — and dropping it here would make its survival depend
+  // on whether an UNRELATED scope named a withheld path, since the rewritten plan is only returned when
+  // something was stripped at all. "Emptied by the strip" and "empty" are different sets.
+  test('a scope that was ALREADY empty survives a strip that emptied a different scope', () => {
+    const { scopes } = planScopes(
+      [scoped('unlisted', []), scoped('bundle', ['build/out.js']), scoped('code', ['src/a.js'])],
+      ['src/a.js'],
+      ['build/out.js'],
+    );
+    assert.deepEqual(scopes.map(s => s.name), ['unlisted', 'code']);
+    assert.deepEqual(scopes[0].files, []);
+  });
+
   // Reported once however many scopes claimed it — and NOT as a duplicate, because after the strip no
   // worker reads it at all. A duplicate warning here would describe a review that does not exist.
   test('a withheld path claimed by two scopes is reported once, and never as a duplicate read', () => {
@@ -182,6 +196,51 @@ describe('the plan boundary strips what the prompt merely forbids', () => {
     const { reviewed, excluded } = filterFiles(FILES, ['build/**', '*.lock']);
     const material = buildPrMaterial({ files: reviewed, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT, excluded });
     assert.deepEqual(material.withheldPaths, ['build/out.js', 'deps.lock']);
+  });
+});
+
+// The unit tests above prove the strip; this proves it is REACHED. material.withheldPaths silently
+// dropping out of the planScopes call would leave every unit test green while production shipped the
+// unguarded prompt — the same wiring gap that made buildCaseMaterial worth extracting.
+describe('the strip is wired end to end — material → plan boundary → worker prompt', () => {
+  test('a scout that scopes a withheld path yields a worker prompt that never names it as a read target', async () => {
+    const { reviewed, excluded } = filterFiles(FILES, ['build/**']);
+    const material = buildPrMaterial({ files: reviewed, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT, excluded });
+    const scopes = [{ name: 'code', focus: 'the change', files: ['src/a.js', 'build/out.js'] }];
+    const workerPrompts = [];
+    const logs = [];
+    // The scout is the pass's first and only solo spawn; every later one is a worker. `deps.lock` is
+    // reviewable and unscoped, so the catch-all worker runs too — the read-target check below picks the
+    // 'code' prompt out by name rather than assuming a single worker.
+    let spawn = 0;
+    const adapter = {
+      async produceReview({ buildPromptFor }) {
+        const prompt = buildPromptFor({});
+        if (spawn++ === 0) return { summary: 'ctx', findings: [], assessments: [], scopes, usage: null };
+        workerPrompts.push(prompt);
+        return { summary: 'sum', findings: [], assessments: [], usage: null };
+      },
+    };
+    await runMultiScopePass({
+      config: { engine: 'fake', name: 'c1' },
+      material,
+      registry: { get: () => adapter },
+      instructionsPath: 'x',
+      maxConcurrent: 4,
+      sweepCap: 0,
+      log: m => logs.push(m),
+      sleepFn: async () => {},
+    });
+
+    // Anchored on the read-targets sentence specifically: the withheld NOTE names build/out.js elsewhere
+    // in this same prompt on purpose, so a bare "does not include" would pass against an unstripped plan.
+    const codePrompt = workerPrompts.find(p => p.includes('code — the change'));
+    assert.ok(codePrompt, 'the scoped worker never ran');
+    const readTargets = codePrompt.match(/assigned changed files: (.*?)\. Skip any among them/);
+    assert.ok(readTargets, 'the worker was given no read-targets line to check');
+    assert.equal(readTargets[1], 'src/a.js');
+    assert.ok(logs.some(m => m.includes('EXCLUDE_PATTERNS-withheld') && m.includes('build/out.js')),
+      'the strip was not announced to the operator');
   });
 });
 
