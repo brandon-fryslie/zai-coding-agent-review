@@ -219,6 +219,32 @@ function loadDiffFiles(diffPath) {
   return files;
 }
 
+// [LAW:decomposition] One job: turn a frozen case's raw changed files into the material a replay runs on
+// — the case-side mirror of run.js's fetch → filter → buildPrMaterial path. It lived inline in main()'s
+// replay body, which no test executes, so when filterFiles' return shape changed the wiring broke in
+// silence and a green suite hid it. Extracted so the wiring HAS a contract a test can hold.
+// [LAW:one-source-of-truth] Filtering runs through production's own filterFiles seam, in the SAME order
+// run.js does. The freezer saves the RAW three-dot diff and stores the patterns separately, so an
+// unfiltered replay would review files the original review's EXCLUDE_PATTERNS stripped — a superset that
+// corrupts the measured verdict. `excluded` rides on to buildPrMaterial for the mirror-image reason: the
+// production material CONFESSES what those patterns removed, so a replay that dropped it would score the
+// reviewer against a prompt production never sends — the instrument measuring the wrong thing.
+// [LAW:effects-at-boundaries] Pure: it computes and throws. The caller owns the stderr line, composed
+// from the `excluded` returned here.
+function buildCaseMaterial({ allFiles, excludePatterns, reviewedRepoRoot }) {
+  const { filterFiles } = require('../src/diff');
+  const { buildPrMaterial } = require('../src/multiscope');
+  const { reviewed: files, excluded } = filterFiles(allFiles, excludePatterns);
+  // [LAW:no-silent-failure] Every changed file excluded means there is nothing to review — a case that
+  // would replay as a vacuous empty review must say so, not quietly produce a zero-finding artifact.
+  if (files.length === 0) {
+    throw new Error(`All ${allFiles.length} changed file(s) were excluded by the case's EXCLUDE_PATTERNS — nothing to review.`);
+  }
+  // maxDiffChars: 0 (no truncation) exactly as scripts/local-review.js does — the frozen diff is the whole
+  // material the workers see, anchored against the same (filtered) files.
+  return { files, excluded, material: buildPrMaterial({ files, maxDiffChars: 0, reviewedRepoRoot, excluded }) };
+}
+
 // [LAW:no-ambient-temporal-coupling] Drain the engine's frozen TRANSCRIPT_DIR into this run's dir, then
 // leave it empty for the next run. TRANSCRIPT_DIR is a module-load constant in src/debug.js (bound to
 // RUNNER_TEMP at first require), so it cannot be re-pointed per run; instead the loop owns the ordering —
@@ -270,7 +296,7 @@ async function main() {
       manifest.engine,
     );
     const { TRANSCRIPT_DIR } = require('../src/debug');
-    const { runMultiScope, buildPrMaterial } = require('../src/multiscope');
+    const { runMultiScope } = require('../src/multiscope');
     const { defaultEffortProfile } = require('../src/effort');
     const registry = require('../src/engine/registry');
     const instructionsPath = path.join(__dirname, '..', 'review-agent', 'instructions.md');
@@ -280,23 +306,10 @@ async function main() {
     // so destDir itself is the repo root.
     extractTree(manifest.treePath, treeTemp);
     const allFiles = loadDiffFiles(manifest.diffPath);
-    // [LAW:one-source-of-truth] Strip the case's EXCLUDE_PATTERNS through production's own filterFiles
-    // seam, in the SAME order run.js does (before buildPrMaterial). The freezer saves the RAW three-dot
-    // diff and stores the patterns separately, so an unfiltered replay would review files the original
-    // review's EXCLUDE_PATTERNS stripped — a superset that corrupts the measured verdict. Reusing the one
-    // enforcer keeps this faithful for every case, present and future, and makes excludePatterns a live field.
-    const { filterFiles } = require('../src/diff');
-    const { reviewed: files, excluded } = filterFiles(allFiles, manifest.excludePatterns);
+    const { files, excluded, material } = buildCaseMaterial({
+      allFiles, excludePatterns: manifest.excludePatterns, reviewedRepoRoot: treeTemp,
+    });
     if (excluded.paths.length > 0) process.stderr.write(`Excluded ${excluded.paths.length} file(s) matching the case's EXCLUDE_PATTERNS: ${excluded.paths.join(', ')}\n`);
-    // [LAW:no-silent-failure] Every changed file excluded means there is nothing to review — a case that
-    // would replay as a vacuous empty review must say so, not quietly produce a zero-finding artifact.
-    if (files.length === 0) throw new Error(`All ${allFiles.length} changed file(s) were excluded by the case's EXCLUDE_PATTERNS — nothing to review.`);
-    // buildPrMaterial with maxDiffChars: 0 (no truncation) exactly as scripts/local-review.js does — the
-    // frozen diff is the whole material the workers see, anchored against the same (filtered) files.
-    // [LAW:one-source-of-truth] `excluded` rides along for the same reason the filter itself does: the
-    // production material CONFESSES what EXCLUDE_PATTERNS removed, so a replay that dropped it would score
-    // the reviewer against a prompt production never sends — the instrument silently measuring the wrong thing.
-    const material = buildPrMaterial({ files, maxDiffChars: 0, reviewedRepoRoot: treeTemp, excluded });
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const caseOutRoot = path.join(path.resolve(opts.out), manifest.name);
@@ -357,4 +370,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, parseCaseManifest, buildProviderInputs, assertConfigMatchesPin, runDirName };
+module.exports = { parseArgs, parseCaseManifest, buildProviderInputs, assertConfigMatchesPin, runDirName, buildCaseMaterial };
