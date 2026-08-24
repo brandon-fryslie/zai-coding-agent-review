@@ -5,6 +5,7 @@ const { defaultEffortProfile, maxTier } = require('./effort');
 const { dedupeFindings, dedupeAssessments, parseScopeValue } = require('./review');
 const { sumCost } = require('./usage');
 const { renderDependencyDiffNote } = require('./dependency-diff');
+const { NO_EXCLUSIONS, excludedPathList } = require('./diff');
 const {
   buildReviewInput,
   buildRepoReviewInput,
@@ -200,8 +201,29 @@ async function runScopeWorker({ scope, context, material, spawn, log, priorFindi
 // engine branch: repo material carries changedPaths = [], so nothing is ever swept and the plan is
 // returned unchanged — a no-op by construction, an empty value, not a mode. sweptPaths is returned so
 // the caller can surface scout quality as an observable signal, never a silent correction. [LAW:no-silent-failure]
-function planScopes(scopes, changedPaths) {
-  const assigned = new Set(scopes.flatMap(s => s.files));
+//
+// withheldPaths is the third slip, and the one this boundary exists to make impossible rather than merely
+// discourage. Naming the EXCLUDE_PATTERNS-withheld paths to the scout is what lets it avoid scoping them,
+// and it is also the only reason it could ever name one: before it was told, those filenames were not in
+// its material at all. A withheld path that survived into a scope would reach buildReviewInput's
+// scopeFiles and render as "Read the complete content of THESE files" — the literal opposite of the same
+// prompt's "Do not read these paths", decided in the worker's favour by whichever instruction it weighs
+// harder. So the plan boundary strips it; the prompt's sentence is the request, this is the guarantee.
+// [LAW:types-are-the-program]
+//
+// The predicate is the withheld set ITSELF, never "not in changedPaths". Those are two different facts —
+// what this review covers vs. what is out of bounds — and the complement of the first is the second only
+// in PR mode: repo material carries changedPaths = [] by design, so a complement-based check would strip
+// every file of every scope on every repo run. [FRAMING:representation]
+//
+// A scope emptied by the strip is DROPPED, not passed through: buildReviewInput reads an empty scopeFiles
+// as "no assigned files" and falls back to "read every changed file in full", so an empty scope would
+// silently undo scope-bounded reads (c783325) — a cost regression wearing the shape of a safety check.
+// Anything orphaned by a dropped scope is picked up by the catch-all below, because the strip runs BEFORE
+// coverage is computed; no second coverage mechanism. [LAW:one-type-per-behavior]
+function planScopes(scopes, changedPaths, withheldPaths = []) {
+  const { scopes: planned, withheldAssignments } = withoutWithheldFiles(scopes, withheldPaths);
+  const assigned = new Set(planned.flatMap(s => s.files));
   const sweptPaths = changedPaths.filter(p => !assigned.has(p));
   // [LAW:verifiable-goals] The scout promises each changed file appears in EXACTLY one scope. The sweep
   // catches the lower bound (a file in no scope); this catches the upper bound (a file in two+ scopes),
@@ -210,14 +232,17 @@ function planScopes(scopes, changedPaths) {
   const seen = new Set();
   const recordedDup = new Set();
   const duplicatePaths = [];
-  for (const p of scopes.flatMap(s => s.files)) {
+  // `planned`, not `scopes`: a withheld path the scout put in two scopes is stripped from both, so it is
+  // not a duplicate to warn about — it is not read by any worker at all. Reporting the pre-strip plan here
+  // would describe a review that no longer exists. [FRAMING:representation]
+  for (const p of planned.flatMap(s => s.files)) {
     if (seen.has(p) && !recordedDup.has(p)) {
       recordedDup.add(p);
       duplicatePaths.push(p); // first-seen order, each duplicate once — O(1) membership, O(n) overall
     }
     seen.add(p);
   }
-  if (sweptPaths.length === 0) return { scopes: uniquelyNamed(scopes), sweptPaths, duplicatePaths };
+  if (sweptPaths.length === 0) return { scopes: uniquelyNamed(planned), sweptPaths, duplicatePaths, withheldAssignments };
   // [LAW:single-enforcer] The catch-all is built through parseScopeValue like every scout-recorded
   // scope, so EVERY Scope value in the system carries the same single-line stamp — a hand-built one
   // would be the one object in the program whose fields skipped the boundary, which is precisely the
@@ -227,7 +252,45 @@ function planScopes(scopes, changedPaths) {
     focus: `These changed files were not covered by the planned scopes: ${sweptPaths.join(', ')}. Review their changes fully.`,
     files: sweptPaths,
   }, 0);
-  return { scopes: uniquelyNamed([...scopes, catchAll]), sweptPaths, duplicatePaths };
+  return { scopes: uniquelyNamed([...planned, catchAll]), sweptPaths, duplicatePaths, withheldAssignments };
+}
+
+// [LAW:decomposition] One job: remove the withheld paths from the plan and say which ones were there.
+// The removals are returned, never merely dropped — a scout that keeps scoping withheld files is a signal
+// about the prompt, and a silent strip would hide the very thing worth measuring. [LAW:no-silent-failure]
+// No early return for the empty set — the loop already answers that question, and a guard would be a
+// second answer to it. Identity is preserved at the END instead, keyed on what was actually removed
+// rather than on what was passed in: a configured-but-unmatched withheld set strips nothing and must be
+// as provably a no-op as an unconfigured one. Same shape as uniquelyNamed below, and the two together are
+// what let planScopes hand back its own input when the scout's plan needed no reconciliation at all.
+function withoutWithheldFiles(scopes, withheldPaths) {
+  const withheld = new Set(withheldPaths);
+  const withheldAssignments = [];
+  const recorded = new Set();
+  const kept = [];
+  for (const scope of scopes) {
+    const files = scope.files.filter(f => {
+      if (!withheld.has(f)) return true;
+      if (!recorded.has(f)) {
+        recorded.add(f);
+        withheldAssignments.push(f); // first-seen order, each path once, however many scopes claimed it
+      }
+      return false;
+    });
+    // Spread rather than parseScopeValue: every field here already crossed that boundary when the scout
+    // recorded the scope, and `files` is a SUBSET of an already-stamped list — removing elements cannot
+    // introduce an unstamped one. [LAW:single-enforcer] holds; there is no new value to parse.
+    // EMPTIED BY THE STRIP, not merely empty. A scope the scout left unlisted arrives with files: []
+    // straight from parseScopeValue (src/review.js) — a legal Scope this mechanism never touched — and
+    // dropping it would make one scope's survival depend on whether some UNRELATED scope named a withheld
+    // path, since `kept` is only returned when something was stripped at all. A strip must be inert on
+    // everything it did not strip. [LAW:dataflow-not-control-flow]
+    const emptiedByStrip = files.length === 0 && scope.files.length > 0;
+    if (!emptiedByStrip) kept.push(files.length === scope.files.length ? scope : { ...scope, files });
+  }
+  // No path removed ⇒ no scope rewritten and none dropped, so `kept` is element-for-element `scopes`;
+  // return the INPUT rather than the copy that merely matches it.
+  return { scopes: withheldAssignments.length === 0 ? scopes : kept, withheldAssignments };
 }
 
 // [LAW:parse-dont-validate] A scope's name is its IDENTIFIER downstream — log lines, sweep labels,
@@ -306,12 +369,18 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // material carries changedPaths = [], so this is a no-op). Unmentioned paths are swept into ONE
   // synthetic catch-all scope so some worker reads them in full. The zero-scope throw above stays
   // FIRST, so a scout that planned nothing fails loud rather than being papered over by the sweep.
-  const { scopes, sweptPaths, duplicatePaths } = planScopes(scoutResult.scopes, material.changedPaths);
+  const { scopes, sweptPaths, duplicatePaths, withheldAssignments } = planScopes(scoutResult.scopes, material.changedPaths, material.withheldPaths);
   if (sweptPaths.length > 0) {
     log(`⚠️ scout left ${sweptPaths.length} changed file(s) unassigned; swept into an 'unassigned files' scope: ${sweptPaths.join(', ')}`);
   }
   if (duplicatePaths.length > 0) {
     log(`⚠️ scout assigned ${duplicatePaths.length} changed file(s) to more than one scope; each is read by every claiming worker: ${duplicatePaths.join(', ')}`);
+  }
+  // The strip is announced, so a scout that keeps scoping withheld paths is visible as a prompt problem
+  // rather than absorbed as a silent correction. Rendered through the shared bounded list for the same
+  // reason the prompts and the operator log are. [LAW:no-silent-failure]
+  if (withheldAssignments.length > 0) {
+    log(`⚠️ scout assigned ${withheldAssignments.length} EXCLUDE_PATTERNS-withheld file(s) to a scope; removed so no worker is told to read them: ${excludedPathList(withheldAssignments)}`);
   }
   const context = scoutResult.summary.trim();
 
@@ -457,7 +526,12 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
 // (fetchPriorPushbacks, src/transport.js). Every worker receives all of them — like the whole diff, which
 // each worker also sees — so a rebuttal about any file informs whichever worker owns it, and the scout
 // need not partition them. [] (a first round, or no replies) flows through unchanged. [LAW:dataflow-not-control-flow]
-function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySummaries = [], priorPushbacks = [] }) {
+// excluded is filterFiles' record of what EXCLUDE_PATTERNS took OUT of `files` ({patterns, paths}) — the
+// one fact neither the scout nor a worker can recover from the material it is handed, since both are
+// handed only what survived the filter. It reaches BOTH prompts because both reason about completeness:
+// the scout plans coverage of the changed set, a worker judges it. NO_EXCLUSIONS (an unfiltered run,
+// e.g. scripts/local-review.js) renders nothing in either. [LAW:dataflow-not-control-flow]
+function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySummaries = [], priorPushbacks = [], excluded = NO_EXCLUSIONS }) {
   const changedPaths = files.map(f => f.filename);
   const dependencyDiffNote = renderDependencyDiffNote(dependencySummaries);
   // Only a resolved bump has upstream context to judge; an unresolved one renders as a plain line in the
@@ -467,10 +541,15 @@ function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySumm
     // [LAW:types-are-the-program] The changed-file list is a first-class field of the material, not
     // recovered from the prompt: runMultiScopePass verifies the scout's plan covers it (planScopes).
     changedPaths,
-    buildScoutPrompt: (toolNames) => buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot }).prompt,
+    // [LAW:types-are-the-program] The out-of-bounds set, carried as its own field rather than inferred
+    // from changedPaths' complement — see planScopes for why the complement is a different fact. The
+    // scout is TOLD these paths (so it can avoid them) and the plan boundary ENFORCES it; this field is
+    // what makes the second possible without the material re-deriving what filterFiles already decided.
+    withheldPaths: excluded.paths,
+    buildScoutPrompt: (toolNames) => buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot, excluded }).prompt,
     // priorFindings is the convergence-sweep value threaded per pass by runScopeWorker: [] on the
     // initial pass (byte-identical prompt), the cumulative found list on a sweep. [LAW:dataflow-not-control-flow]
-    buildWorkerPrompt: (focusText, toolNames, scopeFiles, priorFindings) => buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus: focusText, scopeFiles, dependencyDiffNote, dependencyBumps, priorPushbacks, priorFindings }).prompt,
+    buildWorkerPrompt: (focusText, toolNames, scopeFiles, priorFindings) => buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus: focusText, scopeFiles, dependencyDiffNote, dependencyBumps, priorPushbacks, priorFindings, excluded }).prompt,
   };
 }
 
@@ -481,6 +560,10 @@ function buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot }) {
     // Repo mode has no changed-file list to verify against, so coverage-sweeping is a no-op by
     // construction: an empty value flows to planScopes, never a mode. [LAW:dataflow-not-control-flow]
     changedPaths: [],
+    // Repo mode has no diff, so nothing was withheld FROM one: its exclusion patterns are a bound on
+    // exploration the scout prompt already carries, not a set of named paths hidden from a file list.
+    // Empty for the same reason changedPaths is — an empty value, never a mode. [LAW:dataflow-not-control-flow]
+    withheldPaths: [],
     buildScoutPrompt: (toolNames) => buildRepoScoutInput({ scope, excludePatterns, toolNames, reviewedRepoRoot }).prompt,
     // Repo mode has no diff to partition, so a repo worker reviews its scope broadly by exploring the
     // tree; the scopeFiles arg the PR worker uses is deliberately ignored here, while the convergence
