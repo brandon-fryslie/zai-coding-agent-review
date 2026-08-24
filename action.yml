@@ -112,6 +112,9 @@ inputs:
   GITHUB_REVIEW_TOKEN:
     description: "Token for all GitHub API calls; enables submitting approvals."
     required: false
+  DISMISS_TOKEN:
+    description: "Alternate credential used ONLY to dismiss this action's own round-cap-blocked review; honored whenever set, on either host. Needed on Gitea, whose dismissal endpoint 403s GITHUB_REVIEW_TOKEN's write access and requires a repo-Admin account. Pointless on GitHub, where the review token already dismisses its own reviews — but set there it is used, not ignored."
+    required: false
   PR_NUMBER:
     description: "Pull request number to review."
     required: false

@@ -36302,6 +36302,16 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   if (reviewToken) {
     core.setSecret(reviewToken);
   }
+  // itv.4.1: Gitea's dismiss-review endpoint 403s the review token (write access posts a review fine,
+  // but dismissing one needs repo-Admin — MEASURED live). Deliberately NOT host-gated: the credential
+  // is used for the dismissal write wherever it is set, so this reads one input and holds one value
+  // rather than resolving a transport just to decide which token to carry. [LAW:dataflow-not-control-flow]
+  // Left unset (the usual case, and every GitHub run) releaseUnrevisitableBlocks's `dismissOctokit =
+  // octokit` default applies and nothing changes.
+  const dismissToken = core.getInput('DISMISS_TOKEN');
+  if (dismissToken) {
+    core.setSecret(dismissToken);
+  }
 
   const { context } = github;
   const { owner, repo } = context.repo;
@@ -36322,6 +36332,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
 
   const octokit = github.getOctokit(token);
   const reviewOctokit = github.getOctokit(reviewToken || token);
+  const dismissOctokit = dismissToken ? github.getOctokit(dismissToken) : undefined;
 
   // [LAW:single-enforcer] One PR fetch, one place that decides fork eligibility. The PR object
   // also feeds config-file label/body selection below, so it is fetched once here.
@@ -36531,6 +36542,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
       : selectTransport(octokit, owner, repo, pullNumber)), {
       owner, repo, pullNumber, reviews: prior.reviews, capMessage: message,
       commitId: headSha, reviewerName, releaseFailureBodies: prior.releaseFailureBodies,
+      dismissOctokit,
     });
     return;
   }
@@ -37725,8 +37737,20 @@ async function announceReleaseFailure(octokit, {
 // rather than propagating to the generic top-level handler, which would name neither the PR nor the
 // consequence. It is reached only when something IS outstanding, so it can never red a run that had
 // nothing to release.
+// [LAW:no-silent-failure] `dismissOctokit` defaults to `octokit` — the pre-itv.4.1 behavior — so a caller
+// that never passes it (every test below, and a run with no DISMISS_TOKEN configured) gets exactly
+// today's dismissal, unchanged. It exists because Gitea's dismiss-review endpoint requires the dismissing
+// account to hold repo-Admin (MEASURED against a live Gitea 1.27.1: the "write" access that is enough to
+// post a review 403s here), while GitHub's needs nothing more than the review token already carries — so
+// only the WRITE this function makes needs a second, more-privileged identity; every read in this module
+// (blockStillHolds, the listReviews this is fed from) stays on the ordinary `octokit`. [LAW:single-enforcer]
+// The identity is a CARRIED VALUE, never a host test: whoever the caller hands in dismisses, on either
+// host. Gating it on `transport` would resolve the thunk below just to choose a credential — the exact
+// re-listing this function is shaped to avoid — and re-open the host branch that the two-arm `TRANSPORTS`
+// table exists to keep out of here. [LAW:dataflow-not-control-flow]
 async function releaseUnrevisitableBlocks(octokit, resolveTransport, {
   owner, repo, pullNumber, reviews, capMessage, commitId, reviewerName, releaseFailureBodies,
+  dismissOctokit = octokit,
 }) {
   // Sorted by id, not left in listReviews's pagination order: Gitea's /pulls/{index}/reviews does not
   // guarantee stable ordering across calls (see the note on `reviews` in summarizePriorReviews above), and
@@ -37758,7 +37782,7 @@ async function releaseUnrevisitableBlocks(octokit, resolveTransport, {
   const failures = [];
   for (const review of outstanding) {
     try {
-      await transport.dismissReview(octokit, { owner, repo, pullNumber, reviewId: review.id, message });
+      await transport.dismissReview(dismissOctokit, { owner, repo, pullNumber, reviewId: review.id, message });
       core.info(`Dismissed this action's own blocking review ${review.id} on PR #${pullNumber}: it will not be revisited.`);
     } catch (e) {
       // The goal is a STATE, not a successful call: a review someone else already dismissed satisfies it.
