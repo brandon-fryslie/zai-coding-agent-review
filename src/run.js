@@ -4,7 +4,7 @@ const github = require('@actions/github');
 const fs = require('fs');
 const path = require('path');
 
-const { filterFiles, buildReviewAnchors, diffChurn } = require('./diff');
+const { filterFiles, buildReviewAnchors, diffChurn, excludedPathList } = require('./diff');
 const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = require('./transport');
 const { buildReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
@@ -161,13 +161,17 @@ function warnBudgetExhausted(review) {
 // [LAW:one-source-of-truth] `excluded` — what the filter removed — travels OUT of here as a value
 // alongside the files that survived, because it is a fact about the material the review is about to
 // judge and the reviewer cannot see it from the inside (buildPrMaterial confesses it in the prompt).
-// The operator log reads the same record rather than recovering a count by subtracting list lengths.
+// The operator log reads the same record rather than recovering a count by subtracting list lengths, and
+// renders it through the SAME bounded list the prompts use: a `vendor/**` or grouped-dependency PR
+// withholds thousands of paths, and one unbounded line floods the Actions log while telling the operator
+// no more than a bounded one does. The count is always exact — it is the list, never the number, that the
+// bound touches. [LAW:one-source-of-truth]
 async function fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatterns) {
   core.info(`Fetching changed files for PR #${pullNumber}...`);
   const transport = await selectTransport(octokit, owner, repo, pullNumber);
   const { reviewed, excluded } = filterFiles(transport.files, excludePatterns);
   if (excluded.paths.length > 0) {
-    core.info(`Excluded ${excluded.paths.length} file(s) matching EXCLUDE_PATTERNS: ${excluded.paths.join(', ')}`);
+    core.info(`Excluded ${excluded.paths.length} file(s) matching EXCLUDE_PATTERNS: ${excludedPathList(excluded.paths)}`);
   }
   return { transport, filteredFiles: reviewed, excluded };
 }

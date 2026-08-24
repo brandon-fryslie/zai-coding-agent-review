@@ -1,5 +1,5 @@
 'use strict';
-const { annotatePatchWithLines, NO_EXCLUSIONS } = require('./diff');
+const { annotatePatchWithLines, NO_EXCLUSIONS, excludedPathList } = require('./diff');
 const { findingLineText } = require('./review');
 
 // [LAW:one-source-of-truth] The REVIEW PHILOSOPHY lives here, once, shared by both the PR-diff and
@@ -88,21 +88,6 @@ function reviewCharter(toolNames) {
     "might one day". Every finding names a concrete way the code misbehaves, breaks a caller, or will
     bite a maintainer. Do NOT state an approval decision, a request-changes decision, or a finding
     count — the host owns the review's disposition, derived from the recorded findings.`;
-}
-
-// [LAW:one-source-of-truth] The withheld-path list, rendered once for both the scout and the worker.
-// It is BOUNDED: a PR that bumps a large vendored tree removes thousands of changed files, and this list
-// is paid on every engine spawn. Twenty names the ordinary case (build output, lockfiles) in full, and
-// beyond that the remainder is stated rather than dropped — a truncated list that lied about its own
-// length would be the same withheld-information defect one level down. [LAW:no-silent-failure]
-// No flatten: these paths crossed parseReviewableFiles (src/diff.js) BEFORE filterFiles ever saw them, so
-// every one is already single-line and byte-exact — a path that could break out of this line was refused
-// at that boundary rather than collapsed here.
-const MAX_EXCLUDED_PATHS_SHOWN = 20;
-function excludedPathList(paths) {
-  const shown = paths.slice(0, MAX_EXCLUDED_PATHS_SHOWN);
-  const more = paths.length - shown.length;
-  return `${shown.join(', ')}${more > 0 ? ` (and ${more} more)` : ''}`;
 }
 
 // toolNames is required; callers supply adapter.toolNames so each engine's actual

@@ -31441,6 +31441,28 @@ function filterFiles(files, excludePatterns) {
   };
 }
 
+// [LAW:one-source-of-truth] The one way a withheld set is displayed, wherever it is displayed — the scout
+// prompt, every worker and sweep prompt, the operator log, and the plan-boundary warning. It lives here,
+// beside the record it renders, because "how long may this list be?" is a property of showing a withheld
+// set and not of any one sink; restating it per sink is how two sinks acquire two truncation contracts.
+// It is BOUNDED: a PR that bumps a large vendored tree removes thousands of changed files, and in the
+// prompt this list is paid on every engine spawn. Twenty names the ordinary case (build output,
+// lockfiles) in full; beyond that the remainder is STATED rather than dropped — a truncated list that
+// lied about its own length would be the same withheld-information defect one level down, which is the
+// exact defect this whole mechanism exists to remove. [LAW:no-silent-failure]
+// One cap for every sink, deliberately. A per-sink limit would buy an operator paths 21–100 at the price
+// of two numbers to reason about, and the patterns plus the count already say how to find them; the token
+// cost is why the bound is 20 rather than 200, never why a bound exists.
+// No flatten: these paths crossed parseReviewableFiles BEFORE filterFiles ever saw them, so every one is
+// already single-line and byte-exact — a path that could break out of this line was refused at that
+// boundary rather than collapsed here.
+const MAX_EXCLUDED_PATHS_SHOWN = 20;
+function excludedPathList(paths) {
+  const shown = paths.slice(0, MAX_EXCLUDED_PATHS_SHOWN);
+  const more = paths.length - shown.length;
+  return `${shown.join(', ')}${more > 0 ? ` (and ${more} more)` : ''}`;
+}
+
 // [LAW:one-source-of-truth] The new-file line number is the one honest anchor for a
 // changed line; both GitHub (line+side) and Gitea (new_position) speak it natively.
 // Each hunk header resets the new-side counter; only added/context lines advance it
@@ -31655,6 +31677,8 @@ module.exports = {
   parseReviewableFiles,
   filterFiles,
   NO_EXCLUSIONS,
+  excludedPathList,
+  MAX_EXCLUDED_PATHS_SHOWN,
   patchLines,
   buildFileAnchors,
   buildReviewAnchors,
@@ -33935,7 +33959,7 @@ const { defaultEffortProfile, maxTier } = __nccwpck_require__(4652);
 const { dedupeFindings, dedupeAssessments, parseScopeValue } = __nccwpck_require__(1565);
 const { sumCost } = __nccwpck_require__(9614);
 const { renderDependencyDiffNote } = __nccwpck_require__(9838);
-const { NO_EXCLUSIONS } = __nccwpck_require__(9898);
+const { NO_EXCLUSIONS, excludedPathList } = __nccwpck_require__(9898);
 const {
   buildReviewInput,
   buildRepoReviewInput,
@@ -34131,8 +34155,29 @@ async function runScopeWorker({ scope, context, material, spawn, log, priorFindi
 // engine branch: repo material carries changedPaths = [], so nothing is ever swept and the plan is
 // returned unchanged — a no-op by construction, an empty value, not a mode. sweptPaths is returned so
 // the caller can surface scout quality as an observable signal, never a silent correction. [LAW:no-silent-failure]
-function planScopes(scopes, changedPaths) {
-  const assigned = new Set(scopes.flatMap(s => s.files));
+//
+// withheldPaths is the third slip, and the one this boundary exists to make impossible rather than merely
+// discourage. Naming the EXCLUDE_PATTERNS-withheld paths to the scout is what lets it avoid scoping them,
+// and it is also the only reason it could ever name one: before it was told, those filenames were not in
+// its material at all. A withheld path that survived into a scope would reach buildReviewInput's
+// scopeFiles and render as "Read the complete content of THESE files" — the literal opposite of the same
+// prompt's "Do not read these paths", decided in the worker's favour by whichever instruction it weighs
+// harder. So the plan boundary strips it; the prompt's sentence is the request, this is the guarantee.
+// [LAW:types-are-the-program]
+//
+// The predicate is the withheld set ITSELF, never "not in changedPaths". Those are two different facts —
+// what this review covers vs. what is out of bounds — and the complement of the first is the second only
+// in PR mode: repo material carries changedPaths = [] by design, so a complement-based check would strip
+// every file of every scope on every repo run. [FRAMING:representation]
+//
+// A scope emptied by the strip is DROPPED, not passed through: buildReviewInput reads an empty scopeFiles
+// as "no assigned files" and falls back to "read every changed file in full", so an empty scope would
+// silently undo scope-bounded reads (c783325) — a cost regression wearing the shape of a safety check.
+// Anything orphaned by a dropped scope is picked up by the catch-all below, because the strip runs BEFORE
+// coverage is computed; no second coverage mechanism. [LAW:one-type-per-behavior]
+function planScopes(scopes, changedPaths, withheldPaths = []) {
+  const { scopes: planned, withheldAssignments } = withoutWithheldFiles(scopes, withheldPaths);
+  const assigned = new Set(planned.flatMap(s => s.files));
   const sweptPaths = changedPaths.filter(p => !assigned.has(p));
   // [LAW:verifiable-goals] The scout promises each changed file appears in EXACTLY one scope. The sweep
   // catches the lower bound (a file in no scope); this catches the upper bound (a file in two+ scopes),
@@ -34141,14 +34186,17 @@ function planScopes(scopes, changedPaths) {
   const seen = new Set();
   const recordedDup = new Set();
   const duplicatePaths = [];
-  for (const p of scopes.flatMap(s => s.files)) {
+  // `planned`, not `scopes`: a withheld path the scout put in two scopes is stripped from both, so it is
+  // not a duplicate to warn about — it is not read by any worker at all. Reporting the pre-strip plan here
+  // would describe a review that no longer exists. [FRAMING:representation]
+  for (const p of planned.flatMap(s => s.files)) {
     if (seen.has(p) && !recordedDup.has(p)) {
       recordedDup.add(p);
       duplicatePaths.push(p); // first-seen order, each duplicate once — O(1) membership, O(n) overall
     }
     seen.add(p);
   }
-  if (sweptPaths.length === 0) return { scopes: uniquelyNamed(scopes), sweptPaths, duplicatePaths };
+  if (sweptPaths.length === 0) return { scopes: uniquelyNamed(planned), sweptPaths, duplicatePaths, withheldAssignments };
   // [LAW:single-enforcer] The catch-all is built through parseScopeValue like every scout-recorded
   // scope, so EVERY Scope value in the system carries the same single-line stamp — a hand-built one
   // would be the one object in the program whose fields skipped the boundary, which is precisely the
@@ -34158,7 +34206,39 @@ function planScopes(scopes, changedPaths) {
     focus: `These changed files were not covered by the planned scopes: ${sweptPaths.join(', ')}. Review their changes fully.`,
     files: sweptPaths,
   }, 0);
-  return { scopes: uniquelyNamed([...scopes, catchAll]), sweptPaths, duplicatePaths };
+  return { scopes: uniquelyNamed([...planned, catchAll]), sweptPaths, duplicatePaths, withheldAssignments };
+}
+
+// [LAW:decomposition] One job: remove the withheld paths from the plan and say which ones were there.
+// The removals are returned, never merely dropped — a scout that keeps scoping withheld files is a signal
+// about the prompt, and a silent strip would hide the very thing worth measuring. [LAW:no-silent-failure]
+// No early return for the empty set — the loop already answers that question, and a guard would be a
+// second answer to it. Identity is preserved at the END instead, keyed on what was actually removed
+// rather than on what was passed in: a configured-but-unmatched withheld set strips nothing and must be
+// as provably a no-op as an unconfigured one. Same shape as uniquelyNamed below, and the two together are
+// what let planScopes hand back its own input when the scout's plan needed no reconciliation at all.
+function withoutWithheldFiles(scopes, withheldPaths) {
+  const withheld = new Set(withheldPaths);
+  const withheldAssignments = [];
+  const recorded = new Set();
+  const kept = [];
+  for (const scope of scopes) {
+    const files = scope.files.filter(f => {
+      if (!withheld.has(f)) return true;
+      if (!recorded.has(f)) {
+        recorded.add(f);
+        withheldAssignments.push(f); // first-seen order, each path once, however many scopes claimed it
+      }
+      return false;
+    });
+    // Spread rather than parseScopeValue: every field here already crossed that boundary when the scout
+    // recorded the scope, and `files` is a SUBSET of an already-stamped list — removing elements cannot
+    // introduce an unstamped one. [LAW:single-enforcer] holds; there is no new value to parse.
+    if (files.length > 0) kept.push(files.length === scope.files.length ? scope : { ...scope, files });
+  }
+  // No path removed ⇒ no scope rewritten and none dropped, so `kept` is element-for-element `scopes`;
+  // return the INPUT rather than the copy that merely matches it.
+  return { scopes: withheldAssignments.length === 0 ? scopes : kept, withheldAssignments };
 }
 
 // [LAW:parse-dont-validate] A scope's name is its IDENTIFIER downstream — log lines, sweep labels,
@@ -34237,12 +34317,18 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // material carries changedPaths = [], so this is a no-op). Unmentioned paths are swept into ONE
   // synthetic catch-all scope so some worker reads them in full. The zero-scope throw above stays
   // FIRST, so a scout that planned nothing fails loud rather than being papered over by the sweep.
-  const { scopes, sweptPaths, duplicatePaths } = planScopes(scoutResult.scopes, material.changedPaths);
+  const { scopes, sweptPaths, duplicatePaths, withheldAssignments } = planScopes(scoutResult.scopes, material.changedPaths, material.withheldPaths);
   if (sweptPaths.length > 0) {
     log(`⚠️ scout left ${sweptPaths.length} changed file(s) unassigned; swept into an 'unassigned files' scope: ${sweptPaths.join(', ')}`);
   }
   if (duplicatePaths.length > 0) {
     log(`⚠️ scout assigned ${duplicatePaths.length} changed file(s) to more than one scope; each is read by every claiming worker: ${duplicatePaths.join(', ')}`);
+  }
+  // The strip is announced, so a scout that keeps scoping withheld paths is visible as a prompt problem
+  // rather than absorbed as a silent correction. Rendered through the shared bounded list for the same
+  // reason the prompts and the operator log are. [LAW:no-silent-failure]
+  if (withheldAssignments.length > 0) {
+    log(`⚠️ scout assigned ${withheldAssignments.length} EXCLUDE_PATTERNS-withheld file(s) to a scope; removed so no worker is told to read them: ${excludedPathList(withheldAssignments)}`);
   }
   const context = scoutResult.summary.trim();
 
@@ -34403,6 +34489,11 @@ function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySumm
     // [LAW:types-are-the-program] The changed-file list is a first-class field of the material, not
     // recovered from the prompt: runMultiScopePass verifies the scout's plan covers it (planScopes).
     changedPaths,
+    // [LAW:types-are-the-program] The out-of-bounds set, carried as its own field rather than inferred
+    // from changedPaths' complement — see planScopes for why the complement is a different fact. The
+    // scout is TOLD these paths (so it can avoid them) and the plan boundary ENFORCES it; this field is
+    // what makes the second possible without the material re-deriving what filterFiles already decided.
+    withheldPaths: excluded.paths,
     buildScoutPrompt: (toolNames) => buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot, excluded }).prompt,
     // priorFindings is the convergence-sweep value threaded per pass by runScopeWorker: [] on the
     // initial pass (byte-identical prompt), the cumulative found list on a sweep. [LAW:dataflow-not-control-flow]
@@ -34417,6 +34508,10 @@ function buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot }) {
     // Repo mode has no changed-file list to verify against, so coverage-sweeping is a no-op by
     // construction: an empty value flows to planScopes, never a mode. [LAW:dataflow-not-control-flow]
     changedPaths: [],
+    // Repo mode has no diff, so nothing was withheld FROM one: its exclusion patterns are a bound on
+    // exploration the scout prompt already carries, not a set of named paths hidden from a file list.
+    // Empty for the same reason changedPaths is — an empty value, never a mode. [LAW:dataflow-not-control-flow]
+    withheldPaths: [],
     buildScoutPrompt: (toolNames) => buildRepoScoutInput({ scope, excludePatterns, toolNames, reviewedRepoRoot }).prompt,
     // Repo mode has no diff to partition, so a repo worker reviews its scope broadly by exploring the
     // tree; the scopeFiles arg the PR worker uses is deliberately ignored here, while the convergence
@@ -34583,7 +34678,7 @@ module.exports = { preflight, probeConfig, classifyProbe, PROBE_TIMEOUT_MS };
 
 "use strict";
 
-const { annotatePatchWithLines, NO_EXCLUSIONS } = __nccwpck_require__(9898);
+const { annotatePatchWithLines, NO_EXCLUSIONS, excludedPathList } = __nccwpck_require__(9898);
 const { findingLineText } = __nccwpck_require__(1565);
 
 // [LAW:one-source-of-truth] The REVIEW PHILOSOPHY lives here, once, shared by both the PR-diff and
@@ -34672,21 +34767,6 @@ function reviewCharter(toolNames) {
     "might one day". Every finding names a concrete way the code misbehaves, breaks a caller, or will
     bite a maintainer. Do NOT state an approval decision, a request-changes decision, or a finding
     count — the host owns the review's disposition, derived from the recorded findings.`;
-}
-
-// [LAW:one-source-of-truth] The withheld-path list, rendered once for both the scout and the worker.
-// It is BOUNDED: a PR that bumps a large vendored tree removes thousands of changed files, and this list
-// is paid on every engine spawn. Twenty names the ordinary case (build output, lockfiles) in full, and
-// beyond that the remainder is stated rather than dropped — a truncated list that lied about its own
-// length would be the same withheld-information defect one level down. [LAW:no-silent-failure]
-// No flatten: these paths crossed parseReviewableFiles (src/diff.js) BEFORE filterFiles ever saw them, so
-// every one is already single-line and byte-exact — a path that could break out of this line was refused
-// at that boundary rather than collapsed here.
-const MAX_EXCLUDED_PATHS_SHOWN = 20;
-function excludedPathList(paths) {
-  const shown = paths.slice(0, MAX_EXCLUDED_PATHS_SHOWN);
-  const more = paths.length - shown.length;
-  return `${shown.join(', ')}${more > 0 ? ` (and ${more} more)` : ''}`;
 }
 
 // toolNames is required; callers supply adapter.toolNames so each engine's actual
@@ -35876,7 +35956,7 @@ const github = __nccwpck_require__(3228);
 const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 
-const { filterFiles, buildReviewAnchors, diffChurn } = __nccwpck_require__(9898);
+const { filterFiles, buildReviewAnchors, diffChurn, excludedPathList } = __nccwpck_require__(9898);
 const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = __nccwpck_require__(7228);
 const { buildReviewInput } = __nccwpck_require__(3479);
 const { partitionFindings } = __nccwpck_require__(1565);
@@ -36033,13 +36113,17 @@ function warnBudgetExhausted(review) {
 // [LAW:one-source-of-truth] `excluded` — what the filter removed — travels OUT of here as a value
 // alongside the files that survived, because it is a fact about the material the review is about to
 // judge and the reviewer cannot see it from the inside (buildPrMaterial confesses it in the prompt).
-// The operator log reads the same record rather than recovering a count by subtracting list lengths.
+// The operator log reads the same record rather than recovering a count by subtracting list lengths, and
+// renders it through the SAME bounded list the prompts use: a `vendor/**` or grouped-dependency PR
+// withholds thousands of paths, and one unbounded line floods the Actions log while telling the operator
+// no more than a bounded one does. The count is always exact — it is the list, never the number, that the
+// bound touches. [LAW:one-source-of-truth]
 async function fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatterns) {
   core.info(`Fetching changed files for PR #${pullNumber}...`);
   const transport = await selectTransport(octokit, owner, repo, pullNumber);
   const { reviewed, excluded } = filterFiles(transport.files, excludePatterns);
   if (excluded.paths.length > 0) {
-    core.info(`Excluded ${excluded.paths.length} file(s) matching EXCLUDE_PATTERNS: ${excluded.paths.join(', ')}`);
+    core.info(`Excluded ${excluded.paths.length} file(s) matching EXCLUDE_PATTERNS: ${excludedPathList(excluded.paths)}`);
   }
   return { transport, filteredFiles: reviewed, excluded };
 }

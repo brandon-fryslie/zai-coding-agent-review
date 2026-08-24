@@ -39,6 +39,28 @@ function filterFiles(files, excludePatterns) {
   };
 }
 
+// [LAW:one-source-of-truth] The one way a withheld set is displayed, wherever it is displayed — the scout
+// prompt, every worker and sweep prompt, the operator log, and the plan-boundary warning. It lives here,
+// beside the record it renders, because "how long may this list be?" is a property of showing a withheld
+// set and not of any one sink; restating it per sink is how two sinks acquire two truncation contracts.
+// It is BOUNDED: a PR that bumps a large vendored tree removes thousands of changed files, and in the
+// prompt this list is paid on every engine spawn. Twenty names the ordinary case (build output,
+// lockfiles) in full; beyond that the remainder is STATED rather than dropped — a truncated list that
+// lied about its own length would be the same withheld-information defect one level down, which is the
+// exact defect this whole mechanism exists to remove. [LAW:no-silent-failure]
+// One cap for every sink, deliberately. A per-sink limit would buy an operator paths 21–100 at the price
+// of two numbers to reason about, and the patterns plus the count already say how to find them; the token
+// cost is why the bound is 20 rather than 200, never why a bound exists.
+// No flatten: these paths crossed parseReviewableFiles BEFORE filterFiles ever saw them, so every one is
+// already single-line and byte-exact — a path that could break out of this line was refused at that
+// boundary rather than collapsed here.
+const MAX_EXCLUDED_PATHS_SHOWN = 20;
+function excludedPathList(paths) {
+  const shown = paths.slice(0, MAX_EXCLUDED_PATHS_SHOWN);
+  const more = paths.length - shown.length;
+  return `${shown.join(', ')}${more > 0 ? ` (and ${more} more)` : ''}`;
+}
+
 // [LAW:one-source-of-truth] The new-file line number is the one honest anchor for a
 // changed line; both GitHub (line+side) and Gitea (new_position) speak it natively.
 // Each hunk header resets the new-side counter; only added/context lines advance it
@@ -253,6 +275,8 @@ module.exports = {
   parseReviewableFiles,
   filterFiles,
   NO_EXCLUSIONS,
+  excludedPathList,
+  MAX_EXCLUDED_PATHS_SHOWN,
   patchLines,
   buildFileAnchors,
   buildReviewAnchors,
