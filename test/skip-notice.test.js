@@ -769,4 +769,78 @@ describe('a block the reviewer will not revisit is released', () => {
     await release(pr, pr.reviews);
     assert.equal(pr.calls[0].priors, false);
   });
+
+  // itv.4.1: on Gitea the review-posting account's write access is refused by the dismiss endpoint (403,
+  // repo-Admin required), which a second, Admin-level credential fixes. Modelled here as two distinct
+  // fake octokit clients sharing the same `reviews` store: `writeOctokit` always 403s the dismissal route
+  // (today's unfixed shape), `adminOctokit` succeeds. The call must go out on whichever one is passed as
+  // `dismissOctokit`, never silently fall back to the write-level default when one is supplied.
+  describe('a separate credential can be used for the dismissal call alone', () => {
+    function splitCredentialHost() {
+      const pr = fakeHost('gitea');
+      const writeOctokit = pr.octokit;
+      const writeCalls = [];
+      const adminCalls = [];
+      const adminOctokit = {
+        rest: writeOctokit.rest,
+        request: async (route, params) => {
+          if (route === pr.host.route) {
+            adminCalls.push(params);
+            return writeOctokit.request(route, params);
+          }
+          return writeOctokit.request(route, params);
+        },
+      };
+      pr.octokit = {
+        rest: writeOctokit.rest,
+        request: async (route, params) => {
+          if (route === pr.host.route) {
+            writeCalls.push(params);
+            throw new Error("403 Forbidden: doer's Permission denied, needs repo Admin");
+          }
+          return writeOctokit.request(route, params);
+        },
+      };
+      return { pr, adminOctokit, writeCalls, adminCalls };
+    }
+
+    test('dismissOctokit carries the dismissal; the write-level octokit never sees the call succeed', async () => {
+      const { pr, adminOctokit, writeCalls, adminCalls } = splitCredentialHost();
+      const review = pr.block(101);
+      const result = await releaseUnrevisitableBlocks(pr.octokit, pr.resolveTransport, {
+        owner: 'o', repo: 'r', pullNumber: PR, reviews: pr.reviews, capMessage: CAP_MESSAGE,
+        commitId: 'sha', reviewerName: 'RA', releaseFailureBodies: [], dismissOctokit: adminOctokit,
+      });
+      assert.equal(result, 'released');
+      assert.equal(isOutstandingBlock(review), false, 'the block was actually released');
+      assert.equal(adminCalls.length, 1, 'the admin credential made the dismissal call');
+      assert.equal(writeCalls.length, 0, 'the write-level credential was never asked to dismiss');
+    });
+
+    // No `dismissOctokit` passed at all is every existing call site and every test above this one —
+    // the default MUST still be the plain `octokit`, so a run with no GITEA_DISMISS_TOKEN configured
+    // reproduces exactly today's (broken-on-Gitea) behavior rather than a new one.
+    test('omitting dismissOctokit falls back to the plain octokit, unchanged from before this feature', async () => {
+      const { pr, writeCalls } = splitCredentialHost();
+      pr.block(101);
+      const said = [];
+      const realSetFailed = core.setFailed;
+      const before = process.exitCode;
+      try {
+        process.exitCode = 0;
+        core.setFailed = m => said.push(m);
+        const result = await releaseUnrevisitableBlocks(pr.octokit, pr.resolveTransport, {
+          owner: 'o', repo: 'r', pullNumber: PR, reviews: pr.reviews, capMessage: CAP_MESSAGE,
+          commitId: 'sha', reviewerName: 'RA', releaseFailureBodies: [],
+        });
+        assert.equal(result, 'failed');
+      } finally {
+        core.setFailed = realSetFailed;
+        process.exitCode = before;
+      }
+      assert.equal(writeCalls.length, 1, 'the only credential available was tried, and it was refused');
+      assert.equal(said.length, 1);
+      assert.match(said[0], /repo-Admin/);
+    });
+  });
 });

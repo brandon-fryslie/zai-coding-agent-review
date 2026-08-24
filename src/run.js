@@ -343,6 +343,14 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   if (reviewToken) {
     core.setSecret(reviewToken);
   }
+  // itv.4.1: Gitea's dismiss-review endpoint 403s the review token (write access posts a review fine,
+  // but dismissing one needs repo-Admin — MEASURED live). Unset on GitHub, where reviewToken already
+  // dismisses its own reviews: releaseUnrevisitableBlocks's `dismissOctokit = octokit` default then
+  // applies and nothing changes there.
+  const dismissToken = core.getInput('GITEA_DISMISS_TOKEN');
+  if (dismissToken) {
+    core.setSecret(dismissToken);
+  }
 
   const { context } = github;
   const { owner, repo } = context.repo;
@@ -363,6 +371,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
 
   const octokit = github.getOctokit(token);
   const reviewOctokit = github.getOctokit(reviewToken || token);
+  const dismissOctokit = dismissToken ? github.getOctokit(dismissToken) : undefined;
 
   // [LAW:single-enforcer] One PR fetch, one place that decides fork eligibility. The PR object
   // also feeds config-file label/body selection below, so it is fetched once here.
@@ -572,6 +581,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
       : selectTransport(octokit, owner, repo, pullNumber)), {
       owner, repo, pullNumber, reviews: prior.reviews, capMessage: message,
       commitId: headSha, reviewerName, releaseFailureBodies: prior.releaseFailureBodies,
+      dismissOctokit,
     });
     return;
   }
