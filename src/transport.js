@@ -191,7 +191,15 @@ async function blockStillHolds(octokit, { owner, repo, pullNumber, reviewId }) {
       'GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}',
       { owner, repo, pull_number: pullNumber, review_id: reviewId },
     );
-    return isOutstandingBlock(data);
+    // [LAW:one-source-of-truth] Through the recognition rule's own projection, exactly as
+    // summarizePriorReviews' loop reads its rows. This is the SECOND site that turns a raw host review
+    // payload into release facts, and routing it here is what makes "a new host's release-flag mapping is
+    // added at reviewReleaseFacts" true by construction rather than true of one call site. Reading
+    // `data` directly worked only by coincidence of today's two hosts — GitHub omits the key and Gitea's
+    // is already named `dismissed` — so a third host reporting release under another key would have been
+    // mapped for the loop and silently missed here, answering "still blocking" for a review it had
+    // genuinely released and reddening every capped push on that host.
+    return isOutstandingBlock(reviewReleaseFacts(data));
   } catch {
     return true;
   }
@@ -830,8 +838,9 @@ async function releaseUnrevisitableBlocks(octokit, resolveTransport, { owner, re
   } catch (e) {
     core.setFailed(
       `Could not determine how to dismiss this action's own blocking review(s) on PR #${pullNumber}: `
-      + `${e.message}. The pull request is left blocked by a review this action has declined to revisit, `
-      + 'so it cannot be merged until someone dismisses that review by hand.',
+      + `${e.message}. The pull request is left blocked by review(s) this action has declined to revisit `
+      + `(${outstanding.map(r => r.id).join(', ')}), so while it stays open it cannot be merged until `
+      + 'someone dismisses them by hand.',
     );
     return 'failed';
   }
@@ -869,8 +878,9 @@ async function releaseUnrevisitableBlocks(octokit, resolveTransport, { owner, re
     // the same trap the fork/round-cap postFailureHint split exists to avoid.
     core.setFailed(
       `Could not dismiss this action's own blocking review(s) on PR #${pullNumber}: ${failures.join('; ')}. `
-      + 'Each of these was re-read afterwards and is STILL holding the merge, so the pull request cannot '
-      + 'be merged until someone dismisses that review by hand. Causes that reach here: the token may lack '
+      + 'Each of these was re-read afterwards and is STILL holding the merge, so while the pull request '
+      + 'stays open it cannot be merged until someone dismisses them by hand. Causes that reach here: the '
+      + 'token may lack '
       + '`pull-requests: write`; the pull request may be closed or merged (both hosts refuse a dismissal '
       + 'then); or the host may have been detected as GitHub because no changed file carried a patch, in '
       + 'which case the dismissal used the wrong host route.',

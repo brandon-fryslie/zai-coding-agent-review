@@ -546,7 +546,10 @@ describe('a block the reviewer will not revisit is released', () => {
         }
         assert.equal(pr.calls.length, 0);
         assert.match(said[0], /listFiles exploded/);
-        assert.match(said[0], /left blocked by a review this action has declined to revisit/);
+        assert.match(said[0], /left blocked by review\(s\) this action has declined to revisit/);
+        // The operator is told WHICH review to go dismiss by hand — the same specificity the
+        // refused-dismissal path gives, on the path that never got as far as naming one.
+        assert.match(said[0], /\b101\b/);
       });
 
       test('the dismissal says the findings were NOT re-checked', async () => {
