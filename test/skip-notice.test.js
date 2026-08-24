@@ -4,8 +4,8 @@ const assert = require('node:assert/strict');
 const core = require('@actions/core');
 const {
   announceNotReviewed, renderNotReviewedBody, parseAgentArtifact, summarizePriorReviews,
-  releaseUnrevisitableBlocks, isOutstandingBlock, giteaTransport,
-  forkNotice, roundCapNotice, submitReview, gitHubTransport,
+  releaseUnrevisitableBlocks, isOutstandingBlock, giteaTransport, announceReleaseFailure,
+  forkNotice, roundCapNotice, submitReview, gitHubTransport, RELEASE_FAILED_MARKER,
   NOT_REVIEWED_MESSAGE, NOT_REVIEWED_REASONS, NOT_REVIEWED_MARKER_PREFIX, REVIEW_MARKER,
 } = require('../src/transport');
 
@@ -14,6 +14,10 @@ const {
 // against ONE store makes these ROUND-TRIP tests. A marker the sink writes and the reader cannot parse
 // fails here — which is precisely the drift a hand-written fixture string would hide, and the drift the
 // whole "a skip must be distinguishable" contract rests on. [LAW:behavior-not-structure]
+// GitHub's real createReview returns a `state` mirroring the submitted `event` (REQUEST_CHANGES ->
+// CHANGES_REQUESTED, APPROVE -> APPROVED, anything else -> COMMENTED) — translated here so a review this
+// fixture creates is recognizable by isOutstandingBlock exactly like a live one, not just by its body.
+const GITHUB_EVENT_TO_STATE = { REQUEST_CHANGES: 'CHANGES_REQUESTED', APPROVE: 'APPROVED' };
 function fakePr() {
   const reviews = [];
   return {
@@ -21,7 +25,10 @@ function fakePr() {
     octokit: {
       rest: {
         pulls: {
-          createReview: async params => { reviews.push({ id: reviews.length + 1, ...params }); },
+          createReview: async params => {
+            const state = GITHUB_EVENT_TO_STATE[params.event] || 'COMMENTED';
+            reviews.push({ id: reviews.length + 1, state, ...params });
+          },
           listReviews: async ({ page }) => ({ data: page === 1 ? reviews : [] }),
         },
       },
@@ -369,6 +376,18 @@ function fakeHost(kind) {
       return review;
     },
     octokit: {
+      // Serves announceReleaseFailure's post the same way fakePr() serves announceNotReviewed's: appended
+      // to the same `reviews` store the block-tracking above reads, so a released-failure notice can be
+      // asserted against pr.reviews / pr.calls exactly like a real listReviews round trip would show it.
+      rest: {
+        pulls: {
+          createReview: async (params) => {
+            const posted = { id: reviews.length + 1, state: 'COMMENT', dismissed: false, body: params.body };
+            reviews.push(posted);
+            return { data: posted };
+          },
+        },
+      },
       request: async (route, params) => {
         // The single-review read is served at the SAME literal path by both hosts (verified live), which
         // is why the re-check needs no transport member. The fake serves it from the same store the
@@ -393,9 +412,17 @@ function fakeHost(kind) {
   };
 }
 
+// releaseFailureBodies is re-derived from pr.reviews on every call, exactly as a real run re-derives it
+// from a fresh listReviews each time (summarizePriorReviews's own pagination pass) rather than the caller
+// tracking it across calls — so a second release() attempt automatically "sees" the first attempt's
+// posted notice the same way production would, with no manual bookkeeping in the tests below.
 const release = (pr, reviews, resolveTransport = pr.resolveTransport) =>
   releaseUnrevisitableBlocks(pr.octokit, resolveTransport, {
     owner: 'o', repo: 'r', pullNumber: PR, reviews, capMessage: CAP_MESSAGE,
+    commitId: 'sha', reviewerName: 'RA',
+    releaseFailureBodies: pr.reviews
+      .map(r => (r.body || '').trimEnd())
+      .filter(body => body.endsWith(RELEASE_FAILED_MARKER)),
   });
 
 describe('a block the reviewer will not revisit is released', () => {
@@ -579,8 +606,133 @@ describe('a block the reviewer will not revisit is released', () => {
           process.exitCode = before;
         }
       });
+
+      // The gap the ticket's own acceptance criterion names: a refusal that only reaches setFailed is
+      // invisible to anyone reading the PR conversation instead of the Actions log — and on Gitea this is
+      // not a rare fluke, it is the permanent steady state (dismissal needs repo-Admin; the bot is
+      // deliberately kept at write). The PR itself must carry the explanation, not just the run log.
+      test('a refused dismissal ALSO posts the explanation to the PR itself, not just the run log', async () => {
+        const pr = fakeHost(kind);
+        pr.block(101);
+        pr.octokit.request = async () => { throw new Error('403 Forbidden: Must be repo admin'); };
+        const realSetFailed = core.setFailed;
+        const before = process.exitCode;
+        try {
+          process.exitCode = 0;
+          core.setFailed = () => {};
+          assert.equal(await release(pr, pr.reviews), 'failed');
+        } finally {
+          core.setFailed = realSetFailed;
+          process.exitCode = before;
+        }
+        const posted = pr.reviews.find(r => (r.body || '').includes(RELEASE_FAILED_MARKER));
+        assert.ok(posted, 'the release-failure notice was posted as a review comment on the PR');
+        assert.match(posted.body, /BLOCK NOT RELEASED/);
+        assert.match(posted.body, /\b101\b/, 'names the review still holding the merge');
+        assert.match(posted.body, /repo-Admin/, 'names the measured Gitea cause, not just a generic guess');
+      });
+
+      // Without this the explanation would repost on every single capped push for the rest of the PR's
+      // life, once dismissal is structurally refused (the Gitea-admin case, which never resolves itself).
+      test('an unchanged release failure does not repost — it would spam every push forever otherwise', async () => {
+        const pr = fakeHost(kind);
+        pr.block(101);
+        pr.octokit.request = async () => { throw new Error('403 Forbidden'); };
+        const realSetFailed = core.setFailed;
+        const before = process.exitCode;
+        try {
+          process.exitCode = 0;
+          core.setFailed = () => {};
+          await release(pr, pr.reviews);
+          const afterFirst = pr.reviews.filter(r => (r.body || '').includes(RELEASE_FAILED_MARKER)).length;
+          assert.equal(afterFirst, 1);
+          await release(pr, pr.reviews);
+          const afterSecond = pr.reviews.filter(r => (r.body || '').includes(RELEASE_FAILED_MARKER)).length;
+          assert.equal(afterSecond, 1, 'the second identical failure posted no duplicate');
+        } finally {
+          core.setFailed = realSetFailed;
+          process.exitCode = before;
+        }
+      });
+
+      // Gitea's listReviews does not guarantee stable ordering across calls (summarizePriorReviews already
+      // documents and designs around this elsewhere). Two outstanding blocks, fetched in different orders
+      // on two separate pushes, must still produce the identical message — otherwise the dedup's exact
+      // string match sees a "new" failure every time the fetch order happens to differ, and reposts.
+      test('two outstanding blocks fetched in a different order still dedup as the same failure', async () => {
+        const pr = fakeHost(kind);
+        pr.block(205);
+        pr.block(101);
+        pr.octokit.request = async () => { throw new Error('403 Forbidden'); };
+        const realSetFailed = core.setFailed;
+        const before = process.exitCode;
+        try {
+          process.exitCode = 0;
+          core.setFailed = () => {};
+          await release(pr, pr.reviews);
+          const afterFirst = pr.reviews.filter(r => (r.body || '').includes(RELEASE_FAILED_MARKER)).length;
+          assert.equal(afterFirst, 1);
+          // Same two reviews, opposite arrival order — as if a second listReviews call happened to page
+          // them back the other way around, with nothing about the actual failure changed.
+          await release(pr, [...pr.reviews].reverse());
+          const afterSecond = pr.reviews.filter(r => (r.body || '').includes(RELEASE_FAILED_MARKER)).length;
+          assert.equal(afterSecond, 1, 'a reordered fetch of the same unresolved failure posted no duplicate');
+        } finally {
+          core.setFailed = realSetFailed;
+          process.exitCode = before;
+        }
+      });
     });
   }
+
+  // The gap the earlier tests in this block missed: fakeHost's `reviews` store is NOT what production
+  // threads into releaseUnrevisitableBlocks — run.js passes prior.reviews and prior.releaseFailureBodies,
+  // both produced by the REAL summarizePriorReviews, which shapes/filters differently than a raw store
+  // (see summarizePriorReviews's own comments). This test goes through that real function on both ends —
+  // the initial fetch AND the re-fetch a next push would make — so a mismatch between what
+  // summarizePriorReviews actually returns and what announceReleaseFailure actually reads cannot hide
+  // behind a fixture that happens to look similar. [LAW:behavior-not-structure]
+  test('a real run, through the real summarizePriorReviews: notice posts once, then dedups on the real re-fetch', async () => {
+    const pr = fakePr();
+    // A genuine completed round — REQUEST_CHANGES + REVIEW_MARKER, exactly what submitReview writes —
+    // is the only way a review becomes eligible for isOutstandingBlock in the real pipeline.
+    await submitReview(pr.octokit, 'o', 'r', PR, 'sha1', 'RA', {
+      summary: 'Found something.',
+      findings: [{ path: 'a.js', line: 1, body: 'bad thing', severity: 4 }],
+      unanchored: [], unreviewedScopes: [], unreviewableFiles: [],
+    }, true, gitHubTransport([], []));
+
+    // A transport whose dismissal always refuses — blockStillHolds' re-check then hits pr.octokit.request,
+    // which fakePr() does not define, so it throws and blockStillHolds' own catch-all answers "still
+    // blocking" (the safe direction), same as a real refused-and-confirmed-live dismissal.
+    const failingTransport = { dismissReview: async () => { throw new Error('403 Forbidden: Must be repo admin'); } };
+    const realSetFailed = core.setFailed;
+    core.setFailed = () => {};
+    try {
+      const prior1 = await summarizePriorReviews(pr.octokit, 'o', 'r', PR);
+      assert.equal(prior1.releaseFailureBodies.length, 0, 'no release-failure notice exists yet');
+      const result1 = await releaseUnrevisitableBlocks(pr.octokit, () => failingTransport, {
+        owner: 'o', repo: 'r', pullNumber: PR, reviews: prior1.reviews, capMessage: CAP_MESSAGE,
+        commitId: 'sha2', reviewerName: 'RA', releaseFailureBodies: prior1.releaseFailureBodies,
+      });
+      assert.equal(result1, 'failed');
+      const posted = pr.reviews.filter(r => (r.body || '').includes(RELEASE_FAILED_MARKER));
+      assert.equal(posted.length, 1, 'a real run posts exactly one release-failure notice');
+
+      // Exactly what the NEXT push does: a fresh summarizePriorReviews, a fresh release attempt.
+      const prior2 = await summarizePriorReviews(pr.octokit, 'o', 'r', PR);
+      assert.equal(prior2.releaseFailureBodies.length, 1, 'summarizePriorReviews itself now finds the notice');
+      const before = pr.reviews.length;
+      const result2 = await releaseUnrevisitableBlocks(pr.octokit, () => failingTransport, {
+        owner: 'o', repo: 'r', pullNumber: PR, reviews: prior2.reviews, capMessage: CAP_MESSAGE,
+        commitId: 'sha2', reviewerName: 'RA', releaseFailureBodies: prior2.releaseFailureBodies,
+      });
+      assert.equal(result2, 'failed');
+      assert.equal(pr.reviews.length, before, 'the real re-fetch path posted no duplicate');
+    } finally {
+      core.setFailed = realSetFailed;
+    }
+  });
 
   // Three spellings for one concept: the event SUBMITTED is REQUEST_CHANGES on both hosts, but the state
   // READ BACK differs, and Gitea's dismissed review keeps the live spelling. Reading GitHub's word on

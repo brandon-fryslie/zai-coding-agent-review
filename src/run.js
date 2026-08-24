@@ -571,6 +571,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
       ? fetched.transport
       : selectTransport(octokit, owner, repo, pullNumber)), {
       owner, repo, pullNumber, reviews: prior.reviews, capMessage: message,
+      commitId: headSha, reviewerName, releaseFailureBodies: prior.releaseFailureBodies,
     });
     return;
   }

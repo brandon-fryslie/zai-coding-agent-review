@@ -348,6 +348,15 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
   // of "is this review still blocking" — the state spellings and the release-flag name — live together
   // at isOutstandingBlock, so adding a host cannot make this pagination loop wrong. [LAW:decomposition]
   const reviews = [];
+  // [LAW:one-source-of-truth] announceReleaseFailure's OWN dedup source — the raw, unprojected bodies of
+  // every release-failure notice this action has posted, collected from the SAME pagination pass rather
+  // than a second listReviews call. `reviews` above cannot serve this: it is deliberately shaped to
+  // `{id, state, dismissed}` with no body, and gated to `parseAgentArtifact` kind 'review' only — a
+  // release-failure notice carries RELEASE_FAILED_MARKER, which parseAgentArtifact does not recognize at
+  // all (by design, so it stays invisible to round-counting and latestArtifact), so it would never reach
+  // `reviews` regardless of shape. The check here is a disjoint literal match, independent of
+  // parseAgentArtifact, for exactly that reason. [LAW:carrying-cost]
+  const releaseFailureBodies = [];
   // [LAW:one-source-of-truth] The NEWEST thing this action left on the PR — a round or a not-reviewed
   // notice — read out of the SAME pass that counts rounds, so "what does this PR currently say about
   // itself" has one definition. announceNotReviewed consumes it as its idempotency key: it stays quiet
@@ -373,6 +382,10 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
     });
     for (const r of data) {
       const body = typeof r.body === 'string' ? r.body : '';
+      // A disjoint check, run BEFORE the parseAgentArtifact gate below: parseAgentArtifact does not
+      // recognize RELEASE_FAILED_MARKER at all (by design — see its definition), so a release-failure
+      // notice would otherwise fall straight through the `!artifact` continue and never be collected.
+      if (body.trimEnd().endsWith(RELEASE_FAILED_MARKER)) releaseFailureBodies.push(body.trimEnd());
       // [LAW:single-enforcer] ONE definition of "an agent review round" — the 'review' arm of
       // parseAgentArtifact — gates the count, the cost sum, AND the RA-review-id set, so none of the
       // three can drift from the others or from what submitReview writes.
@@ -399,7 +412,7 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
     if (data.length < 100) break;
     page++;
   }
-  return { count, cost: tallies, reviews, latestArtifact };
+  return { count, cost: tallies, reviews, latestArtifact, releaseFailureBodies };
 }
 
 // [LAW:effects-at-boundaries] Pure, split from the fetch below so it is testable without a fake API:
@@ -799,6 +812,60 @@ function unrevisitableBlockMessage(capMessage) {
     + 'addressed is now a human judgement; the review and its comments stay on the PR to be read.';
 }
 
+// [LAW:no-silent-failure] `setFailed` reaches only the Actions log/annotations — a sink nobody reads from
+// the PR conversation itself, which is exactly where this ticket's own acceptance criterion says the
+// procedure must be visible when auto-release isn't the design. That is not a rare edge case on Gitea: a
+// review's own author needs repo-Admin access to dismiss it there (`ctx.Repo.IsAdmin()`, MEASURED against
+// a live Gitea 1.27.1 via the literal string "Must be repo admin", not assumed from GitHub's write-access
+// rule) and this repo's copirate-bot collaborator grant is deliberately capped at "write"
+// (terraform/gitea/gitea.tf) for reasons unrelated to dismissal — so on Gitea this failure is not a
+// transient fluke, it is the PERMANENT steady state every time the round cap is hit. A message only a
+// human reading Actions logs will ever see recreates the exact "green-looking, silently broken" shape
+// this whole notice mechanism exists to abolish. [FRAMING:representation]
+//
+// Deliberately NOT folded into `announceNotReviewed`'s NOT_REVIEWED_REASONS taxonomy: that mechanism's own
+// design comment (see NOT_REVIEWED_REASONS above) enumerates exactly the exits that involve no review
+// happening at all, and its single-latest-artifact dedup is keyed off "the newest thing this action left
+// on the PR" — a second, later notice from THIS function would silently defeat the round-cap notice's own
+// dedup on every subsequent capped push (each one would look newer than the round-cap text it displaced),
+// reposting an unchanged round-cap notice forever. This function owns a disjoint marker and dedups against
+// "does any existing review already carry this exact message", not "is this the single latest artifact" —
+// so the two notices coexist without either clobbering the other's memory. [LAW:one-type-per-behavior]
+const RELEASE_FAILED_MARKER = '<!-- copirate-code-review-agent:release-failed -->';
+
+async function announceReleaseFailure(octokit, {
+  owner, repo, pullNumber, commitId, reviewerName, message, releaseFailureBodies,
+}) {
+  const body = `## ${reviewerName}\n\n⚠️ **BLOCK NOT RELEASED**\n\n${message}\n\n${RELEASE_FAILED_MARKER}`;
+  // [LAW:one-source-of-truth] Body equality against every release-failure notice already on the PR, not
+  // just the latest — new information (a changed review-id list, a different cause) always earns a new
+  // post; unchanged content never does, on this run or any later one. `releaseFailureBodies` is
+  // summarizePriorReviews's OWN raw-body collection for exactly this marker (see there) — never the
+  // `reviews` array, which is shaped to `{id, state, dismissed}` with no body at all and would make this
+  // comparison permanently false. [LAW:no-silent-failure]
+  const alreadyPosted = releaseFailureBodies.includes(body);
+  if (alreadyPosted) {
+    core.info(`PR #${pullNumber} already carries this exact release-failure notice; not posting a duplicate.`);
+    return 'already-posted';
+  }
+  try {
+    await octokit.rest.pulls.createReview({
+      owner, repo, pull_number: pullNumber, commit_id: commitId, event: 'COMMENT', body,
+    });
+  } catch (e) {
+    // Both hosts are already reached by a prior core.setFailed from the caller before this runs — this is
+    // a second, narrower failure (the EXPLANATION itself didn't land), reported for its own sake rather
+    // than swallowed because the run is already red. [LAW:no-silent-failure]
+    core.setFailed(
+      `Could not post the release-failure notice to PR #${pullNumber}: ${e.message}. The pull request `
+      + 'stays blocked with no explanation of why visible on the PR itself — only in this run\'s log.',
+    );
+    return 'failed';
+  }
+  core.info(`Posted a release-failure notice to PR #${pullNumber}.`);
+  return 'posted';
+}
+
 // [LAW:single-enforcer] THE one place the action releases a merge block, and the one rule it enforces:
 // never leave a blocking review this action refuses to revisit. It is called from the round-cap exit and
 // nowhere else, because that exit is the only moment the action decides it is done looking — and a
@@ -831,20 +898,29 @@ function unrevisitableBlockMessage(capMessage) {
 // rather than propagating to the generic top-level handler, which would name neither the PR nor the
 // consequence. It is reached only when something IS outstanding, so it can never red a run that had
 // nothing to release.
-async function releaseUnrevisitableBlocks(octokit, resolveTransport, { owner, repo, pullNumber, reviews, capMessage }) {
-  const outstanding = reviews.filter(isOutstandingBlock);
+async function releaseUnrevisitableBlocks(octokit, resolveTransport, {
+  owner, repo, pullNumber, reviews, capMessage, commitId, reviewerName, releaseFailureBodies,
+}) {
+  // Sorted by id, not left in listReviews's pagination order: Gitea's /pulls/{index}/reviews does not
+  // guarantee stable ordering across calls (see the note on `reviews` in summarizePriorReviews above), and
+  // both messages below join outstanding ids/failures into text that announceReleaseFailure's dedup matches
+  // by exact string — an order that varies between two fetches of the same underlying facts would make an
+  // unchanged failure look like a new one and repost. [LAW:one-source-of-truth]
+  const outstanding = reviews.filter(isOutstandingBlock).sort((a, b) => a.id - b.id);
   if (outstanding.length === 0) return 'nothing-to-release';
 
   let transport;
   try {
     transport = await resolveTransport();
   } catch (e) {
-    core.setFailed(
-      `Could not determine how to dismiss this action's own blocking review(s) on PR #${pullNumber}: `
-      + `${e.message}. The pull request is left blocked by review(s) this action has declined to revisit `
-      + `(${outstanding.map(r => r.id).join(', ')}), so while it stays open it cannot be merged until `
-      + 'someone dismisses them by hand.',
-    );
+    const message = `Could not determine how to dismiss this action's own blocking review(s) on PR `
+      + `#${pullNumber}: ${e.message}. The pull request is left blocked by review(s) this action has `
+      + `declined to revisit (${outstanding.map(r => r.id).join(', ')}), so while it stays open it cannot `
+      + 'be merged until someone dismisses them by hand.';
+    core.setFailed(message);
+    await announceReleaseFailure(octokit, {
+      owner, repo, pullNumber, commitId, reviewerName, message, releaseFailureBodies,
+    });
     return 'failed';
   }
 
@@ -879,15 +955,19 @@ async function releaseUnrevisitableBlocks(octokit, resolveTransport, { owner, re
     // of oversized files both reach — so a Gitea PR in that state would be dismissed over GitHub's route
     // and refused. Asserting "check your permissions" there sends the operator after the wrong cause,
     // the same trap the fork/round-cap postFailureHint split exists to avoid.
-    core.setFailed(
-      `Could not dismiss this action's own blocking review(s) on PR #${pullNumber}: ${failures.join('; ')}. `
-      + 'Each of these was re-read afterwards and is STILL holding the merge, so while the pull request '
-      + 'stays open it cannot be merged until someone dismisses them by hand. Causes that reach here: the '
-      + 'token may lack '
-      + '`pull-requests: write`; the pull request may be closed or merged (both hosts refuse a dismissal '
-      + 'then); or the host may have been detected as GitHub because no changed file carried a patch, in '
-      + 'which case the dismissal used the wrong host route.',
-    );
+    const message = `Could not dismiss this action's own blocking review(s) on PR #${pullNumber}: `
+      + `${failures.join('; ')}. Each of these was re-read afterwards and is STILL holding the merge, so `
+      + 'while the pull request stays open it cannot be merged until someone dismisses them by hand. Causes '
+      + 'that reach here: on Gitea, dismissing a review needs the dismissing account to hold repo-Admin '
+      + 'access — the "write" access that is enough to post a review is NOT enough, and no token scope '
+      + 'change fixes this, only a higher collaborator role does (MEASURED against a live Gitea 1.27.1, not '
+      + 'assumed); the token may otherwise lack `pull-requests: write` on GitHub; the pull request may be '
+      + 'closed or merged (both hosts refuse a dismissal then); or the host may have been detected as '
+      + 'GitHub because no changed file carried a patch, in which case the dismissal used the wrong host route.';
+    core.setFailed(message);
+    await announceReleaseFailure(octokit, {
+      owner, repo, pullNumber, commitId, reviewerName, message, releaseFailureBodies,
+    });
     return 'failed';
   }
   return 'released';
@@ -938,6 +1018,8 @@ module.exports = {
   summarizePriorReviews,
   parseAgentArtifact,
   announceNotReviewed,
+  announceReleaseFailure,
+  RELEASE_FAILED_MARKER,
   releaseUnrevisitableBlocks,
   isOutstandingBlock,
   unrevisitableBlockMessage,
