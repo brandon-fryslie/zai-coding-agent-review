@@ -194,7 +194,7 @@ describe('sumUsage', () => {
 // ── composeSummary ────────────────────────────────────────────────────────────────────────────
 
 describe('composeSummary', () => {
-  const scopes = [{ name: 'cost', focus: 'x' }, { name: 'diff', focus: 'y' }];
+  const scopes = [{ name: 'cost', focus: 'x', files: [] }, { name: 'diff', focus: 'y', files: [] }];
   test('names every scope and carries each worker summary, never raw JSON', () => {
     const summary = composeSummary(scopes, [
       { name: 'cost', summary: 'Looks fine.' },
@@ -206,7 +206,7 @@ describe('composeSummary', () => {
     assert.doesNotMatch(summary, /[[{]"name"/);
   });
   test('renders a placeholder for an empty worker summary', () => {
-    const summary = composeSummary([{ name: 'a', focus: 'x' }], [{ name: 'a', summary: '' }]);
+    const summary = composeSummary([{ name: 'a', focus: 'x', files: [] }], [{ name: 'a', summary: '' }]);
     assert.match(summary, /\*\*a\*\* — \(no summary\)/);
   });
 });
@@ -272,9 +272,9 @@ describe('runScopeWorkers', () => {
 
 describe('runMultiScopePass — spawn-level transient resilience', () => {
   const SCOPES = [
-    { name: 'a', focus: 'fa' },
-    { name: 'b', focus: 'fb' },
-    { name: 'c', focus: 'fc' },
+    { name: 'a', focus: 'fa', files: [] },
+    { name: 'b', focus: 'fb', files: [] },
+    { name: 'c', focus: 'fc', files: [] },
   ];
   const material = {
     changedPaths: [], // no coverage sweep in this suite; scope-worker resilience is what's under test
@@ -372,7 +372,7 @@ describe('runMultiScope — reasoningTier fold onto the chain', () => {
     buildScoutPrompt: () => 'SCOUT',
     buildWorkerPrompt: (focusText) => focusText,
   };
-  const SCOPES = [{ name: 'a', focus: 'fa' }];
+  const SCOPES = [{ name: 'a', focus: 'fa', files: [] }];
 
   // A fake adapter that records the `reasoning` of every config it is spawned with.
   function recordingRegistry(seen) {
@@ -603,7 +603,7 @@ describe('runMultiScopePass — scout coverage sweep', () => {
 // hunting only for what is missing; the loop stops when a sweep adds nothing new (by the dedupeFindings
 // key — the one sameness definition) or at the effort profile's sweepCap.
 describe('runMultiScopePass — convergence sweeps', () => {
-  const SCOPES = [{ name: 'a', focus: 'fa' }, { name: 'b', focus: 'fb' }];
+  const SCOPES = [{ name: 'a', focus: 'fa', files: [] }, { name: 'b', focus: 'fb', files: [] }];
   // The material ENCODES the priorFindings value into the worker prompt, so the tests can assert the
   // per-pass threading (pass 0 gets none; a sweep gets the cumulative list).
   const material = {
@@ -1199,9 +1199,9 @@ describe('shipped prompts carry no reviewed-repo layout', () => {
 // which fails fast with the knob named.
 describe('runMultiScopePass — wall-clock time budget', () => {
   const SCOPES = [
-    { name: 'a', focus: 'fa' },
-    { name: 'b', focus: 'fb' },
-    { name: 'c', focus: 'fc' },
+    { name: 'a', focus: 'fa', files: [] },
+    { name: 'b', focus: 'fb', files: [] },
+    { name: 'c', focus: 'fc', files: [] },
   ];
   const material = {
     changedPaths: [],
@@ -1351,7 +1351,7 @@ describe('planScopes — unique scope names', () => {
     // Two same-named scopes, one deadline-killed: the summary must count the reviewed one as
     // reviewed, not subtract both via the shared name.
     const summary = composeSummary(
-      [{ name: 'sync', focus: 'f1' }, { name: 'sync (2)', focus: 'f2' }],
+      [{ name: 'sync', focus: 'f1', files: [] }, { name: 'sync (2)', focus: 'f2', files: [] }],
       [{ name: 'sync', summary: 'ok' }],
       [],
       { exhausted: true, unreviewedScopes: ['sync (2)'] },
