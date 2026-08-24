@@ -343,8 +343,21 @@ function parseAgentArtifact(rawBody) {
 // the round count and re-reviews a PR that has already spent its cap. When the question cannot be
 // answered, saying so is the only answer that isn't a lie.
 //
-// Host-agnostic by shape, not by branch: Gitea serves /user for its own token, so a Gitea runner lands
-// on the login arm with no host test — and never reaches the bot arm, whose `type` field is GitHub's.
+// Host-agnostic by shape, not by branch — but the two hosts are NOT equally evidenced here, and the
+// difference is the part a maintainer needs. The GitHub arms are measured (a real Actions job,
+// 2026-08-24): the /user 200-vs-403 split and the /installation/repositories confirmation were both
+// observed in both directions. The Gitea expectation — that its runner token is served by /user and so
+// lands on the login arm, never reaching the bot arm whose `type` field is GitHub's — is REASONED FROM
+// SHAPE AND NOT YET MEASURED.
+//
+// State the blast radius rather than the comfort: this gate is a hard failure, so if a Gitea act_runner
+// token is refused by /user for any reason, the fallback probe is a GitHub-Apps endpoint Gitea has no
+// reason to implement, both arms miss, and EVERY Gitea run reds — a whole-host regression, where before
+// this gate summarizePriorReviews needed no identity at all. That is a strictly larger failure than the
+// forgery being closed, and it is unproven in the safe direction. Confirming it needs the same live
+// instance itv.4 used (Gitea 1.27.1), not a fake shaped like an assumption: a test asserting Gitea
+// serves /user would encode the guess and then pass, which is how an unmeasured claim acquires the
+// appearance of coverage. Tracked with the itv.4.1 probe. [LAW:no-silent-failure]
 async function resolveReviewerIdentity(octokit) {
   let data;
   try {
@@ -384,7 +397,12 @@ async function resolveReviewerIdentity(octokit) {
 // transition still disowns the earlier rounds. Stated rather than papered over; the recovery is the same
 // as it has always been, dismiss the stale block by hand.
 //
-// Duplicates are collapsed so the common single-token run resolves once and the gate does one compare.
+// The `sameIdentity` collapse below is about the SHAPE of the answer, not its cost: two tokens on one
+// account must yield one identity, so the gate does one compare instead of the same compare twice. It
+// saves no probe — the loop resolves every octokit it is handed, before it can know any are duplicates.
+// The single probe an ordinary run actually pays for is bought one level up, where run.js dedups the
+// token STRINGS before a client is built from either; a caller that hands this function two clients on
+// one token pays two probes, and that is a fact about the caller, not a promise broken here.
 async function resolveReviewerIdentities(octokits) {
   const identities = [];
   for (const octokit of octokits) {

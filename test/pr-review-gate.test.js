@@ -37,6 +37,7 @@ Object.assign(process.env, {
 const { test, describe, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 
+const core = require('@actions/core');
 const github = require('@actions/github');
 const preflightModule = require('../src/preflight');
 const multiscope = require('../src/multiscope');
@@ -48,9 +49,9 @@ const TOOL_NAMES = { requestChange: 'request_change', finishReview: 'finish_revi
 let host;
 let engineSpawns;
 let engineFindings;
-// Every token this run built a client from, in order — the record that makes "both credentials were
-// threaded" an assertable fact rather than an inference from downstream behavior.
-let octokitTokens;
+// What the run reported as fatal, if anything — the observable that separates "reviewed and found
+// nothing" from "could not review at all", which is the whole point of the identity gate failing loud.
+let failures;
 
 // A pull request nobody has reviewed yet, from a branch on the base repo (not a fork).
 //
@@ -61,6 +62,10 @@ let octokitTokens;
 // arm, and only the multi-credential test sets it.
 function fakeOctokit(tokenValue) {
   const isPat = host.patTokens.has(tokenValue);
+  // A credential that can answer NEITHER arm: /user refuses it and the installation probe refuses it too
+  // — a revoked PAT, an SSO-gated one, a secondary rate limit. Identity is then unresolvable, and the
+  // design's whole claim is that this reds the run rather than guessing in either direction.
+  const identityBroken = host.brokenIdentityTokens.has(tokenValue);
   return {
     rest: {
       // The default GITHUB_TOKEN an unconfigured consumer runs on: an installation token, which refuses
@@ -70,6 +75,11 @@ function fakeOctokit(tokenValue) {
       // most consumers never take.
       users: {
         getAuthenticated: async () => {
+          if (identityBroken) {
+            const e = new Error('Bad credentials');
+            e.status = 403;
+            throw e;
+          }
           if (isPat) return { data: { login: `${tokenValue}-account`, type: 'User' } };
           const e = new Error('Resource not accessible by integration');
           e.status = 403;
@@ -86,20 +96,32 @@ function fakeOctokit(tokenValue) {
     // Two routes reach `request`, and they must not answer for each other: the unified-diff fallback
     // selectTransport takes when no file carries an inline patch, and the probe that CONFIRMS this token
     // is an installation token. A catch-all would confirm the installation by coincidence.
-    request: async (route) => (route === 'GET /installation/repositories'
-      ? { data: { total_count: 1 } }
-      : { data: host.unifiedDiff }),
+    request: async (route) => {
+      if (route === 'GET /installation/repositories') {
+        if (identityBroken) {
+          const e = new Error('Resource not accessible by personal access token');
+          e.status = 403;
+          throw e;
+        }
+        return { data: { total_count: 1 } };
+      }
+      return { data: host.unifiedDiff };
+    },
   };
 }
 
 beforeEach(() => {
-  host = { files: [], unifiedDiff: '', reviews: [], priorReviews: [], patTokens: new Set() };
+  host = {
+    files: [], unifiedDiff: '', reviews: [], priorReviews: [],
+    patTokens: new Set(), brokenIdentityTokens: new Set(),
+  };
   engineSpawns = [];
   engineFindings = [];
-  octokitTokens = [];
+  failures = [];
 });
 
-github.getOctokit = (tokenValue) => { octokitTokens.push(tokenValue); return fakeOctokit(tokenValue); };
+github.getOctokit = (tokenValue) => fakeOctokit(tokenValue);
+core.setFailed = (m) => { failures.push(m); };
 // A probe result is not what these tests are about; the chain is usable.
 preflightModule.preflight = async () => ({ ok: true, results: [] });
 // Stand in for the whole scout→workers pass, capturing the material it was handed so the worker
@@ -244,12 +266,11 @@ describe('a run holding both GITHUB_TOKEN and GITHUB_REVIEW_TOKEN', () => {
     host.priorReviews = [roundByInstallationToken];
   });
 
-  test('builds a client from each distinct credential', async () => {
-    await reviewCappedAtOne();
-    assert.ok(octokitTokens.includes('gh-token'), 'GITHUB_TOKEN was never used to build a client');
-    assert.ok(octokitTokens.includes('gh-review-token'), 'GITHUB_REVIEW_TOKEN was never used to build a client');
-  });
-
+  // There is deliberately NO "a client was built from each credential" test here. Both tokens reach
+  // getOctokit at the top of runPrReview — for the reading client and the posting client — on every run
+  // in this file, so such an assertion holds with the identity wiring deleted: a test that cannot fail,
+  // which is worse than no test because it reads as coverage. The behavior worth guarding is the one
+  // below, and it is guarded by its consequence. [LAW:behavior-not-structure]
   test('a round posted under the other credential is still counted as ours', async () => {
     await reviewCappedAtOne();
     // If only the posting PAT's identity were resolved, the bot-authored round would read as a stranger's,
@@ -257,5 +278,21 @@ describe('a run holding both GITHUB_TOKEN and GITHUB_REVIEW_TOKEN', () => {
     assert.equal(engineSpawns.length, 0, 'the prior round was disowned: the cap did not bind');
     assert.equal(host.reviews.length, 1);
     assert.match(host.reviews[0].body, /not-reviewed:round-cap/);
+  });
+
+  // The gate's own failure arm, through the orchestrator. resolveReviewerIdentity throwing is not a
+  // degraded mode this run can continue in: with no identity, the round count and the cost totals are
+  // both unattributable, and every direction out is a lie — trusting all bodies restores the forgery,
+  // trusting none zeroes a spend cap. So the run must red WITHOUT spending an engine spawn and WITHOUT
+  // posting anything to the PR, since a posted artifact would itself become unattributable history.
+  test('an unresolvable credential reds the run before any spend, and says nothing at the PR', async () => {
+    host.patTokens = new Set();
+    host.brokenIdentityTokens = new Set(['gh-review-token']);
+    host.priorReviews = [];
+    await reviewCappedAtOne();
+    assert.equal(engineSpawns.length, 0, 'an engine was spawned on a run that cannot attribute its own reviews');
+    assert.equal(host.reviews.length, 0, 'a review was posted by a run with no resolvable identity');
+    assert.equal(failures.length, 1);
+    assert.match(failures[0], /identity|Bad credentials|attributed/i);
   });
 });
