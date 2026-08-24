@@ -372,7 +372,13 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   }
 
   const octokit = github.getOctokit(token);
-  const reviewOctokit = github.getOctokit(reviewToken || token);
+  // [LAW:one-source-of-truth] "Which token posts the review" is decided HERE, once, and every consumer
+  // reads this value. The identity set resolved below must name the account that actually posts, so a
+  // second `reviewToken || token` spelled out at that call site would be a rival source: change the
+  // fallback in one and the identity set silently stops covering the real poster — reintroducing the
+  // very "our own block isn't ours" deadlock this identity gate exists to close.
+  const postingToken = reviewToken || token;
+  const reviewOctokit = github.getOctokit(postingToken);
   const dismissOctokit = dismissToken ? github.getOctokit(dismissToken) : undefined;
 
   // [LAW:single-enforcer] One PR fetch, one place that decides fork eligibility. The PR object
@@ -434,7 +440,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   // run, which is precisely the guarantee the fork path was built not to have.
   let identities;
   try {
-    const distinctTokens = [...new Set([reviewToken || token, token])];
+    const distinctTokens = [...new Set([postingToken, token])];
     identities = await resolveReviewerIdentities(distinctTokens.map(t => github.getOctokit(t)));
   } catch (e) {
     core.setFailed(e.message);

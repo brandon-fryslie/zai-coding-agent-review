@@ -48,9 +48,19 @@ const TOOL_NAMES = { requestChange: 'request_change', finishReview: 'finish_revi
 let host;
 let engineSpawns;
 let engineFindings;
+// Every token this run built a client from, in order — the record that makes "both credentials were
+// threaded" an assertable fact rather than an inference from downstream behavior.
+let octokitTokens;
 
 // A pull request nobody has reviewed yet, from a branch on the base repo (not a fork).
-function fakeOctokit() {
+//
+// The fake is built FROM THE TOKEN, because which account a run acts as is the thing the identity gate
+// turns on: a fake that discarded its token could not tell a run that threaded both credentials from one
+// that dropped either. Every token behaves as an installation by default, so each test below is
+// byte-identical to before this parameter existed; `host.patTokens` is what opts one token into the PAT
+// arm, and only the multi-credential test sets it.
+function fakeOctokit(tokenValue) {
+  const isPat = host.patTokens.has(tokenValue);
   return {
     rest: {
       // The default GITHUB_TOKEN an unconfigured consumer runs on: an installation token, which refuses
@@ -60,6 +70,7 @@ function fakeOctokit() {
       // most consumers never take.
       users: {
         getAuthenticated: async () => {
+          if (isPat) return { data: { login: `${tokenValue}-account`, type: 'User' } };
           const e = new Error('Resource not accessible by integration');
           e.status = 403;
           throw e;
@@ -68,7 +79,7 @@ function fakeOctokit() {
       pulls: {
         get: async () => ({ data: { number: 7, labels: [], body: '', user: { login: 'author' }, base: { repo: { id: 1 } }, head: { repo: { id: 1 } } } }),
         listFiles: async () => ({ data: host.files }),
-        listReviews: async () => ({ data: [] }),
+        listReviews: async () => ({ data: host.priorReviews }),
         createReview: async (args) => { host.reviews.push(args); },
       },
     },
@@ -82,12 +93,13 @@ function fakeOctokit() {
 }
 
 beforeEach(() => {
-  host = { files: [], unifiedDiff: '', reviews: [] };
+  host = { files: [], unifiedDiff: '', reviews: [], priorReviews: [], patTokens: new Set() };
   engineSpawns = [];
   engineFindings = [];
+  octokitTokens = [];
 });
 
-github.getOctokit = () => fakeOctokit();
+github.getOctokit = (tokenValue) => { octokitTokens.push(tokenValue); return fakeOctokit(tokenValue); };
 // A probe result is not what these tests are about; the chain is usable.
 preflightModule.preflight = async () => ({ ok: true, results: [] });
 // Stand in for the whole scout→workers pass, capturing the material it was handed so the worker
@@ -195,5 +207,55 @@ describe('a pull request whose diffs are shown inline (unchanged behavior)', () 
     host.files = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const a = 1;' }];
     await review();
     assert.equal(host.reviews[0].event, 'APPROVE');
+  });
+});
+
+// ── Both credentials reach the identity gate ──
+//
+// zai-review-trust-6yp gates every marker on its author, which makes "which accounts are us" a
+// correctness input to the round cap, the cost totals, and which block may be dismissed. An operator who
+// adds GITHUB_REVIEW_TOKEN mid-PR changes the posting account, and the rounds already on that PR were
+// posted by the OTHER one. Resolving only the poster disowns them: the count resets to zero, the cap
+// stops binding, and an outstanding block falls outside the set releaseUnrevisitableBlocks can release —
+// the deadlock this line of work exists to close, reintroduced by a credential change alone.
+//
+// The unit tests cover resolveReviewerIdentities and summarizePriorReviews in isolation, and the
+// multi-identity case by handing summarizePriorReviews an identities array built by hand. What none of
+// them can see is whether run.js resolves and passes the RIGHT tokens — which is glue, and therefore
+// exactly the class of bug this file was opened for.
+describe('a run holding both GITHUB_TOKEN and GITHUB_REVIEW_TOKEN', () => {
+  const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
+  // The prior round: posted by the installation token, back before GITHUB_REVIEW_TOKEN was configured.
+  const roundByInstallationToken = {
+    id: 11,
+    state: 'COMMENTED',
+    user: { login: 'github-actions[bot]', type: 'Bot' },
+    body: `an earlier round\n\n${REVIEW_MARKER}`,
+  };
+  // A cap of 1 makes the count observable as behavior rather than as an internal: one prior round of ours
+  // is the cap, so the engine must not spawn. [LAW:behavior-not-structure]
+  const reviewCappedAtOne = () => runPrReview('Review Agent', [], defaultEffortProfile({ roundCap: 1 }), null);
+
+  beforeEach(() => {
+    // GITHUB_REVIEW_TOKEN as consumers are told to set it: a user PAT, which names itself on GET /user
+    // and so resolves to the login arm — a DIFFERENT identity from the installation token's bot arm.
+    host.patTokens = new Set(['gh-review-token']);
+    host.files = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const a = 1;' }];
+    host.priorReviews = [roundByInstallationToken];
+  });
+
+  test('builds a client from each distinct credential', async () => {
+    await reviewCappedAtOne();
+    assert.ok(octokitTokens.includes('gh-token'), 'GITHUB_TOKEN was never used to build a client');
+    assert.ok(octokitTokens.includes('gh-review-token'), 'GITHUB_REVIEW_TOKEN was never used to build a client');
+  });
+
+  test('a round posted under the other credential is still counted as ours', async () => {
+    await reviewCappedAtOne();
+    // If only the posting PAT's identity were resolved, the bot-authored round would read as a stranger's,
+    // the count would be 0, the cap would not bind, and an engine would spawn on an already-capped PR.
+    assert.equal(engineSpawns.length, 0, 'the prior round was disowned: the cap did not bind');
+    assert.equal(host.reviews.length, 1);
+    assert.match(host.reviews[0].body, /not-reviewed:round-cap/);
   });
 });

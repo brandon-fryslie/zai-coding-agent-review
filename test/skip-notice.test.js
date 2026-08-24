@@ -342,6 +342,17 @@ describe('an untrusted PR cannot silence its own notice', () => {
     );
   });
 
+  // The case the per-review placement of this refusal could not reach: with the check applied once per
+  // row, a PR with NO rows never ran it, so an unattributable run returned a clean `{count: 0}` — the
+  // zeroed round cap wearing the exact shape of a legitimate answer. Zero reviews is not a milder version
+  // of this failure; it is the one where the wrong answer is least distinguishable from a right one.
+  test('an unresolved identity throws on a PR with no prior reviews at all', async () => {
+    const pr = fakePr();
+    assert.equal(pr.reviews.length, 0);
+    await assert.rejects(() => summarizePriorReviews(pr.octokit, 'o', 'r', PR, []), /No reviewer identity/);
+    await assert.rejects(() => summarizePriorReviews(pr.octokit, 'o', 'r', PR, undefined), /No reviewer identity/);
+  });
+
   // [LAW:verifiable-goals] The identity-change transition. Adding GITHUB_REVIEW_TOKEN to a repo with a
   // live PR is a step the README recommends, and a single-value identity disowned every round posted
   // before it — resetting the count and, worse, dropping an outstanding REQUEST_CHANGES out of the set

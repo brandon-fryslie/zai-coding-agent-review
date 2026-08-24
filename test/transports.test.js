@@ -146,7 +146,9 @@ describe('summarizePriorReviews', () => {
   const OURS = { login: 'github-actions[bot]', type: 'Bot' };
   // A fake octokit whose listReviews returns fixed pages; asserts the marker filter, cost sum, pagination.
   // A fixture is authored by US unless it names its own author: these cases exercise the BODY gate, so
-  // the author gate must not be the thing filtering them. The forgery cases below supply an author.
+  // the author gate must not be the thing filtering them. The author gate itself — a stranger's forged
+  // REVIEW_MARKER, the same body under our own account, the identity-change transition — is exercised in
+  // test/skip-notice.test.js, which owns that concern; nothing in this file varies the author.
   const fakeOctokit = (pages) => ({
     rest: {
       pulls: {
