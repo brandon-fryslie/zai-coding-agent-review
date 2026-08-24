@@ -654,6 +654,34 @@ describe('a block the reviewer will not revisit is released', () => {
           process.exitCode = before;
         }
       });
+
+      // Gitea's listReviews does not guarantee stable ordering across calls (summarizePriorReviews already
+      // documents and designs around this elsewhere). Two outstanding blocks, fetched in different orders
+      // on two separate pushes, must still produce the identical message — otherwise the dedup's exact
+      // string match sees a "new" failure every time the fetch order happens to differ, and reposts.
+      test('two outstanding blocks fetched in a different order still dedup as the same failure', async () => {
+        const pr = fakeHost(kind);
+        pr.block(205);
+        pr.block(101);
+        pr.octokit.request = async () => { throw new Error('403 Forbidden'); };
+        const realSetFailed = core.setFailed;
+        const before = process.exitCode;
+        try {
+          process.exitCode = 0;
+          core.setFailed = () => {};
+          await release(pr, pr.reviews);
+          const afterFirst = pr.reviews.filter(r => (r.body || '').includes(RELEASE_FAILED_MARKER)).length;
+          assert.equal(afterFirst, 1);
+          // Same two reviews, opposite arrival order — as if a second listReviews call happened to page
+          // them back the other way around, with nothing about the actual failure changed.
+          await release(pr, [...pr.reviews].reverse());
+          const afterSecond = pr.reviews.filter(r => (r.body || '').includes(RELEASE_FAILED_MARKER)).length;
+          assert.equal(afterSecond, 1, 'a reordered fetch of the same unresolved failure posted no duplicate');
+        } finally {
+          core.setFailed = realSetFailed;
+          process.exitCode = before;
+        }
+      });
     });
   }
 

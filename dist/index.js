@@ -37728,7 +37728,12 @@ async function announceReleaseFailure(octokit, {
 async function releaseUnrevisitableBlocks(octokit, resolveTransport, {
   owner, repo, pullNumber, reviews, capMessage, commitId, reviewerName, releaseFailureBodies,
 }) {
-  const outstanding = reviews.filter(isOutstandingBlock);
+  // Sorted by id, not left in listReviews's pagination order: Gitea's /pulls/{index}/reviews does not
+  // guarantee stable ordering across calls (see the note on `reviews` in summarizePriorReviews above), and
+  // both messages below join outstanding ids/failures into text that announceReleaseFailure's dedup matches
+  // by exact string — an order that varies between two fetches of the same underlying facts would make an
+  // unchanged failure look like a new one and repost. [LAW:one-source-of-truth]
+  const outstanding = reviews.filter(isOutstandingBlock).sort((a, b) => a.id - b.id);
   if (outstanding.length === 0) return 'nothing-to-release';
 
   let transport;
