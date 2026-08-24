@@ -286,15 +286,17 @@ async function main() {
     // review's EXCLUDE_PATTERNS stripped — a superset that corrupts the measured verdict. Reusing the one
     // enforcer keeps this faithful for every case, present and future, and makes excludePatterns a live field.
     const { filterFiles } = require('../src/diff');
-    const files = filterFiles(allFiles, manifest.excludePatterns);
-    const excluded = allFiles.length - files.length;
-    if (excluded > 0) process.stderr.write(`Excluded ${excluded} file(s) matching the case's EXCLUDE_PATTERNS.\n`);
+    const { reviewed: files, excluded } = filterFiles(allFiles, manifest.excludePatterns);
+    if (excluded.paths.length > 0) process.stderr.write(`Excluded ${excluded.paths.length} file(s) matching the case's EXCLUDE_PATTERNS: ${excluded.paths.join(', ')}\n`);
     // [LAW:no-silent-failure] Every changed file excluded means there is nothing to review — a case that
     // would replay as a vacuous empty review must say so, not quietly produce a zero-finding artifact.
     if (files.length === 0) throw new Error(`All ${allFiles.length} changed file(s) were excluded by the case's EXCLUDE_PATTERNS — nothing to review.`);
     // buildPrMaterial with maxDiffChars: 0 (no truncation) exactly as scripts/local-review.js does — the
     // frozen diff is the whole material the workers see, anchored against the same (filtered) files.
-    const material = buildPrMaterial({ files, maxDiffChars: 0, reviewedRepoRoot: treeTemp });
+    // [LAW:one-source-of-truth] `excluded` rides along for the same reason the filter itself does: the
+    // production material CONFESSES what EXCLUDE_PATTERNS removed, so a replay that dropped it would score
+    // the reviewer against a prompt production never sends — the instrument silently measuring the wrong thing.
+    const material = buildPrMaterial({ files, maxDiffChars: 0, reviewedRepoRoot: treeTemp, excluded });
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const caseOutRoot = path.join(path.resolve(opts.out), manifest.name);
