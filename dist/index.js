@@ -36334,7 +36334,13 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   }
 
   const octokit = github.getOctokit(token);
-  const reviewOctokit = github.getOctokit(reviewToken || token);
+  // [LAW:one-source-of-truth] "Which token posts the review" is decided HERE, once, and every consumer
+  // reads this value. The identity set resolved below must name the account that actually posts, so a
+  // second `reviewToken || token` spelled out at that call site would be a rival source: change the
+  // fallback in one and the identity set silently stops covering the real poster — reintroducing the
+  // very "our own block isn't ours" deadlock this identity gate exists to close.
+  const postingToken = reviewToken || token;
+  const reviewOctokit = github.getOctokit(postingToken);
   const dismissOctokit = dismissToken ? github.getOctokit(dismissToken) : undefined;
 
   // [LAW:single-enforcer] One PR fetch, one place that decides fork eligibility. The PR object
@@ -36396,7 +36402,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   // run, which is precisely the guarantee the fork path was built not to have.
   let identities;
   try {
-    const distinctTokens = [...new Set([reviewToken || token, token])];
+    const distinctTokens = [...new Set([postingToken, token])];
     identities = await resolveReviewerIdentities(distinctTokens.map(t => github.getOctokit(t)));
   } catch (e) {
     core.setFailed(e.message);
@@ -37271,17 +37277,30 @@ function sameIdentity(a, b) {
 // Covering one of them alone would be worse than covering none: it would make that field look protected
 // while the rest stayed forgeable, an inconsistent trust model inside a single function.
 //
-// [LAW:no-silent-failure] An EMPTY identity set is refused rather than answering "nothing is ours" — that
-// answer is indistinguishable from a PR with no prior rounds, which is precisely the zeroed round cap
-// this whole design treats as worse than the forgery.
+// The empty-set refusal is NOT here. It lives at requireIdentities, which summarizePriorReviews applies
+// before its pagination loop — because a check that only fires per-review cannot fire on the PR that
+// needs it most: one with zero prior reviews never enters the loop, so the refusal never ran and the
+// unattributable run returned a clean `count: 0`, the zeroed round cap wearing the shape of an answer.
+// [LAW:dataflow-not-control-flow]
 function isOwnArtifact(identities, user) {
+  return identities.some(identity => matchesIdentity(identity, user));
+}
+
+// [LAW:parse-dont-validate] The crossing that turns a caller-supplied array into the non-empty identity
+// set every attribution downstream assumes. It has the three legs: its own unit, an output that could
+// not have existed before the check, and a loud failure arm — never a success-shaped `[]`.
+//
+// [LAW:no-silent-failure] An EMPTY identity set is refused rather than answering "nothing is ours". That
+// answer is byte-identical to a PR with no prior rounds, so accepting it would zero the round cap and the
+// cost totals at once — the outcome this whole design ranks as worse than the forgery it defends against.
+function requireIdentities(identities) {
   if (!Array.isArray(identities) || identities.length === 0) {
     throw new Error(
       'No reviewer identity was resolved for this run, so prior reviews cannot be attributed and both '
       + 'the round cap and the cost totals would be wrong.',
     );
   }
-  return identities.some(identity => matchesIdentity(identity, user));
+  return identities;
 }
 
 // [LAW:dataflow-not-control-flow] The branch is the identity type's own discriminator, and the default
@@ -37320,6 +37339,10 @@ function matchesIdentity(identity, user) {
 // both markers live in the body regardless of host, so this is host-agnostic. [LAW:no-silent-failure]
 // pagination is exhausted so a PR with many reviews is summarized in full, never truncated.
 async function summarizePriorReviews(octokit, owner, repo, pullNumber, identities) {
+  // [LAW:single-enforcer] The author gate's precondition is established ONCE, here, before a single row
+  // is read — unconditionally, so a PR with zero prior reviews is refused on the same terms as a PR with
+  // fifty. Inland, isOwnArtifact re-asks nothing: it receives a set that could not be empty.
+  const owners = requireIdentities(identities);
   let count = 0;
   // [LAW:one-type-per-behavior] Two tallies of one shape — dollars actually spent, and Anthropic
   // list price for the rounds billed to subscription quota. They are reported side by side and
@@ -37380,7 +37403,7 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber, identitie
       // account with read access can submit a COMMENT review, so before this existed a stranger could end
       // a body with REVIEW_MARKER and forge a ROUND — enough of them push a PR past MAX_REVIEW_ROUNDS and
       // it is never reviewed again — or forge a not-reviewed notice and silence the real one.
-      if (!isOwnArtifact(identities, r.user)) continue;
+      if (!isOwnArtifact(owners, r.user)) continue;
       const body = typeof r.body === 'string' ? r.body : '';
       // A disjoint check, run BEFORE the parseAgentArtifact gate below: parseAgentArtifact does not
       // recognize RELEASE_FAILED_MARKER at all (by design — see its definition), so a release-failure
