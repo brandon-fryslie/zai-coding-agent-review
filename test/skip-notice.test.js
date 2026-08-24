@@ -4,8 +4,8 @@ const assert = require('node:assert/strict');
 const core = require('@actions/core');
 const {
   announceNotReviewed, renderNotReviewedBody, parseAgentArtifact, summarizePriorReviews,
-  releaseUnrevisitableBlocks, isOutstandingBlock, giteaTransport,
-  forkNotice, roundCapNotice, submitReview, gitHubTransport,
+  releaseUnrevisitableBlocks, isOutstandingBlock, giteaTransport, announceReleaseFailure,
+  forkNotice, roundCapNotice, submitReview, gitHubTransport, RELEASE_FAILED_MARKER,
   NOT_REVIEWED_MESSAGE, NOT_REVIEWED_REASONS, NOT_REVIEWED_MARKER_PREFIX, REVIEW_MARKER,
 } = require('../src/transport');
 
@@ -369,6 +369,18 @@ function fakeHost(kind) {
       return review;
     },
     octokit: {
+      // Serves announceReleaseFailure's post the same way fakePr() serves announceNotReviewed's: appended
+      // to the same `reviews` store the block-tracking above reads, so a released-failure notice can be
+      // asserted against pr.reviews / pr.calls exactly like a real listReviews round trip would show it.
+      rest: {
+        pulls: {
+          createReview: async (params) => {
+            const posted = { id: reviews.length + 1, state: 'COMMENT', dismissed: false, body: params.body };
+            reviews.push(posted);
+            return { data: posted };
+          },
+        },
+      },
       request: async (route, params) => {
         // The single-review read is served at the SAME literal path by both hosts (verified live), which
         // is why the re-check needs no transport member. The fake serves it from the same store the
@@ -396,6 +408,7 @@ function fakeHost(kind) {
 const release = (pr, reviews, resolveTransport = pr.resolveTransport) =>
   releaseUnrevisitableBlocks(pr.octokit, resolveTransport, {
     owner: 'o', repo: 'r', pullNumber: PR, reviews, capMessage: CAP_MESSAGE,
+    commitId: 'sha', reviewerName: 'RA',
   });
 
 describe('a block the reviewer will not revisit is released', () => {
@@ -576,6 +589,54 @@ describe('a block the reviewer will not revisit is released', () => {
           assert.equal(await release(pr, pr.reviews), 'failed');
           assert.equal(process.exitCode, 1, 'a still-deadlocked PR must not also be green');
         } finally {
+          process.exitCode = before;
+        }
+      });
+
+      // The gap the ticket's own acceptance criterion names: a refusal that only reaches setFailed is
+      // invisible to anyone reading the PR conversation instead of the Actions log — and on Gitea this is
+      // not a rare fluke, it is the permanent steady state (dismissal needs repo-Admin; the bot is
+      // deliberately kept at write). The PR itself must carry the explanation, not just the run log.
+      test('a refused dismissal ALSO posts the explanation to the PR itself, not just the run log', async () => {
+        const pr = fakeHost(kind);
+        pr.block(101);
+        pr.octokit.request = async () => { throw new Error('403 Forbidden: Must be repo admin'); };
+        const realSetFailed = core.setFailed;
+        const before = process.exitCode;
+        try {
+          process.exitCode = 0;
+          core.setFailed = () => {};
+          assert.equal(await release(pr, pr.reviews), 'failed');
+        } finally {
+          core.setFailed = realSetFailed;
+          process.exitCode = before;
+        }
+        const posted = pr.reviews.find(r => (r.body || '').includes(RELEASE_FAILED_MARKER));
+        assert.ok(posted, 'the release-failure notice was posted as a review comment on the PR');
+        assert.match(posted.body, /BLOCK NOT RELEASED/);
+        assert.match(posted.body, /\b101\b/, 'names the review still holding the merge');
+        assert.match(posted.body, /repo-Admin/, 'names the measured Gitea cause, not just a generic guess');
+      });
+
+      // Without this the explanation would repost on every single capped push for the rest of the PR's
+      // life, once dismissal is structurally refused (the Gitea-admin case, which never resolves itself).
+      test('an unchanged release failure does not repost — it would spam every push forever otherwise', async () => {
+        const pr = fakeHost(kind);
+        pr.block(101);
+        pr.octokit.request = async () => { throw new Error('403 Forbidden'); };
+        const realSetFailed = core.setFailed;
+        const before = process.exitCode;
+        try {
+          process.exitCode = 0;
+          core.setFailed = () => {};
+          await release(pr, pr.reviews);
+          const afterFirst = pr.reviews.filter(r => (r.body || '').includes(RELEASE_FAILED_MARKER)).length;
+          assert.equal(afterFirst, 1);
+          await release(pr, pr.reviews);
+          const afterSecond = pr.reviews.filter(r => (r.body || '').includes(RELEASE_FAILED_MARKER)).length;
+          assert.equal(afterSecond, 1, 'the second identical failure posted no duplicate');
+        } finally {
+          core.setFailed = realSetFailed;
           process.exitCode = before;
         }
       });
