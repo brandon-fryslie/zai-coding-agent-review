@@ -1,0 +1,183 @@
+'use strict';
+
+// ── The pre-spawn gate: which pull requests get an engine, and which get a review with no engine ──
+//
+// zai-coverage-bxa lived exactly here, in glue no unit test could see. Every seam downstream was
+// already correct in isolation — buildReviewInput hands a patchless file to the worker as a
+// read-in-full target, an off-grid finding partitions as unanchored, and an unanchored finding still
+// forces REQUEST_CHANGES — yet runPrReview filtered the changed set on `f.patch` before any of them
+// ran, and posted a clean APPROVE on a pull request nothing had opened. Two definitions of
+// "reviewable" in two files, the stricter one first. [LAW:single-enforcer]
+//
+// So these assertions are about what the ORCHESTRATOR does, and they substitute only the run's
+// outermost collaborators — the host API, the provider probe, and the engine layer — letting every
+// seam between them run for real (transport selection, EXCLUDE_PATTERNS, material construction,
+// prompt building, finding partition, review submission). The substitution is by module export and
+// must happen BEFORE src/run.js is required: run.js destructures its collaborators at require time,
+// so a later assignment would never be seen. node:test gives each file its own process, so the
+// patched modules never leak into another suite.
+
+// Read at require time by @actions/github (context.repo) and src/run.js (REVIEWED_REPO_ROOT).
+process.env.GITHUB_REPOSITORY = 'acme/widget';
+process.env.GITHUB_WORKSPACE = '/home/runner/work/widget/widget';
+// core.getInput reads INPUT_*; every unset input is '' and takes its own off-value, so the budget
+// gradient, difficulty scaling, dependency diff and config file are all off — simple mode.
+Object.assign(process.env, {
+  INPUT_PROVIDER: 'zai',
+  INPUT_ZAI_API_KEY: 'test-key',
+  INPUT_GITHUB_TOKEN: 'gh-token',
+  // A token that CAN approve. Without it every clean review posts COMMENT, which would make each
+  // "approval is withheld" assertion below pass for the wrong reason.
+  INPUT_GITHUB_REVIEW_TOKEN: 'gh-review-token',
+  INPUT_PR_NUMBER: '7',
+  INPUT_HEAD_SHA: 'head-sha',
+  INPUT_MAX_DIFF_CHARS: '0',
+});
+
+const { test, describe, beforeEach } = require('node:test');
+const assert = require('node:assert/strict');
+
+const github = require('@actions/github');
+const preflightModule = require('../src/preflight');
+const multiscope = require('../src/multiscope');
+const { defaultEffortProfile } = require('../src/effort');
+
+const TOOL_NAMES = { requestChange: 'request_change', finishReview: 'finish_review' };
+
+// The run's state for one test: what the host returns, what the engine found, what got posted.
+let host;
+let engineSpawns;
+let engineFindings;
+
+// A pull request nobody has reviewed yet, from a branch on the base repo (not a fork).
+function fakeOctokit() {
+  return {
+    rest: {
+      pulls: {
+        get: async () => ({ data: { number: 7, labels: [], body: '', user: { login: 'author' }, base: { repo: { id: 1 } }, head: { repo: { id: 1 } } } }),
+        listFiles: async () => ({ data: host.files }),
+        listReviews: async () => ({ data: [] }),
+        createReview: async (args) => { host.reviews.push(args); },
+      },
+    },
+    // The unified-diff fallback selectTransport takes when no file carries an inline patch.
+    request: async () => ({ data: host.unifiedDiff }),
+  };
+}
+
+beforeEach(() => {
+  host = { files: [], unifiedDiff: '', reviews: [] };
+  engineSpawns = [];
+  engineFindings = [];
+});
+
+github.getOctokit = () => fakeOctokit();
+// A probe result is not what these tests are about; the chain is usable.
+preflightModule.preflight = async () => ({ ok: true, results: [] });
+// Stand in for the whole scout→workers pass, capturing the material it was handed so the worker
+// prompt this run would have sent can be built from it — the real buildReviewInput, via the real
+// buildPrMaterial, exactly as an engine would receive it.
+multiscope.runMultiScope = async ({ material, chain }) => {
+  engineSpawns.push(material);
+  return {
+    review: { summary: 'Reviewed.', findings: engineFindings, unreviewedScopes: [], assessments: [], usage: null },
+    configUsed: chain[0],
+  };
+};
+
+const { runPrReview } = require('../src/run');
+
+const review = () => runPrReview('Review Agent', [], defaultEffortProfile({ roundCap: 0 }), null);
+const workerPrompt = (material) => material.buildWorkerPrompt('the whole change', TOOL_NAMES, material.changedPaths, []);
+
+describe('a pull request whose every changed file arrives without a patch', () => {
+  // GitHub omits `patch` for a file whose diff is large (roughly >400 changed lines) or binary, so
+  // this is an ordinary big single-file refactor — the case where being reviewed matters most.
+  const patchless = [
+    { filename: 'src/engine.js', status: 'modified' },
+    { filename: 'assets/logo.png', status: 'added' },
+  ];
+
+  test('spawns the engine — it is not approved unread', async () => {
+    host.files = patchless;
+    await review();
+    assert.equal(engineSpawns.length, 1);
+  });
+
+  test('hands the worker every patchless file as a read-in-full target at its absolute path', async () => {
+    host.files = patchless;
+    await review();
+    const prompt = workerPrompt(engineSpawns[0]);
+    assert.match(prompt, /could not be shown \(too large or binary/);
+    assert.match(prompt, /\/home\/runner\/work\/widget\/widget\/src\/engine\.js/);
+    assert.match(prompt, /\/home\/runner\/work\/widget\/widget\/assets\/logo\.png/);
+    // No diff was shown, so nothing is on the LINE grid — the worker cites real file line numbers.
+    assert.doesNotMatch(prompt, /```diff/);
+  });
+
+  test('a finding in a patchless file blocks the merge, rendered outside the reviewed diff', async () => {
+    host.files = patchless;
+    // No patch means no anchors, so this lands as unanchored — and an unanchored finding still counts.
+    engineFindings = [{ path: 'src/engine.js', line: 412, body: 'unchecked index', severity: 2 }];
+    await review();
+    const posted = host.reviews[0];
+    assert.equal(posted.event, 'REQUEST_CHANGES');
+    assert.match(posted.body, /Findings outside the reviewed diff/);
+    assert.match(posted.body, /unchecked index/);
+    assert.equal(posted.comments, undefined); // nothing anchorable, so no inline comment
+  });
+
+  test('EXCLUDE_PATTERNS still applies — an excluded patchless file never reaches the engine', async () => {
+    host.files = patchless;
+    await runPrReview('Review Agent', ['assets/**'], defaultEffortProfile({ roundCap: 0 }), null);
+    assert.deepEqual(engineSpawns[0].changedPaths, ['src/engine.js']);
+  });
+});
+
+describe('a pull request with no reviewable changed file', () => {
+  test('an empty changed set posts a review and spawns no engine', async () => {
+    host.files = [];
+    await review();
+    assert.equal(engineSpawns.length, 0);
+    assert.equal(host.reviews.length, 1);
+    assert.match(host.reviews[0].body, /changed no reviewable files/);
+  });
+
+  test('EXCLUDE_PATTERNS matching every changed file spawns no engine', async () => {
+    host.files = [{ filename: 'dist/index.js', status: 'modified', patch: '@@ -1 +1 @@\n+x' }];
+    await runPrReview('Review Agent', ['dist/**'], defaultEffortProfile({ roundCap: 0 }), null);
+    assert.equal(engineSpawns.length, 0);
+    assert.equal(host.reviews.length, 1);
+  });
+
+  // [LAW:no-silent-failure] "every changed file was refused at the diff boundary" arrives here looking
+  // exactly like "the pull request is empty". It must never be approved: the refusal rides to the sink
+  // as review.unreviewableFiles, is listed under "Changed files NOT reviewed", and withholds approval.
+  test('a changed file refused at the diff boundary is named, and approval is withheld', async () => {
+    host.files = [{ filename: 'src/a\nEVIL.js', status: 'modified' }];
+    await review();
+    assert.equal(engineSpawns.length, 0);
+    const posted = host.reviews[0];
+    assert.notEqual(posted.event, 'APPROVE');
+    assert.match(posted.body, /Changed files NOT reviewed/);
+  });
+});
+
+describe('a pull request whose diffs are shown inline (unchanged behavior)', () => {
+  test('spawns the engine and anchors a finding to the diff line', async () => {
+    host.files = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,2 +1,3 @@\n const a = 1;\n+const b = 2;' }];
+    engineFindings = [{ path: 'src/a.js', line: 2, body: 'shadowed name', severity: 3 }];
+    await review();
+    assert.equal(engineSpawns.length, 1);
+    const posted = host.reviews[0];
+    assert.equal(posted.event, 'REQUEST_CHANGES');
+    assert.equal(posted.comments.length, 1);
+    assert.equal(posted.comments[0].line, 2);
+  });
+
+  test('a clean review of a shown diff still approves', async () => {
+    host.files = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const a = 1;' }];
+    await review();
+    assert.equal(host.reviews[0].event, 'APPROVE');
+  });
+});

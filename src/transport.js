@@ -261,9 +261,12 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
     // artifact was in EXCLUDE_PATTERNS and there was genuinely nothing to review.
     //
     // Returning the unpatched files as a value hands the decision to the ONE place that can judge it:
-    // runPrReview filters by EXCLUDE_PATTERNS and, finding nothing patchable, submits a clean
-    // "No patchable changes found after filtering." review. Same treatment partitionFindings gives a
-    // mis-anchored finding — reconcile as a value, never abort the whole review over it.
+    // runPrReview REVIEWS them. A changed file with no patch is not unreviewable — buildReviewInput
+    // hands each to the worker as a read-in-full target at its absolute path, and an issue found there
+    // returns as an unanchored finding that still blocks the merge. Only an EMPTY changed set (nothing
+    // changed, or EXCLUDE_PATTERNS matched everything) short-circuits to a posted review with no engine
+    // spawned. Same treatment partitionFindings gives a mis-anchored finding — reconcile as a value,
+    // never abort the whole review over it.
     //
     // The refusals that travel with it are listFiles' own, not the diff's: this arm hands back the
     // listFiles rendering, so it must report exactly that rendering's coverage loss. [FRAMING:representation]
