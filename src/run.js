@@ -437,7 +437,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   }
   const budgetOn = dailyBudget > 0;
   let effort = defaultEffort;
-  let fetched = null;      // { transport, filteredFiles } — populated early only when this block is active
+  let fetched = null;      // fetchFilteredFiles' result — populated early only when this block is active
   let ledgerIssue = null;  // the issue this review's actual cost is appended to, after submit
   // [LAW:one-source-of-truth] The ceiling difficulty PROPOSED for this change, before any budget cap —
   // the most expensive candidate. It is `defaultEffort` unchanged when difficulty is off. The round-cap
