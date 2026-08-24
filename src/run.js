@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { filterFiles, buildReviewAnchors, diffChurn } = require('./diff');
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = require('./transport');
+const { selectTransport, announceUnreviewable, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = require('./transport');
 const { buildReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
@@ -160,7 +160,10 @@ function warnBudgetExhausted(review) {
 // off, this runs in its original post-preflight position, unchanged. [LAW:one-source-of-truth]
 async function fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatterns) {
   core.info(`Fetching changed files for PR #${pullNumber}...`);
-  const transport = await selectTransport(octokit, owner, repo, pullNumber);
+  // [LAW:decomposition] The review path is what withholds approval over a refused file, so it is the
+  // path that announces one. selectTransport only builds the transport; the round-cap release resolves
+  // one too and must NOT claim anything about approval, since it submits no review.
+  const transport = announceUnreviewable(await selectTransport(octokit, owner, repo, pullNumber));
   const filteredFiles = filterFiles(transport.files, excludePatterns);
   if (excludePatterns.length > 0) {
     const excluded = transport.files.length - filteredFiles.length;

@@ -35806,7 +35806,7 @@ const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 
 const { filterFiles, buildReviewAnchors, diffChurn } = __nccwpck_require__(9898);
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = __nccwpck_require__(7228);
+const { selectTransport, announceUnreviewable, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = __nccwpck_require__(7228);
 const { buildReviewInput } = __nccwpck_require__(3479);
 const { partitionFindings } = __nccwpck_require__(1565);
 const { buildAttributionFooter } = __nccwpck_require__(2887);
@@ -35961,7 +35961,10 @@ function warnBudgetExhausted(review) {
 // off, this runs in its original post-preflight position, unchanged. [LAW:one-source-of-truth]
 async function fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatterns) {
   core.info(`Fetching changed files for PR #${pullNumber}...`);
-  const transport = await selectTransport(octokit, owner, repo, pullNumber);
+  // [LAW:decomposition] The review path is what withholds approval over a refused file, so it is the
+  // path that announces one. selectTransport only builds the transport; the round-cap release resolves
+  // one too and must NOT claim anything about approval, since it submits no review.
+  const transport = announceUnreviewable(await selectTransport(octokit, owner, repo, pullNumber));
   const filteredFiles = filterFiles(transport.files, excludePatterns);
   if (excludePatterns.length > 0) {
     const excluded = transport.files.length - filteredFiles.length;
@@ -36779,17 +36782,65 @@ function giteaTransport(files, unreviewable) {
 // The union is exact rather than lenient: the two read vocabularies do not collide, so each host's live
 // spelling is accepted and each host's released shape is rejected, with no state either host can emit
 // left ambiguous. Measured 2026-08-24 against github.com (promptctl/copirate-code-review-agent PR #114
-// live, #117 dismissed) and Gitea v1.27.1 (homelab-infra PR #157, review 110 dismissed / 111 live).
+// live, #117 dismissed) and Gitea v1.27.1, where the SAME PR served both states — homelab-infra #157
+// review 110 `{state:'REQUEST_CHANGES', dismissed:true}` and review 111 `{..., dismissed:false}` — so the
+// flag's presence is a two-state measurement, not one observation of the true case.
+//
+// [LAW:no-silent-failure] A review that reports NO dismissal state is treated as live. That direction is
+// deliberate and it is the loud one: the alternative — reading absence as "not blocking" — would leave a
+// real block unreleased and the PR deadlocked with nothing said, which is the exact state this feature
+// exists to abolish. A host that never reports dismissal state cannot be served idempotently at all
+// (dismissal is not a no-op on either host — GitHub answers a second attempt with 422 "Can not dismiss a
+// dismissed pull request review"), so this reds every push there rather than silently doing nothing. That
+// is a real limitation of such a host, stated here rather than discovered in production.
+//
+// A THIRD host is not free: it needs its blocking spelling added to this set as well as its own
+// transport. Omitting it fails SILENTLY — that host's blocking reviews are simply never recognized as
+// outstanding, so nothing is ever dismissed and the deadlock returns. Named in CLAUDE.md's Host transport
+// section for the same reason.
 const BLOCKING_REVIEW_STATES = new Set(['CHANGES_REQUESTED', 'REQUEST_CHANGES']);
 
 function isOutstandingBlock(review) {
   return BLOCKING_REVIEW_STATES.has(review.state) && !review.dismissed;
 }
 
-// [LAW:no-silent-failure] A refused path is warned with its reason at the one place a transport is
-// built, so it appears once in the run log regardless of which host branch produced the file list —
-// and the record it warns from is the same one that reaches the posted review, never a second rendering.
-function announce(transport) {
+// [LAW:one-source-of-truth] After a refused dismissal, the question is not "what did the error say" but
+// "is this review still holding the merge" — so the answer comes from the review's own state through the
+// SAME predicate that selected it, never from matching error text. The two hosts word their refusals
+// differently (GitHub 422 "Can not dismiss a dismissed pull request review"; Gitea 403 "can't dismiss a
+// review associated to a closed or merged PR"), and a two-host error-string table is exactly the
+// enumeration gap this module already exists to close once.
+//
+// Dismissal is NOT idempotent at either host, so this path is genuinely reachable: a human dismissing the
+// review between summarizePriorReviews' snapshot and this call, or two runs racing, turns a satisfied
+// goal into a hard error. Reporting that as "the PR is left blocked" is a false claim on a green PR.
+//
+// The read is host-agnostic: GET /repos/{o}/{r}/pulls/{n}/reviews/{id} is served at the same literal path
+// by both hosts and returns the fields isOutstandingBlock already reads (verified 2026-08-24 against both).
+// [LAW:no-silent-failure] A re-read that itself fails answers "still blocking" — the honest answer when
+// the state cannot be established is the one that keeps the failure loud.
+async function blockStillHolds(octokit, { owner, repo, pullNumber, reviewId }) {
+  try {
+    const { data } = await octokit.request(
+      'GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}',
+      { owner, repo, pull_number: pullNumber, review_id: reviewId },
+    );
+    return isOutstandingBlock(data);
+  } catch {
+    return true;
+  }
+}
+
+// [LAW:no-silent-failure] A refused path is warned with its reason, once per run, from the same record
+// that reaches the posted review — never a second rendering.
+//
+// [LAW:decomposition] This is the REVIEW path's job, not the transport constructor's, which is why it is
+// applied by the caller rather than inside selectTransport. The sentence itself settles the question:
+// "It is reported on the PR and withholds approval" is a claim about submitting a review, and it was
+// false on the one caller that only wants a dismissal route — no review is being submitted there and no
+// approval withheld. Moving it puts the words and their position in agreement, rather than adding an
+// announce-or-not parameter that would leave the wrong sentence reachable behind a `false`.
+function announceUnreviewable(transport) {
   transport.unreviewable.forEach(u => core.warning(
     `Skipping ${u.filename} from the review: ${u.reason}. It is reported on the PR and withholds approval.`));
   return transport;
@@ -36807,7 +36858,7 @@ function announce(transport) {
 async function selectTransport(octokit, owner, repo, pullNumber) {
   const { files, unreviewable } = parseReviewableFiles(await listAllFiles(octokit, owner, repo, pullNumber));
   if (files.length === 0 || files.some(f => typeof f.patch === 'string')) {
-    return announce(gitHubTransport(files, unreviewable));
+    return gitHubTransport(files, unreviewable);
   }
   // [LAW:no-silent-failure] Gitea omits per-file patch; its unified .diff carries the hunks.
   const { data } = await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}.diff', {
@@ -36840,9 +36891,9 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
       `nothing in it is anchorable. Changed file(s): ${files.map(f => f.filename).join(', ')}. This is ` +
       'expected when every changed file is too large for the host to return a patch (e.g. a committed bundle).',
     );
-    return announce(gitHubTransport(files, unreviewable));
+    return gitHubTransport(files, unreviewable);
   }
-  return announce(giteaTransport(parsed.files, parsed.unreviewable));
+  return giteaTransport(parsed.files, parsed.unreviewable);
 }
 
 // [LAW:parse-dont-validate] The one reader that turns a raw review body into what this action left
@@ -37418,7 +37469,17 @@ async function releaseUnrevisitableBlocks(octokit, resolveTransport, { owner, re
       await transport.dismissReview(octokit, { owner, repo, pullNumber, reviewId: review.id, message });
       core.info(`Dismissed this action's own blocking review ${review.id} on PR #${pullNumber}: it will not be revisited.`);
     } catch (e) {
-      failures.push(`${review.id} (${e.message})`);
+      // The goal is a STATE, not a successful call: a review someone else already dismissed satisfies it.
+      // Only a review still holding the merge is a failure. [LAW:no-silent-failure] the benign arm is
+      // still logged — it means another actor moved under us, which is worth seeing in the run log.
+      if (await blockStillHolds(octokit, { owner, repo, pullNumber, reviewId: review.id })) {
+        failures.push(`${review.id} (${e.message})`);
+      } else {
+        core.info(
+          `Blocking review ${review.id} on PR #${pullNumber} was already released by someone else `
+          + `(the dismissal was refused: ${e.message}); it is no longer holding the merge.`,
+        );
+      }
     }
   }
   if (failures.length > 0) {
@@ -37431,10 +37492,11 @@ async function releaseUnrevisitableBlocks(octokit, resolveTransport, { owner, re
     // the same trap the fork/round-cap postFailureHint split exists to avoid.
     core.setFailed(
       `Could not dismiss this action's own blocking review(s) on PR #${pullNumber}: ${failures.join('; ')}. `
-      + 'The pull request is left blocked by a review this action has declined to revisit, so it cannot be '
-      + 'merged until someone dismisses that review by hand. Two causes reach here: the token may lack '
-      + '`pull-requests: write` (the PR must also be open), or the host may have been detected as GitHub '
-      + 'because no changed file carried a patch, in which case the dismissal used the wrong host route.',
+      + 'Each of these was re-read afterwards and is STILL holding the merge, so the pull request cannot '
+      + 'be merged until someone dismisses that review by hand. Causes that reach here: the token may lack '
+      + '`pull-requests: write`; the pull request may be closed or merged (both hosts refuse a dismissal '
+      + 'then); or the host may have been detected as GitHub because no changed file carried a patch, in '
+      + 'which case the dismissal used the wrong host route.',
     );
     return 'failed';
   }
@@ -37479,6 +37541,7 @@ module.exports = {
   gitHubTransport,
   giteaTransport,
   selectTransport,
+  announceUnreviewable,
   submitReview,
   resolveReviewTarget,
   prIsFromFork,

@@ -333,6 +333,7 @@ const HOSTS = {
     targetId: params => params.review_id,
     // GitHub REPLACES the state; the review is no longer CHANGES_REQUESTED afterwards.
     markDismissed: review => { review.state = 'DISMISSED'; },
+    isLive: review => review.state === 'CHANGES_REQUESTED',
   },
   gitea: {
     transport: () => giteaTransport([], []),
@@ -342,6 +343,7 @@ const HOSTS = {
     // Gitea KEEPS state='REQUEST_CHANGES' and flips a flag — the case that makes a state-only predicate
     // re-dismiss the same review on every single push.
     markDismissed: review => { review.dismissed = true; },
+    isLive: review => !review.dismissed,
   },
 };
 
@@ -368,11 +370,24 @@ function fakeHost(kind) {
     },
     octokit: {
       request: async (route, params) => {
+        // The single-review read is served at the SAME literal path by both hosts (verified live), which
+        // is why the re-check needs no transport member. The fake serves it from the same store the
+        // dismissal mutates, so "already dismissed" is a real round trip and not a stubbed answer.
+        if (route === 'GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}') {
+          const found = reviews.find(r => r.id === params.review_id);
+          if (!found) throw new Error(`404 no review ${params.review_id}`);
+          return { data: found };
+        }
         if (route !== host.route) throw new Error(`404 Not Found: ${kind} does not serve "${route}"`);
         const target = reviews.find(r => r.id === host.targetId(params));
         if (!target) throw new Error(`404 no review ${JSON.stringify(host.targetId(params))} on this PR`);
+        // Neither host makes dismissal idempotent — GitHub answers a second attempt with 422 "Can not
+        // dismiss a dismissed pull request review" (measured). Modelling that is the whole point: a
+        // permissive fake would let the release loop look correct while reddening real runs.
+        if (!host.isLive(target)) throw new Error('422 Can not dismiss a dismissed pull request review');
         calls.push(params);
         host.markDismissed(target);
+        return { data: target };
       },
     },
   };
@@ -466,6 +481,29 @@ describe('a block the reviewer will not revisit is released', () => {
         assert.equal(pr.transportResolutions, 1, 'resolved once for the whole release, not per review');
       });
 
+      // Dismissal is not idempotent at either host, so a review someone else released between the
+      // snapshot and the call answers with a hard error. The goal is a STATE though, and that state is
+      // satisfied — reporting it as failure would red a build over a PR that is not blocked at all.
+      test('a block someone else already released is not reported as a failure', async () => {
+        const pr = fakeHost(kind);
+        const review = pr.block(101);
+        pr.host.markDismissed(review); // a human, or a racing run, got there first
+        const said = [];
+        const realSetFailed = core.setFailed;
+        const before = process.exitCode;
+        try {
+          process.exitCode = 0;
+          core.setFailed = m => said.push(m);
+          // The snapshot still remembers it as outstanding, exactly as summarizePriorReviews would.
+          assert.equal(await release(pr, [{ ...review, ...pr.host.liveBlock(101) }]), 'released');
+          assert.equal(process.exitCode, 0, 'a PR that is not blocked must not red the run');
+        } finally {
+          core.setFailed = realSetFailed;
+          process.exitCode = before;
+        }
+        assert.deepEqual(said, []);
+      });
+
       // Failing to work out HOW to dismiss is a failure to enforce the invariant, not a harmless miss:
       // the PR may be deadlocked while every other signal says the cap was handled.
       test('a thunk that throws REDS the run and says the PR is still blocked', async () => {
@@ -530,6 +568,16 @@ describe('a block the reviewer will not revisit is released', () => {
     for (const state of ['APPROVED', 'COMMENTED', 'PENDING']) {
       assert.equal(isOutstandingBlock({ state }), false, state);
     }
+  });
+
+  // A host that reports no dismissal state at all cannot be served idempotently — dismissal is not a
+  // no-op on either host — so the choice is between reddening every push and silently never releasing.
+  // Absence-as-live is the loud direction, pinned here rather than left to Boolean(undefined) by accident.
+  test('a review reporting no dismissal state at all is treated as live, not as released', () => {
+    assert.equal(isOutstandingBlock({ state: 'REQUEST_CHANGES' }), true);
+    // The alternative reading would leave a real block unreleased with nothing said — the exact
+    // deadlock this feature exists to abolish, reached silently.
+    assert.equal(isOutstandingBlock({ state: 'REQUEST_CHANGES', dismissed: undefined }), true);
   });
 
   // Gitea dismisses `priors: false` — `true` would sweep every earlier review on the PR, including a
