@@ -1,7 +1,7 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, summarizePriorReviews, fetchPriorPushbacks, pairPushbacks, roundCapReached, parseMaxRounds, REVIEW_MARKER } = require('../src/index.js');
+const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, summarizePriorReviews, fetchPriorPushbacks, pairPushbacks, roundCapReached, parseMaxRounds, REVIEW_MARKER, isOutstandingBlock } = require('../src/index.js');
 const { costMarker } = require('../src/usage');
 
 describe('gitHubTransport.toComment', () => {
@@ -251,8 +251,7 @@ describe('summarizePriorReviews', () => {
       { id: 22, body: 'a human review, no marker', state: 'CHANGES_REQUESTED' },
     ]]);
     const { reviews } = await summarizePriorReviews(octokit, 'o', 'r', 1);
-    const transport = gitHubTransport([], []);
-    assert.deepEqual(reviews.filter(transport.isOutstandingBlock).map(r => r.id), [11]);
+    assert.deepEqual(reviews.filter(isOutstandingBlock).map(r => r.id), [11]);
   });
 
   test('exhausts pagination — a full first page forces a second fetch (count AND cost span pages)', async () => {

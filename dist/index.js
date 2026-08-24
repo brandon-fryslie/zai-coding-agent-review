@@ -33741,7 +33741,7 @@ if (process.argv.includes(COLLECTOR_SERVER_ARG)) {
 
 // Re-exports for test imports — all symbols the T1 test suite requires from this path.
 const { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines, unquoteCStylePath, parseGitDiffHeader } = __nccwpck_require__(9898);
-const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, summarizePriorReviews, fetchPriorPushbacks, pairPushbacks, roundCapReached, parseMaxRounds, REVIEW_MARKER } = __nccwpck_require__(7228);
+const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, summarizePriorReviews, fetchPriorPushbacks, pairPushbacks, roundCapReached, parseMaxRounds, isOutstandingBlock, REVIEW_MARKER } = __nccwpck_require__(7228);
 const { TransientError, parseRetryAfterMs, transientBackoffMs } = __nccwpck_require__(2887);
 const { classifyClaudeError } = __nccwpck_require__(3048);
 const { LEDGER_MARKER, ledgerEntryBody, sumCostToday, readSpentToday, appendCost } = __nccwpck_require__(8192);
@@ -33762,6 +33762,7 @@ module.exports = {
   pairPushbacks,
   roundCapReached,
   parseMaxRounds,
+  isOutstandingBlock,
   REVIEW_MARKER,
   TransientError,
   classifyClaudeError,
@@ -36341,24 +36342,14 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     // otherwise — the same fetch-once-reuse shape the review path uses below. This is the skip path only;
     // the reviewing path is untouched. [LAW:one-source-of-truth]
     //
-    // [LAW:no-silent-failure] Not being ABLE to tell whether a block is outstanding is itself a failure
-    // to enforce the invariant, not a harmless miss — the PR may be sitting deadlocked while the run
-    // reports the cap was handled — so it reds here rather than falling through to the generic top-level
-    // handler, which would name neither the PR nor the consequence.
-    let capTransport;
-    try {
-      capTransport = fetched
-        ? fetched.transport
-        : await selectTransport(octokit, owner, repo, pullNumber);
-    } catch (e) {
-      core.setFailed(
-        `Could not determine whether PR #${pullNumber} is still blocked by a review this action has `
-        + `declined to revisit: ${e.message}. If it is, the pull request cannot be merged until someone `
-        + 'dismisses that review by hand.',
-      );
-      return;
-    }
-    await releaseUnrevisitableBlocks(reviewOctokit, capTransport, {
+    // The transport is passed as a THUNK, not resolved here: only the release knows whether this PR has
+    // anything outstanding, and the common capped push has nothing — resolving a transport for it would
+    // re-list every changed file on every push forever to build a route that is never called. The budget
+    // phase's transport is reused when that phase ran, so the thunk costs a fetch only on the rare push
+    // that genuinely has a block to release. [LAW:carrying-cost]
+    await releaseUnrevisitableBlocks(reviewOctokit, () => (fetched
+      ? fetched.transport
+      : selectTransport(octokit, owner, repo, pullNumber)), {
       owner, repo, pullNumber, reviews: prior.reviews, capMessage: message,
     });
     return;
@@ -36720,8 +36711,8 @@ async function listAllFiles(octokit, owner, repo, pullNumber) {
 
 // [LAW:one-type-per-behavior] One transport; the host differs only in how the diff is
 // sourced, how a finding's new-file line becomes a review comment, which literal string
-// its review-submission API expects for an approval event (approveEvent below), and how a
-// blocking review is recognized and released (isOutstandingBlock / dismissReview below).
+// its review-submission API expects for an approval event (approveEvent below), and which
+// route releases a blocking review (dismissReview below).
 // [LAW:dataflow-not-control-flow] Capability — does listFiles carry per-file patch? —
 // selects the instance, not a hardcoded hostname (GitHub & Enterprise carry it; Gitea does not).
 //
@@ -36739,30 +36730,17 @@ async function listAllFiles(octokit, owner, repo, pullNumber) {
 // travels as a value to the sink that gates approval on it. Carrying only `files` is what let a refused
 // file cost review coverage while the approval gate never heard about it.
 //
-// [LAW:no-silent-failure] `isOutstandingBlock` and `dismissReview` are the third and fourth host
-// differences, and both were MEASURED rather than recalled — a wrong guess here is silent in the worst
-// direction, either re-dismissing a review on every push or never releasing a deadlocked PR at all.
-//
-// Three spellings are in play for one concept, which is exactly why this cannot be one shared literal:
-// the event SUBMITTED for a blocking review is 'REQUEST_CHANGES' on both hosts, but the state READ BACK
-// is GitHub's past-tense 'CHANGES_REQUESTED' and Gitea's 'REQUEST_CHANGES'. The two hosts also disagree
-// on how a dismissed review reports itself: GitHub REPLACES the state with 'DISMISSED', while Gitea
-// leaves state='REQUEST_CHANGES' and flips a separate `dismissed` flag — so on Gitea the state alone can
-// never distinguish a live block from a released one. Measured 2026-08-24 against github.com
-// (promptctl/copirate-code-review-agent PR #114 live, #117 dismissed) and Gitea v1.27.1
-// (homelab-infra PR #157, review 110 dismissed / 111 live).
-//
-// [LAW:one-source-of-truth] The dismissal ROUTE differs too and is stated once per host, next to the
-// predicate that finds its target: GitHub takes PUT .../dismissals, Gitea POST .../dismissals with a
-// `priors` flag (confirmed from the live instance's own swagger, operationId repoDismissPullReview).
-// Sending GitHub's verb to Gitea is a 405, so this can never be one shared call.
+// [LAW:no-silent-failure] `dismissReview` is the fourth host difference, and it was MEASURED rather than
+// recalled: GitHub takes PUT .../dismissals, Gitea POST .../dismissals with a `priors` flag (confirmed
+// from a live instance's own swagger, operationId repoDismissPullReview). Sending GitHub's verb to Gitea
+// is a 405, so this can never be one shared call. Only the WRITE is per-host — recognizing a live block
+// is one host-agnostic rule, `isOutstandingBlock` below.
 function gitHubTransport(files, unreviewable) {
   return {
     files,
     unreviewable,
     toComment: f => ({ path: f.path, line: f.line, side: 'RIGHT', body: f.body }),
     approveEvent: 'APPROVE',
-    isOutstandingBlock: r => r.state === 'CHANGES_REQUESTED',
     dismissReview: (octokit, { owner, repo, pullNumber, reviewId, message }) => octokit.request(
       'PUT /repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}/dismissals',
       { owner, repo, pull_number: pullNumber, review_id: reviewId, message },
@@ -36776,7 +36754,6 @@ function giteaTransport(files, unreviewable) {
     unreviewable,
     toComment: f => ({ path: f.path, new_position: f.line, body: f.body }),
     approveEvent: 'APPROVED',
-    isOutstandingBlock: r => r.state === 'REQUEST_CHANGES' && !r.dismissed,
     // `priors: false` dismisses THIS review alone. `true` would sweep every earlier review on the PR,
     // including a human's — the action releases only the block it is itself holding. [LAW:single-enforcer]
     dismissReview: (octokit, { owner, repo, pullNumber, reviewId, message }) => octokit.request(
@@ -36784,6 +36761,29 @@ function giteaTransport(files, unreviewable) {
       { owner, repo, index: pullNumber, id: reviewId, message, priors: false },
     ),
   };
+}
+
+// [LAW:one-source-of-truth] "This review is still blocking the merge" is ONE rule, not one per host, and
+// it is deliberately not a transport member: reading a review's state needs no knowledge of how the host
+// serves diffs, and pairing the two would force a diff fetch just to ask a question about a review — the
+// cost `releaseUnrevisitableBlocks` avoids by filtering before it resolves any route.
+//
+// Three spellings are in play for one concept, which is why none of them can be reused from another: the
+// event SUBMITTED for a blocking review is 'REQUEST_CHANGES' on BOTH hosts, but the state READ BACK is
+// GitHub's past-tense 'CHANGES_REQUESTED' and Gitea's 'REQUEST_CHANGES'. The two also disagree on how a
+// dismissed review reports itself — GitHub REPLACES the state with 'DISMISSED', Gitea KEEPS
+// 'REQUEST_CHANGES' and flips a separate `dismissed` flag — so on Gitea the state alone can never tell a
+// live block from a released one, and a state-only predicate would re-dismiss the same review on every
+// push forever.
+//
+// The union is exact rather than lenient: the two read vocabularies do not collide, so each host's live
+// spelling is accepted and each host's released shape is rejected, with no state either host can emit
+// left ambiguous. Measured 2026-08-24 against github.com (promptctl/copirate-code-review-agent PR #114
+// live, #117 dismissed) and Gitea v1.27.1 (homelab-infra PR #157, review 110 dismissed / 111 live).
+const BLOCKING_REVIEW_STATES = new Set(['CHANGES_REQUESTED', 'REQUEST_CHANGES']);
+
+function isOutstandingBlock(review) {
+  return BLOCKING_REVIEW_STATES.has(review.state) && !review.dismissed;
 }
 
 // [LAW:no-silent-failure] A refused path is warned with its reason at the one place a transport is
@@ -37379,9 +37379,39 @@ function unrevisitableBlockMessage(capMessage) {
 // roundCapNotice's policy and for the same reason: a round cap is only ever reached on a same-repo PR,
 // where the `pull-requests: write` this needs is always grantable. Every failure is attempted and then
 // reported together, so an operator fixing permissions sees the whole list once. [LAW:no-silent-failure]
-async function releaseUnrevisitableBlocks(octokit, transport, { owner, repo, pullNumber, reviews, capMessage }) {
-  const outstanding = reviews.filter(transport.isOutstandingBlock);
+// `resolveTransport` is a THUNK, not a resolved transport, because only this function knows whether a
+// route is needed at all: the overwhelmingly common capped push has nothing outstanding, and resolving a
+// transport there would re-list every changed file — and on Gitea re-fetch the whole unified diff — on
+// every push for the rest of the PR's life, to build a route it then never calls. Recognizing a block
+// needs no transport (isOutstandingBlock is host-agnostic), so the filter runs first and the route is
+// resolved only against a non-empty list. [LAW:carrying-cost] The same emptiness-gates-the-IO shape
+// run.js already applies to fetchPriorPushbacks.
+//
+// [LAW:no-silent-failure] The thunk's own failure is a failure to enforce the invariant, not a harmless
+// miss — a PR may be sitting deadlocked while the run reports the cap was handled — so it reds here
+// rather than propagating to the generic top-level handler, which would name neither the PR nor the
+// consequence. It is reached only when something IS outstanding, so it can never red a run that had
+// nothing to release.
+async function releaseUnrevisitableBlocks(octokit, resolveTransport, { owner, repo, pullNumber, reviews, capMessage }) {
+  const outstanding = reviews.filter(isOutstandingBlock);
+  if (outstanding.length === 0) return 'nothing-to-release';
+
+  let transport;
+  try {
+    transport = await resolveTransport();
+  } catch (e) {
+    core.setFailed(
+      `Could not determine how to dismiss this action's own blocking review(s) on PR #${pullNumber}: `
+      + `${e.message}. The pull request is left blocked by a review this action has declined to revisit, `
+      + 'so it cannot be merged until someone dismisses that review by hand.',
+    );
+    return 'failed';
+  }
+
   const message = unrevisitableBlockMessage(capMessage);
+  // Every outstanding block is attempted before anything is reported: a PR that drew findings on more
+  // than one round carries several reviews that all still satisfy isOutstandingBlock, and aborting on the
+  // first refusal would leave the rest blocked while reporting one tidy failure. [LAW:no-silent-failure]
   const failures = [];
   for (const review of outstanding) {
     try {
@@ -37392,15 +37422,23 @@ async function releaseUnrevisitableBlocks(octokit, transport, { owner, repo, pul
     }
   }
   if (failures.length > 0) {
+    // [FRAMING:representation] The message names both candidate causes rather than asserting one it
+    // cannot know. A refusal is usually a token without `pull-requests: write`, but selectTransport
+    // answers "which host is this?" from diff capability and falls back to a GitHub-shaped transport when
+    // no file carries a patch and the unified diff parses to zero files — a state Gitea and a GitHub PR
+    // of oversized files both reach — so a Gitea PR in that state would be dismissed over GitHub's route
+    // and refused. Asserting "check your permissions" there sends the operator after the wrong cause,
+    // the same trap the fork/round-cap postFailureHint split exists to avoid.
     core.setFailed(
       `Could not dismiss this action's own blocking review(s) on PR #${pullNumber}: ${failures.join('; ')}. `
       + 'The pull request is left blocked by a review this action has declined to revisit, so it cannot be '
-      + 'merged until someone dismisses that review by hand. The token needs `pull-requests: write`, and '
-      + 'the PR must be open.',
+      + 'merged until someone dismisses that review by hand. Two causes reach here: the token may lack '
+      + '`pull-requests: write` (the PR must also be open), or the host may have been detected as GitHub '
+      + 'because no changed file carried a patch, in which case the dismissal used the wrong host route.',
     );
     return 'failed';
   }
-  return outstanding.length > 0 ? 'released' : 'nothing-to-release';
+  return 'released';
 }
 
 // [LAW:single-enforcer] One resolver decides which pull request to review, from
@@ -37448,6 +37486,7 @@ module.exports = {
   parseAgentArtifact,
   announceNotReviewed,
   releaseUnrevisitableBlocks,
+  isOutstandingBlock,
   unrevisitableBlockMessage,
   forkNotice,
   roundCapNotice,

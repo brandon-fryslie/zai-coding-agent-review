@@ -541,24 +541,14 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     // otherwise — the same fetch-once-reuse shape the review path uses below. This is the skip path only;
     // the reviewing path is untouched. [LAW:one-source-of-truth]
     //
-    // [LAW:no-silent-failure] Not being ABLE to tell whether a block is outstanding is itself a failure
-    // to enforce the invariant, not a harmless miss — the PR may be sitting deadlocked while the run
-    // reports the cap was handled — so it reds here rather than falling through to the generic top-level
-    // handler, which would name neither the PR nor the consequence.
-    let capTransport;
-    try {
-      capTransport = fetched
-        ? fetched.transport
-        : await selectTransport(octokit, owner, repo, pullNumber);
-    } catch (e) {
-      core.setFailed(
-        `Could not determine whether PR #${pullNumber} is still blocked by a review this action has `
-        + `declined to revisit: ${e.message}. If it is, the pull request cannot be merged until someone `
-        + 'dismisses that review by hand.',
-      );
-      return;
-    }
-    await releaseUnrevisitableBlocks(reviewOctokit, capTransport, {
+    // The transport is passed as a THUNK, not resolved here: only the release knows whether this PR has
+    // anything outstanding, and the common capped push has nothing — resolving a transport for it would
+    // re-list every changed file on every push forever to build a route that is never called. The budget
+    // phase's transport is reused when that phase ran, so the thunk costs a fetch only on the rare push
+    // that genuinely has a block to release. [LAW:carrying-cost]
+    await releaseUnrevisitableBlocks(reviewOctokit, () => (fetched
+      ? fetched.transport
+      : selectTransport(octokit, owner, repo, pullNumber)), {
       owner, repo, pullNumber, reviews: prior.reviews, capMessage: message,
     });
     return;

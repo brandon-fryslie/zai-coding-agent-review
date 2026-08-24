@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const core = require('@actions/core');
 const {
   announceNotReviewed, renderNotReviewedBody, parseAgentArtifact, summarizePriorReviews,
-  releaseUnrevisitableBlocks, giteaTransport,
+  releaseUnrevisitableBlocks, isOutstandingBlock, giteaTransport,
   forkNotice, roundCapNotice, submitReview, gitHubTransport,
   NOT_REVIEWED_MESSAGE, NOT_REVIEWED_REASONS, NOT_REVIEWED_MARKER_PREFIX, REVIEW_MARKER,
 } = require('../src/transport');
@@ -326,7 +326,9 @@ describe('parseAgentArtifact', () => {
 const HOSTS = {
   github: {
     transport: () => gitHubTransport([], []),
-    blockingState: 'CHANGES_REQUESTED',
+    // A live GitHub review carries NO `dismissed` key at all, so the shape below is the real one — a fake
+    // that helpfully added `dismissed: false` would hide a predicate that required the field.
+    liveBlock: id => ({ id, state: 'CHANGES_REQUESTED' }),
     route: 'PUT /repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}/dismissals',
     targetId: params => params.review_id,
     // GitHub REPLACES the state; the review is no longer CHANGES_REQUESTED afterwards.
@@ -334,7 +336,7 @@ const HOSTS = {
   },
   gitea: {
     transport: () => giteaTransport([], []),
-    blockingState: 'REQUEST_CHANGES',
+    liveBlock: id => ({ id, state: 'REQUEST_CHANGES', dismissed: false }),
     route: 'POST /repos/{owner}/{repo}/pulls/{index}/reviews/{id}/dismissals',
     targetId: params => params.id,
     // Gitea KEEPS state='REQUEST_CHANGES' and flips a flag — the case that makes a state-only predicate
@@ -347,13 +349,20 @@ function fakeHost(kind) {
   const host = HOSTS[kind];
   const reviews = [];
   const calls = [];
+  // Counted, not just captured: "the route was never resolved" is the perf contract, and only a count
+  // can assert the absence of a call.
+  let transportResolutions = 0;
   return {
     host,
     reviews,
     calls,
-    transport: host.transport(),
+    get transportResolutions() { return transportResolutions; },
+    resolveTransport: () => {
+      transportResolutions += 1;
+      return host.transport();
+    },
     block(id) {
-      const review = { id, state: host.blockingState, dismissed: false };
+      const review = host.liveBlock(id);
       reviews.push(review);
       return review;
     },
@@ -369,9 +378,10 @@ function fakeHost(kind) {
   };
 }
 
-const release = (pr, reviews) => releaseUnrevisitableBlocks(pr.octokit, pr.transport, {
-  owner: 'o', repo: 'r', pullNumber: PR, reviews, capMessage: CAP_MESSAGE,
-});
+const release = (pr, reviews, resolveTransport = pr.resolveTransport) =>
+  releaseUnrevisitableBlocks(pr.octokit, resolveTransport, {
+    owner: 'o', repo: 'r', pullNumber: PR, reviews, capMessage: CAP_MESSAGE,
+  });
 
 describe('a block the reviewer will not revisit is released', () => {
   for (const kind of Object.keys(HOSTS)) {
@@ -384,7 +394,47 @@ describe('a block the reviewer will not revisit is released', () => {
         assert.equal(await release(pr, pr.reviews), 'released');
         assert.equal(pr.calls.length, 1);
         assert.equal(pr.host.targetId(pr.calls[0]), 101);
-        assert.equal(pr.transport.isOutstandingBlock(blocked), false, 'the PR is no longer blocked');
+        assert.equal(isOutstandingBlock(blocked), false, 'the PR is no longer blocked');
+      });
+
+      // A PR that drew findings on more than one round before hitting the cap carries SEVERAL reviews
+      // that all still block: neither host retroactively rewrites an earlier round's state when a later
+      // round posts. Releasing only one of them would leave the PR just as deadlocked.
+      test('every outstanding block is released, not just the newest', async () => {
+        const pr = fakeHost(kind);
+        const blocked = [pr.block(101), pr.block(102), pr.block(103)];
+        assert.equal(await release(pr, pr.reviews), 'released');
+        assert.deepEqual(pr.calls.map(c => pr.host.targetId(c)), [101, 102, 103]);
+        assert.deepEqual(blocked.filter(isOutstandingBlock), [], 'no block left holding the merge');
+      });
+
+      // The partial path is where a `return` in the catch instead of a `push` would hide: the first
+      // review would silently stay blocked while the run reported one tidy failure.
+      test('one refused dismissal does not abandon the others, and only it is named', async () => {
+        const pr = fakeHost(kind);
+        const first = pr.block(101);
+        const second = pr.block(102);
+        const realRequest = pr.octokit.request;
+        pr.octokit.request = async (route, params) => {
+          if (pr.host.targetId(params) === 102) throw new Error('403 Forbidden');
+          return realRequest(route, params);
+        };
+        const said = [];
+        const realSetFailed = core.setFailed;
+        const before = process.exitCode;
+        try {
+          process.exitCode = 0;
+          core.setFailed = m => said.push(m);
+          assert.equal(await release(pr, pr.reviews), 'failed');
+        } finally {
+          core.setFailed = realSetFailed;
+          process.exitCode = before;
+        }
+        assert.equal(isOutstandingBlock(first), false, 'the reachable block was still released');
+        assert.equal(isOutstandingBlock(second), true, 'the refused one is honestly still blocking');
+        assert.equal(said.length, 1);
+        assert.match(said[0], /102/);
+        assert.equal(/\b101\b/.test(said[0]), false, 'the released review is not reported as a failure');
       });
 
       // Without this the reviewer would post a fresh dismissal on every push for the rest of the PR's
@@ -397,11 +447,42 @@ describe('a block the reviewer will not revisit is released', () => {
         assert.equal(pr.calls.length, 1);
       });
 
-      test('a PR with no outstanding block is untouched', async () => {
+      // The route is never even resolved here. That is the perf contract, not an incidental detail: this
+      // is the shape of every capped push for the rest of the PR's life, and resolving a transport would
+      // re-list every changed file (and on Gitea re-fetch the whole unified diff) each time.
+      test('a PR with no outstanding block is untouched, and no route is resolved', async () => {
         const pr = fakeHost(kind);
         pr.reviews.push({ id: 7, state: 'COMMENTED', dismissed: false });
         assert.equal(await release(pr, pr.reviews), 'nothing-to-release');
         assert.equal(pr.calls.length, 0);
+        assert.equal(pr.transportResolutions, 0, 'no diff fetch on the common capped push');
+      });
+
+      test('the route IS resolved once when there is something to release', async () => {
+        const pr = fakeHost(kind);
+        pr.block(101);
+        pr.block(102);
+        assert.equal(await release(pr, pr.reviews), 'released');
+        assert.equal(pr.transportResolutions, 1, 'resolved once for the whole release, not per review');
+      });
+
+      // Failing to work out HOW to dismiss is a failure to enforce the invariant, not a harmless miss:
+      // the PR may be deadlocked while every other signal says the cap was handled.
+      test('a thunk that throws REDS the run and says the PR is still blocked', async () => {
+        const pr = fakeHost(kind);
+        pr.block(101);
+        const said = [];
+        const realSetFailed = core.setFailed;
+        try {
+          core.setFailed = m => said.push(m);
+          const boom = () => { throw new Error('listFiles exploded'); };
+          assert.equal(await release(pr, pr.reviews, boom), 'failed');
+        } finally {
+          core.setFailed = realSetFailed;
+        }
+        assert.equal(pr.calls.length, 0);
+        assert.match(said[0], /listFiles exploded/);
+        assert.match(said[0], /left blocked by a review this action has declined to revisit/);
       });
 
       test('the dismissal says the findings were NOT re-checked', async () => {
@@ -437,17 +518,17 @@ describe('a block the reviewer will not revisit is released', () => {
   // Three spellings for one concept: the event SUBMITTED is REQUEST_CHANGES on both hosts, but the state
   // READ BACK differs, and Gitea's dismissed review keeps the live spelling. Reading GitHub's word on
   // Gitea never releases anything; reading Gitea's word on GitHub re-dismisses forever.
-  test('each host reads only its own vocabulary for a live block', () => {
-    const github = gitHubTransport([], []);
-    const gitea = giteaTransport([], []);
-    assert.equal(github.isOutstandingBlock({ state: 'CHANGES_REQUESTED' }), true);
-    assert.equal(github.isOutstandingBlock({ state: 'DISMISSED' }), false);
-    assert.equal(gitea.isOutstandingBlock({ state: 'REQUEST_CHANGES', dismissed: false }), true);
-    assert.equal(gitea.isOutstandingBlock({ state: 'REQUEST_CHANGES', dismissed: true }), false);
-    // An approval or a plain comment is not a block on either host.
-    for (const transport of [github, gitea]) {
-      assert.equal(transport.isOutstandingBlock({ state: 'APPROVED' }), false);
-      assert.equal(transport.isOutstandingBlock({ state: 'COMMENTED' }), false);
+  test('one predicate accepts each host live block and rejects each host released shape', () => {
+    // GitHub: no `dismissed` key exists at all, and a released review changes STATE.
+    assert.equal(isOutstandingBlock({ state: 'CHANGES_REQUESTED' }), true);
+    assert.equal(isOutstandingBlock({ state: 'DISMISSED' }), false);
+    // Gitea: the state is UNCHANGED by dismissal, so only the flag separates live from released. This
+    // pair is the whole reason the predicate cannot read state alone.
+    assert.equal(isOutstandingBlock({ state: 'REQUEST_CHANGES', dismissed: false }), true);
+    assert.equal(isOutstandingBlock({ state: 'REQUEST_CHANGES', dismissed: true }), false);
+    // Neither host's non-blocking verdicts are ever mistaken for a block.
+    for (const state of ['APPROVED', 'COMMENTED', 'PENDING']) {
+      assert.equal(isOutstandingBlock({ state }), false, state);
     }
   });
 
