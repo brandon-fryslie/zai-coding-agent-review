@@ -51,7 +51,7 @@ BASE_REF="${1:?usage: check-version-bump.sh <base-ref>}"
 # entry, the bundled code, the runtime reviewer instructions). Defined ONCE, here.
 # .github/workflows/, scripts/, test/, docs, and CLAUDE.md are NOT shipped — a
 # change confined to them needs no release. [LAW:one-source-of-truth]
-SHIPPED_SURFACE=(src dist action.yml review-agent)
+SHIPPED_SURFACE=(src dist action.yml review-agent dismiss-block)
 
 mapfile -t CHANGED < <(git diff --name-only "${BASE_REF}...HEAD")
 
@@ -82,7 +82,7 @@ BASE_VERSION="$(pkg_version "$BASE_PKG")"
 [ -n "$BASE_VERSION" ] || die "could not read version from package.json on ${BASE_REF}."
 
 if ! version_gt "$HEAD_VERSION" "$BASE_VERSION"; then
-  die "this PR changes the shipped surface (src/, dist/, action.yml, or review-agent/) \
+  die "this PR changes the shipped surface (src/, dist/, action.yml, review-agent/, or dismiss-block/) \
 but package.json's version (${HEAD_VERSION}) is not greater than the base (${BASE_VERSION}). \
 Bump the version (a strict increase) and rebuild dist/ in this PR — see CLAUDE.md, \
 'Every PR that changes what consumers run bumps the version'."

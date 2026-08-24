@@ -818,7 +818,7 @@ describe('a block the reviewer will not revisit is released', () => {
     });
 
     // No `dismissOctokit` passed at all is every existing call site and every test above this one —
-    // the default MUST still be the plain `octokit`, so a run with no DISMISS_TOKEN configured
+    // the default MUST still be the plain `octokit`, so `run.js`'s review run (which never passes one)
     // reproduces exactly today's (broken-on-Gitea) behavior rather than a new one.
     test('omitting dismissOctokit falls back to the plain octokit, unchanged from before this feature', async () => {
       const { pr, writeCalls } = splitCredentialHost();

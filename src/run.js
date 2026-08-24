@@ -343,16 +343,6 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   if (reviewToken) {
     core.setSecret(reviewToken);
   }
-  // itv.4.1: Gitea's dismiss-review endpoint 403s the review token (write access posts a review fine,
-  // but dismissing one needs repo-Admin — MEASURED live). Deliberately NOT host-gated: the credential
-  // is used for the dismissal write wherever it is set, so this reads one input and holds one value
-  // rather than resolving a transport just to decide which token to carry. [LAW:dataflow-not-control-flow]
-  // Left unset (the usual case, and every GitHub run) releaseUnrevisitableBlocks's `dismissOctokit =
-  // octokit` default applies and nothing changes.
-  const dismissToken = core.getInput('DISMISS_TOKEN');
-  if (dismissToken) {
-    core.setSecret(dismissToken);
-  }
 
   const { context } = github;
   const { owner, repo } = context.repo;
@@ -373,7 +363,6 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
 
   const octokit = github.getOctokit(token);
   const reviewOctokit = github.getOctokit(reviewToken || token);
-  const dismissOctokit = dismissToken ? github.getOctokit(dismissToken) : undefined;
 
   // [LAW:single-enforcer] One PR fetch, one place that decides fork eligibility. The PR object
   // also feeds config-file label/body selection below, so it is fetched once here.
@@ -583,7 +572,6 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
       : selectTransport(octokit, owner, repo, pullNumber)), {
       owner, repo, pullNumber, reviews: prior.reviews, capMessage: message,
       commitId: headSha, reviewerName, releaseFailureBodies: prior.releaseFailureBodies,
-      dismissOctokit,
     });
     return;
   }
