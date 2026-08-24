@@ -537,10 +537,20 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
         + `MAX_REVIEW_ROUNDS ${defaultEffort.roundCap}). To review further pushes, ${remedies.join(' or ')}.`
       : `PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
         + `the MAX_REVIEW_ROUNDS cap of ${effort.roundCap}. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.`;
-    await announceNotReviewed(reviewOctokit, {
+    const noticeResult = await announceNotReviewed(reviewOctokit, {
       owner, repo, pullNumber, commitId: headSha, reviewerName,
       notice: roundCapNotice(message, prior.latestArtifact),
     });
+    // A block is released only once its explanation actually reached the PR. `announceNotReviewed`
+    // reports a failed post via `setFailed` rather than throwing (roundCapNotice's postFailureHint is a
+    // remedy for THAT failure, and a throw here would skip straight past it), so nothing upstream stops
+    // this function on 'failed' by itself — this check is what makes the sequencing in the comment below
+    // ("say it, then stop enforcing it") true of the code and not just of the comment. Skipping the
+    // release leaves the block in place, which is the safe direction: the PR stays exactly as gated as it
+    // was, rather than losing its merge block with no visible reason on the PR. The next push re-attempts
+    // the notice (this round never became the newest artifact) and, once it posts, releases then.
+    // [LAW:no-silent-failure]
+    if (noticeResult === 'failed') return;
     // Say it, then stop enforcing it. Announcing that the PR will not be reviewed again while still
     // holding a REQUEST_CHANGES against it is the deadlock this exit used to create: the cap can even
     // shrink BENEATH a block already posted (a first round costing enough to de-rate the cap to 1 leaves

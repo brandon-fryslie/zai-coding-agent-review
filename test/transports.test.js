@@ -3,6 +3,8 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, summarizePriorReviews, fetchPriorPushbacks, pairPushbacks, roundCapReached, parseMaxRounds, REVIEW_MARKER, isOutstandingBlock } = require('../src/index.js');
 const { costMarker } = require('../src/usage');
+const core = require('@actions/core');
+const { submitReview } = require('../src/transport');
 
 describe('gitHubTransport.toComment', () => {
   test('maps finding to GitHub inline comment shape', () => {
@@ -466,6 +468,43 @@ describe('selectTransport — refused paths reach the caller as data', () => {
   test('a clean PR carries an empty refusal list, never undefined', async () => {
     const t = await selectTransport(fakeHost([{ filename: 'src/ok.js', patch: '@@' }]), 'o', 'r', 1);
     assert.deepEqual(t.unreviewable, []);
+  });
+
+  // The relocation this PR's design churn was about: the "reported on the PR and withholds approval"
+  // warning is only true once a review is actually submitted, so it must fire from submitReview and
+  // must NOT fire from the fetch that merely lists files — a claim neither half of which was pinned by
+  // any prior test. [LAW:behavior-not-structure] asserts the contract (warns iff a review is submitted
+  // with unreviewable files), not the refactor's shape.
+  test('submitReview warns about its own unreviewable files', async () => {
+    const octokit = { rest: { pulls: { createReview: async () => {} } } };
+    const warnings = [];
+    const original = core.warning;
+    core.warning = m => warnings.push(m);
+    try {
+      await submitReview(octokit, 'o', 'r', 1, 'sha', 'RA', {
+        summary: 'x', findings: [], unreviewedScopes: [],
+        unreviewableFiles: [{ filename: 'src/a\nEVIL.js', reason: 'embedded line separator' }],
+      }, true, gitHubTransport([], []));
+    } finally {
+      core.warning = original;
+    }
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /embedded line separator/);
+    assert.match(warnings[0], /reported on the PR and withholds approval/);
+  });
+
+  test('selectTransport itself never warns — listing files is not submitting a review', async () => {
+    const warnings = [];
+    const original = core.warning;
+    core.warning = m => warnings.push(m);
+    try {
+      await selectTransport(fakeHost([
+        { filename: 'src/a\nEVIL.js', status: 'modified', patch: '@@' },
+      ]), 'o', 'r', 1);
+    } finally {
+      core.warning = original;
+    }
+    assert.deepEqual(warnings, []);
   });
 
   test('the Gitea path refuses on its own parsed diff, and reports only those refusals', async () => {
