@@ -90,6 +90,21 @@ function reviewCharter(toolNames) {
     count — the host owns the review's disposition, derived from the recorded findings.`;
 }
 
+// [LAW:one-source-of-truth] The withheld-path list, rendered once for both the scout and the worker.
+// It is BOUNDED: a PR that bumps a large vendored tree removes thousands of changed files, and this list
+// is paid on every engine spawn. Twenty names the ordinary case (build output, lockfiles) in full, and
+// beyond that the remainder is stated rather than dropped — a truncated list that lied about its own
+// length would be the same withheld-information defect one level down. [LAW:no-silent-failure]
+// No flatten: these paths crossed parseReviewableFiles (src/diff.js) BEFORE filterFiles ever saw them, so
+// every one is already single-line and byte-exact — a path that could break out of this line was refused
+// at that boundary rather than collapsed here.
+const MAX_EXCLUDED_PATHS_SHOWN = 20;
+function excludedPathList(paths) {
+  const shown = paths.slice(0, MAX_EXCLUDED_PATHS_SHOWN);
+  const more = paths.length - shown.length;
+  return `${shown.join(', ')}${more > 0 ? ` (and ${more} more)` : ''}`;
+}
+
 // toolNames is required; callers supply adapter.toolNames so each engine's actual
 // MCP tool identifiers are interpolated into the prompt. [LAW:composability]
 // reviewedRepoRoot is the absolute path of the checked-out repo. The engine spawns with a
@@ -176,6 +191,14 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // diff" while holding a filtered SUBSET of it reports the gap as a defect — an [S4] "the build output
   // was never regenerated" on a PR that regenerated it in every commit (zai-review-prompt-2tx). Every
   // finding blocks, so a false one costs a human adjudication.
+  // [FRAMING:representation] It names the PATHS, not just the patterns, because naming only the patterns
+  // MEASURABLY LOST: delivered verbatim to all 15 spawns of a real run, it still drew that same finding.
+  // A predicate about an unseen file asks the model to notice an absence, recall the globs, test a name it
+  // was never shown, and then retract a conclusion it has already evidenced from the repo's own rules.
+  // Naming the file as changed-and-withheld deletes the premise instead of arguing with the conclusion —
+  // there is no absence left to interpret. The rule-compliance clause is load-bearing for the same reason:
+  // the model had READ the repo rule demanding these files change, and a note that only forbids the
+  // conclusion loses to a rule the repository states emphatically.
   // [LAW:one-type-per-behavior] This is deliberately NOT merged with the unshowable-files note above,
   // which they superficially resemble: an unshowable file is still REVIEWABLE (read it at its absolute
   // path and record findings against it), an excluded one is out of bounds entirely. Same absence from
@@ -183,7 +206,8 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // [LAW:dataflow-not-control-flow] A value: no paths removed ⇒ no block. Patterns that matched nothing
   // hid nothing, so silence is the truth there, not an omission.
   if (excluded.paths.length > 0) {
-    diffs += `\n\n> **Note:** EXCLUDE_PATTERNS (${excluded.patterns.join(', ')}) removed ${excluded.paths.length} changed file(s) from your view, so this diff is a filtered subset of the change. A path matching those patterns is absent by configuration, not by evidence — it may well have been changed, and changed correctly. Do not read those paths, and never record a finding asserting one of them was missed, not updated, or left inconsistent with the rest of the change, wherever you would anchor it.`;
+    diffs += `\n\n**Withheld from this diff — changed in this pull request:** ${excludedPathList(excluded.paths)}\n\n`
+      + `These ${excluded.paths.length} file(s) are part of this change and were modified by it; EXCLUDE_PATTERNS (${excluded.patterns.join(', ')}) removed them from your view, so their absence below is a display setting, not evidence about the change. Their contents are unobservable from this material, so no claim about their state — updated, not updated, regenerated, stale, or inconsistent with the rest of the change — can be supported here, and that holds equally for a repository rule you have read requiring that they change: you cannot check compliance in either direction from what you were given. Do not read these paths, and record no finding that rests on one of them, wherever you would anchor it.`;
   }
 
   if (dependencyDiffNote) {
@@ -434,7 +458,8 @@ function buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot, excluded
   // the scout PLANS, so the failure it must not commit is scoping an invisible path or sending a worker
   // to investigate an absence. One fact, two audiences — never re-derived, only re-aimed.
   const exclusionNote = excluded.paths.length > 0
-    ? `\n\n    > **Note:** EXCLUDE_PATTERNS (${excluded.patterns.join(', ')}) removed ${excluded.paths.length} changed file(s) from the list above, so it is a filtered subset of the change. Never create a scope for, or aim a scope's focus at, a path matching those patterns, and never treat such a path's absence as a gap to investigate.`
+    ? `\n\n    **Withheld from the list above — changed in this pull request:** ${excludedPathList(excluded.paths)}\n\n`
+      + `    EXCLUDE_PATTERNS (${excluded.patterns.join(', ')}) removed these ${excluded.paths.length} changed file(s) from the list, so their absence is a display setting, not a gap. Create no scope for them, aim no scope's focus at them, and treat nothing about their state as reviewable in this run.`
     : '';
   return {
     prompt: `

@@ -51,20 +51,37 @@ describe('the reviewer is told what was removed from its view', () => {
   const { reviewed, excluded } = filterFiles(FILES, ['build/**', '*.lock']);
   const material = buildPrMaterial({ files: reviewed, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT, excluded });
 
-  test('the worker prompt names the patterns, the count, and that absence proves nothing', () => {
+  // Naming the PATHS, not only the patterns, is the contract: a predicate about a file the model was
+  // never shown asks it to infer from an absence, and that measurably lost — delivered verbatim to all
+  // 15 spawns of a real run, the patterns-only note still drew the finding it forbade.
+  test('the worker prompt names the withheld paths as changed, plus the patterns and the count', () => {
     const prompt = material.buildWorkerPrompt('code — src/a.js', TOOL_NAMES, ['src/a.js']);
-    assert.match(prompt, /EXCLUDE_PATTERNS \(build\/\*\*, \*\.lock\) removed 2 changed file\(s\) from your view/);
-    assert.match(prompt, /absent by configuration, not by evidence/);
-    assert.match(prompt, /never record a finding asserting one of them was missed, not updated/);
+    assert.match(prompt, /Withheld from this diff — changed in this pull request:\*\* build\/out\.js, deps\.lock/);
+    assert.match(prompt, /These 2 file\(s\) are part of this change and were modified by it/);
+    assert.match(prompt, /EXCLUDE_PATTERNS \(build\/\*\*, \*\.lock\) removed them from your view/);
   });
 
-  // The note must not become a route BACK to the excluded files: they are out of bounds, not merely
-  // undisplayed — the opposite of the unshowable-files note, which sends the worker to read them.
-  test('the worker prompt does not name the excluded paths or send the reviewer to read them', () => {
+  // The escape route the model actually took: it had read the repo's own rule demanding these files
+  // change, and a note that only forbade the conclusion lost to it. The claim is not that the files are
+  // fine — it is that compliance is unobservable from this material, in either direction.
+  test('the worker prompt forecloses a repo rule about the withheld files, and is not a route back to reading them', () => {
     const prompt = material.buildWorkerPrompt('code — src/a.js', TOOL_NAMES, ['src/a.js']);
-    assert.ok(!prompt.includes('build/out.js'), 'excluded path leaked into the worker prompt');
-    assert.ok(!prompt.includes('deps.lock'), 'excluded path leaked into the worker prompt');
-    assert.match(prompt, /Do not read those paths/);
+    assert.match(prompt, /holds equally for a repository rule you have read requiring that they change/);
+    assert.match(prompt, /cannot check compliance in either direction/);
+    assert.match(prompt, /Do not read these paths, and record no finding that rests on one of them/);
+  });
+
+  // Bounded: this list is paid on every engine spawn, so a PR excluding a large vendored tree must not
+  // inflate it — and a truncated list that lied about its own length would be the same withheld-
+  // information defect one level down.
+  test('a large withheld set is capped, and says how many it did not name', () => {
+    const many = Array.from({ length: 25 }, (_, i) => ({ filename: `build/f${i}.js`, status: 'modified', patch: '@@ -1,1 +1,1 @@\n+x' }));
+    const { reviewed, excluded } = filterFiles([...FILES, ...many], ['build/**']);
+    const prompt = buildPrMaterial({ files: reviewed, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT, excluded })
+      .buildWorkerPrompt('code', TOOL_NAMES, ['src/a.js']);
+    assert.match(prompt, /\(and 6 more\)/);          // 1 build/out.js + 25 = 26 withheld, 20 named
+    assert.match(prompt, /These 26 file\(s\) are part of this change/);
+    assert.ok(!prompt.includes('build/f24.js'), 'the cap did not bound the list');
   });
 
   // A convergence sweep is a fresh hunt over the same material, so it needs the same confession —
@@ -73,14 +90,14 @@ describe('the reviewer is told what was removed from its view', () => {
     const priorFindings = [{ path: 'src/a.js', line: 1, body: 'something', severity: 3 }];
     const prompt = material.buildWorkerPrompt('code — src/a.js', TOOL_NAMES, ['src/a.js'], priorFindings);
     assert.match(prompt, /THIS IS A CONVERGENCE SWEEP/);
-    assert.match(prompt, /EXCLUDE_PATTERNS \(build\/\*\*, \*\.lock\) removed 2 changed file\(s\)/);
+    assert.match(prompt, /Withheld from this diff — changed in this pull request:\*\* build\/out\.js, deps\.lock/);
   });
 
-  test('the scout is told too, and forbidden to scope an invisible path', () => {
+  test('the scout is told too, and forbidden to scope a withheld path', () => {
     const prompt = material.buildScoutPrompt(TOOL_NAMES);
-    assert.match(prompt, /EXCLUDE_PATTERNS \(build\/\*\*, \*\.lock\) removed 2 changed file\(s\) from the list above/);
-    assert.match(prompt, /Never create a scope for, or aim a scope's focus at, a path matching those patterns/);
-    assert.ok(!prompt.includes('build/out.js'), 'excluded path leaked into the scout prompt');
+    assert.match(prompt, /Withheld from the list above — changed in this pull request:\*\* build\/out\.js, deps\.lock/);
+    assert.match(prompt, /removed these 2 changed file\(s\) from the list, so their absence is a display setting, not a gap/);
+    assert.match(prompt, /Create no scope for them/);
   });
 });
 
