@@ -313,15 +313,10 @@ function parseAgentArtifact(rawBody) {
   return m ? { kind: 'not-reviewed', reason: m[1], body } : null;
 }
 
-// [LAW:parse-dont-validate] The one crossing that turns the token this run POSTS reviews with into a
-// typed identity — a value that could not have existed before the check, and that summarizePriorReviews
-// requires in its signature. Nothing downstream re-asks who we are, because inland there is nothing left
-// to ask: the identity IS the proof.
-//
-// It takes the octokit that WRITES reviews, never the one that reads them. Those are two different
-// tokens whenever GITHUB_REVIEW_TOKEN is set (run.js: `octokit` reads, `reviewOctokit` posts), and it is
-// the writer's account that authors the artifacts this gate must recognize. Resolving from the reader
-// would misjudge exactly the PAT path, which is the path that has the most to lose.
+// [LAW:parse-dont-validate] The one crossing that turns a token this run holds into a typed identity —
+// a value that could not have existed before the check, and that summarizePriorReviews requires in its
+// signature. Nothing downstream re-asks who we are, because inland there is nothing left to ask: the
+// identity IS the proof.
 //
 // The arms come from a measurement, not a guess — taken in a real Actions job on 2026-08-24
 // (zai-review-trust-6yp), because every cheaper discriminator is measured-WRONG. `author_association`
@@ -329,19 +324,24 @@ function parseAgentArtifact(rawBody) {
 // alone reads a user-PAT GITHUB_REVIEW_TOKEN's own reviews as not-ours, which would silently zero the
 // round count and disable a cost control — strictly worse than the forgery it set out to stop.
 //
-//   GET /user -> 200   a user PAT. It names itself, so the gate is an exact login match.
-//   GET /user -> 403   an installation token ('Resource not accessible by integration'). It CANNOT name
-//                      itself: /app and /repos/{o}/{r}/installation are JWT-only (401) and no response
-//                      header carries an app identity, so the gate recognizes it by shape instead.
+//   GET /user -> 200                        a user PAT; it NAMES itself, so the gate is a login match
+//   GET /user -> refused, /installation/
+//     repositories -> 200                   an installation token; it cannot name itself, so by shape
 //
-// The two are opposite by construction rather than by coincidence — measured pairwise, an installation
-// token also answers 200 to /installation/repositories where a PAT answers 403 — so this is a total
-// discriminator of the two token kinds, not a claim about one endpoint's undocumented behavior.
+// The installation arm is CONFIRMED, never inferred from the /user failure. 403 is not exclusive to
+// 'Resource not accessible by integration': a secondary rate limit, SSO/SAML enforcement, and some PAT
+// scope failures all answer 403 too, and reading any of them as "installation" would resolve a PAT to
+// the bot arm — whose own reviews are type 'User' — silently zeroing the round count. That is the exact
+// failure this design ranks as worse than the forgery, so the fact is ESTABLISHED rather than deduced
+// from an absence: /installation/repositories answers 200 only to an installation token and 403 to a
+// PAT (measured in both directions), so a 403 arising from any other cause fails the confirmation and
+// falls through to the throw below. Matching GitHub's error prose would be the same inference wearing a
+// string compare. [FRAMING:representation]
 //
-// [LAW:no-silent-failure] Anything else is an UNRESOLVED identity and throws. Neither permissive default
-// is available: "trust everything" restores the forgery, and "trust nothing" zeroes the round count and
-// re-reviews a PR that has already spent its cap. When the question cannot be answered, saying so is the
-// only answer that isn't a lie.
+// [LAW:no-silent-failure] Anything that is neither arm is an UNRESOLVED identity and throws. Neither
+// permissive default is available: "trust everything" restores the forgery, and "trust nothing" zeroes
+// the round count and re-reviews a PR that has already spent its cap. When the question cannot be
+// answered, saying so is the only answer that isn't a lie.
 //
 // Host-agnostic by shape, not by branch: Gitea serves /user for its own token, so a Gitea runner lands
 // on the login arm with no host test — and never reaches the bot arm, whose `type` field is GitHub's.
@@ -349,9 +349,17 @@ async function resolveReviewerIdentity(octokit) {
   let data;
   try {
     ({ data } = await octokit.rest.users.getAuthenticated());
-  } catch (e) {
-    if (e.status === 403) return { kind: 'bot' };
-    throw new Error(`Could not resolve this run's own reviewer identity (GET /user): ${e.message}`);
+  } catch (userError) {
+    try {
+      await octokit.request('GET /installation/repositories', { per_page: 1 });
+    } catch {
+      throw new Error(
+        `Could not resolve this run's own reviewer identity. GET /user was refused (${userError.message}) `
+        + 'and this token is not an installation token either, so its prior reviews cannot be told from a '
+        + 'forged one. Refusing to guess: one wrong answer trusts a stranger, the other uncaps review spend.',
+      );
+    }
+    return { kind: 'bot' };
   }
   const login = data && data.login;
   if (typeof login !== 'string' || login === '') {
@@ -363,6 +371,33 @@ async function resolveReviewerIdentity(octokit) {
   return { kind: 'login', login };
 }
 
+// [LAW:one-source-of-truth] The identity of this run is a SET — every distinct token it holds — because
+// a PR outlives the configuration that reviewed it. `GITHUB_REVIEW_TOKEN` added mid-flight (the README
+// recommends adding it, to get formal approvals) makes the account that posts round N+1 different from
+// the one that posted round N, and a single-value identity would disown every earlier round: the count
+// and cost silently reset, and — the serious half — an outstanding REQUEST_CHANGES posted under the old
+// account drops out of the dismissible set, so releaseUnrevisitableBlocks can never release it and the
+// round-cap deadlock it exists to prevent comes straight back.
+//
+// The set is what the run can actually prove: the tokens in its own hand. It does NOT cover rotating one
+// PAT to a different PAT — there is no way to learn an identity the run no longer holds — so that
+// transition still disowns the earlier rounds. Stated rather than papered over; the recovery is the same
+// as it has always been, dismiss the stale block by hand.
+//
+// Duplicates are collapsed so the common single-token run resolves once and the gate does one compare.
+async function resolveReviewerIdentities(octokits) {
+  const identities = [];
+  for (const octokit of octokits) {
+    const identity = await resolveReviewerIdentity(octokit);
+    if (!identities.some(seen => sameIdentity(seen, identity))) identities.push(identity);
+  }
+  return identities;
+}
+
+function sameIdentity(a, b) {
+  return a.kind === b.kind && a.login === b.login;
+}
+
 // [LAW:single-enforcer] THE author gate. Every value summarizePriorReviews derives — the round count that
 // caps spend, the cost tallies, the RA review-id set that decides which inline comments are ours and
 // which blocks may be dismissed, the not-reviewed notice's idempotency key, and the release-failure
@@ -370,18 +405,39 @@ async function resolveReviewerIdentity(octokit) {
 // Covering one of them alone would be worse than covering none: it would make that field look protected
 // while the rest stayed forgeable, an inconsistent trust model inside a single function.
 //
+// [LAW:no-silent-failure] An EMPTY identity set is refused rather than answering "nothing is ours" — that
+// answer is indistinguishable from a PR with no prior rounds, which is precisely the zeroed round cap
+// this whole design treats as worse than the forgery.
+function isOwnArtifact(identities, user) {
+  if (!Array.isArray(identities) || identities.length === 0) {
+    throw new Error(
+      'No reviewer identity was resolved for this run, so prior reviews cannot be attributed and both '
+      + 'the round cap and the cost totals would be wrong.',
+    );
+  }
+  return identities.some(identity => matchesIdentity(identity, user));
+}
+
 // [LAW:dataflow-not-control-flow] The branch is the identity type's own discriminator, and the default
 // arm THROWS rather than answering. An unknown kind is a programming error, and the two ways to be wrong
 // here are both silent and both expensive, so this refuses to have a lenient direction at all.
-function isOwnArtifact(identity, user) {
+function matchesIdentity(identity, user) {
   switch (identity && identity.kind) {
     // Exact. A stranger cannot post a review as us, so a forged marker under their own login is simply
     // not ours — the check is on the account, which the host stamps, not on anything the body can claim.
     case 'login': return user?.login === identity.login;
-    // Structural, and sound BECAUSE the login arm exists: the one measured failure of a type test was
-    // misreading our own PAT-posted reviews, and a PAT no longer arrives here. What remains is the bar an
-    // attacker must clear — posting a review AS a Bot needs control of a GitHub App installed on this
-    // repo, not the mere read access that makes today's forgery a one-liner.
+    // Structural, and DELIBERATELY COARSER than the login arm: it admits any Bot, so what it buys is not
+    // "this action's own installation" but "the forger must be a privileged app already installed on this
+    // repo" — Dependabot, Renovate, a sibling workflow on the default GITHUB_TOKEN. That is a large
+    // reduction from "any account with read access", not an elimination, and it is stated here rather
+    // than overclaimed because the residual is the part a future maintainer needs.
+    //
+    // It is not pinned to an account id because it CANNOT be: the measurement behind this design found
+    // that an installation token cannot name its own app (/app and /repos/{o}/{r}/installation are
+    // JWT-only, no response header carries one). The only pinnable value would be a hardcoded
+    // github-actions[bot], which rejects the own reviews of any consumer using actions/create-github-app-
+    // token — silently zeroing their round count, the failure ranked worse than the forgery. Pinning
+    // waits on a way to learn the app identity, not on someone deciding it would be nice.
     case 'bot': return user?.type === 'Bot';
     default: throw new Error(
       `Unknown reviewer identity kind: ${JSON.stringify(identity && identity.kind)}. `
@@ -397,7 +453,7 @@ function isOwnArtifact(identity, user) {
 // agent reviews" is one cohesive concern. The listReviews API is served by GitHub and Gitea alike and
 // both markers live in the body regardless of host, so this is host-agnostic. [LAW:no-silent-failure]
 // pagination is exhausted so a PR with many reviews is summarized in full, never truncated.
-async function summarizePriorReviews(octokit, owner, repo, pullNumber, identity) {
+async function summarizePriorReviews(octokit, owner, repo, pullNumber, identities) {
   let count = 0;
   // [LAW:one-type-per-behavior] Two tallies of one shape — dollars actually spent, and Anthropic
   // list price for the rounds billed to subscription quota. They are reported side by side and
@@ -458,7 +514,7 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber, identity)
       // account with read access can submit a COMMENT review, so before this existed a stranger could end
       // a body with REVIEW_MARKER and forge a ROUND — enough of them push a PR past MAX_REVIEW_ROUNDS and
       // it is never reviewed again — or forge a not-reviewed notice and silence the real one.
-      if (!isOwnArtifact(identity, r.user)) continue;
+      if (!isOwnArtifact(identities, r.user)) continue;
       const body = typeof r.body === 'string' ? r.body : '';
       // A disjoint check, run BEFORE the parseAgentArtifact gate below: parseAgentArtifact does not
       // recognize RELEASE_FAILED_MARKER at all (by design — see its definition), so a release-failure
@@ -757,13 +813,16 @@ function renderNotReviewedBody(reviewerName, notice) {
 //
 // The fork notice's key is `null` — a VALUE meaning "nothing here is worth trusting, post it" — because
 // its dedup key would be parsed out of review bodies on a PR whose author is, by definition, someone this
-// action refuses to trust. A forged `not-reviewed:fork` marker would otherwise let that author switch off
-// the warning about their own unreviewed PR. The round-cap notice keeps a key: its body is equally
-// forgeable (any account with READ access can post a review — "push access" is not the bar, on a public
-// repo there is effectively no bar), but the party who benefits from suppressing it is the PR's author,
-// who already holds push access and can do far worse, while a third party gains nothing by silencing a
-// notice on someone else's PR. The ticket's no-duplicate criterion is met at that stated risk;
-// `zai-review-trust-6yp` is what removes the risk rather than reasoning about it.
+// action refuses to trust. The round-cap notice keeps a key, and since zai-review-trust-6yp that key is
+// no longer forgeable by a passer-by: isOwnArtifact filters a review by its AUTHOR before parseAgentArtifact
+// is ever handed the body, so a planted `not-reviewed:round-cap` marker under someone else's account is
+// not an artifact at all.
+//
+// That does NOT make this `null` redundant, and it must not be "simplified" away. The fork gate runs
+// before any prior-review fetch — before an identity is resolved, before a body is read — precisely so
+// that "a fork PR is skipped, unconditionally" depends on nothing that can fail. Passing no key is what
+// keeps that true. Two independent reasons the forged marker cannot land, on the one path where the
+// beneficiary IS the untrusted outsider.
 function forkNotice(pullNumber) {
   return {
     reason: NOT_REVIEWED_REASONS.FORK,
@@ -1107,6 +1166,7 @@ module.exports = {
   prIsFromFork,
   summarizePriorReviews,
   resolveReviewerIdentity,
+  resolveReviewerIdentities,
   isOwnArtifact,
   parseAgentArtifact,
   announceNotReviewed,

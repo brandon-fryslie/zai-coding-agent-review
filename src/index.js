@@ -12,7 +12,7 @@ if (process.argv.includes(COLLECTOR_SERVER_ARG)) {
 
 // Re-exports for test imports — all symbols the T1 test suite requires from this path.
 const { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines, unquoteCStylePath, parseGitDiffHeader } = require('./diff');
-const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentity, isOwnArtifact, fetchPriorPushbacks, pairPushbacks, roundCapReached, parseMaxRounds, isOutstandingBlock, REVIEW_MARKER } = require('./transport');
+const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentity, resolveReviewerIdentities, isOwnArtifact, fetchPriorPushbacks, pairPushbacks, roundCapReached, parseMaxRounds, isOutstandingBlock, REVIEW_MARKER } = require('./transport');
 const { TransientError, parseRetryAfterMs, transientBackoffMs } = require('./failover');
 const { classifyClaudeError } = require('./engine/claude-code');
 const { LEDGER_MARKER, ledgerEntryBody, sumCostToday, readSpentToday, appendCost } = require('./ledger');
@@ -30,6 +30,7 @@ module.exports = {
   prIsFromFork,
   summarizePriorReviews,
   resolveReviewerIdentity,
+  resolveReviewerIdentities,
   isOwnArtifact,
   fetchPriorPushbacks,
   pairPushbacks,

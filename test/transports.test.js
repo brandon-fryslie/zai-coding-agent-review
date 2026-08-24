@@ -142,7 +142,7 @@ describe('parseMaxRounds', () => {
 describe('summarizePriorReviews', () => {
   // The identity a default-GITHUB_TOKEN run resolves to, and the author its reviews carry (measured:
   // login github-actions[bot], type Bot).
-  const BOT_IDENTITY = { kind: 'bot' };
+  const BOT_IDENTITY = [{ kind: 'bot' }];
   const OURS = { login: 'github-actions[bot]', type: 'Bot' };
   // A fake octokit whose listReviews returns fixed pages; asserts the marker filter, cost sum, pagination.
   // A fixture is authored by US unless it names its own author: these cases exercise the BODY gate, so

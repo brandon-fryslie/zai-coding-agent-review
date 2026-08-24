@@ -7,6 +7,7 @@ const {
   releaseUnrevisitableBlocks, isOutstandingBlock, giteaTransport, announceReleaseFailure,
   forkNotice, roundCapNotice, submitReview, gitHubTransport, RELEASE_FAILED_MARKER,
   NOT_REVIEWED_MESSAGE, NOT_REVIEWED_REASONS, NOT_REVIEWED_MARKER_PREFIX, REVIEW_MARKER,
+  resolveReviewerIdentity, resolveReviewerIdentities,
 } = require('../src/transport');
 
 // A fake pull request: createReview appends, listReviews serves back exactly what was posted, in order.
@@ -41,7 +42,7 @@ function fakePr() {
 
 // What a default-GITHUB_TOKEN run resolves to, and the author its reviews carry (measured 2026-08-24:
 // login github-actions[bot], type Bot).
-const BOT_IDENTITY = { kind: 'bot' };
+const BOT_IDENTITY = [{ kind: 'bot' }];
 const OURS = { login: 'github-actions[bot]', type: 'Bot' };
 // Any account with read access to a public repo — the whole population that can forge a marker today.
 const STRANGER = { login: 'passer-by', type: 'User' };
@@ -320,7 +321,7 @@ describe('an untrusted PR cannot silence its own notice', () => {
   // control, which is strictly worse than the forgery. Under the login arm they are recognized by name.
   test('under a user-PAT identity our own reviews are recognized by login, and a stranger is not', async () => {
     const pr = fakePr();
-    const pat = { kind: 'login', login: 'release-bot' };
+    const pat = [{ kind: 'login', login: 'release-bot' }];
     pr.reviews.push({ id: 60, state: 'COMMENTED', user: { login: 'release-bot', type: 'User' }, body: `ours\n\n${REVIEW_MARKER}` });
     pr.reviews.push({ id: 61, state: 'COMMENTED', user: { login: 'someone-else', type: 'User' }, body: `forged\n\n${REVIEW_MARKER}` });
     assert.equal((await summarizePriorReviews(pr.octokit, 'o', 'r', PR, pat)).count, 1);
@@ -328,13 +329,34 @@ describe('an untrusted PR cannot silence its own notice', () => {
 
   // [LAW:no-silent-failure] Both permissive directions are unavailable: trusting everything restores the
   // forgery, and trusting nothing zeroes the round count and re-reviews a PR that already spent its cap.
-  test('an unresolvable identity throws rather than resolving to a lenient default', async () => {
+  test('an unresolved identity throws rather than resolving to a lenient default', async () => {
     const pr = fakePr();
     pr.reviews.push({ id: 70, user: OURS, body: `a real round\n\n${REVIEW_MARKER}` });
+    // An empty set must not answer "nothing here is ours" — that reads exactly like a PR with no prior
+    // rounds, which IS the zeroed round cap this design ranks as worse than the forgery.
+    await assert.rejects(() => summarizePriorReviews(pr.octokit, 'o', 'r', PR, []), /No reviewer identity/);
+    await assert.rejects(() => summarizePriorReviews(pr.octokit, 'o', 'r', PR, undefined), /No reviewer identity/);
     await assert.rejects(
-      () => summarizePriorReviews(pr.octokit, 'o', 'r', PR, undefined),
+      () => summarizePriorReviews(pr.octokit, 'o', 'r', PR, [{ kind: 'nonsense' }]),
       /Unknown reviewer identity kind/,
     );
+  });
+
+  // [LAW:verifiable-goals] The identity-change transition. Adding GITHUB_REVIEW_TOKEN to a repo with a
+  // live PR is a step the README recommends, and a single-value identity disowned every round posted
+  // before it — resetting the count and, worse, dropping an outstanding REQUEST_CHANGES out of the set
+  // releaseUnrevisitableBlocks can release, which is the round-cap deadlock returning by the back door.
+  test('a round posted under the other token this run holds is still ours', async () => {
+    const pr = fakePr();
+    // Rounds 1-2 ran before GITHUB_REVIEW_TOKEN was set, so the default token posted them.
+    pr.reviews.push({ id: 80, state: 'CHANGES_REQUESTED', user: OURS, body: `round 1\n\n${REVIEW_MARKER}` });
+    pr.reviews.push({ id: 81, state: 'COMMENTED', user: { login: 'release-bot', type: 'User' }, body: `round 2\n\n${REVIEW_MARKER}` });
+    pr.reviews.push({ id: 82, state: 'CHANGES_REQUESTED', user: STRANGER, body: `forged\n\n${REVIEW_MARKER}` });
+    const both = [{ kind: 'login', login: 'release-bot' }, { kind: 'bot' }];
+    const prior = await summarizePriorReviews(pr.octokit, 'o', 'r', PR, both);
+    assert.equal(prior.count, 2, 'both of our tokens\' rounds count toward the cap');
+    // The block posted under the old token stays releasable — the deadlock does not come back.
+    assert.deepEqual(prior.reviews.map(r => r.id), [80, 81]);
   });
 
   test('the accepted cost: a fork notice repeats on every push, and that is the safe direction', async () => {
@@ -896,6 +918,67 @@ describe('a block the reviewer will not revisit is released', () => {
       assert.equal(writeCalls.length, 1, 'the only credential available was tried, and it was refused');
       assert.equal(said.length, 1);
       assert.match(said[0], /repo-Admin/);
+    });
+  });
+});
+
+// [LAW:verifiable-goals] The sole gate against a forged round/notice/block marker, tested directly at
+// every arm rather than only through the one path a run() integration test happens to take.
+describe('resolveReviewerIdentity', () => {
+  // A fake octokit whose two probes answer independently, so each token kind is expressed as data.
+  const refuse = (status, message) => async () => { const e = new Error(message); e.status = status; throw e; };
+  const fake = ({ user, installation }) => ({
+    rest: { users: { getAuthenticated: typeof user === 'function' ? user : async () => ({ data: user }) } },
+    request: typeof installation === 'function' ? installation : async () => ({ data: installation }),
+  });
+  // The two measured token kinds (real Actions job, 2026-08-24).
+  const PAT = { user: { login: 'release-bot', id: 7, type: 'User' }, installation: refuse(403, 'You must authenticate with an installation access token') };
+  const INSTALLATION = { user: refuse(403, 'Resource not accessible by integration'), installation: { total_count: 1 } };
+
+  test('a user PAT names itself — the exact arm', async () => {
+    assert.deepEqual(await resolveReviewerIdentity(fake(PAT)), { kind: 'login', login: 'release-bot' });
+  });
+
+  test('an installation token is CONFIRMED as one, not inferred from the /user refusal', async () => {
+    assert.deepEqual(await resolveReviewerIdentity(fake(INSTALLATION)), { kind: 'bot' });
+  });
+
+  // [LAW:no-silent-failure] 403 is not exclusive to "Resource not accessible by integration": a secondary
+  // rate limit, SSO enforcement and some PAT scope failures answer 403 too. Reading any of them as the
+  // installation arm would resolve a PAT to `bot`, whose own reviews are type 'User' — silently zeroing
+  // the round count, the failure this design ranks as worse than the forgery it prevents.
+  test('a 403 that is NOT an installation token throws — it never falls through to the bot arm', async () => {
+    const rateLimited = fake({ user: refuse(403, 'You have exceeded a secondary rate limit'), installation: refuse(403, 'not an installation') });
+    await assert.rejects(() => resolveReviewerIdentity(rateLimited), /secondary rate limit/);
+    await assert.rejects(() => resolveReviewerIdentity(rateLimited), /not an installation token either/);
+  });
+
+  test('a bad credential throws rather than resolving to anything', async () => {
+    const bad = fake({ user: refuse(401, 'Bad credentials'), installation: refuse(401, 'Bad credentials') });
+    await assert.rejects(() => resolveReviewerIdentity(bad), /Bad credentials/);
+  });
+
+  test('a 200 that names no login throws — an unnamed identity cannot gate anything', async () => {
+    await assert.rejects(() => resolveReviewerIdentity(fake({ user: { id: 7 } })), /named no login/);
+    await assert.rejects(() => resolveReviewerIdentity(fake({ user: { login: '' } })), /named no login/);
+  });
+
+  describe('resolveReviewerIdentities', () => {
+    test('two distinct tokens yield both identities, so neither one\'s rounds are disowned', async () => {
+      assert.deepEqual(
+        await resolveReviewerIdentities([fake(PAT), fake(INSTALLATION)]),
+        [{ kind: 'login', login: 'release-bot' }, { kind: 'bot' }],
+      );
+    });
+
+    test('the ordinary single-token run collapses to one identity and one compare', async () => {
+      assert.deepEqual(await resolveReviewerIdentities([fake(INSTALLATION), fake(INSTALLATION)]), [{ kind: 'bot' }]);
+      assert.deepEqual(await resolveReviewerIdentities([fake(PAT), fake(PAT)]), [{ kind: 'login', login: 'release-bot' }]);
+    });
+
+    test('one unresolvable token fails the whole set — a partial identity is not a lenient one', async () => {
+      const bad = fake({ user: refuse(500, 'upstream error'), installation: refuse(500, 'upstream error') });
+      await assert.rejects(() => resolveReviewerIdentities([fake(INSTALLATION), bad]), /upstream error/);
     });
   });
 });

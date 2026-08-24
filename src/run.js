@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { filterFiles, buildReviewAnchors, diffChurn, excludedPathList } = require('./diff');
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentity, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = require('./transport');
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentities, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = require('./transport');
 const { buildReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
@@ -417,17 +417,25 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     return;
   }
 
-  // [LAW:parse-dont-validate] Who this run posts as, resolved ONCE, from the octokit that actually posts
-  // (reviewOctokit — the review token when set, which is a different account from the reader's). It is
-  // what makes every marker below attributable: without it, any account with read access could end a
-  // review body with REVIEW_MARKER and forge a round.
+  // [LAW:parse-dont-validate] Who this run posts as, resolved ONCE. It is what makes every marker below
+  // attributable: without it, any account with read access could end a review body with REVIEW_MARKER
+  // and forge a round — and enough forged rounds push a PR past its cap so it is never reviewed again.
+  //
+  // [LAW:one-source-of-truth] The DISTINCT tokens this run holds, deduped here where the token strings
+  // live. The review token posts and the default token reads, and they are the same account until an
+  // operator sets GITHUB_REVIEW_TOKEN — at which point earlier rounds of a live PR were posted by the
+  // OTHER one. Resolving both is what keeps those rounds ours across that change; resolving only the
+  // poster would disown them, resetting the count and stranding an outstanding block outside the set
+  // releaseUnrevisitableBlocks can release. Identical tokens resolve once, so the ordinary run pays for
+  // exactly one probe.
   //
   // Deliberately placed AFTER the fork gate. That gate decides from the already-fetched `pr` and nothing
   // else, on purpose: putting an API call in front of it would let a transient failure red a fork PR's
   // run, which is precisely the guarantee the fork path was built not to have.
-  let identity;
+  let identities;
   try {
-    identity = await resolveReviewerIdentity(reviewOctokit);
+    const distinctTokens = [...new Set([reviewToken || token, token])];
+    identities = await resolveReviewerIdentities(distinctTokens.map(t => github.getOctokit(t)));
   } catch (e) {
     core.setFailed(e.message);
     return;
@@ -445,7 +453,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   // again depend on nothing but `pr`.
   let prior;
   try {
-    prior = await summarizePriorReviews(octokit, owner, repo, pullNumber, identity);
+    prior = await summarizePriorReviews(octokit, owner, repo, pullNumber, identities);
   } catch (e) {
     core.setFailed(`Failed to summarize prior reviews for PR #${pullNumber}: ${e.message}`);
     return;

@@ -54,9 +54,10 @@ function fakeOctokit() {
   return {
     rest: {
       // The default GITHUB_TOKEN an unconfigured consumer runs on: an installation token, which refuses
-      // GET /user with 403 'Resource not accessible by integration' (measured in a real Actions job,
-      // 2026-08-24). So these run()-level tests exercise the bot arm of resolveReviewerIdentity — the
-      // arm production reaches by default — rather than a PAT path most consumers never take.
+      // GET /user with 403 'Resource not accessible by integration' and answers the installation probe
+      // below (measured in a real Actions job, 2026-08-24). So these run()-level tests exercise the bot
+      // arm of resolveReviewerIdentity — the arm production reaches by default — rather than a PAT path
+      // most consumers never take.
       users: {
         getAuthenticated: async () => {
           const e = new Error('Resource not accessible by integration');
@@ -71,8 +72,12 @@ function fakeOctokit() {
         createReview: async (args) => { host.reviews.push(args); },
       },
     },
-    // The unified-diff fallback selectTransport takes when no file carries an inline patch.
-    request: async () => ({ data: host.unifiedDiff }),
+    // Two routes reach `request`, and they must not answer for each other: the unified-diff fallback
+    // selectTransport takes when no file carries an inline patch, and the probe that CONFIRMS this token
+    // is an installation token. A catch-all would confirm the installation by coincidence.
+    request: async (route) => (route === 'GET /installation/repositories'
+      ? { data: { total_count: 1 } }
+      : { data: host.unifiedDiff }),
   };
 }
 
