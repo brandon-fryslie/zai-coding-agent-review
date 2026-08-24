@@ -48,6 +48,14 @@ jobs:
           }
           probe /user
           probe /installation/repositories
+          # Can the installation arm NAME the app, or must it hardcode a login? A workflow using a
+          # different app's token (actions/create-github-app-token) posts as <app-slug>[bot], so a
+          # hardcoded github-actions[bot] would misjudge it.
+          probe /app
+          probe "/repos/${GITHUB_REPOSITORY}/installation"
+          echo "=== response headers on an installation-token call ==="
+          curl -sS -D - -o /dev/null -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" "${GITHUB_API_URL}/installation/repositories"
           # The territory the gate would compare against: how a review THIS action posted is authored
           # when read back through the same token. jq trims the multi-KB bodies to the identity fields.
           echo "=== reviews on PR #121, identity fields only ==="
