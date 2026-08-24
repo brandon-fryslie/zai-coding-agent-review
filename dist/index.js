@@ -36530,7 +36530,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
       ? fetched.transport
       : selectTransport(octokit, owner, repo, pullNumber)), {
       owner, repo, pullNumber, reviews: prior.reviews, capMessage: message,
-      commitId: headSha, reviewerName,
+      commitId: headSha, reviewerName, releaseFailureBodies: prior.releaseFailureBodies,
     });
     return;
   }
@@ -37175,6 +37175,15 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
   // of "is this review still blocking" — the state spellings and the release-flag name — live together
   // at isOutstandingBlock, so adding a host cannot make this pagination loop wrong. [LAW:decomposition]
   const reviews = [];
+  // [LAW:one-source-of-truth] announceReleaseFailure's OWN dedup source — the raw, unprojected bodies of
+  // every release-failure notice this action has posted, collected from the SAME pagination pass rather
+  // than a second listReviews call. `reviews` above cannot serve this: it is deliberately shaped to
+  // `{id, state, dismissed}` with no body, and gated to `parseAgentArtifact` kind 'review' only — a
+  // release-failure notice carries RELEASE_FAILED_MARKER, which parseAgentArtifact does not recognize at
+  // all (by design, so it stays invisible to round-counting and latestArtifact), so it would never reach
+  // `reviews` regardless of shape. The check here is a disjoint literal match, independent of
+  // parseAgentArtifact, for exactly that reason. [LAW:carrying-cost]
+  const releaseFailureBodies = [];
   // [LAW:one-source-of-truth] The NEWEST thing this action left on the PR — a round or a not-reviewed
   // notice — read out of the SAME pass that counts rounds, so "what does this PR currently say about
   // itself" has one definition. announceNotReviewed consumes it as its idempotency key: it stays quiet
@@ -37200,6 +37209,10 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
     });
     for (const r of data) {
       const body = typeof r.body === 'string' ? r.body : '';
+      // A disjoint check, run BEFORE the parseAgentArtifact gate below: parseAgentArtifact does not
+      // recognize RELEASE_FAILED_MARKER at all (by design — see its definition), so a release-failure
+      // notice would otherwise fall straight through the `!artifact` continue and never be collected.
+      if (body.trimEnd().endsWith(RELEASE_FAILED_MARKER)) releaseFailureBodies.push(body.trimEnd());
       // [LAW:single-enforcer] ONE definition of "an agent review round" — the 'review' arm of
       // parseAgentArtifact — gates the count, the cost sum, AND the RA-review-id set, so none of the
       // three can drift from the others or from what submitReview writes.
@@ -37226,7 +37239,7 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
     if (data.length < 100) break;
     page++;
   }
-  return { count, cost: tallies, reviews, latestArtifact };
+  return { count, cost: tallies, reviews, latestArtifact, releaseFailureBodies };
 }
 
 // [LAW:effects-at-boundaries] Pure, split from the fetch below so it is testable without a fake API:
@@ -37647,12 +37660,17 @@ function unrevisitableBlockMessage(capMessage) {
 // so the two notices coexist without either clobbering the other's memory. [LAW:one-type-per-behavior]
 const RELEASE_FAILED_MARKER = '<!-- copirate-code-review-agent:release-failed -->';
 
-async function announceReleaseFailure(octokit, { owner, repo, pullNumber, commitId, reviewerName, message, reviews }) {
+async function announceReleaseFailure(octokit, {
+  owner, repo, pullNumber, commitId, reviewerName, message, releaseFailureBodies,
+}) {
   const body = `## ${reviewerName}\n\n⚠️ **BLOCK NOT RELEASED**\n\n${message}\n\n${RELEASE_FAILED_MARKER}`;
-  // [LAW:one-source-of-truth] Body equality against every review already on the PR, not just the latest —
-  // new information (a changed review-id list, a different cause) always earns a new post; unchanged
-  // content never does, on this run or any later one, regardless of what else got posted in between.
-  const alreadyPosted = reviews.some((r) => (r.body || '').trimEnd() === body);
+  // [LAW:one-source-of-truth] Body equality against every release-failure notice already on the PR, not
+  // just the latest — new information (a changed review-id list, a different cause) always earns a new
+  // post; unchanged content never does, on this run or any later one. `releaseFailureBodies` is
+  // summarizePriorReviews's OWN raw-body collection for exactly this marker (see there) — never the
+  // `reviews` array, which is shaped to `{id, state, dismissed}` with no body at all and would make this
+  // comparison permanently false. [LAW:no-silent-failure]
+  const alreadyPosted = releaseFailureBodies.includes(body);
   if (alreadyPosted) {
     core.info(`PR #${pullNumber} already carries this exact release-failure notice; not posting a duplicate.`);
     return 'already-posted';
@@ -37708,7 +37726,7 @@ async function announceReleaseFailure(octokit, { owner, repo, pullNumber, commit
 // consequence. It is reached only when something IS outstanding, so it can never red a run that had
 // nothing to release.
 async function releaseUnrevisitableBlocks(octokit, resolveTransport, {
-  owner, repo, pullNumber, reviews, capMessage, commitId, reviewerName,
+  owner, repo, pullNumber, reviews, capMessage, commitId, reviewerName, releaseFailureBodies,
 }) {
   const outstanding = reviews.filter(isOutstandingBlock);
   if (outstanding.length === 0) return 'nothing-to-release';
@@ -37722,7 +37740,9 @@ async function releaseUnrevisitableBlocks(octokit, resolveTransport, {
       + `declined to revisit (${outstanding.map(r => r.id).join(', ')}), so while it stays open it cannot `
       + 'be merged until someone dismisses them by hand.';
     core.setFailed(message);
-    await announceReleaseFailure(octokit, { owner, repo, pullNumber, commitId, reviewerName, message, reviews });
+    await announceReleaseFailure(octokit, {
+      owner, repo, pullNumber, commitId, reviewerName, message, releaseFailureBodies,
+    });
     return 'failed';
   }
 
@@ -37767,7 +37787,9 @@ async function releaseUnrevisitableBlocks(octokit, resolveTransport, {
       + 'closed or merged (both hosts refuse a dismissal then); or the host may have been detected as '
       + 'GitHub because no changed file carried a patch, in which case the dismissal used the wrong host route.';
     core.setFailed(message);
-    await announceReleaseFailure(octokit, { owner, repo, pullNumber, commitId, reviewerName, message, reviews });
+    await announceReleaseFailure(octokit, {
+      owner, repo, pullNumber, commitId, reviewerName, message, releaseFailureBodies,
+    });
     return 'failed';
   }
   return 'released';
