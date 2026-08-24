@@ -237,9 +237,12 @@ describe('summarizePriorReviews', () => {
       { id: 33, body: withCost(0.02), state: 'COMMENTED' },
     ]]);
     const { reviews } = await summarizePriorReviews(octokit, 'o', 'r', 1);
+    // Verbatim, not normalized: these GitHub-shaped fixtures carry no `dismissed` key, and the loop
+    // reports that absence rather than coercing it to `false`. Interpreting absence is the recognition
+    // rule's job, and coercing here would put half that rule in a function that promises not to interpret.
     assert.deepEqual(reviews, [
-      { id: 11, state: 'CHANGES_REQUESTED', dismissed: false },
-      { id: 33, state: 'COMMENTED', dismissed: false },
+      { id: 11, state: 'CHANGES_REQUESTED', dismissed: undefined },
+      { id: 33, state: 'COMMENTED', dismissed: undefined },
     ]);
   });
 

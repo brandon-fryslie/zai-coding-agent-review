@@ -35806,7 +35806,7 @@ const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 
 const { filterFiles, buildReviewAnchors, diffChurn } = __nccwpck_require__(9898);
-const { selectTransport, announceUnreviewable, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = __nccwpck_require__(7228);
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = __nccwpck_require__(7228);
 const { buildReviewInput } = __nccwpck_require__(3479);
 const { partitionFindings } = __nccwpck_require__(1565);
 const { buildAttributionFooter } = __nccwpck_require__(2887);
@@ -35961,10 +35961,11 @@ function warnBudgetExhausted(review) {
 // off, this runs in its original post-preflight position, unchanged. [LAW:one-source-of-truth]
 async function fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatterns) {
   core.info(`Fetching changed files for PR #${pullNumber}...`);
-  // [LAW:decomposition] The review path is what withholds approval over a refused file, so it is the
-  // path that announces one. selectTransport only builds the transport; the round-cap release resolves
-  // one too and must NOT claim anything about approval, since it submits no review.
-  const transport = announceUnreviewable(await selectTransport(octokit, owner, repo, pullNumber));
+  // Fetching a diff does NOT mean a review will be submitted: this also runs purely to size the change
+  // for the budget/difficulty gradient, before the round-cap gate, and that push can return without
+  // reviewing anything. So the refused-file warning is not announced here — submitReview owns it, being
+  // the one place a review is actually submitted. [LAW:decomposition]
+  const transport = await selectTransport(octokit, owner, repo, pullNumber);
   const filteredFiles = filterFiles(transport.files, excludePatterns);
   if (excludePatterns.length > 0) {
     const excluded = transport.files.length - filteredFiles.length;
@@ -36800,6 +36801,18 @@ function giteaTransport(files, unreviewable) {
 // section for the same reason.
 const BLOCKING_REVIEW_STATES = new Set(['CHANGES_REQUESTED', 'REQUEST_CHANGES']);
 
+// [LAW:one-source-of-truth] The projection the rule reads, owned BY the rule. "Which fields say a review
+// was released" and "which states say it is blocking" are one concern, so naming `dismissed` anywhere
+// else — as the summarize loop once did — puts half the recognition rule in a module whose own comment
+// promises it does not interpret host payloads. A host reporting release under another key changes this
+// function, beside the state set, and nothing else.
+//
+// No Boolean() coercion: isOutstandingBlock reads `!dismissed`, which already handles an absent field.
+// Coercing here made the field name look load-bearing at a site that has no business knowing it.
+function reviewReleaseFacts(review) {
+  return { state: review.state, dismissed: review.dismissed };
+}
+
 function isOutstandingBlock(review) {
   return BLOCKING_REVIEW_STATES.has(review.state) && !review.dismissed;
 }
@@ -36834,16 +36847,23 @@ async function blockStillHolds(octokit, { owner, repo, pullNumber, reviewId }) {
 // [LAW:no-silent-failure] A refused path is warned with its reason, once per run, from the same record
 // that reaches the posted review — never a second rendering.
 //
-// [LAW:decomposition] This is the REVIEW path's job, not the transport constructor's, which is why it is
-// applied by the caller rather than inside selectTransport. The sentence itself settles the question:
-// "It is reported on the PR and withholds approval" is a claim about submitting a review, and it was
-// false on the one caller that only wants a dismissal route — no review is being submitted there and no
-// approval withheld. Moving it puts the words and their position in agreement, rather than adding an
-// announce-or-not parameter that would leave the wrong sentence reachable behind a `false`.
-function announceUnreviewable(transport) {
-  transport.unreviewable.forEach(u => core.warning(
+// [LAW:decomposition] Applied by submitReview — the one place that actually submits the review this
+// sentence talks about — and by nothing else. "It is reported on the PR and withholds approval" is a
+// claim about a review being submitted, so anywhere it can fire without one, it lies.
+//
+// It lived in selectTransport, then briefly in fetchFilteredFiles, and was wrong in both: a transport is
+// also built to find a dismissal route, and a diff is also fetched merely to SIZE the change for the
+// budget/difficulty gradient — a push that then hits the round cap returns without ever submitting a
+// review, having already warned that approval was withheld. That second miss fires on every push of any
+// repo running DAILY_BUDGET_USD. Both were audits of the callers, and the audit is what kept being wrong;
+// hosting it at the sink makes it unreachable-by-construction from a path that submits nothing.
+//
+// Beside renderUnreviewableSection deliberately: the log warning and the PR's "Changed files NOT
+// reviewed" section now render the same list from one value at one site. [LAW:one-source-of-truth]
+// It takes the list rather than a transport, which is all it ever read.
+function announceUnreviewable(unreviewable) {
+  unreviewable.forEach(u => core.warning(
     `Skipping ${u.filename} from the review: ${u.reason}. It is reported on the PR and withholds approval.`));
-  return transport;
 }
 
 // [LAW:single-enforcer] Every changed-file list — GitHub's listFiles and Gitea's parsed unified diff
@@ -36958,9 +36978,11 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
   // release site has to remember. A human's REQUEST_CHANGES never enters this array, so it is not
   // reachable from there. [LAW:types-are-the-program]
   //
-  // The state words are carried VERBATIM as the host said them; this function reports, it does not
-  // interpret. Which spelling means "still blocking" is a host fact and lives on the transport, so
-  // adding a host cannot make this pagination loop wrong. [LAW:decomposition]
+  // The release facts are carried VERBATIM as the host said them, through the recognition rule's own
+  // projection (reviewReleaseFacts) rather than by naming host fields here — so this function reports
+  // and does not interpret, and that is a property of the code rather than a claim about it. Both halves
+  // of "is this review still blocking" — the state spellings and the release-flag name — live together
+  // at isOutstandingBlock, so adding a host cannot make this pagination loop wrong. [LAW:decomposition]
   const reviews = [];
   // [LAW:one-source-of-truth] The NEWEST thing this action left on the PR — a round or a not-reviewed
   // notice — read out of the SAME pass that counts rounds, so "what does this PR currently say about
@@ -37001,7 +37023,7 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
       // counting it would push a PR past its cap using a review that never happened.
       if (artifact.kind !== 'review') continue;
       count++;
-      reviews.push({ id: r.id, state: r.state, dismissed: Boolean(r.dismissed) });
+      reviews.push({ id: r.id, ...reviewReleaseFacts(r) });
       // [LAW:parse-dont-validate] The body's marker is parsed back into the Cost value that wrote it,
       // then folded by the one tally rule — this module never re-decides what a marker string means.
       // [LAW:no-silent-failure] An agent round with a numeric figure is summed into its own basis;
@@ -37223,6 +37245,8 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   // see every scope and every file may report and request changes, but it may never approve. Findings
   // outrank the partial state — an issue found in a half-reviewed diff still blocks.
   const unreviewableFiles = review.unreviewableFiles;
+  // A review IS being submitted here, so the warning's claim holds. [LAW:single-enforcer]
+  announceUnreviewable(unreviewableFiles);
   const complete = review.unreviewedScopes.length === 0 && unreviewableFiles.length === 0;
   const event = reviewEvent(requestsChanges, canApprove && complete, transport);
   const verdict = requestsChanges ? REQUEST_CHANGES_MESSAGE : (complete ? APPROVED_MESSAGE : PARTIAL_MESSAGE);

@@ -504,6 +504,32 @@ describe('a block the reviewer will not revisit is released', () => {
         assert.deepEqual(said, []);
       });
 
+      // The mirror of the test above, and the branch where the state read actually decides: the refusal
+      // is a permissions error, NOT "already released", so the re-check must find the block still live
+      // and red. Only the dismissal route throws — the GET is served normally — so the verdict comes
+      // from isOutstandingBlock on a real response rather than from the unreachable-host fallback.
+      test('a refusal that is NOT a release still reds, decided by re-reading the state', async () => {
+        const pr = fakeHost(kind);
+        const review = pr.block(101);
+        const realRequest = pr.octokit.request;
+        pr.octokit.request = async (route, params) => {
+          if (route === pr.host.route) throw new Error('403 Forbidden');
+          return realRequest(route, params);
+        };
+        const said = [];
+        const realSetFailed = core.setFailed;
+        try {
+          core.setFailed = m => said.push(m);
+          assert.equal(await release(pr, pr.reviews), 'failed');
+        } finally {
+          core.setFailed = realSetFailed;
+        }
+        assert.equal(isOutstandingBlock(review), true, 'the block really is still holding');
+        assert.equal(said.length, 1);
+        assert.match(said[0], /101/);
+        assert.match(said[0], /STILL holding the merge/);
+      });
+
       // Failing to work out HOW to dismiss is a failure to enforce the invariant, not a harmless miss:
       // the PR may be deadlocked while every other signal says the cap was handled.
       test('a thunk that throws REDS the run and says the PR is still blocked', async () => {

@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { filterFiles, buildReviewAnchors, diffChurn } = require('./diff');
-const { selectTransport, announceUnreviewable, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = require('./transport');
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = require('./transport');
 const { buildReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
@@ -160,10 +160,11 @@ function warnBudgetExhausted(review) {
 // off, this runs in its original post-preflight position, unchanged. [LAW:one-source-of-truth]
 async function fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatterns) {
   core.info(`Fetching changed files for PR #${pullNumber}...`);
-  // [LAW:decomposition] The review path is what withholds approval over a refused file, so it is the
-  // path that announces one. selectTransport only builds the transport; the round-cap release resolves
-  // one too and must NOT claim anything about approval, since it submits no review.
-  const transport = announceUnreviewable(await selectTransport(octokit, owner, repo, pullNumber));
+  // Fetching a diff does NOT mean a review will be submitted: this also runs purely to size the change
+  // for the budget/difficulty gradient, before the round-cap gate, and that push can return without
+  // reviewing anything. So the refused-file warning is not announced here — submitReview owns it, being
+  // the one place a review is actually submitted. [LAW:decomposition]
+  const transport = await selectTransport(octokit, owner, repo, pullNumber);
   const filteredFiles = filterFiles(transport.files, excludePatterns);
   if (excludePatterns.length > 0) {
     const excluded = transport.files.length - filteredFiles.length;
