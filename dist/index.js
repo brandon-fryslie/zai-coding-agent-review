@@ -33782,7 +33782,7 @@ if (process.argv.includes(COLLECTOR_SERVER_ARG)) {
 
 // Re-exports for test imports — all symbols the T1 test suite requires from this path.
 const { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines, unquoteCStylePath, parseGitDiffHeader } = __nccwpck_require__(9898);
-const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, summarizePriorReviews, fetchPriorPushbacks, pairPushbacks, roundCapReached, parseMaxRounds, isOutstandingBlock, REVIEW_MARKER } = __nccwpck_require__(7228);
+const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentity, isOwnArtifact, fetchPriorPushbacks, pairPushbacks, roundCapReached, parseMaxRounds, isOutstandingBlock, REVIEW_MARKER } = __nccwpck_require__(7228);
 const { TransientError, parseRetryAfterMs, transientBackoffMs } = __nccwpck_require__(2887);
 const { classifyClaudeError } = __nccwpck_require__(3048);
 const { LEDGER_MARKER, ledgerEntryBody, sumCostToday, readSpentToday, appendCost } = __nccwpck_require__(8192);
@@ -33799,6 +33799,8 @@ module.exports = {
   resolveReviewTarget,
   prIsFromFork,
   summarizePriorReviews,
+  resolveReviewerIdentity,
+  isOwnArtifact,
   fetchPriorPushbacks,
   pairPushbacks,
   roundCapReached,
@@ -35964,7 +35966,7 @@ const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 
 const { filterFiles, buildReviewAnchors, diffChurn, excludedPathList } = __nccwpck_require__(9898);
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = __nccwpck_require__(7228);
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentity, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = __nccwpck_require__(7228);
 const { buildReviewInput } = __nccwpck_require__(3479);
 const { partitionFindings } = __nccwpck_require__(1565);
 const { buildAttributionFooter } = __nccwpck_require__(2887);
@@ -36376,6 +36378,22 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     return;
   }
 
+  // [LAW:parse-dont-validate] Who this run posts as, resolved ONCE, from the octokit that actually posts
+  // (reviewOctokit — the review token when set, which is a different account from the reader's). It is
+  // what makes every marker below attributable: without it, any account with read access could end a
+  // review body with REVIEW_MARKER and forge a round.
+  //
+  // Deliberately placed AFTER the fork gate. That gate decides from the already-fetched `pr` and nothing
+  // else, on purpose: putting an API call in front of it would let a transient failure red a fork PR's
+  // run, which is precisely the guarantee the fork path was built not to have.
+  let identity;
+  try {
+    identity = await resolveReviewerIdentity(reviewOctokit);
+  } catch (e) {
+    core.setFailed(e.message);
+    return;
+  }
+
   // [LAW:no-silent-failure] Name the prior-review summary as the failure point, matching the PR fetch
   // above — a bare throw would surface only the generic top-level message, hiding which step failed. A
   // listReviews error fails the run loud rather than silently skipping the cap. ONE fetch feeds three
@@ -36388,7 +36406,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   // again depend on nothing but `pr`.
   let prior;
   try {
-    prior = await summarizePriorReviews(octokit, owner, repo, pullNumber);
+    prior = await summarizePriorReviews(octokit, owner, repo, pullNumber, identity);
   } catch (e) {
     core.setFailed(`Failed to summarize prior reviews for PR #${pullNumber}: ${e.message}`);
     return;
@@ -37133,15 +37151,10 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
 // produces — `latestArtifact` would stop coming back as 'not-reviewed' and the notice would re-post on
 // every push, with nothing failing to say why.
 //
-// [LAW:no-silent-failure] The artifact is trusted from body content alone, NOT from the review's author
-// — so a forged marker from any account with read access is read as this action's own output. That is
-// the pre-existing trust model of every marker consumer here (count, cost, the review set), not a
-// property of this reader; forging a REVIEW_MARKER round is the strictly stronger version of the same
-// attack. The release path inherits that model without widening it: the only block a forged marker can
-// get dismissed is the forger's own, and a human reviewer's REQUEST_CHANGES carries no marker and so is
-// unreachable from it either way.
-// Closing it needs ONE author gate covering all four values, which needs an identity mechanism that
-// must be measured under a real Actions token first: `zai-review-trust-6yp`.
+// [LAW:decomposition] This reader answers "what does this body say" and nothing else. WHO wrote it is a
+// separate question with a separate answer — isOwnArtifact, applied by summarizePriorReviews before a
+// body ever reaches here — so a marker forged by a stranger is never parsed at all rather than parsed
+// and then second-guessed. Keeping the two apart is what lets one author gate cover every consumer.
 const NOT_REVIEWED_MARKER_RE = new RegExp(
   `${NOT_REVIEWED_MARKER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([a-z-]+) -->$`,
 );
@@ -37157,6 +37170,83 @@ function parseAgentArtifact(rawBody) {
   return m ? { kind: 'not-reviewed', reason: m[1], body } : null;
 }
 
+// [LAW:parse-dont-validate] The one crossing that turns the token this run POSTS reviews with into a
+// typed identity — a value that could not have existed before the check, and that summarizePriorReviews
+// requires in its signature. Nothing downstream re-asks who we are, because inland there is nothing left
+// to ask: the identity IS the proof.
+//
+// It takes the octokit that WRITES reviews, never the one that reads them. Those are two different
+// tokens whenever GITHUB_REVIEW_TOKEN is set (run.js: `octokit` reads, `reviewOctokit` posts), and it is
+// the writer's account that authors the artifacts this gate must recognize. Resolving from the reader
+// would misjudge exactly the PAT path, which is the path that has the most to lose.
+//
+// The arms come from a measurement, not a guess — taken in a real Actions job on 2026-08-24
+// (zai-review-trust-6yp), because every cheaper discriminator is measured-WRONG. `author_association`
+// reads NONE for github-actions[bot], byte-identical to an outside contributor. `user.type === 'Bot'`
+// alone reads a user-PAT GITHUB_REVIEW_TOKEN's own reviews as not-ours, which would silently zero the
+// round count and disable a cost control — strictly worse than the forgery it set out to stop.
+//
+//   GET /user -> 200   a user PAT. It names itself, so the gate is an exact login match.
+//   GET /user -> 403   an installation token ('Resource not accessible by integration'). It CANNOT name
+//                      itself: /app and /repos/{o}/{r}/installation are JWT-only (401) and no response
+//                      header carries an app identity, so the gate recognizes it by shape instead.
+//
+// The two are opposite by construction rather than by coincidence — measured pairwise, an installation
+// token also answers 200 to /installation/repositories where a PAT answers 403 — so this is a total
+// discriminator of the two token kinds, not a claim about one endpoint's undocumented behavior.
+//
+// [LAW:no-silent-failure] Anything else is an UNRESOLVED identity and throws. Neither permissive default
+// is available: "trust everything" restores the forgery, and "trust nothing" zeroes the round count and
+// re-reviews a PR that has already spent its cap. When the question cannot be answered, saying so is the
+// only answer that isn't a lie.
+//
+// Host-agnostic by shape, not by branch: Gitea serves /user for its own token, so a Gitea runner lands
+// on the login arm with no host test — and never reaches the bot arm, whose `type` field is GitHub's.
+async function resolveReviewerIdentity(octokit) {
+  let data;
+  try {
+    ({ data } = await octokit.rest.users.getAuthenticated());
+  } catch (e) {
+    if (e.status === 403) return { kind: 'bot' };
+    throw new Error(`Could not resolve this run's own reviewer identity (GET /user): ${e.message}`);
+  }
+  const login = data && data.login;
+  if (typeof login !== 'string' || login === '') {
+    throw new Error(
+      'GET /user succeeded but named no login, so this run cannot tell its own prior reviews from a '
+      + 'forged one. Refusing to guess: a wrong answer either uncaps review spend or trusts a stranger.',
+    );
+  }
+  return { kind: 'login', login };
+}
+
+// [LAW:single-enforcer] THE author gate. Every value summarizePriorReviews derives — the round count that
+// caps spend, the cost tallies, the RA review-id set that decides which inline comments are ours and
+// which blocks may be dismissed, the not-reviewed notice's idempotency key, and the release-failure
+// dedup — passes through this one predicate, applied once per review before its body is read at all.
+// Covering one of them alone would be worse than covering none: it would make that field look protected
+// while the rest stayed forgeable, an inconsistent trust model inside a single function.
+//
+// [LAW:dataflow-not-control-flow] The branch is the identity type's own discriminator, and the default
+// arm THROWS rather than answering. An unknown kind is a programming error, and the two ways to be wrong
+// here are both silent and both expensive, so this refuses to have a lenient direction at all.
+function isOwnArtifact(identity, user) {
+  switch (identity && identity.kind) {
+    // Exact. A stranger cannot post a review as us, so a forged marker under their own login is simply
+    // not ours — the check is on the account, which the host stamps, not on anything the body can claim.
+    case 'login': return user?.login === identity.login;
+    // Structural, and sound BECAUSE the login arm exists: the one measured failure of a type test was
+    // misreading our own PAT-posted reviews, and a PAT no longer arrives here. What remains is the bar an
+    // attacker must clear — posting a review AS a Bot needs control of a GitHub App installed on this
+    // repo, not the mere read access that makes today's forgery a one-liner.
+    case 'bot': return user?.type === 'Bot';
+    default: throw new Error(
+      `Unknown reviewer identity kind: ${JSON.stringify(identity && identity.kind)}. `
+      + 'Prior reviews cannot be attributed, so the round cap and cost totals would both be wrong.',
+    );
+  }
+}
+
 // [LAW:one-source-of-truth] A completed review round IS a posted review carrying REVIEW_MARKER, and its
 // cost IS the cost marker in that same body — there is no separate counter or ledger to drift. One pass
 // over the PR's own reviews yields BOTH the round count (for the round cap) and the summed cost (for the
@@ -37164,7 +37254,7 @@ function parseAgentArtifact(rawBody) {
 // agent reviews" is one cohesive concern. The listReviews API is served by GitHub and Gitea alike and
 // both markers live in the body regardless of host, so this is host-agnostic. [LAW:no-silent-failure]
 // pagination is exhausted so a PR with many reviews is summarized in full, never truncated.
-async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
+async function summarizePriorReviews(octokit, owner, repo, pullNumber, identity) {
   let count = 0;
   // [LAW:one-type-per-behavior] Two tallies of one shape — dollars actually spent, and Anthropic
   // list price for the rounds billed to subscription quota. They are reported side by side and
@@ -37220,6 +37310,12 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
       page,
     });
     for (const r of data) {
+      // [LAW:single-enforcer] The author gate, ahead of every body read below, so that "this action wrote
+      // it" is established ONCE for the whole pass rather than per derived value. On a public repo any
+      // account with read access can submit a COMMENT review, so before this existed a stranger could end
+      // a body with REVIEW_MARKER and forge a ROUND — enough of them push a PR past MAX_REVIEW_ROUNDS and
+      // it is never reviewed again — or forge a not-reviewed notice and silence the real one.
+      if (!isOwnArtifact(identity, r.user)) continue;
       const body = typeof r.body === 'string' ? r.body : '';
       // A disjoint check, run BEFORE the parseAgentArtifact gate below: parseAgentArtifact does not
       // recognize RELEASE_FAILED_MARKER at all (by design — see its definition), so a release-failure
@@ -37867,6 +37963,8 @@ module.exports = {
   resolveReviewTarget,
   prIsFromFork,
   summarizePriorReviews,
+  resolveReviewerIdentity,
+  isOwnArtifact,
   parseAgentArtifact,
   announceNotReviewed,
   announceReleaseFailure,

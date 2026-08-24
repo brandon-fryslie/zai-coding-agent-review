@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { filterFiles, buildReviewAnchors, diffChurn, excludedPathList } = require('./diff');
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = require('./transport');
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentity, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = require('./transport');
 const { buildReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
@@ -417,6 +417,22 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     return;
   }
 
+  // [LAW:parse-dont-validate] Who this run posts as, resolved ONCE, from the octokit that actually posts
+  // (reviewOctokit — the review token when set, which is a different account from the reader's). It is
+  // what makes every marker below attributable: without it, any account with read access could end a
+  // review body with REVIEW_MARKER and forge a round.
+  //
+  // Deliberately placed AFTER the fork gate. That gate decides from the already-fetched `pr` and nothing
+  // else, on purpose: putting an API call in front of it would let a transient failure red a fork PR's
+  // run, which is precisely the guarantee the fork path was built not to have.
+  let identity;
+  try {
+    identity = await resolveReviewerIdentity(reviewOctokit);
+  } catch (e) {
+    core.setFailed(e.message);
+    return;
+  }
+
   // [LAW:no-silent-failure] Name the prior-review summary as the failure point, matching the PR fetch
   // above — a bare throw would surface only the generic top-level message, hiding which step failed. A
   // listReviews error fails the run loud rather than silently skipping the cap. ONE fetch feeds three
@@ -429,7 +445,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   // again depend on nothing but `pr`.
   let prior;
   try {
-    prior = await summarizePriorReviews(octokit, owner, repo, pullNumber);
+    prior = await summarizePriorReviews(octokit, owner, repo, pullNumber, identity);
   } catch (e) {
     core.setFailed(`Failed to summarize prior reviews for PR #${pullNumber}: ${e.message}`);
     return;

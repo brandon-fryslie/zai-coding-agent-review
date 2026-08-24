@@ -53,6 +53,17 @@ let engineFindings;
 function fakeOctokit() {
   return {
     rest: {
+      // The default GITHUB_TOKEN an unconfigured consumer runs on: an installation token, which refuses
+      // GET /user with 403 'Resource not accessible by integration' (measured in a real Actions job,
+      // 2026-08-24). So these run()-level tests exercise the bot arm of resolveReviewerIdentity — the
+      // arm production reaches by default — rather than a PAT path most consumers never take.
+      users: {
+        getAuthenticated: async () => {
+          const e = new Error('Resource not accessible by integration');
+          e.status = 403;
+          throw e;
+        },
+      },
       pulls: {
         get: async () => ({ data: { number: 7, labels: [], body: '', user: { login: 'author' }, base: { repo: { id: 1 } }, head: { repo: { id: 1 } } } }),
         listFiles: async () => ({ data: host.files }),

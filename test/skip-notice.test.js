@@ -27,7 +27,10 @@ function fakePr() {
         pulls: {
           createReview: async params => {
             const state = GITHUB_EVENT_TO_STATE[params.event] || 'COMMENTED';
-            reviews.push({ id: reviews.length + 1, state, ...params });
+            // Authored by us: this fake stores exactly the reviews the action posted, and on the
+            // default token those come back authored by github-actions[bot]. Stamping it here keeps the
+            // round trip whole now that summarizePriorReviews gates on the author as well as the body.
+            reviews.push({ id: reviews.length + 1, state, user: OURS, ...params });
           },
           listReviews: async ({ page }) => ({ data: page === 1 ? reviews : [] }),
         },
@@ -35,6 +38,13 @@ function fakePr() {
     },
   };
 }
+
+// What a default-GITHUB_TOKEN run resolves to, and the author its reviews carry (measured 2026-08-24:
+// login github-actions[bot], type Bot).
+const BOT_IDENTITY = { kind: 'bot' };
+const OURS = { login: 'github-actions[bot]', type: 'Bot' };
+// Any account with read access to a public repo — the whole population that can forge a marker today.
+const STRANGER = { login: 'passer-by', type: 'User' };
 
 const PR = 7;
 const CAP_MESSAGE = `PR #${PR} has already been reviewed 5 time(s), reaching the MAX_REVIEW_ROUNDS cap `
@@ -49,7 +59,7 @@ const announce = (octokit, notice, commitId = 'sha') => announceNotReviewed(octo
 
 // One capped push: read the PR's current state, then announce — exactly the sequence runPrReview runs.
 async function cappedPush(pr, commitId, message = CAP_MESSAGE) {
-  const prior = await summarizePriorReviews(pr.octokit, 'o', 'r', PR);
+  const prior = await summarizePriorReviews(pr.octokit, 'o', 'r', PR, BOT_IDENTITY);
   return announce(pr.octokit, roundCapNotice(message, prior.latestArtifact), commitId);
 }
 
@@ -100,7 +110,7 @@ describe('a review-less run speaks at the PR', () => {
   test('a notice is never counted as a review round, so it cannot spend the cap it reports', async () => {
     const pr = fakePr();
     await cappedPush(pr, 'sha1');
-    const prior = await summarizePriorReviews(pr.octokit, 'o', 'r', PR);
+    const prior = await summarizePriorReviews(pr.octokit, 'o', 'r', PR, BOT_IDENTITY);
     assert.equal(prior.count, 0);
     assert.deepEqual(prior.reviews, []);
     assert.equal(prior.cost.billed.count, 0);
@@ -174,13 +184,13 @@ describe('a review-less run speaks at the PR', () => {
       rest: {
         pulls: {
           listReviews: async ({ page }) => ({
-            data: page === 1 ? [{ id: 9, body: round }, { id: 4, body: notice }] : [],
+            data: page === 1 ? [{ id: 9, body: round, user: OURS }, { id: 4, body: notice, user: OURS }] : [],
           }),
         },
       },
     };
     // The round has the higher id, so it is the newest agent artifact even though the notice came last.
-    const prior = await summarizePriorReviews(descending, 'o', 'r', PR);
+    const prior = await summarizePriorReviews(descending, 'o', 'r', PR, BOT_IDENTITY);
     assert.deepEqual(prior.latestArtifact, { kind: 'review' });
   });
 });
@@ -270,16 +280,61 @@ describe('a notice that cannot be posted is as loud as the gap it was hiding', (
 describe('an untrusted PR cannot silence its own notice', () => {
   test('a forged notice already on the PR does not suppress the real one', async () => {
     const pr = fakePr();
-    // The PR author plants a body carrying the action's own fork marker.
-    pr.reviews.push({ id: 99, body: `nothing to see here\n\n${NOT_REVIEWED_MARKER_PREFIX}fork -->` });
-    // It parses as an artifact — the reader cannot tell forged from genuine, which is the open problem
-    // tracked as zai-review-trust-6yp.
-    const prior = await summarizePriorReviews(pr.octokit, 'o', 'r', PR);
-    assert.equal(prior.latestArtifact.reason, 'fork');
-    // forkNotice never consults it, so the real notice lands anyway.
+    // The PR author plants a body carrying the action's own fork marker, under their own account.
+    pr.reviews.push({ id: 99, body: `nothing to see here\n\n${NOT_REVIEWED_MARKER_PREFIX}fork -->`, user: STRANGER });
+    // The author gate refuses it before the body is read, so it is not an artifact at all (zai-review-trust-6yp).
+    const prior = await summarizePriorReviews(pr.octokit, 'o', 'r', PR, BOT_IDENTITY);
+    assert.equal(prior.latestArtifact, null);
+    // And forkNotice consults no key regardless, so the real notice lands by two independent routes.
     assert.equal(await announce(pr.octokit, forkNotice(PR)), 'posted');
     assert.equal(pr.reviews.length, 2);
     assert.ok(pr.reviews[1].body.includes(NOT_REVIEWED_MESSAGE));
+  });
+
+  // [LAW:verifiable-goals] AC #4 for zai-review-trust-6yp. On a public repo ANY account with read access
+  // can submit a COMMENT review, so before the author gate a stranger could end a body with REVIEW_MARKER
+  // and forge a ROUND — enough of them push a PR past MAX_REVIEW_ROUNDS and it is never reviewed again.
+  // One gate, so this asserts ALL FOUR derived values at once: a partial fix that protected one while the
+  // others stayed forgeable would be worse than none.
+  test("a stranger's forged REVIEW_MARKER round contributes to none of the derived values", async () => {
+    const pr = fakePr();
+    pr.reviews.push({ id: 50, state: 'CHANGES_REQUESTED', user: STRANGER, body: `forged round\n\n${REVIEW_MARKER}` });
+    pr.reviews.push({ id: 51, state: 'CHANGES_REQUESTED', user: STRANGER, body: `also forged\n\n${REVIEW_MARKER}` });
+    const prior = await summarizePriorReviews(pr.octokit, 'o', 'r', PR, BOT_IDENTITY);
+    assert.equal(prior.count, 0, 'a forged round must not push the PR toward its cap');
+    assert.equal(prior.cost.billed.count, 0, 'a forged cost marker must not be summed');
+    assert.deepEqual(prior.reviews, [], 'a stranger\'s block is not ours to dismiss');
+    assert.equal(prior.latestArtifact, null, 'a forged notice must not act as our idempotency key');
+  });
+
+  test("the same forged body under OUR account still counts — the gate is the author, not the text", async () => {
+    const pr = fakePr();
+    pr.reviews.push({ id: 50, state: 'CHANGES_REQUESTED', user: OURS, body: `a real round\n\n${REVIEW_MARKER}` });
+    const prior = await summarizePriorReviews(pr.octokit, 'o', 'r', PR, BOT_IDENTITY);
+    assert.equal(prior.count, 1);
+    assert.deepEqual(prior.reviews, [{ id: 50, state: 'CHANGES_REQUESTED', dismissed: undefined }]);
+  });
+
+  // The identity arms are what make the gate total. A user-PAT GITHUB_REVIEW_TOKEN posts as a User, so a
+  // type-only test would read our OWN rounds as not-ours and silently zero the count — disabling a cost
+  // control, which is strictly worse than the forgery. Under the login arm they are recognized by name.
+  test('under a user-PAT identity our own reviews are recognized by login, and a stranger is not', async () => {
+    const pr = fakePr();
+    const pat = { kind: 'login', login: 'release-bot' };
+    pr.reviews.push({ id: 60, state: 'COMMENTED', user: { login: 'release-bot', type: 'User' }, body: `ours\n\n${REVIEW_MARKER}` });
+    pr.reviews.push({ id: 61, state: 'COMMENTED', user: { login: 'someone-else', type: 'User' }, body: `forged\n\n${REVIEW_MARKER}` });
+    assert.equal((await summarizePriorReviews(pr.octokit, 'o', 'r', PR, pat)).count, 1);
+  });
+
+  // [LAW:no-silent-failure] Both permissive directions are unavailable: trusting everything restores the
+  // forgery, and trusting nothing zeroes the round count and re-reviews a PR that already spent its cap.
+  test('an unresolvable identity throws rather than resolving to a lenient default', async () => {
+    const pr = fakePr();
+    pr.reviews.push({ id: 70, user: OURS, body: `a real round\n\n${REVIEW_MARKER}` });
+    await assert.rejects(
+      () => summarizePriorReviews(pr.octokit, 'o', 'r', PR, undefined),
+      /Unknown reviewer identity kind/,
+    );
   });
 
   test('the accepted cost: a fork notice repeats on every push, and that is the safe direction', async () => {
@@ -709,7 +764,7 @@ describe('a block the reviewer will not revisit is released', () => {
     const realSetFailed = core.setFailed;
     core.setFailed = () => {};
     try {
-      const prior1 = await summarizePriorReviews(pr.octokit, 'o', 'r', PR);
+      const prior1 = await summarizePriorReviews(pr.octokit, 'o', 'r', PR, BOT_IDENTITY);
       assert.equal(prior1.releaseFailureBodies.length, 0, 'no release-failure notice exists yet');
       const result1 = await releaseUnrevisitableBlocks(pr.octokit, () => failingTransport, {
         owner: 'o', repo: 'r', pullNumber: PR, reviews: prior1.reviews, capMessage: CAP_MESSAGE,
@@ -720,7 +775,7 @@ describe('a block the reviewer will not revisit is released', () => {
       assert.equal(posted.length, 1, 'a real run posts exactly one release-failure notice');
 
       // Exactly what the NEXT push does: a fresh summarizePriorReviews, a fresh release attempt.
-      const prior2 = await summarizePriorReviews(pr.octokit, 'o', 'r', PR);
+      const prior2 = await summarizePriorReviews(pr.octokit, 'o', 'r', PR, BOT_IDENTITY);
       assert.equal(prior2.releaseFailureBodies.length, 1, 'summarizePriorReviews itself now finds the notice');
       const before = pr.reviews.length;
       const result2 = await releaseUnrevisitableBlocks(pr.octokit, () => failingTransport, {
