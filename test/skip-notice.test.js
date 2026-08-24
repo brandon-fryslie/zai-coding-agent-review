@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const core = require('@actions/core');
 const {
   announceNotReviewed, renderNotReviewedBody, parseAgentArtifact, summarizePriorReviews,
+  releaseUnrevisitableBlocks, isOutstandingBlock, giteaTransport,
   forkNotice, roundCapNotice, submitReview, gitHubTransport,
   NOT_REVIEWED_MESSAGE, NOT_REVIEWED_REASONS, NOT_REVIEWED_MARKER_PREFIX, REVIEW_MARKER,
 } = require('../src/transport');
@@ -94,7 +95,7 @@ describe('a review-less run speaks at the PR', () => {
     await cappedPush(pr, 'sha1');
     const prior = await summarizePriorReviews(pr.octokit, 'o', 'r', PR);
     assert.equal(prior.count, 0);
-    assert.deepEqual(prior.reviewIds, []);
+    assert.deepEqual(prior.reviews, []);
     assert.equal(prior.cost.billed.count, 0);
     assert.equal(prior.cost.billed.unknownCount, 0);
     assert.equal(prior.latestArtifact.kind, 'not-reviewed');
@@ -312,5 +313,308 @@ describe('parseAgentArtifact', () => {
     const notice = renderNotReviewedBody('RA', roundCapNotice(CAP_MESSAGE, null));
     assert.equal(notice.trimEnd().endsWith(REVIEW_MARKER), false);
     assert.equal(parseAgentArtifact(notice).kind, 'not-reviewed');
+  });
+});
+
+// The two hosts' MEASURED dismissal contracts, as one table. Both rows were verified against live
+// instances (github.com and Gitea v1.27.1) — see the transport constructors for the evidence. The fake
+// below serves EXACTLY the row it is built for and 404s anything else, so a transport that sent GitHub's
+// verb to Gitea fails here instead of at 3am on a deadlocked PR. A permissive fake accepting either route
+// on either host would pass a swapped implementation, which is the one defect this seam exists to
+// prevent. [LAW:behavior-not-structure] the contract asserted is "the block is released on this host",
+// never "these functions were called".
+const HOSTS = {
+  github: {
+    transport: () => gitHubTransport([], []),
+    // A live GitHub review carries NO `dismissed` key at all, so the shape below is the real one — a fake
+    // that helpfully added `dismissed: false` would hide a predicate that required the field.
+    liveBlock: id => ({ id, state: 'CHANGES_REQUESTED' }),
+    route: 'PUT /repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}/dismissals',
+    targetId: params => params.review_id,
+    // GitHub REPLACES the state; the review is no longer CHANGES_REQUESTED afterwards.
+    markDismissed: review => { review.state = 'DISMISSED'; },
+    isLive: review => review.state === 'CHANGES_REQUESTED',
+  },
+  gitea: {
+    transport: () => giteaTransport([], []),
+    liveBlock: id => ({ id, state: 'REQUEST_CHANGES', dismissed: false }),
+    route: 'POST /repos/{owner}/{repo}/pulls/{index}/reviews/{id}/dismissals',
+    targetId: params => params.id,
+    // Gitea KEEPS state='REQUEST_CHANGES' and flips a flag — the case that makes a state-only predicate
+    // re-dismiss the same review on every single push.
+    markDismissed: review => { review.dismissed = true; },
+    isLive: review => !review.dismissed,
+  },
+};
+
+function fakeHost(kind) {
+  const host = HOSTS[kind];
+  const reviews = [];
+  const calls = [];
+  // Counted, not just captured: "the route was never resolved" is the perf contract, and only a count
+  // can assert the absence of a call.
+  let transportResolutions = 0;
+  return {
+    host,
+    reviews,
+    calls,
+    get transportResolutions() { return transportResolutions; },
+    resolveTransport: () => {
+      transportResolutions += 1;
+      return host.transport();
+    },
+    block(id) {
+      const review = host.liveBlock(id);
+      reviews.push(review);
+      return review;
+    },
+    octokit: {
+      request: async (route, params) => {
+        // The single-review read is served at the SAME literal path by both hosts (verified live), which
+        // is why the re-check needs no transport member. The fake serves it from the same store the
+        // dismissal mutates, so "already dismissed" is a real round trip and not a stubbed answer.
+        if (route === 'GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}') {
+          const found = reviews.find(r => r.id === params.review_id);
+          if (!found) throw new Error(`404 no review ${params.review_id}`);
+          return { data: found };
+        }
+        if (route !== host.route) throw new Error(`404 Not Found: ${kind} does not serve "${route}"`);
+        const target = reviews.find(r => r.id === host.targetId(params));
+        if (!target) throw new Error(`404 no review ${JSON.stringify(host.targetId(params))} on this PR`);
+        // Neither host makes dismissal idempotent — GitHub answers a second attempt with 422 "Can not
+        // dismiss a dismissed pull request review" (measured). Modelling that is the whole point: a
+        // permissive fake would let the release loop look correct while reddening real runs.
+        if (!host.isLive(target)) throw new Error('422 Can not dismiss a dismissed pull request review');
+        calls.push(params);
+        host.markDismissed(target);
+        return { data: target };
+      },
+    },
+  };
+}
+
+const release = (pr, reviews, resolveTransport = pr.resolveTransport) =>
+  releaseUnrevisitableBlocks(pr.octokit, resolveTransport, {
+    owner: 'o', repo: 'r', pullNumber: PR, reviews, capMessage: CAP_MESSAGE,
+  });
+
+describe('a block the reviewer will not revisit is released', () => {
+  for (const kind of Object.keys(HOSTS)) {
+    describe(kind, () => {
+      // The deadlock in one test: the round cap says "never again" while a REQUEST_CHANGES still gates
+      // the merge, so an author who fixed every finding cannot merge and no re-review can ever clear it.
+      test('the action dismisses its OWN outstanding block', async () => {
+        const pr = fakeHost(kind);
+        const blocked = pr.block(101);
+        assert.equal(await release(pr, pr.reviews), 'released');
+        assert.equal(pr.calls.length, 1);
+        assert.equal(pr.host.targetId(pr.calls[0]), 101);
+        assert.equal(isOutstandingBlock(blocked), false, 'the PR is no longer blocked');
+      });
+
+      // A PR that drew findings on more than one round before hitting the cap carries SEVERAL reviews
+      // that all still block: neither host retroactively rewrites an earlier round's state when a later
+      // round posts. Releasing only one of them would leave the PR just as deadlocked.
+      test('every outstanding block is released, not just the newest', async () => {
+        const pr = fakeHost(kind);
+        const blocked = [pr.block(101), pr.block(102), pr.block(103)];
+        assert.equal(await release(pr, pr.reviews), 'released');
+        assert.deepEqual(pr.calls.map(c => pr.host.targetId(c)), [101, 102, 103]);
+        assert.deepEqual(blocked.filter(isOutstandingBlock), [], 'no block left holding the merge');
+      });
+
+      // The partial path is where a `return` in the catch instead of a `push` would hide: the first
+      // review would silently stay blocked while the run reported one tidy failure.
+      test('one refused dismissal does not abandon the others, and only it is named', async () => {
+        const pr = fakeHost(kind);
+        const first = pr.block(101);
+        const second = pr.block(102);
+        const realRequest = pr.octokit.request;
+        pr.octokit.request = async (route, params) => {
+          if (pr.host.targetId(params) === 102) throw new Error('403 Forbidden');
+          return realRequest(route, params);
+        };
+        const said = [];
+        const realSetFailed = core.setFailed;
+        const before = process.exitCode;
+        try {
+          process.exitCode = 0;
+          core.setFailed = m => said.push(m);
+          assert.equal(await release(pr, pr.reviews), 'failed');
+        } finally {
+          core.setFailed = realSetFailed;
+          process.exitCode = before;
+        }
+        assert.equal(isOutstandingBlock(first), false, 'the reachable block was still released');
+        assert.equal(isOutstandingBlock(second), true, 'the refused one is honestly still blocking');
+        assert.equal(said.length, 1);
+        assert.match(said[0], /102/);
+        assert.equal(/\b101\b/.test(said[0]), false, 'the released review is not reported as a failure');
+      });
+
+      // Without this the reviewer would post a fresh dismissal on every push for the rest of the PR's
+      // life. It falls out of the predicate rather than a flag: a released review is not outstanding.
+      test('a second capped push releases nothing — the release is idempotent', async () => {
+        const pr = fakeHost(kind);
+        pr.block(101);
+        await release(pr, pr.reviews);
+        assert.equal(await release(pr, pr.reviews), 'nothing-to-release');
+        assert.equal(pr.calls.length, 1);
+      });
+
+      // The route is never even resolved here. That is the perf contract, not an incidental detail: this
+      // is the shape of every capped push for the rest of the PR's life, and resolving a transport would
+      // re-list every changed file (and on Gitea re-fetch the whole unified diff) each time.
+      test('a PR with no outstanding block is untouched, and no route is resolved', async () => {
+        const pr = fakeHost(kind);
+        pr.reviews.push({ id: 7, state: 'COMMENTED', dismissed: false });
+        assert.equal(await release(pr, pr.reviews), 'nothing-to-release');
+        assert.equal(pr.calls.length, 0);
+        assert.equal(pr.transportResolutions, 0, 'no diff fetch on the common capped push');
+      });
+
+      test('the route IS resolved once when there is something to release', async () => {
+        const pr = fakeHost(kind);
+        pr.block(101);
+        pr.block(102);
+        assert.equal(await release(pr, pr.reviews), 'released');
+        assert.equal(pr.transportResolutions, 1, 'resolved once for the whole release, not per review');
+      });
+
+      // Dismissal is not idempotent at either host, so a review someone else released between the
+      // snapshot and the call answers with a hard error. The goal is a STATE though, and that state is
+      // satisfied — reporting it as failure would red a build over a PR that is not blocked at all.
+      test('a block someone else already released is not reported as a failure', async () => {
+        const pr = fakeHost(kind);
+        const review = pr.block(101);
+        pr.host.markDismissed(review); // a human, or a racing run, got there first
+        const said = [];
+        const realSetFailed = core.setFailed;
+        const before = process.exitCode;
+        try {
+          process.exitCode = 0;
+          core.setFailed = m => said.push(m);
+          // The snapshot still remembers it as outstanding, exactly as summarizePriorReviews would.
+          assert.equal(await release(pr, [{ ...review, ...pr.host.liveBlock(101) }]), 'released');
+          assert.equal(process.exitCode, 0, 'a PR that is not blocked must not red the run');
+        } finally {
+          core.setFailed = realSetFailed;
+          process.exitCode = before;
+        }
+        assert.deepEqual(said, []);
+      });
+
+      // The mirror of the test above, and the branch where the state read actually decides: the refusal
+      // is a permissions error, NOT "already released", so the re-check must find the block still live
+      // and red. Only the dismissal route throws — the GET is served normally — so the verdict comes
+      // from isOutstandingBlock on a real response rather than from the unreachable-host fallback.
+      test('a refusal that is NOT a release still reds, decided by re-reading the state', async () => {
+        const pr = fakeHost(kind);
+        const review = pr.block(101);
+        const realRequest = pr.octokit.request;
+        pr.octokit.request = async (route, params) => {
+          if (route === pr.host.route) throw new Error('403 Forbidden');
+          return realRequest(route, params);
+        };
+        const said = [];
+        const realSetFailed = core.setFailed;
+        try {
+          core.setFailed = m => said.push(m);
+          assert.equal(await release(pr, pr.reviews), 'failed');
+        } finally {
+          core.setFailed = realSetFailed;
+        }
+        assert.equal(isOutstandingBlock(review), true, 'the block really is still holding');
+        assert.equal(said.length, 1);
+        assert.match(said[0], /101/);
+        assert.match(said[0], /STILL holding the merge/);
+      });
+
+      // Failing to work out HOW to dismiss is a failure to enforce the invariant, not a harmless miss:
+      // the PR may be deadlocked while every other signal says the cap was handled.
+      test('a thunk that throws REDS the run and says the PR is still blocked', async () => {
+        const pr = fakeHost(kind);
+        pr.block(101);
+        const said = [];
+        const realSetFailed = core.setFailed;
+        try {
+          core.setFailed = m => said.push(m);
+          const boom = () => { throw new Error('listFiles exploded'); };
+          assert.equal(await release(pr, pr.reviews, boom), 'failed');
+        } finally {
+          core.setFailed = realSetFailed;
+        }
+        assert.equal(pr.calls.length, 0);
+        assert.match(said[0], /listFiles exploded/);
+        assert.match(said[0], /left blocked by review\(s\) this action has declined to revisit/);
+        // The operator is told WHICH review to go dismiss by hand — the same specificity the
+        // refused-dismissal path gives, on the path that never got as far as naming one.
+        assert.match(said[0], /\b101\b/);
+      });
+
+      test('the dismissal says the findings were NOT re-checked', async () => {
+        const pr = fakeHost(kind);
+        pr.block(101);
+        await release(pr, pr.reviews);
+        const { message } = pr.calls[0];
+        // A dismissal that just vanished would read as "the reviewer looked again and is satisfied".
+        assert.match(message, /NOT re-checked and are NOT confirmed fixed/);
+        assert.match(message, /removes only the merge block/);
+        // The remedy is single-sourced with the notice, so the PR cannot state two different ones.
+        assert.ok(message.includes(CAP_MESSAGE), 'carries the same cap sentence the notice carries');
+      });
+
+      // A dismissal the host refused leaves the PR exactly as deadlocked, while every other signal says
+      // the cap was handled — green-and-stuck is the state this whole mechanism exists to abolish.
+      test('a refused dismissal REDS the run and says the PR is still blocked', async () => {
+        const pr = fakeHost(kind);
+        pr.block(101);
+        pr.octokit.request = async () => { throw new Error('403 Forbidden'); };
+        const before = process.exitCode;
+        try {
+          process.exitCode = 0;
+          assert.equal(await release(pr, pr.reviews), 'failed');
+          assert.equal(process.exitCode, 1, 'a still-deadlocked PR must not also be green');
+        } finally {
+          process.exitCode = before;
+        }
+      });
+    });
+  }
+
+  // Three spellings for one concept: the event SUBMITTED is REQUEST_CHANGES on both hosts, but the state
+  // READ BACK differs, and Gitea's dismissed review keeps the live spelling. Reading GitHub's word on
+  // Gitea never releases anything; reading Gitea's word on GitHub re-dismisses forever.
+  test('one predicate accepts each host live block and rejects each host released shape', () => {
+    // GitHub: no `dismissed` key exists at all, and a released review changes STATE.
+    assert.equal(isOutstandingBlock({ state: 'CHANGES_REQUESTED' }), true);
+    assert.equal(isOutstandingBlock({ state: 'DISMISSED' }), false);
+    // Gitea: the state is UNCHANGED by dismissal, so only the flag separates live from released. This
+    // pair is the whole reason the predicate cannot read state alone.
+    assert.equal(isOutstandingBlock({ state: 'REQUEST_CHANGES', dismissed: false }), true);
+    assert.equal(isOutstandingBlock({ state: 'REQUEST_CHANGES', dismissed: true }), false);
+    // Neither host's non-blocking verdicts are ever mistaken for a block.
+    for (const state of ['APPROVED', 'COMMENTED', 'PENDING']) {
+      assert.equal(isOutstandingBlock({ state }), false, state);
+    }
+  });
+
+  // A host that reports no dismissal state at all cannot be served idempotently — dismissal is not a
+  // no-op on either host — so the choice is between reddening every push and silently never releasing.
+  // Absence-as-live is the loud direction, pinned here rather than left to Boolean(undefined) by accident.
+  test('a review reporting no dismissal state at all is treated as live, not as released', () => {
+    assert.equal(isOutstandingBlock({ state: 'REQUEST_CHANGES' }), true);
+    // The alternative reading would leave a real block unreleased with nothing said — the exact
+    // deadlock this feature exists to abolish, reached silently.
+    assert.equal(isOutstandingBlock({ state: 'REQUEST_CHANGES', dismissed: undefined }), true);
+  });
+
+  // Gitea dismisses `priors: false` — `true` would sweep every earlier review on the PR, including a
+  // human's. The action releases only the block it is itself holding.
+  test('the Gitea dismissal never sweeps prior reviews', async () => {
+    const pr = fakeHost('gitea');
+    pr.block(101);
+    await release(pr, pr.reviews);
+    assert.equal(pr.calls[0].priors, false);
   });
 });
