@@ -36303,10 +36303,12 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     core.setSecret(reviewToken);
   }
   // itv.4.1: Gitea's dismiss-review endpoint 403s the review token (write access posts a review fine,
-  // but dismissing one needs repo-Admin — MEASURED live). Unset on GitHub, where reviewToken already
-  // dismisses its own reviews: releaseUnrevisitableBlocks's `dismissOctokit = octokit` default then
-  // applies and nothing changes there.
-  const dismissToken = core.getInput('GITEA_DISMISS_TOKEN');
+  // but dismissing one needs repo-Admin — MEASURED live). Deliberately NOT host-gated: the credential
+  // is used for the dismissal write wherever it is set, so this reads one input and holds one value
+  // rather than resolving a transport just to decide which token to carry. [LAW:dataflow-not-control-flow]
+  // Left unset (the usual case, and every GitHub run) releaseUnrevisitableBlocks's `dismissOctokit =
+  // octokit` default applies and nothing changes.
+  const dismissToken = core.getInput('DISMISS_TOKEN');
   if (dismissToken) {
     core.setSecret(dismissToken);
   }
@@ -37736,12 +37738,16 @@ async function announceReleaseFailure(octokit, {
 // consequence. It is reached only when something IS outstanding, so it can never red a run that had
 // nothing to release.
 // [LAW:no-silent-failure] `dismissOctokit` defaults to `octokit` — the pre-itv.4.1 behavior — so a caller
-// that never passes it (every test below, and a run with no GITEA_DISMISS_TOKEN configured) gets exactly
+// that never passes it (every test below, and a run with no DISMISS_TOKEN configured) gets exactly
 // today's dismissal, unchanged. It exists because Gitea's dismiss-review endpoint requires the dismissing
 // account to hold repo-Admin (MEASURED against a live Gitea 1.27.1: the "write" access that is enough to
 // post a review 403s here), while GitHub's needs nothing more than the review token already carries — so
 // only the WRITE this function makes needs a second, more-privileged identity; every read in this module
 // (blockStillHolds, the listReviews this is fed from) stays on the ordinary `octokit`. [LAW:single-enforcer]
+// The identity is a CARRIED VALUE, never a host test: whoever the caller hands in dismisses, on either
+// host. Gating it on `transport` would resolve the thunk below just to choose a credential — the exact
+// re-listing this function is shaped to avoid — and re-open the host branch that the two-arm `TRANSPORTS`
+// table exists to keep out of here. [LAW:dataflow-not-control-flow]
 async function releaseUnrevisitableBlocks(octokit, resolveTransport, {
   owner, repo, pullNumber, reviews, capMessage, commitId, reviewerName, releaseFailureBodies,
   dismissOctokit = octokit,

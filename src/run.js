@@ -344,10 +344,12 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     core.setSecret(reviewToken);
   }
   // itv.4.1: Gitea's dismiss-review endpoint 403s the review token (write access posts a review fine,
-  // but dismissing one needs repo-Admin — MEASURED live). Unset on GitHub, where reviewToken already
-  // dismisses its own reviews: releaseUnrevisitableBlocks's `dismissOctokit = octokit` default then
-  // applies and nothing changes there.
-  const dismissToken = core.getInput('GITEA_DISMISS_TOKEN');
+  // but dismissing one needs repo-Admin — MEASURED live). Deliberately NOT host-gated: the credential
+  // is used for the dismissal write wherever it is set, so this reads one input and holds one value
+  // rather than resolving a transport just to decide which token to carry. [LAW:dataflow-not-control-flow]
+  // Left unset (the usual case, and every GitHub run) releaseUnrevisitableBlocks's `dismissOctokit =
+  // octokit` default applies and nothing changes.
+  const dismissToken = core.getInput('DISMISS_TOKEN');
   if (dismissToken) {
     core.setSecret(dismissToken);
   }
