@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { filterFiles, buildReviewAnchors, diffChurn } = require('./diff');
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = require('./transport');
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = require('./transport');
 const { buildReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
@@ -530,6 +530,37 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
       owner, repo, pullNumber, commitId: headSha, reviewerName,
       notice: roundCapNotice(message, prior.latestArtifact),
     });
+    // Say it, then stop enforcing it. Announcing that the PR will not be reviewed again while still
+    // holding a REQUEST_CHANGES against it is the deadlock this exit used to create: the cap can even
+    // shrink BENEATH a block already posted (a first round costing enough to de-rate the cap to 1 leaves
+    // round 1's rejection permanently unsupersedable), so refusing to post the final round's block would
+    // not have covered this. Releasing at the moment the action declines to look again covers every path
+    // to it, which is why this is the only enforcement site. [LAW:single-enforcer]
+    //
+    // The transport is reused when the budget/difficulty phase already selected one, and selected here
+    // otherwise — the same fetch-once-reuse shape the review path uses below. This is the skip path only;
+    // the reviewing path is untouched. [LAW:one-source-of-truth]
+    //
+    // [LAW:no-silent-failure] Not being ABLE to tell whether a block is outstanding is itself a failure
+    // to enforce the invariant, not a harmless miss — the PR may be sitting deadlocked while the run
+    // reports the cap was handled — so it reds here rather than falling through to the generic top-level
+    // handler, which would name neither the PR nor the consequence.
+    let capTransport;
+    try {
+      capTransport = fetched
+        ? fetched.transport
+        : await selectTransport(octokit, owner, repo, pullNumber);
+    } catch (e) {
+      core.setFailed(
+        `Could not determine whether PR #${pullNumber} is still blocked by a review this action has `
+        + `declined to revisit: ${e.message}. If it is, the pull request cannot be merged until someone `
+        + 'dismisses that review by hand.',
+      );
+      return;
+    }
+    await releaseUnrevisitableBlocks(reviewOctokit, capTransport, {
+      owner, repo, pullNumber, reviews: prior.reviews, capMessage: message,
+    });
     return;
   }
 
@@ -572,7 +603,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   const dependencySummaries = await resolveDependencySummaries(octokit, filteredFiles, dependencyDiffOn);
   // [LAW:dataflow-not-control-flow] Prior-round pushbacks (the PR author's replies to earlier findings)
   // feed this round's workers so RA stops re-litigating soundly-rebutted points. The pairing is keyed by
-  // IDENTITY: findings are the inline comments of RA's marker-bearing reviews (prior.reviewIds), and a
+  // IDENTITY: findings are the inline comments of RA's marker-bearing reviews (prior.reviews), and a
   // pushback is a reply authored by the PR author (pr.user.login) — so a human reviewer's thread or a
   // bystander's reply is never misattributed as RA's finding / the author's rebuttal. The fetch is gated on
   // prior.count: with zero prior RA reviews there are no findings and thus no replies, so the result is
@@ -588,7 +619,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   let priorPushbacks = [];
   if (prior.count > 0) {
     try {
-      priorPushbacks = await fetchPriorPushbacks(octokit, owner, repo, pullNumber, { findingReviewIds: prior.reviewIds, authorLogin: pr.user?.login });
+      priorPushbacks = await fetchPriorPushbacks(octokit, owner, repo, pullNumber, { findingReviewIds: prior.reviews.map(r => r.id), authorLogin: pr.user?.login });
     } catch (e) {
       core.warning(`Failed to fetch prior-round pushbacks for PR #${pullNumber}: ${e.message}. Proceeding without pushback context.`);
     }

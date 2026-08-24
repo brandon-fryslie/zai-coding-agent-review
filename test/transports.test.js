@@ -221,22 +221,38 @@ describe('summarizePriorReviews', () => {
   });
 
   test('returns zeroes when the PR has no reviews', async () => {
-    const { count, cost, reviewIds } = await summarizePriorReviews(fakeOctokit([[]]), 'o', 'r', 1);
+    const { count, cost, reviews } = await summarizePriorReviews(fakeOctokit([[]]), 'o', 'r', 1);
     assert.equal(count, 0);
     assert.deepEqual(cost, ZERO_TALLIES);
-    assert.deepEqual(reviewIds, []);
+    assert.deepEqual(reviews, []);
   });
 
-  // [LAW:one-source-of-truth] reviewIds collects ONLY the marker-bearing (RA) reviews, from the same gate
-  // as count/cost — a human review is excluded, so fetchPriorPushbacks can key RA findings off this set.
-  test('reviewIds carries the ids of exactly the marker-bearing reviews', async () => {
+  // [LAW:one-source-of-truth] The review set collects ONLY the marker-bearing (RA) reviews, from the same
+  // gate as count/cost — a human review is excluded, so fetchPriorPushbacks can key RA findings off it AND
+  // releaseUnrevisitableBlocks can never dismiss a block this action did not post.
+  test('the review set carries exactly the marker-bearing reviews, with the state the host reported', async () => {
     const octokit = fakeOctokit([[
-      { id: 11, body: `round\n\n${REVIEW_MARKER}` },
-      { id: 22, body: 'a human review, no marker' },
-      { id: 33, body: withCost(0.02) },
+      { id: 11, body: `round\n\n${REVIEW_MARKER}`, state: 'CHANGES_REQUESTED' },
+      { id: 22, body: 'a human review, no marker', state: 'CHANGES_REQUESTED' },
+      { id: 33, body: withCost(0.02), state: 'COMMENTED' },
     ]]);
-    const { reviewIds } = await summarizePriorReviews(octokit, 'o', 'r', 1);
-    assert.deepEqual(reviewIds, [11, 33]);
+    const { reviews } = await summarizePriorReviews(octokit, 'o', 'r', 1);
+    assert.deepEqual(reviews, [
+      { id: 11, state: 'CHANGES_REQUESTED', dismissed: false },
+      { id: 33, state: 'COMMENTED', dismissed: false },
+    ]);
+  });
+
+  // The human's blocking review at id 22 above is the one this must never reach. Asserted through the
+  // real predicate rather than by re-reading the array, so the exclusion is proven where it is consumed.
+  test("a human's blocking review is not in the set the release path can dismiss", async () => {
+    const octokit = fakeOctokit([[
+      { id: 11, body: `round\n\n${REVIEW_MARKER}`, state: 'CHANGES_REQUESTED' },
+      { id: 22, body: 'a human review, no marker', state: 'CHANGES_REQUESTED' },
+    ]]);
+    const { reviews } = await summarizePriorReviews(octokit, 'o', 'r', 1);
+    const transport = gitHubTransport([], []);
+    assert.deepEqual(reviews.filter(transport.isOutstandingBlock).map(r => r.id), [11]);
   });
 
   test('exhausts pagination — a full first page forces a second fetch (count AND cost span pages)', async () => {

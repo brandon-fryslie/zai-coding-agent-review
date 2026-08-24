@@ -67,8 +67,9 @@ async function listAllFiles(octokit, owner, repo, pullNumber) {
 }
 
 // [LAW:one-type-per-behavior] One transport; the host differs only in how the diff is
-// sourced, how a finding's new-file line becomes a review comment, and which literal
-// string its review-submission API expects for an approval event (approveEvent below).
+// sourced, how a finding's new-file line becomes a review comment, which literal string
+// its review-submission API expects for an approval event (approveEvent below), and how a
+// blocking review is recognized and released (isOutstandingBlock / dismissReview below).
 // [LAW:dataflow-not-control-flow] Capability — does listFiles carry per-file patch? —
 // selects the instance, not a hardcoded hostname (GitHub & Enterprise carry it; Gitea does not).
 //
@@ -85,12 +86,52 @@ async function listAllFiles(octokit, owner, repo, pullNumber) {
 // a transport states BOTH what it can hand a reviewer and what it had to refuse, so the coverage loss
 // travels as a value to the sink that gates approval on it. Carrying only `files` is what let a refused
 // file cost review coverage while the approval gate never heard about it.
+//
+// [LAW:no-silent-failure] `isOutstandingBlock` and `dismissReview` are the third and fourth host
+// differences, and both were MEASURED rather than recalled — a wrong guess here is silent in the worst
+// direction, either re-dismissing a review on every push or never releasing a deadlocked PR at all.
+//
+// Three spellings are in play for one concept, which is exactly why this cannot be one shared literal:
+// the event SUBMITTED for a blocking review is 'REQUEST_CHANGES' on both hosts, but the state READ BACK
+// is GitHub's past-tense 'CHANGES_REQUESTED' and Gitea's 'REQUEST_CHANGES'. The two hosts also disagree
+// on how a dismissed review reports itself: GitHub REPLACES the state with 'DISMISSED', while Gitea
+// leaves state='REQUEST_CHANGES' and flips a separate `dismissed` flag — so on Gitea the state alone can
+// never distinguish a live block from a released one. Measured 2026-08-24 against github.com
+// (promptctl/copirate-code-review-agent PR #114 live, #117 dismissed) and Gitea v1.27.1
+// (homelab-infra PR #157, review 110 dismissed / 111 live).
+//
+// [LAW:one-source-of-truth] The dismissal ROUTE differs too and is stated once per host, next to the
+// predicate that finds its target: GitHub takes PUT .../dismissals, Gitea POST .../dismissals with a
+// `priors` flag (confirmed from the live instance's own swagger, operationId repoDismissPullReview).
+// Sending GitHub's verb to Gitea is a 405, so this can never be one shared call.
 function gitHubTransport(files, unreviewable) {
-  return { files, unreviewable, toComment: f => ({ path: f.path, line: f.line, side: 'RIGHT', body: f.body }), approveEvent: 'APPROVE' };
+  return {
+    files,
+    unreviewable,
+    toComment: f => ({ path: f.path, line: f.line, side: 'RIGHT', body: f.body }),
+    approveEvent: 'APPROVE',
+    isOutstandingBlock: r => r.state === 'CHANGES_REQUESTED',
+    dismissReview: (octokit, { owner, repo, pullNumber, reviewId, message }) => octokit.request(
+      'PUT /repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}/dismissals',
+      { owner, repo, pull_number: pullNumber, review_id: reviewId, message },
+    ),
+  };
 }
 
 function giteaTransport(files, unreviewable) {
-  return { files, unreviewable, toComment: f => ({ path: f.path, new_position: f.line, body: f.body }), approveEvent: 'APPROVED' };
+  return {
+    files,
+    unreviewable,
+    toComment: f => ({ path: f.path, new_position: f.line, body: f.body }),
+    approveEvent: 'APPROVED',
+    isOutstandingBlock: r => r.state === 'REQUEST_CHANGES' && !r.dismissed,
+    // `priors: false` dismisses THIS review alone. `true` would sweep every earlier review on the PR,
+    // including a human's — the action releases only the block it is itself holding. [LAW:single-enforcer]
+    dismissReview: (octokit, { owner, repo, pullNumber, reviewId, message }) => octokit.request(
+      'POST /repos/{owner}/{repo}/pulls/{index}/reviews/{id}/dismissals',
+      { owner, repo, index: pullNumber, id: reviewId, message, priors: false },
+    ),
+  };
 }
 
 // [LAW:no-silent-failure] A refused path is warned with its reason at the one place a transport is
@@ -168,8 +209,11 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
 //
 // [LAW:no-silent-failure] The artifact is trusted from body content alone, NOT from the review's author
 // — so a forged marker from any account with read access is read as this action's own output. That is
-// the pre-existing trust model of every marker consumer here (count, cost, reviewIds), not a property of
-// this reader; forging a REVIEW_MARKER round is the strictly stronger version of the same attack.
+// the pre-existing trust model of every marker consumer here (count, cost, the review set), not a
+// property of this reader; forging a REVIEW_MARKER round is the strictly stronger version of the same
+// attack. The release path inherits that model without widening it: the only block a forged marker can
+// get dismissed is the forger's own, and a human reviewer's REQUEST_CHANGES carries no marker and so is
+// unreachable from it either way.
 // Closing it needs ONE author gate covering all four values, which needs an identity mechanism that
 // must be measured under a real Actions token first: `zai-review-trust-6yp`.
 const NOT_REVIEWED_MARKER_RE = new RegExp(
@@ -201,11 +245,20 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
   // NEVER added: a PR whose early rounds ran on a paid API and whose later rounds ran on the
   // subscription must not report one blended number that is true of neither.
   const tallies = emptyTallies();
-  // [LAW:one-source-of-truth] The IDs of the marker-bearing (RA) reviews, collected inside the SAME
-  // marker gate that drives count/cost — so "which reviews are RA's" is defined exactly once here, never
-  // re-derived downstream. fetchPriorPushbacks consumes this to tell an RA finding's inline comment
-  // (pull_request_review_id ∈ reviewIds) from a human reviewer's, without a second marker check.
-  const reviewIds = [];
+  // [LAW:one-source-of-truth] The marker-bearing (RA) reviews, collected inside the SAME marker gate that
+  // drives count/cost — so "which reviews are RA's" is defined exactly once here, never re-derived
+  // downstream. Two consumers read it, and BOTH depend on that gate for their correctness:
+  // fetchPriorPushbacks tells an RA finding's inline comment (pull_request_review_id ∈ these ids) from a
+  // human reviewer's, and releaseUnrevisitableBlocks dismisses a stale block. The second is why this
+  // carries each review's STATE and not just its id: dismissing is a write, and the marker gate is what
+  // makes "the action only ever releases its OWN block" a property of the data rather than a rule the
+  // release site has to remember. A human's REQUEST_CHANGES never enters this array, so it is not
+  // reachable from there. [LAW:types-are-the-program]
+  //
+  // The state words are carried VERBATIM as the host said them; this function reports, it does not
+  // interpret. Which spelling means "still blocking" is a host fact and lives on the transport, so
+  // adding a host cannot make this pagination loop wrong. [LAW:decomposition]
+  const reviews = [];
   // [LAW:one-source-of-truth] The NEWEST thing this action left on the PR — a round or a not-reviewed
   // notice — read out of the SAME pass that counts rounds, so "what does this PR currently say about
   // itself" has one definition. announceNotReviewed consumes it as its idempotency key: it stays quiet
@@ -245,7 +298,7 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
       // counting it would push a PR past its cap using a review that never happened.
       if (artifact.kind !== 'review') continue;
       count++;
-      reviewIds.push(r.id);
+      reviews.push({ id: r.id, state: r.state, dismissed: Boolean(r.dismissed) });
       // [LAW:parse-dont-validate] The body's marker is parsed back into the Cost value that wrote it,
       // then folded by the one tally rule — this module never re-decides what a marker string means.
       // [LAW:no-silent-failure] An agent round with a numeric figure is summed into its own basis;
@@ -257,7 +310,7 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
     if (data.length < 100) break;
     page++;
   }
-  return { count, cost: tallies, reviewIds, latestArtifact };
+  return { count, cost: tallies, reviews, latestArtifact };
 }
 
 // [LAW:effects-at-boundaries] Pure, split from the fetch below so it is testable without a fake API:
@@ -327,7 +380,7 @@ function pairPushbacks(comments, { findingReviewIds = [], authorLogin } = {}) {
 // served by GitHub and Gitea alike, so this is host-agnostic like summarizePriorReviews. [LAW:decomposition]
 // This is a SEPARATE concern from summarizePriorReviews (which reads review BODIES for round-count + cost)
 // — a different endpoint (inline COMMENTS) and a different product (finding↔reply pairs) — so it is its own
-// function. It consumes that function's `reviewIds` (the marker-bearing set) rather than re-deriving "which
+// function. It consumes that function's review set (the marker-bearing one) rather than re-deriving "which
 // reviews are RA's", keeping that definition single-sourced. [LAW:one-source-of-truth]
 async function fetchPriorPushbacks(octokit, owner, repo, pullNumber, { findingReviewIds, authorLogin } = {}) {
   const comments = [];
@@ -639,6 +692,65 @@ async function announceNotReviewed(octokit, { owner, repo, pullNumber, commitId,
   return 'posted';
 }
 
+// [LAW:effects-at-boundaries] Pure: the dismissal message, which is the only place a reader learns why a
+// blocking verdict stopped blocking. It carries the SAME cap sentence the not-reviewed notice carries,
+// passed in rather than recomposed, so the PR cannot state two different remedies. [LAW:one-source-of-truth]
+//
+// It says plainly that nothing was re-read. A dismissal that merely disappeared would be indistinguishable
+// from "the reviewer looked again and is satisfied" — the exact silent-success shape this action refuses
+// everywhere else, and the more dangerous one here because it clears a merge gate. [LAW:no-silent-failure]
+function unrevisitableBlockMessage(capMessage) {
+  return 'Dismissed by the reviewer that posted it, because it will not look at this pull request again: '
+    + `${capMessage}\n\n`
+    + 'The findings in that review were NOT re-checked and are NOT confirmed fixed — no code was read on '
+    + 'this run. This dismissal removes only the merge block, which the reviewer can no longer justify '
+    + 'holding once it has declined to revisit its own verdict. Whether those findings were actually '
+    + 'addressed is now a human judgement; the review and its comments stay on the PR to be read.';
+}
+
+// [LAW:single-enforcer] THE one place the action releases a merge block, and the one rule it enforces:
+// never leave a blocking review this action refuses to revisit. It is called from the round-cap exit and
+// nowhere else, because that exit is the only moment the action decides it is done looking — and a
+// REQUEST_CHANGES that will never be reconsidered has stopped being a gate and become a deadlock. The
+// two policies that collide here are each sound alone: the round cap assumes a rejection is advisory and
+// will be revisited, while `block_merge_on_rejected_reviews` assumes a rejection is blocking and can be
+// cleared by a better review. Their composition had no exit at all, so an author who fixed every finding
+// correctly stayed unmergeable and the documented remedy was a hand-written API call.
+//
+// [LAW:dataflow-not-control-flow] The release is UNCONDITIONAL — a PR with nothing outstanding filters to
+// an empty list and dismisses nothing, which is the same code path taking a different value. That also
+// makes it idempotent across pushes without a "have I done this" flag: a review this loop dismissed no
+// longer satisfies `isOutstandingBlock` on the next run, on either host.
+//
+// Failure is LOUD and terminal. A dismissal the host refused leaves the PR exactly as deadlocked as
+// before while every other signal on the run says the cap was handled — so this reds the run, matching
+// roundCapNotice's policy and for the same reason: a round cap is only ever reached on a same-repo PR,
+// where the `pull-requests: write` this needs is always grantable. Every failure is attempted and then
+// reported together, so an operator fixing permissions sees the whole list once. [LAW:no-silent-failure]
+async function releaseUnrevisitableBlocks(octokit, transport, { owner, repo, pullNumber, reviews, capMessage }) {
+  const outstanding = reviews.filter(transport.isOutstandingBlock);
+  const message = unrevisitableBlockMessage(capMessage);
+  const failures = [];
+  for (const review of outstanding) {
+    try {
+      await transport.dismissReview(octokit, { owner, repo, pullNumber, reviewId: review.id, message });
+      core.info(`Dismissed this action's own blocking review ${review.id} on PR #${pullNumber}: it will not be revisited.`);
+    } catch (e) {
+      failures.push(`${review.id} (${e.message})`);
+    }
+  }
+  if (failures.length > 0) {
+    core.setFailed(
+      `Could not dismiss this action's own blocking review(s) on PR #${pullNumber}: ${failures.join('; ')}. `
+      + 'The pull request is left blocked by a review this action has declined to revisit, so it cannot be '
+      + 'merged until someone dismisses that review by hand. The token needs `pull-requests: write`, and '
+      + 'the PR must be open.',
+    );
+    return 'failed';
+  }
+  return outstanding.length > 0 ? 'released' : 'nothing-to-release';
+}
+
 // [LAW:single-enforcer] One resolver decides which pull request to review, from
 // whichever provenance the triggering event offers. pull_request / pull_request_target
 // carry the PR in the event payload; other events (workflow_run, workflow_dispatch)
@@ -683,6 +795,8 @@ module.exports = {
   summarizePriorReviews,
   parseAgentArtifact,
   announceNotReviewed,
+  releaseUnrevisitableBlocks,
+  unrevisitableBlockMessage,
   forkNotice,
   roundCapNotice,
   renderNotReviewedBody,
