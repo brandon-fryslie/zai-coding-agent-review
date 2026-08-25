@@ -296,13 +296,21 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
 //
 // [LAW:no-silent-failure] The artifact is trusted from body content alone, NOT from the review's author
 // — so a forged marker from any account with read access is read as this action's own output. That is
-// the pre-existing trust model of every marker consumer here (count, cost, the review set), not a
+// the pre-existing trust model of every marker consumer here (count, cost, the review set, dedup), not a
 // property of this reader; forging a REVIEW_MARKER round is the strictly stronger version of the same
-// attack. The release path inherits that model without widening it: the only block a forged marker can
-// get dismissed is the forger's own, and a human reviewer's REQUEST_CHANGES carries no marker and so is
-// unreachable from it either way.
-// Closing it needs ONE author gate covering all four values, which needs an identity mechanism that
-// must be measured under a real Actions token first: `zai-review-trust-6yp`.
+// attack. The release path inherits that model for the LOW-STAKES consumers (count/cost/review-set/dedup
+// — worst case is a wrong number in a log line, a review released without a fresh look, or a re-posted
+// notice), where widening it costs more plumbing than the exposure justifies.
+//
+// ONE consumer is not low-stakes: `hasDeclinedRevisit` below is the sole gate `dismiss-block` uses to fire
+// an Admin-credentialed dismissal, and body content alone is not enough there — a forged notice from ANY
+// account with read access would release a genuinely outstanding block with no round cap ever hit
+// (home-copirate-review-itv-4-2, round 4). That one caller checks `postedBy` — the review's actual
+// `user.id`, carried alongside the parsed artifact — against the identity the run itself trusts to have
+// posted it, so it needs no wider fix here. Closing the remaining four (count, cost, review-set, dedup)
+// needs ONE author gate over all five values, still blocked on an identity mechanism proven under a real
+// Actions token, since a run's own "who am I" answer is the one piece this offline change cannot measure
+// live: `zai-review-trust-6yp`.
 const NOT_REVIEWED_MARKER_RE = new RegExp(
   `${NOT_REVIEWED_MARKER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([a-z-]+) -->$`,
 );
@@ -316,6 +324,54 @@ function parseAgentArtifact(rawBody) {
   // capped by the budget gradient instead, leaving the operator reading the wrong cap and the wrong
   // remedy. The reason stays on the value for logging and for the enumeration, not for the key.
   return m ? { kind: 'not-reviewed', reason: m[1], body } : null;
+}
+
+// "Has this action announced, on this pull request, that it will not look at it again?" — read off the
+// PR itself rather than recomputed. The round-cap exit posts its notice and releases its own block only
+// once that post succeeded (`run.js`), so the notice being the NEWEST agent artifact is the durable
+// record of that decision: nothing this action wrote has superseded it.
+//
+// [LAW:one-source-of-truth] This exists for `dismiss-block/`, which runs as a SEPARATE process and so
+// cannot inherit `run.js`'s round-cap decision from its position in control flow. The alternative — give
+// that action a MAX_REVIEW_ROUNDS input and re-run `roundCapReached` — would be a second derivation of a
+// cap the first one does not use: `run.js` enforces `effort.roundCap`, de-rated by the DAILY_BUDGET_USD
+// gradient and DIFFICULTY_SCALING, so a re-derivation from the raw input disagrees with it in exactly the
+// de-rated case the release exists to serve. The notice is the decision already recorded as data.
+//
+// [LAW:types-are-the-program] It is also what makes the dismissal MESSAGE true. That message tells the
+// reader the action's own notice explains the refusal; gating the dismissal on that notice being present
+// and newest means the sentence cannot be posted into a world where it is false — including the one where
+// `announceNotReviewed` failed, `run.js` returned before releasing, and no explanation ever reached the PR.
+//
+// The FORK reason is not a declination to revisit: a fork PR is never reviewed at all, so this action
+// holds no block on it to release. Matching the reason by name keeps that distinction in the enumeration
+// rather than in a string literal typed a second time. [LAW:one-source-of-truth]
+//
+// [LAW:no-silent-failure] `trustedReviewerId` is the ONE author gate this codebase's marker-trust model
+// (see `parseAgentArtifact` above) does not skip, because this is the one caller a forged marker actually
+// hurts: `dismiss-block` fires an Admin-credentialed dismissal off this return value alone, and body
+// content says nothing about who posted it. On a public repo any account with read access can submit a
+// review whose body ends with the literal, public round-cap marker — that becomes the PR's newest agent
+// artifact, and without this check it would release every genuinely outstanding `REQUEST_CHANGES` this
+// action has posted, defeating `block_merge_on_rejected_reviews` with one forged comment and no round cap
+// ever hit (found in review of home-copirate-review-itv-4-2, round 4).
+//
+// The comparison is by `postedBy.id`, not `.login` — a login can be renamed out from under a comparison,
+// an id cannot — and BOTH sides must be present: `latestArtifact.postedBy.id == null` (a fixture, or a
+// host that omitted `user`) and `trustedReviewerId == null` (the caller's own identity lookup failed) are
+// each treated as "unverifiable", not "not a mismatch" — `undefined === undefined` would otherwise let two
+// absent identities forge a match. [LAW:no-defensive-null-guards] this is the real precondition, not a
+// defensive habit: an identity check that can be satisfied by both sides being silent is not a check.
+// `trustedReviewerId` is what the CALLER's own credential resolves to (`dismiss-block`'s `GITHUB_REVIEW_TOKEN`,
+// the same identity `run.js` posts round-cap notices under) — never a hardcoded bot name, which would
+// break the documented user-PAT `GITHUB_REVIEW_TOKEN` path this repo already supports.
+function hasDeclinedRevisit(latestArtifact, trustedReviewerId) {
+  return Boolean(latestArtifact)
+    && latestArtifact.kind === 'not-reviewed'
+    && latestArtifact.reason === NOT_REVIEWED_REASONS.ROUND_CAP
+    && latestArtifact.postedBy?.id != null
+    && trustedReviewerId != null
+    && latestArtifact.postedBy.id === trustedReviewerId;
 }
 
 // [LAW:one-source-of-truth] A completed review round IS a posted review carrying REVIEW_MARKER, and its
@@ -393,7 +449,14 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
       if (!artifact) continue; // a human's review, or a body this action did not write
       if (r.id > latestArtifactId) {
         latestArtifactId = r.id;
-        latestArtifact = artifact;
+        // [LAW:no-silent-failure] `postedBy` rides on EVERY latestArtifact, not just the 'not-reviewed'
+        // arm `hasDeclinedRevisit` actually reads — one shape for the value, so a future privileged
+        // consumer of a 'review'-kind latestArtifact is not the second place this identity has to be
+        // threaded in from scratch. `r.user` is read verbatim (never coerced or defaulted) so an absent
+        // `user` — a fixture, or a host that omits it — surfaces as `id: undefined`, which
+        // `hasDeclinedRevisit` treats as unverifiable rather than as a value that could accidentally
+        // match an equally-absent trusted id. [LAW:one-source-of-truth]
+        latestArtifact = { ...artifact, postedBy: { id: r.user?.id, login: r.user?.login } };
       }
       // [LAW:dataflow-not-control-flow] The one branch is the artifact type's own discriminator. A
       // notice contributes to `latestArtifact` alone: it recorded no round and spent no money, so
@@ -867,8 +930,13 @@ async function announceReleaseFailure(octokit, {
 }
 
 // [LAW:single-enforcer] THE one place the action releases a merge block, and the one rule it enforces:
-// never leave a blocking review this action refuses to revisit. It is called from the round-cap exit and
-// nowhere else, because that exit is the only moment the action decides it is done looking — and a
+// never leave a blocking review this action refuses to revisit. TWO callers reach it, and they share the
+// precondition rather than each deciding one: a release happens only once this action has declined to
+// look at the PR again. `run.js`'s round-cap exit knows that by POSITION (it is inside the branch, and
+// releases only after its notice actually posted); `dismiss-block/`'s standalone entrypoint has no
+// position to inherit, so it reads the same decision back off the PR — the round-cap notice standing as
+// the newest agent artifact — via `hasDeclinedRevisit`. Anything reaching here has already established
+// that the action is done looking, which is the moment that matters, because a
 // REQUEST_CHANGES that will never be reconsidered has stopped being a gate and become a deadlock. The
 // two policies that collide here are each sound alone: the round cap assumes a rejection is advisory and
 // will be revisited, while `block_merge_on_rejected_reviews` assumes a rejection is blocking and can be
@@ -898,17 +966,20 @@ async function announceReleaseFailure(octokit, {
 // rather than propagating to the generic top-level handler, which would name neither the PR nor the
 // consequence. It is reached only when something IS outstanding, so it can never red a run that had
 // nothing to release.
-// [LAW:no-silent-failure] `dismissOctokit` defaults to `octokit` — the pre-itv.4.1 behavior — so a caller
-// that never passes it (every test below, and a run with no DISMISS_TOKEN configured) gets exactly
-// today's dismissal, unchanged. It exists because Gitea's dismiss-review endpoint requires the dismissing
-// account to hold repo-Admin (MEASURED against a live Gitea 1.27.1: the "write" access that is enough to
-// post a review 403s here), while GitHub's needs nothing more than the review token already carries — so
-// only the WRITE this function makes needs a second, more-privileged identity; every read in this module
-// (blockStillHolds, the listReviews this is fed from) stays on the ordinary `octokit`. [LAW:single-enforcer]
-// The identity is a CARRIED VALUE, never a host test: whoever the caller hands in dismisses, on either
-// host. Gating it on `transport` would resolve the thunk below just to choose a credential — the exact
-// re-listing this function is shaped to avoid — and re-open the host branch that the two-arm `TRANSPORTS`
-// table exists to keep out of here. [LAW:dataflow-not-control-flow]
+// [LAW:no-silent-failure] `dismissOctokit` defaults to `octokit` — the pre-itv.4.1 behavior — so `run.js`'s
+// call (which never passes it) and every test below get exactly today's dismissal, unchanged. It exists
+// because Gitea's dismiss-review endpoint requires the dismissing account to hold repo-Admin (MEASURED
+// against a live Gitea 1.27.1: the "write" access that is enough to post a review 403s here), while
+// GitHub's needs nothing more than the review token already carries — so only the WRITE this function
+// makes needs a second, more-privileged identity; every read in this module (blockStillHolds, the
+// listReviews this is fed from) stays on the ordinary `octokit`. [LAW:single-enforcer] The identity is a
+// CARRIED VALUE, never a host test: whoever the caller hands in dismisses, on either host. Gating it on
+// `transport` would resolve the thunk below just to choose a credential — the exact re-listing this
+// function is shaped to avoid — and re-open the host branch that the two-arm `TRANSPORTS` table exists to
+// keep out of here. [LAW:dataflow-not-control-flow] `run.js`'s own review run never supplies one — the
+// only caller that does is `dismiss-block/`'s standalone entrypoint, a second, small action this repo
+// ships specifically so a Gitea-only credential never becomes an input on the action every GitHub
+// consumer shares (itv.4.1; see `dismiss-block/README.md`).
 async function releaseUnrevisitableBlocks(octokit, resolveTransport, {
   owner, repo, pullNumber, reviews, capMessage, commitId, reviewerName, releaseFailureBodies,
   dismissOctokit = octokit,
@@ -1029,6 +1100,7 @@ module.exports = {
   prIsFromFork,
   summarizePriorReviews,
   parseAgentArtifact,
+  hasDeclinedRevisit,
   announceNotReviewed,
   announceReleaseFailure,
   RELEASE_FAILED_MARKER,

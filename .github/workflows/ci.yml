@@ -18,22 +18,28 @@ jobs:
 
       - run: npm ci
 
-      - name: Assert README inputs table matches action.yml
-        # action.yml is the source of truth for the input contract; the README inputs
-        # table is a derived view (and the Marketplace listing body). Fail if they drift
-        # — an undocumented input or an orphan row. kx9.7 reconciled them by hand; this
-        # keeps them reconciled by construction. [LAW:single-enforcer][LAW:one-source-of-truth]
+      - name: Assert README inputs tables match their action.yml
+        # An action.yml is the source of truth for its input contract; the matching README
+        # inputs table is a derived view (and the Marketplace listing body). Fail if they
+        # drift — an undocumented input or an orphan row. kx9.7 reconciled them by hand;
+        # this keeps them reconciled by construction. [LAW:single-enforcer][LAW:one-source-of-truth]
+        # EVERY shipped action is checked; the pair list lives in the script, so a third
+        # action is a data row there and never a second step here.
         run: node scripts/check-readme-inputs.js
 
       - name: Build
         run: npm run build
 
-      - name: Assert dist/ is up to date
-        # Fail if the committed dist/ doesn't match a fresh build.
-        # A stale dist/ means the shipped bundle doesn't reflect src/ changes.
+      - name: Assert bundles are up to date
+        # Fail if a committed bundle doesn't match a fresh build. A stale bundle means the
+        # shipped code doesn't reflect src/ changes — and the runner executes the bundle,
+        # never src/, so a stale one ships silently. EVERY output of `npm run build` is
+        # checked, not just the first: `build` emits two bundles (the review action's dist/
+        # and dismiss-block/dist/), and a gate covering a subset of its output leaves the
+        # rest to ship stale with CI green. [LAW:no-silent-failure]
         run: |
-          if ! git diff --exit-code dist/; then
-            echo "dist/ is stale — run 'npm run build' and commit dist/ alongside src/ changes"
+          if ! git diff --exit-code dist/ dismiss-block/dist/; then
+            echo "a bundle is stale — run 'npm run build' and commit dist/ and dismiss-block/dist/ alongside src/ changes"
             exit 1
           fi
 
