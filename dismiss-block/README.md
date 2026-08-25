@@ -33,19 +33,29 @@ precisely the pushes it exists for. Gating on the notice reads the review action
 decision off the PR instead of guessing at it, and it also makes the dismissal message
 (which points readers at that notice) true by construction: no notice, no dismissal.
 
+(2) is checked by **identity, not just by text**. The round-cap marker this step looks
+for is a public, literal string, so on a public repo any account with read access could
+post a review ending in it and — if this step trusted body content alone — talk it into
+releasing a genuinely outstanding block with the Admin credential below. Before trusting a
+notice, this step asks `GITHUB_REVIEW_TOKEN` (or its `GITHUB_TOKEN` fallback) who it is
+and requires the notice's actual author to match: the same identity the review step posts
+its round-cap notices under. A notice from anyone else — or a notice this step cannot
+attribute to anyone, including because the identity check itself failed — is treated as
+unverified and released nothing, same as no notice at all.
+
 So a PR the reviewer still intends to revisit is a no-op, as is one with nothing
-outstanding — safe as an unconditional extra step on every PR event, not just capped ones.
-It never reviews anything, spawns no engine, and posts no verdict; a refused dismissal
-(e.g. `DISMISS_TOKEN` not actually Admin) reds this step's own run and posts the same
-`⚠️ **BLOCK NOT RELEASED**` notice the review action would have posted had it held this
-credential itself.
+outstanding, as is a forged notice — safe as an unconditional extra step on every PR
+event, not just capped ones. It never reviews anything, spawns no engine, and posts no
+verdict; a refused dismissal (e.g. `DISMISS_TOKEN` not actually Admin) reds this step's
+own run and posts the same `⚠️ **BLOCK NOT RELEASED**` notice the review action would have
+posted had it held this credential itself.
 
 ## Inputs
 
 | Input | Default | Description |
 |---|---|---|
 | `GITHUB_TOKEN` | `${{ github.token }}` | Token for reading the PR and its reviews. |
-| `GITHUB_REVIEW_TOKEN` | — | The review step's own bot identity (e.g. `secrets.COPIRATE_REVIEW_TOKEN`); used only to post a failure notice if the dismissal is refused. Pass the same value given to the review step. |
+| `GITHUB_REVIEW_TOKEN` | — | The review step's own bot identity (e.g. `secrets.COPIRATE_REVIEW_TOKEN`). Used to verify a round-cap notice was actually posted by this identity before trusting it, and to post a failure notice if the dismissal is refused. Pass the same value given to the review step. |
 | `DISMISS_TOKEN` | — (required) | Token for a **separate**, repo-Admin account. Used for exactly one call — dismissing the outstanding review — and nothing else this action does. |
 | `PR_NUMBER` | from event | PR number. Auto-detected on `pull_request` events; pass explicitly on others (e.g. `workflow_run`). |
 | `HEAD_SHA` | from event | Head SHA a failure notice anchors to. Auto-detected on `pull_request` events. |

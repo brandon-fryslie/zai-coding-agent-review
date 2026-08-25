@@ -20,13 +20,23 @@ const { REVIEW_MARKER, NOT_REVIEWED_MARKER_PREFIX, NOT_REVIEWED_REASONS } = requ
 // reviewer's REQUEST_CHANGES has no marker and is invisible to this action by construction.
 const ourBlock = (id, state) => ({ id, state, body: `Findings here.\n${REVIEW_MARKER}` });
 
+// The identity `reviewOctokit` (built from GITHUB_REVIEW_TOKEN, or its GITHUB_TOKEN fallback — see
+// setInputs) resolves to via users.getAuthenticated() in these fixtures. A genuine round-cap notice is
+// authored by this account; an attacker posting the same literal marker text is authored by ATTACKER_ID
+// instead, which is exactly what a body-content-only check could not tell apart (itv-4-2 round 4).
+const TRUSTED_BOT_ID = 999;
+const ATTACKER_ID = 666;
+
 // The review action's round-cap NOTICE — the record, on the PR, that it has given up on this PR and
 // will not supersede the block above. Built from the same constants the notice renderer writes with, so
 // a marker rename moves both together instead of leaving this suite asserting a dead spelling.
 // Its ID must exceed the block's: "newest artifact" is the highest review id, not arrival order.
-const capNotice = id => ({
+// `authorId` defaults to the trusted bot — a genuine notice — and is overridden to ATTACKER_ID by the
+// forgery tests below, which is the ONLY thing that differs between a real notice and a forged one.
+const capNotice = (id, authorId = TRUSTED_BOT_ID) => ({
   id,
   state: 'COMMENTED',
+  user: { id: authorId, login: authorId === TRUSTED_BOT_ID ? 'copirate-bot' : 'attacker' },
   body: `Not reviewed.\n\n${NOT_REVIEWED_MARKER_PREFIX}${NOT_REVIEWED_REASONS.ROUND_CAP} -->`,
 });
 
@@ -37,6 +47,11 @@ let adminCalls;
 // The PR object `pulls.get` returns — same-repo (not a fork) by default, so every routing test
 // above reaches its normal path unchanged; the fork test overrides this to a cross-repo PR.
 let prFixture;
+// What GET /user (users.getAuthenticated) answers for the 'gh-token' identity — the credential
+// GITHUB_REVIEW_TOKEN/GITHUB_TOKEN resolves to by default in setInputs, and so the identity dismiss.js
+// asks "who am I" as before trusting any round-cap notice. A test that wants the whoami call itself to
+// fail (a transient host error, not a forgery) sets this to a thrown Error instead of an id object.
+let whoami;
 
 // One shared `reviews` store, read and written by whichever token's fake calls it — the same shape a
 // live Gitea PR has one truth regardless of which of this action's credentials is asking.
@@ -54,6 +69,16 @@ function fakeOctokitFor(token) {
           const posted = { id: reviews.length + 1, state: 'COMMENT', body: params.body };
           reviews.push(posted);
           return { data: posted };
+        },
+      },
+      users: {
+        // Only ever called on the token dismiss.js builds `reviewOctokit` from — TRUSTED_BOT_ID for
+        // 'gh-token', the default in setInputs. A test asking for a different token gets an error, so a
+        // whoami call made against the wrong credential fails loudly instead of quietly answering anyway.
+        getAuthenticated: async () => {
+          if (whoami instanceof Error) throw whoami;
+          if (token !== 'gh-token') throw new Error(`401 Unauthorized: no such identity for token ${token}`);
+          return { data: whoami };
         },
       },
     },
@@ -84,6 +109,7 @@ beforeEach(() => {
   writeCalls = [];
   adminCalls = [];
   prFixture = { head: { repo: { id: 100 } }, base: { repo: { id: 100 } } };
+  whoami = { id: TRUSTED_BOT_ID, login: 'copirate-bot' };
 });
 
 github.getOctokit = token => fakeOctokitFor(token);
@@ -214,5 +240,56 @@ describe('the dismiss-block action', () => {
     assert.equal(said.length, 1);
     assert.match(said[0], /101/);
     assert.equal(reviews[0].state, 'CHANGES_REQUESTED', 'still blocking — the refused call changed nothing');
+  });
+
+  // itv-4-2 round 4: hasDeclinedRevisit used to trust the round-cap marker from body content alone. On a
+  // public repo any account with read access can post a review ending in the same literal marker text —
+  // these four tests are that attack, and the identity check that closes it.
+  describe('a forged round-cap notice must not release a genuinely outstanding block', () => {
+    test('a notice posted by an untrusted account is not treated as the review action giving up', async () => {
+      setInputs();
+      // Same marker text a genuine notice carries, but authored by someone other than the identity
+      // GITHUB_REVIEW_TOKEN resolves to — exactly what an attacker with read access can produce.
+      reviews.push(ourBlock(101, 'CHANGES_REQUESTED'), capNotice(102, ATTACKER_ID));
+      const said = await runCapturingFailures();
+      assert.deepEqual(said, []);
+      assert.equal(adminCalls.length, 0, 'a forged notice never authorizes the Admin-level dismissal');
+      assert.equal(writeCalls.length, 0);
+      assert.equal(reviews[0].state, 'CHANGES_REQUESTED', 'the real block stays up');
+    });
+
+    test('a genuine notice from the trusted identity still releases the block', async () => {
+      setInputs();
+      reviews.push(ourBlock(101, 'CHANGES_REQUESTED'), capNotice(102)); // defaults to TRUSTED_BOT_ID
+      const said = await runCapturingFailures();
+      assert.deepEqual(said, []);
+      assert.equal(adminCalls.length, 1, 'a real round-cap notice, correctly attributed, still releases');
+      assert.equal(reviews[0].state, 'DISMISSED');
+    });
+
+    // A review with no `user` at all (a malformed or stripped payload) must not be treated as a wash with
+    // an equally-absent trusted id — both being undefined must never read as a match.
+    test('a notice with no author information is not trusted either', async () => {
+      setInputs();
+      const notice = capNotice(102);
+      delete notice.user;
+      reviews.push(ourBlock(101, 'CHANGES_REQUESTED'), notice);
+      const said = await runCapturingFailures();
+      assert.deepEqual(said, []);
+      assert.equal(adminCalls.length, 0);
+      assert.equal(reviews[0].state, 'CHANGES_REQUESTED');
+    });
+
+    // If this run cannot establish its own identity, it must not fall back to trusting the notice's body
+    // content — the exact behavior this whole gate exists to remove. The safe failure is "release nothing".
+    test('a failed identity lookup leaves the block up rather than falling back to trusting body content', async () => {
+      setInputs();
+      whoami = new Error('503 Service Unavailable');
+      reviews.push(ourBlock(101, 'CHANGES_REQUESTED'), capNotice(102));
+      const said = await runCapturingFailures();
+      assert.deepEqual(said, [], 'a whoami failure is a warning, not a run failure');
+      assert.equal(adminCalls.length, 0);
+      assert.equal(reviews[0].state, 'CHANGES_REQUESTED');
+    });
   });
 });

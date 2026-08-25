@@ -97,6 +97,32 @@ async function run() {
     return;
   }
 
+  // [LAW:no-silent-failure] home-copirate-review-itv-4-2 (round 4): `hasDeclinedRevisit` used to trust
+  // `prior.latestArtifact` from body content alone — the round-cap marker is a public, literal string, so
+  // any account with read access could post a review ending in it and have this run treat that as the
+  // review action's own decision to give up, releasing every genuinely outstanding block with the Admin
+  // credential below. The fix is to ask who THIS run itself would trust to have posted that notice, and
+  // require the artifact's actual author to match: `reviewOctokit` is built from the same credential
+  // (`GITHUB_REVIEW_TOKEN`, or its `GITHUB_TOKEN` fallback) that `run.js` posts round-cap notices under, so
+  // asking it "who am I" (`GET /user`, served by GitHub and Gitea alike) answers the identity a genuine
+  // notice was posted as, without hardcoding a bot username that would break the documented user-PAT
+  // `GITHUB_REVIEW_TOKEN` path this repo already supports.
+  //
+  // A failure here is NOT a reason to fall back to trusting body content — it is treated as "cannot verify",
+  // which `hasDeclinedRevisit` already refuses to release on (`trustedReviewerId == null`). The safe
+  // direction is a block that stays up one run longer, not one a forgery could talk this run into dropping.
+  let trustedReviewerId = null;
+  try {
+    const { data: self } = await reviewOctokit.rest.users.getAuthenticated();
+    trustedReviewerId = self?.id ?? null;
+  } catch (e) {
+    core.warning(
+      `Could not verify the review action's own identity via GITHUB_REVIEW_TOKEN (or its GITHUB_TOKEN `
+      + `fallback): ${e.message}. Treating PR #${pullNumber}'s round-cap notice, if any, as unverifiable — `
+      + 'no block will be released this run.',
+    );
+  }
+
   // [LAW:dataflow-not-control-flow] "Which of this action's blocks may this run release?" is a VALUE, and
   // the release below runs unconditionally against it — an empty list resolves no transport and dismisses
   // nothing (`releaseUnrevisitableBlocks` returns 'nothing-to-release' before touching the network).
@@ -110,9 +136,11 @@ async function run() {
   //
   // `run.js` carries the missing fact in its position — it releases only from inside the round-cap branch.
   // This action is a separate process with no such position, so it reads the fact off the PR instead: the
-  // round-cap notice standing as the newest agent artifact. [LAW:one-source-of-truth] one decision, made
-  // once by the review run, recorded once on the PR, read here rather than recomputed.
-  const releasable = hasDeclinedRevisit(prior.latestArtifact) ? prior.reviews : [];
+  // round-cap notice standing as the newest agent artifact AND carrying the identity this run trusts.
+  // [LAW:one-source-of-truth] one decision, made once by the review run, recorded once on the PR, read
+  // here rather than recomputed.
+  const declinedRevisit = hasDeclinedRevisit(prior.latestArtifact, trustedReviewerId);
+  const releasable = declinedRevisit ? prior.reviews : [];
 
   // [LAW:types-are-the-program] The gate above is what makes this sentence TRUE rather than merely hopeful.
   // It asserts an explanation is on the PR, and it is posted verbatim into the PR's permanent review
@@ -130,14 +158,24 @@ async function run() {
     dismissOctokit,
   });
   // [LAW:no-silent-failure] The quiet path is the overwhelmingly common one — every push that drew findings
-  // the reviewer still intends to revisit — so it says which of the two quiet reasons it was, rather than
-  // leaving an operator to guess whether this action ran at all. Failures are reported by the release itself.
+  // the reviewer still intends to revisit — so it names which of the three quiet reasons it was, rather
+  // than leaving an operator to guess whether this action ran at all. Failures are reported by the release
+  // itself. The three are distinguished in the same order `hasDeclinedRevisit` checks them: a notice that
+  // isn't a round-cap one at all, a genuine round-cap notice this run could not attribute to a trusted
+  // identity (an unverifiable `trustedReviewerId`, or a mismatched/absent `postedBy`), and nothing
+  // outstanding to release even though the notice checked out.
   if (outcome === 'nothing-to-release') {
-    core.info(
-      `PR #${pullNumber}: nothing released. ${releasable.length === 0
-        ? "The review action has not declined to revisit this pull request — its newest notice is not a round-cap one — so any blocking review it holds is one it still intends to supersede."
-        : "This action's own reviews carry no outstanding block."}`,
-    );
+    let reason;
+    if (!declinedRevisit) {
+      const looksLikeRoundCap = prior.latestArtifact?.kind === 'not-reviewed'
+        && prior.latestArtifact?.reason === 'round-cap';
+      reason = looksLikeRoundCap
+        ? "This pull request carries a round-cap notice, but this run could not attribute it to a trusted identity (see the warning above, if any) — treating it as unverified rather than releasing on body content alone."
+        : "The review action has not declined to revisit this pull request — its newest notice is not a round-cap one — so any blocking review it holds is one it still intends to supersede.";
+    } else {
+      reason = "This action's own reviews carry no outstanding block.";
+    }
+    core.info(`PR #${pullNumber}: nothing released. ${reason}`);
   }
 }
 

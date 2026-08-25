@@ -181,7 +181,7 @@ describe('a review-less run speaks at the PR', () => {
     };
     // The round has the higher id, so it is the newest agent artifact even though the notice came last.
     const prior = await summarizePriorReviews(descending, 'o', 'r', PR);
-    assert.deepEqual(prior.latestArtifact, { kind: 'review' });
+    assert.deepEqual(prior.latestArtifact, { kind: 'review', postedBy: { id: undefined, login: undefined } });
   });
 });
 

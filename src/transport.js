@@ -298,11 +298,19 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
 // — so a forged marker from any account with read access is read as this action's own output. That is
 // the pre-existing trust model of every marker consumer here (count, cost, the review set), not a
 // property of this reader; forging a REVIEW_MARKER round is the strictly stronger version of the same
-// attack. The release path inherits that model without widening it: the only block a forged marker can
-// get dismissed is the forger's own, and a human reviewer's REQUEST_CHANGES carries no marker and so is
-// unreachable from it either way.
-// Closing it needs ONE author gate covering all four values, which needs an identity mechanism that
-// must be measured under a real Actions token first: `zai-review-trust-6yp`.
+// attack. The release path inherits that model for the LOW-STAKES consumers (count/cost/dedup — worst
+// case is a wrong number in a log line or a re-posted notice), where widening it costs more plumbing than
+// the exposure justifies.
+//
+// ONE consumer is not low-stakes: `hasDeclinedRevisit` below is the sole gate `dismiss-block` uses to fire
+// an Admin-credentialed dismissal, and body content alone is not enough there — a forged notice from ANY
+// account with read access would release a genuinely outstanding block with no round cap ever hit
+// (home-copirate-review-itv-4-2, round 4). That one caller checks `postedBy` — the review's actual
+// `user.id`, carried alongside the parsed artifact — against the identity the run itself trusts to have
+// posted it, so it needs no wider fix here. Closing the remaining three (count, cost, dedup) needs ONE
+// author gate over all four values, still blocked on an identity mechanism proven under a real Actions
+// token, since a run's own "who am I" answer is the one piece this offline change cannot measure live:
+// `zai-review-trust-6yp`.
 const NOT_REVIEWED_MARKER_RE = new RegExp(
   `${NOT_REVIEWED_MARKER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([a-z-]+) -->$`,
 );
@@ -338,10 +346,32 @@ function parseAgentArtifact(rawBody) {
 // The FORK reason is not a declination to revisit: a fork PR is never reviewed at all, so this action
 // holds no block on it to release. Matching the reason by name keeps that distinction in the enumeration
 // rather than in a string literal typed a second time. [LAW:one-source-of-truth]
-function hasDeclinedRevisit(latestArtifact) {
+//
+// [LAW:no-silent-failure] `trustedReviewerId` is the ONE author gate this codebase's marker-trust model
+// (see `parseAgentArtifact` above) does not skip, because this is the one caller a forged marker actually
+// hurts: `dismiss-block` fires an Admin-credentialed dismissal off this return value alone, and body
+// content says nothing about who posted it. On a public repo any account with read access can submit a
+// review whose body ends with the literal, public round-cap marker — that becomes the PR's newest agent
+// artifact, and without this check it would release every genuinely outstanding `REQUEST_CHANGES` this
+// action has posted, defeating `block_merge_on_rejected_reviews` with one forged comment and no round cap
+// ever hit (found in review of home-copirate-review-itv-4-2, round 4).
+//
+// The comparison is by `postedBy.id`, not `.login` — a login can be renamed out from under a comparison,
+// an id cannot — and BOTH sides must be present: `latestArtifact.postedBy.id == null` (a fixture, or a
+// host that omitted `user`) and `trustedReviewerId == null` (the caller's own identity lookup failed) are
+// each treated as "unverifiable", not "not a mismatch" — `undefined === undefined` would otherwise let two
+// absent identities forge a match. [LAW:no-defensive-null-guards] this is the real precondition, not a
+// defensive habit: an identity check that can be satisfied by both sides being silent is not a check.
+// `trustedReviewerId` is what the CALLER's own credential resolves to (`dismiss-block`'s `GITHUB_REVIEW_TOKEN`,
+// the same identity `run.js` posts round-cap notices under) — never a hardcoded bot name, which would
+// break the documented user-PAT `GITHUB_REVIEW_TOKEN` path this repo already supports.
+function hasDeclinedRevisit(latestArtifact, trustedReviewerId) {
   return Boolean(latestArtifact)
     && latestArtifact.kind === 'not-reviewed'
-    && latestArtifact.reason === NOT_REVIEWED_REASONS.ROUND_CAP;
+    && latestArtifact.reason === NOT_REVIEWED_REASONS.ROUND_CAP
+    && latestArtifact.postedBy?.id != null
+    && trustedReviewerId != null
+    && latestArtifact.postedBy.id === trustedReviewerId;
 }
 
 // [LAW:one-source-of-truth] A completed review round IS a posted review carrying REVIEW_MARKER, and its
@@ -419,7 +449,14 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
       if (!artifact) continue; // a human's review, or a body this action did not write
       if (r.id > latestArtifactId) {
         latestArtifactId = r.id;
-        latestArtifact = artifact;
+        // [LAW:no-silent-failure] `postedBy` rides on EVERY latestArtifact, not just the 'not-reviewed'
+        // arm `hasDeclinedRevisit` actually reads — one shape for the value, so a future privileged
+        // consumer of a 'review'-kind latestArtifact is not the second place this identity has to be
+        // threaded in from scratch. `r.user` is read verbatim (never coerced or defaulted) so an absent
+        // `user` — a fixture, or a host that omits it — surfaces as `id: undefined`, which
+        // `hasDeclinedRevisit` treats as unverifiable rather than as a value that could accidentally
+        // match an equally-absent trusted id. [LAW:one-source-of-truth]
+        latestArtifact = { ...artifact, postedBy: { id: r.user?.id, login: r.user?.login } };
       }
       // [LAW:dataflow-not-control-flow] The one branch is the artifact type's own discriminator. A
       // notice contributes to `latestArtifact` alone: it recorded no round and spent no money, so
