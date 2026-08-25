@@ -185,7 +185,8 @@ that will never hit a Gitea-only failure mode; a Gitea-specific credential belon
 Gitea-specific action instead. [`dismiss-block/`](dismiss-block/README.md) is that action —
 a small, separate `action.yml` in this same repo, run as an extra step only in Gitea
 workflows, that reads whatever block the review step above left outstanding and releases it
-with its own Admin-level token. See its README for inputs and wiring.
+only once that step has recorded it will not revisit the PR (its round-cap notice), with its
+own Admin-level token. See its README for inputs and wiring.
 
 ## Fork PRs are never reviewed
 

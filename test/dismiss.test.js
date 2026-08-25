@@ -34,6 +34,9 @@ let reviews;
 // Calls the write-level credential made vs. the admin-level one — the whole point under test.
 let writeCalls;
 let adminCalls;
+// The PR object `pulls.get` returns — same-repo (not a fork) by default, so every routing test
+// above reaches its normal path unchanged; the fork test overrides this to a cross-repo PR.
+let prFixture;
 
 // One shared `reviews` store, read and written by whichever token's fake calls it — the same shape a
 // live Gitea PR has one truth regardless of which of this action's credentials is asking.
@@ -41,6 +44,7 @@ function fakeOctokitFor(token) {
   return {
     rest: {
       pulls: {
+        get: async () => ({ data: prFixture }),
         // A single already-patched file is enough to resolve selectTransport to gitHubTransport
         // (PUT .../dismissals) — this suite is about credential ROUTING, which is host-agnostic; the
         // host-detection and Gitea-route behavior are already covered in test/skip-notice.test.js.
@@ -79,6 +83,7 @@ beforeEach(() => {
   reviews = [];
   writeCalls = [];
   adminCalls = [];
+  prFixture = { head: { repo: { id: 100 } }, base: { repo: { id: 100 } } };
 });
 
 github.getOctokit = token => fakeOctokitFor(token);
@@ -174,6 +179,22 @@ describe('the dismiss-block action', () => {
     const said = await runCapturingFailures();
     assert.deepEqual(said, []);
     assert.equal(adminCalls.length, 0);
+  });
+
+  // The bug: a fork PR gets no repository secrets (GITHUB_TOKEN is the one exception, and it arrives
+  // read-only), so DISMISS_TOKEN resolves to '' there — matching GITHUB_REVIEW_TOKEN, per
+  // transport.js's forkNotice comment. That must be a clean no-op, not the misconfiguration failure
+  // below, since dismiss-block/README.md documents this action running unconditionally on every PR
+  // event, fork PRs included.
+  test('a fork PR with no DISMISS_TOKEN is a clean no-op, not a failure', async () => {
+    setInputs({ INPUT_DISMISS_TOKEN: '' });
+    prFixture = { head: { repo: { id: 200 } }, base: { repo: { id: 100 } } };
+    reviews.push(ourBlock(101, 'CHANGES_REQUESTED'), capNotice(102));
+    const said = await runCapturingFailures();
+    assert.deepEqual(said, []);
+    assert.equal(adminCalls.length, 0);
+    assert.equal(writeCalls.length, 0);
+    assert.equal(reviews[0].state, 'CHANGES_REQUESTED', 'a fork PR is never touched — nothing dismissed');
   });
 
   test('DISMISS_TOKEN is required — a run without it fails loud rather than silently skipping', async () => {

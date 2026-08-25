@@ -30244,7 +30244,7 @@ const core = __nccwpck_require__(7484);
 const github = __nccwpck_require__(3228);
 const {
   resolveReviewTarget, summarizePriorReviews, hasDeclinedRevisit, selectTransport,
-  releaseUnrevisitableBlocks, parseReviewerName,
+  releaseUnrevisitableBlocks, parseReviewerName, prIsFromFork,
 } = __nccwpck_require__(7228);
 
 // itv.4.1: the SECOND, small action this repo ships, specifically so a Gitea-only credential never
@@ -30260,16 +30260,6 @@ async function run() {
   core.setSecret(token);
   const reviewToken = core.getInput('GITHUB_REVIEW_TOKEN');
   if (reviewToken) core.setSecret(reviewToken);
-  const dismissToken = core.getInput('DISMISS_TOKEN');
-  if (!dismissToken) {
-    core.setFailed(
-      'DISMISS_TOKEN is required — this action exists to dismiss with a credential the review action '
-      + 'does not carry (Gitea requires repo-Admin to dismiss a review; GITHUB_REVIEW_TOKEN is deliberately '
-      + 'kept at write). Pass a token for a separate Admin-level account.',
-    );
-    return;
-  }
-  core.setSecret(dismissToken);
 
   const { context } = github;
   const { owner, repo } = context.repo;
@@ -30291,6 +30281,51 @@ async function run() {
   // GITHUB_REVIEW_TOKEN (when supplied) is reserved for posting a failure notice under the review
   // action's own identity, matching how a human reading the PR already expects that voice to speak.
   const octokit = github.getOctokit(token);
+
+  // [LAW:one-source-of-truth] The SAME fork gate `run.js` runs, checked BEFORE anything here reads
+  // DISMISS_TOKEN — this action shares `run.js`'s documented wiring (`if: always()`, immediately after
+  // the review step, on the same `pull_request` trigger), and `transport.js`'s `forkNotice` comment
+  // states the fact plainly: a fork PR receives no repository secrets at all, so DISMISS_TOKEN resolves
+  // to '' there just like GITHUB_REVIEW_TOKEN does. That is the expected, unfixable no-secrets case for a
+  // fork PR — not a misconfiguration — so it must never reach the "DISMISS_TOKEN is required" failure
+  // below. This action posts nothing of its own on a fork PR (the review step's own fork notice already
+  // covers it), so a clean, silent no-op is all this needs — the same standing `run.js` gives an
+  // ordinary "nothing outstanding" push. [LAW:no-silent-failure] the reason is still named, on info, so an
+  // operator reading the run log sees why nothing happened rather than being left to guess.
+  let pr;
+  try {
+    ({ data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: pullNumber }));
+  } catch (e) {
+    core.setFailed(`Failed to fetch PR #${pullNumber}: ${e.message}`);
+    return;
+  }
+  let isFork;
+  try {
+    isFork = prIsFromFork(pr);
+  } catch (e) {
+    core.setFailed(e.message);
+    return;
+  }
+  if (isFork) {
+    core.info(
+      `PR #${pullNumber} is from a fork. Fork pull requests receive no repository secrets, so `
+      + 'DISMISS_TOKEN is expected to be unset here — this is not a misconfiguration. Nothing to '
+      + "release: this action never runs the review this PR's block (if any) would need superseding.",
+    );
+    return;
+  }
+
+  const dismissToken = core.getInput('DISMISS_TOKEN');
+  if (!dismissToken) {
+    core.setFailed(
+      'DISMISS_TOKEN is required — this action exists to dismiss with a credential the review action '
+      + 'does not carry (Gitea requires repo-Admin to dismiss a review; GITHUB_REVIEW_TOKEN is deliberately '
+      + 'kept at write). Pass a token for a separate Admin-level account.',
+    );
+    return;
+  }
+  core.setSecret(dismissToken);
+
   const reviewOctokit = github.getOctokit(reviewToken || token);
   const dismissOctokit = github.getOctokit(dismissToken);
   const reviewerName = parseReviewerName(core.getInput('ZAI_REVIEWER_NAME'));
