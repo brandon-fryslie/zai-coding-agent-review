@@ -31638,8 +31638,13 @@ async function announceReleaseFailure(octokit, {
 }
 
 // [LAW:single-enforcer] THE one place the action releases a merge block, and the one rule it enforces:
-// never leave a blocking review this action refuses to revisit. It is called from the round-cap exit and
-// nowhere else, because that exit is the only moment the action decides it is done looking — and a
+// never leave a blocking review this action refuses to revisit. TWO callers reach it, and they share the
+// precondition rather than each deciding one: a release happens only once this action has declined to
+// look at the PR again. `run.js`'s round-cap exit knows that by POSITION (it is inside the branch, and
+// releases only after its notice actually posted); `dismiss-block/`'s standalone entrypoint has no
+// position to inherit, so it reads the same decision back off the PR — the round-cap notice standing as
+// the newest agent artifact — via `hasDeclinedRevisit`. Anything reaching here has already established
+// that the action is done looking, which is the moment that matters, because a
 // REQUEST_CHANGES that will never be reconsidered has stopped being a gate and become a deadlock. The
 // two policies that collide here are each sound alone: the round cap assumes a rejection is advisory and
 // will be revisited, while `block_merge_on_rejected_reviews` assumes a rejection is blocking and can be
