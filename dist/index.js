@@ -37145,6 +37145,32 @@ function parseAgentArtifact(rawBody) {
   return m ? { kind: 'not-reviewed', reason: m[1], body } : null;
 }
 
+// "Has this action announced, on this pull request, that it will not look at it again?" — read off the
+// PR itself rather than recomputed. The round-cap exit posts its notice and releases its own block only
+// once that post succeeded (`run.js`), so the notice being the NEWEST agent artifact is the durable
+// record of that decision: nothing this action wrote has superseded it.
+//
+// [LAW:one-source-of-truth] This exists for `dismiss-block/`, which runs as a SEPARATE process and so
+// cannot inherit `run.js`'s round-cap decision from its position in control flow. The alternative — give
+// that action a MAX_REVIEW_ROUNDS input and re-run `roundCapReached` — would be a second derivation of a
+// cap the first one does not use: `run.js` enforces `effort.roundCap`, de-rated by the DAILY_BUDGET_USD
+// gradient and DIFFICULTY_SCALING, so a re-derivation from the raw input disagrees with it in exactly the
+// de-rated case the release exists to serve. The notice is the decision already recorded as data.
+//
+// [LAW:types-are-the-program] It is also what makes the dismissal MESSAGE true. That message tells the
+// reader the action's own notice explains the refusal; gating the dismissal on that notice being present
+// and newest means the sentence cannot be posted into a world where it is false — including the one where
+// `announceNotReviewed` failed, `run.js` returned before releasing, and no explanation ever reached the PR.
+//
+// The FORK reason is not a declination to revisit: a fork PR is never reviewed at all, so this action
+// holds no block on it to release. Matching the reason by name keeps that distinction in the enumeration
+// rather than in a string literal typed a second time. [LAW:one-source-of-truth]
+function hasDeclinedRevisit(latestArtifact) {
+  return Boolean(latestArtifact)
+    && latestArtifact.kind === 'not-reviewed'
+    && latestArtifact.reason === NOT_REVIEWED_REASONS.ROUND_CAP;
+}
+
 // [LAW:one-source-of-truth] A completed review round IS a posted review carrying REVIEW_MARKER, and its
 // cost IS the cost marker in that same body — there is no separate counter or ledger to drift. One pass
 // over the PR's own reviews yields BOTH the round count (for the round cap) and the summed cost (for the
@@ -37859,6 +37885,7 @@ module.exports = {
   prIsFromFork,
   summarizePriorReviews,
   parseAgentArtifact,
+  hasDeclinedRevisit,
   announceNotReviewed,
   announceReleaseFailure,
   RELEASE_FAILED_MARKER,

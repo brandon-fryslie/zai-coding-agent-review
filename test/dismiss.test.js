@@ -13,12 +13,22 @@ const { test, describe, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const core = require('@actions/core');
 const github = require('@actions/github');
-const { REVIEW_MARKER } = require('../src/transport');
+const { REVIEW_MARKER, NOT_REVIEWED_MARKER_PREFIX, NOT_REVIEWED_REASONS } = require('../src/transport');
 
 // A round-cap-blocked review is one THIS action posted (summarizePriorReviews only ever collects a
 // review whose body carries REVIEW_MARKER into its outstanding-block candidate set) — a human
 // reviewer's REQUEST_CHANGES has no marker and is invisible to this action by construction.
 const ourBlock = (id, state) => ({ id, state, body: `Findings here.\n${REVIEW_MARKER}` });
+
+// The review action's round-cap NOTICE — the record, on the PR, that it has given up on this PR and
+// will not supersede the block above. Built from the same constants the notice renderer writes with, so
+// a marker rename moves both together instead of leaving this suite asserting a dead spelling.
+// Its ID must exceed the block's: "newest artifact" is the highest review id, not arrival order.
+const capNotice = id => ({
+  id,
+  state: 'COMMENTED',
+  body: `Not reviewed.\n\n${NOT_REVIEWED_MARKER_PREFIX}${NOT_REVIEWED_REASONS.ROUND_CAP} -->`,
+});
 
 let reviews;
 // Calls the write-level credential made vs. the admin-level one — the whole point under test.
@@ -105,7 +115,7 @@ async function runCapturingFailures() {
 describe('the dismiss-block action', () => {
   test('dismisses an outstanding block with DISMISS_TOKEN, never the write-level token', async () => {
     setInputs();
-    reviews.push(ourBlock(101, 'CHANGES_REQUESTED'));
+    reviews.push(ourBlock(101, 'CHANGES_REQUESTED'), capNotice(102));
     const said = await runCapturingFailures();
     assert.deepEqual(said, []);
     assert.equal(adminCalls.length, 1, 'the admin credential made the dismissal call');
@@ -115,11 +125,48 @@ describe('the dismiss-block action', () => {
 
   test('a PR with nothing outstanding is a silent no-op — safe to run on every push', async () => {
     setInputs();
-    reviews.push(ourBlock(5, 'COMMENTED'));
+    reviews.push(ourBlock(5, 'COMMENTED'), capNotice(6));
     const said = await runCapturingFailures();
     assert.deepEqual(said, []);
     assert.equal(adminCalls.length, 0);
     assert.equal(writeCalls.length, 0);
+  });
+
+  // The bug this gate exists to prevent. `if: always()` puts this action directly after the review step,
+  // so on a normal round it is looking at a REQUEST_CHANGES posted seconds ago for real, unaddressed
+  // findings — "still blocking" in exactly the same way a round-cap leftover is. Releasing on
+  // outstanding-ness alone would dismiss it, defeating block_merge_on_rejected_reviews on every push that
+  // draws findings. The review is the newest artifact here, so the reviewer has NOT given up on this PR.
+  test('leaves a live block alone when the review action has not declined to revisit the PR', async () => {
+    setInputs();
+    reviews.push(ourBlock(101, 'CHANGES_REQUESTED'));
+    const said = await runCapturingFailures();
+    assert.deepEqual(said, []);
+    assert.equal(adminCalls.length, 0, 'a block the reviewer still intends to supersede is never dismissed');
+    assert.equal(writeCalls.length, 0);
+    assert.equal(reviews[0].state, 'CHANGES_REQUESTED', 'still blocking — the merge gate is intact');
+  });
+
+  // The cap was raised (or the de-rating lifted) and a real round landed afterwards: the notice is no
+  // longer the last word, so the reviewer is back to superseding its own blocks and this action stands down.
+  test('stands down once a real review round supersedes the round-cap notice', async () => {
+    setInputs();
+    reviews.push(capNotice(50), ourBlock(101, 'CHANGES_REQUESTED'));
+    const said = await runCapturingFailures();
+    assert.deepEqual(said, []);
+    assert.equal(adminCalls.length, 0);
+    assert.equal(reviews[1].state, 'CHANGES_REQUESTED');
+  });
+
+  // The round-cap notice failed to post, so run.js returned before releasing anything and no explanation
+  // reached the PR. The dismissal message asserts that an explanation IS on the PR, so this state must be
+  // unreachable from it — otherwise that false claim lands permanently in the PR's review history.
+  test('releases nothing when no round-cap notice ever reached the PR', async () => {
+    setInputs();
+    reviews.push(ourBlock(100, 'CHANGES_REQUESTED'), ourBlock(101, 'CHANGES_REQUESTED'));
+    const said = await runCapturingFailures();
+    assert.deepEqual(said, []);
+    assert.equal(adminCalls.length, 0, 'the message pointing at a notice is never posted without one');
   });
 
   test('a PR with no reviews at all is a silent no-op', async () => {
@@ -141,7 +188,7 @@ describe('the dismiss-block action', () => {
 
   test('a refused dismissal reds the run and names the still-blocking review', async () => {
     setInputs({ INPUT_DISMISS_TOKEN: 'gh-token' }); // not the admin token — refused, same as write access
-    reviews.push(ourBlock(101, 'CHANGES_REQUESTED'));
+    reviews.push(ourBlock(101, 'CHANGES_REQUESTED'), capNotice(102));
     const said = await runCapturingFailures();
     assert.equal(said.length, 1);
     assert.match(said[0], /101/);

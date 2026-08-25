@@ -16,13 +16,29 @@ branch protection.
 
 ## What it does
 
-Reads the PR's prior reviews the same way the review action does, finds any of the review
-action's **own** reviews still marked as blocking, and dismisses them with `DISMISS_TOKEN`.
-A PR with nothing outstanding is a silent no-op — safe to run as an unconditional extra
-step on every PR event, not just capped ones. It never reviews anything, spawns no engine,
-and posts no verdict; a refused dismissal (e.g. `DISMISS_TOKEN` not actually Admin) reds
-this step's own run and posts the same `⚠️ **BLOCK NOT RELEASED**` notice the review action
-would have posted had it held this credential itself.
+Reads the PR's prior reviews the same way the review action does and releases — with
+`DISMISS_TOKEN` — the merge block the review action left behind when it **gave up on the
+PR**. Two things must both hold, and the second is what keeps this safe to run
+unconditionally:
+
+1. one of the review action's **own** reviews is still marked as blocking, and
+2. the review action has announced it will not revisit this PR — its round-cap
+   `NOT REVIEWED` notice is the newest thing it has left on the PR.
+
+Without (2) this action would dismiss *live* blocks. A `REQUEST_CHANGES` posted seconds
+earlier for real, unaddressed findings is "still blocking" in exactly the same way as a
+round-cap leftover, and the wiring below puts this step in front of that review on every
+push — so releasing on (1) alone would defeat `block_merge_on_rejected_reviews` on
+precisely the pushes it exists for. Gating on the notice reads the review action's own
+decision off the PR instead of guessing at it, and it also makes the dismissal message
+(which points readers at that notice) true by construction: no notice, no dismissal.
+
+So a PR the reviewer still intends to revisit is a no-op, as is one with nothing
+outstanding — safe as an unconditional extra step on every PR event, not just capped ones.
+It never reviews anything, spawns no engine, and posts no verdict; a refused dismissal
+(e.g. `DISMISS_TOKEN` not actually Admin) reds this step's own run and posts the same
+`⚠️ **BLOCK NOT RELEASED**` notice the review action would have posted had it held this
+credential itself.
 
 ## Inputs
 

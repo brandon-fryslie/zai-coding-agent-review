@@ -28,12 +28,16 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Assert dist/ is up to date
-        # Fail if the committed dist/ doesn't match a fresh build.
-        # A stale dist/ means the shipped bundle doesn't reflect src/ changes.
+      - name: Assert bundles are up to date
+        # Fail if a committed bundle doesn't match a fresh build. A stale bundle means the
+        # shipped code doesn't reflect src/ changes — and the runner executes the bundle,
+        # never src/, so a stale one ships silently. EVERY output of `npm run build` is
+        # checked, not just the first: `build` emits two bundles (the review action's dist/
+        # and dismiss-block/dist/), and a gate covering a subset of its output leaves the
+        # rest to ship stale with CI green. [LAW:no-silent-failure]
         run: |
-          if ! git diff --exit-code dist/; then
-            echo "dist/ is stale — run 'npm run build' and commit dist/ alongside src/ changes"
+          if ! git diff --exit-code dist/ dismiss-block/dist/; then
+            echo "a bundle is stale — run 'npm run build' and commit dist/ and dismiss-block/dist/ alongside src/ changes"
             exit 1
           fi
 

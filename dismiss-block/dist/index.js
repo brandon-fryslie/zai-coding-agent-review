@@ -30243,7 +30243,7 @@ module.exports = { run };
 const core = __nccwpck_require__(7484);
 const github = __nccwpck_require__(3228);
 const {
-  resolveReviewTarget, summarizePriorReviews, isOutstandingBlock, selectTransport,
+  resolveReviewTarget, summarizePriorReviews, hasDeclinedRevisit, selectTransport,
   releaseUnrevisitableBlocks, parseReviewerName,
 } = __nccwpck_require__(7228);
 
@@ -30303,23 +30303,48 @@ async function run() {
     return;
   }
 
-  const outstanding = prior.reviews.filter(isOutstandingBlock);
-  if (outstanding.length === 0) {
-    core.info(`PR #${pullNumber} has no outstanding block from this action's own reviews; nothing to release.`);
-    return;
-  }
+  // [LAW:dataflow-not-control-flow] "Which of this action's blocks may this run release?" is a VALUE, and
+  // the release below runs unconditionally against it — an empty list resolves no transport and dismisses
+  // nothing (`releaseUnrevisitableBlocks` returns 'nothing-to-release' before touching the network).
+  //
+  // The value is gated, because a still-outstanding block is NOT by itself a block anyone has given up on.
+  // `isOutstandingBlock` is equally true of a REQUEST_CHANGES the review action posted seconds ago for real,
+  // unaddressed findings that it fully intends to re-examine on the next push — and this action's documented
+  // wiring (`if: always()`, immediately after the review step) puts it in front of exactly that review on
+  // every push. Releasing on outstanding-ness alone would therefore dismiss every fresh block a repo's
+  // reviewer ever posts, defeating `block_merge_on_rejected_reviews` on precisely the pushes it exists for.
+  //
+  // `run.js` carries the missing fact in its position — it releases only from inside the round-cap branch.
+  // This action is a separate process with no such position, so it reads the fact off the PR instead: the
+  // round-cap notice standing as the newest agent artifact. [LAW:one-source-of-truth] one decision, made
+  // once by the review run, recorded once on the PR, read here rather than recomputed.
+  const releasable = hasDeclinedRevisit(prior.latestArtifact) ? prior.reviews : [];
 
-  // This run does not know WHY the review action stopped revisiting the PR (the round-cap sentence lives
-  // in that run's own notice, already posted) — it only knows a block is still outstanding after that
-  // decision. Naming the notice rather than repeating an unverifiable reason keeps this message honest:
-  // it can point at where the explanation lives without asserting it here a second time. [LAW:no-silent-failure]
+  // [LAW:types-are-the-program] The gate above is what makes this sentence TRUE rather than merely hopeful.
+  // It asserts an explanation is on the PR, and it is posted verbatim into the PR's permanent review
+  // history — so it must not be reachable from the state where the round-cap notice failed to post and no
+  // explanation exists. It isn't: that state leaves the notice off the PR, so it is not `latestArtifact`,
+  // so `releasable` is empty and nothing is dismissed. Hedging the wording instead ("if a notice exists")
+  // would have kept that state representable and pushed the question onto the reader.
+  // This run still does not repeat WHY the review action stopped — that sentence lives in the notice, whose
+  // presence is now established rather than assumed — it only names where to read it. [LAW:no-silent-failure]
   const capMessage = "the review action's own notice on this pull request explains why it will not "
     + 'revisit this review; this run only releases the merge block it left behind.';
-  await releaseUnrevisitableBlocks(reviewOctokit, () => selectTransport(octokit, owner, repo, pullNumber), {
-    owner, repo, pullNumber, reviews: prior.reviews, capMessage,
+  const outcome = await releaseUnrevisitableBlocks(reviewOctokit, () => selectTransport(octokit, owner, repo, pullNumber), {
+    owner, repo, pullNumber, reviews: releasable, capMessage,
     commitId: headSha, reviewerName, releaseFailureBodies: prior.releaseFailureBodies,
     dismissOctokit,
   });
+  // [LAW:no-silent-failure] The quiet path is the overwhelmingly common one — every push that drew findings
+  // the reviewer still intends to revisit — so it says which of the two quiet reasons it was, rather than
+  // leaving an operator to guess whether this action ran at all. Failures are reported by the release itself.
+  if (outcome === 'nothing-to-release') {
+    core.info(
+      `PR #${pullNumber}: nothing released. ${releasable.length === 0
+        ? "The review action has not declined to revisit this pull request — its newest notice is not a round-cap one — so any blocking review it holds is one it still intends to supersede."
+        : "This action's own reviews carry no outstanding block."}`,
+    );
+  }
 }
 
 module.exports = { run };
@@ -31038,6 +31063,32 @@ function parseAgentArtifact(rawBody) {
   return m ? { kind: 'not-reviewed', reason: m[1], body } : null;
 }
 
+// "Has this action announced, on this pull request, that it will not look at it again?" — read off the
+// PR itself rather than recomputed. The round-cap exit posts its notice and releases its own block only
+// once that post succeeded (`run.js`), so the notice being the NEWEST agent artifact is the durable
+// record of that decision: nothing this action wrote has superseded it.
+//
+// [LAW:one-source-of-truth] This exists for `dismiss-block/`, which runs as a SEPARATE process and so
+// cannot inherit `run.js`'s round-cap decision from its position in control flow. The alternative — give
+// that action a MAX_REVIEW_ROUNDS input and re-run `roundCapReached` — would be a second derivation of a
+// cap the first one does not use: `run.js` enforces `effort.roundCap`, de-rated by the DAILY_BUDGET_USD
+// gradient and DIFFICULTY_SCALING, so a re-derivation from the raw input disagrees with it in exactly the
+// de-rated case the release exists to serve. The notice is the decision already recorded as data.
+//
+// [LAW:types-are-the-program] It is also what makes the dismissal MESSAGE true. That message tells the
+// reader the action's own notice explains the refusal; gating the dismissal on that notice being present
+// and newest means the sentence cannot be posted into a world where it is false — including the one where
+// `announceNotReviewed` failed, `run.js` returned before releasing, and no explanation ever reached the PR.
+//
+// The FORK reason is not a declination to revisit: a fork PR is never reviewed at all, so this action
+// holds no block on it to release. Matching the reason by name keeps that distinction in the enumeration
+// rather than in a string literal typed a second time. [LAW:one-source-of-truth]
+function hasDeclinedRevisit(latestArtifact) {
+  return Boolean(latestArtifact)
+    && latestArtifact.kind === 'not-reviewed'
+    && latestArtifact.reason === NOT_REVIEWED_REASONS.ROUND_CAP;
+}
+
 // [LAW:one-source-of-truth] A completed review round IS a posted review carrying REVIEW_MARKER, and its
 // cost IS the cost marker in that same body — there is no separate counter or ledger to drift. One pass
 // over the PR's own reviews yields BOTH the round count (for the round cap) and the summed cost (for the
@@ -31752,6 +31803,7 @@ module.exports = {
   prIsFromFork,
   summarizePriorReviews,
   parseAgentArtifact,
+  hasDeclinedRevisit,
   announceNotReviewed,
   announceReleaseFailure,
   RELEASE_FAILED_MARKER,
