@@ -30244,7 +30244,7 @@ const core = __nccwpck_require__(7484);
 const github = __nccwpck_require__(3228);
 const {
   resolveReviewTarget, summarizePriorReviews, hasDeclinedRevisit, selectTransport,
-  releaseUnrevisitableBlocks, parseReviewerName, prIsFromFork,
+  releaseUnrevisitableBlocks, parseReviewerName, prIsFromFork, NOT_REVIEWED_REASONS,
 } = __nccwpck_require__(7228);
 
 // itv.4.1: the SECOND, small action this repo ships, specifically so a Gitea-only credential never
@@ -30409,7 +30409,7 @@ async function run() {
     let reason;
     if (!declinedRevisit) {
       const looksLikeRoundCap = prior.latestArtifact?.kind === 'not-reviewed'
-        && prior.latestArtifact?.reason === 'round-cap';
+        && prior.latestArtifact?.reason === NOT_REVIEWED_REASONS.ROUND_CAP;
       reason = looksLikeRoundCap
         ? "This pull request carries a round-cap notice, but this run could not attribute it to a trusted identity (see the warning above, if any) — treating it as unverified rather than releasing on body content alone."
         : "The review action has not declined to revisit this pull request — its newest notice is not a round-cap one — so any blocking review it holds is one it still intends to supersede.";
@@ -31114,21 +31114,21 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
 //
 // [LAW:no-silent-failure] The artifact is trusted from body content alone, NOT from the review's author
 // — so a forged marker from any account with read access is read as this action's own output. That is
-// the pre-existing trust model of every marker consumer here (count, cost, the review set), not a
+// the pre-existing trust model of every marker consumer here (count, cost, the review set, dedup), not a
 // property of this reader; forging a REVIEW_MARKER round is the strictly stronger version of the same
-// attack. The release path inherits that model for the LOW-STAKES consumers (count/cost/dedup — worst
-// case is a wrong number in a log line or a re-posted notice), where widening it costs more plumbing than
-// the exposure justifies.
+// attack. The release path inherits that model for the LOW-STAKES consumers (count/cost/review-set/dedup
+// — worst case is a wrong number in a log line, a review released without a fresh look, or a re-posted
+// notice), where widening it costs more plumbing than the exposure justifies.
 //
 // ONE consumer is not low-stakes: `hasDeclinedRevisit` below is the sole gate `dismiss-block` uses to fire
 // an Admin-credentialed dismissal, and body content alone is not enough there — a forged notice from ANY
 // account with read access would release a genuinely outstanding block with no round cap ever hit
 // (home-copirate-review-itv-4-2, round 4). That one caller checks `postedBy` — the review's actual
 // `user.id`, carried alongside the parsed artifact — against the identity the run itself trusts to have
-// posted it, so it needs no wider fix here. Closing the remaining three (count, cost, dedup) needs ONE
-// author gate over all four values, still blocked on an identity mechanism proven under a real Actions
-// token, since a run's own "who am I" answer is the one piece this offline change cannot measure live:
-// `zai-review-trust-6yp`.
+// posted it, so it needs no wider fix here. Closing the remaining four (count, cost, review-set, dedup)
+// needs ONE author gate over all five values, still blocked on an identity mechanism proven under a real
+// Actions token, since a run's own "who am I" answer is the one piece this offline change cannot measure
+// live: `zai-review-trust-6yp`.
 const NOT_REVIEWED_MARKER_RE = new RegExp(
   `${NOT_REVIEWED_MARKER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([a-z-]+) -->$`,
 );

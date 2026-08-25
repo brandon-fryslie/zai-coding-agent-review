@@ -3,7 +3,7 @@ const core = require('@actions/core');
 const github = require('@actions/github');
 const {
   resolveReviewTarget, summarizePriorReviews, hasDeclinedRevisit, selectTransport,
-  releaseUnrevisitableBlocks, parseReviewerName, prIsFromFork,
+  releaseUnrevisitableBlocks, parseReviewerName, prIsFromFork, NOT_REVIEWED_REASONS,
 } = require('./transport');
 
 // itv.4.1: the SECOND, small action this repo ships, specifically so a Gitea-only credential never
@@ -168,7 +168,7 @@ async function run() {
     let reason;
     if (!declinedRevisit) {
       const looksLikeRoundCap = prior.latestArtifact?.kind === 'not-reviewed'
-        && prior.latestArtifact?.reason === 'round-cap';
+        && prior.latestArtifact?.reason === NOT_REVIEWED_REASONS.ROUND_CAP;
       reason = looksLikeRoundCap
         ? "This pull request carries a round-cap notice, but this run could not attribute it to a trusted identity (see the warning above, if any) — treating it as unverified rather than releasing on body content alone."
         : "The review action has not declined to revisit this pull request — its newest notice is not a round-cap one — so any blocking review it holds is one it still intends to supersede.";
