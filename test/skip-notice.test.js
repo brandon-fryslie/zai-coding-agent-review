@@ -43,7 +43,9 @@ function fakePr() {
 // What a default-GITHUB_TOKEN run resolves to, and the author its reviews carry (measured 2026-08-24:
 // login github-actions[bot], type Bot).
 const BOT_IDENTITY = [{ kind: 'bot' }];
-const OURS = { login: 'github-actions[bot]', type: 'Bot' };
+// A real review user always carries an id; the fixture does too, so `postedBy` assertions test what the
+// reader copies off `r.user` rather than a hole in the fixture. 41898282 is github-actions[bot]'s own id.
+const OURS = { id: 41898282, login: 'github-actions[bot]', type: 'Bot' };
 // Any account with read access to a public repo — the whole population that can forge a marker today.
 const STRANGER = { login: 'passer-by', type: 'User' };
 
@@ -192,7 +194,10 @@ describe('a review-less run speaks at the PR', () => {
     };
     // The round has the higher id, so it is the newest agent artifact even though the notice came last.
     const prior = await summarizePriorReviews(descending, 'o', 'r', PR, BOT_IDENTITY);
-    assert.deepEqual(prior.latestArtifact, { kind: 'review' });
+    assert.deepEqual(prior.latestArtifact, {
+      kind: 'review',
+      postedBy: { id: OURS.id, login: OURS.login },
+    });
   });
 });
 
@@ -906,7 +911,7 @@ describe('a block the reviewer will not revisit is released', () => {
     });
 
     // No `dismissOctokit` passed at all is every existing call site and every test above this one —
-    // the default MUST still be the plain `octokit`, so a run with no DISMISS_TOKEN configured
+    // the default MUST still be the plain `octokit`, so `run.js`'s review run (which never passes one)
     // reproduces exactly today's (broken-on-Gitea) behavior rather than a new one.
     test('omitting dismissOctokit falls back to the plain octokit, unchanged from before this feature', async () => {
       const { pr, writeCalls } = splitCredentialHost();
@@ -946,12 +951,25 @@ describe('resolveReviewerIdentity', () => {
   const PAT = { user: { login: 'release-bot', id: 7, type: 'User' }, installation: refuse(403, 'You must authenticate with an installation access token') };
   const INSTALLATION = { user: refuse(403, 'Resource not accessible by integration'), installation: { total_count: 1 } };
 
-  test('a user PAT names itself — the exact arm', async () => {
-    assert.deepEqual(await resolveReviewerIdentity(fake(PAT)), { kind: 'login', login: 'release-bot' });
+  // The `id` is carried off the same /user answer the login came from, so dismiss-block reads one
+  // resolution instead of asking the endpoint a second time on the same credential.
+  test('a user PAT names itself — the exact arm, id included', async () => {
+    assert.deepEqual(await resolveReviewerIdentity(fake(PAT)), { kind: 'login', login: 'release-bot', id: 7 });
   });
 
+  // `id: null` is the measured fact that an installation token cannot name its own app — carried as a
+  // value, so the one consumer that compares ids reads "unverifiable" rather than accidentally matching
+  // another absent id.
   test('an installation token is CONFIRMED as one, not inferred from the /user refusal', async () => {
-    assert.deepEqual(await resolveReviewerIdentity(fake(INSTALLATION)), { kind: 'bot' });
+    assert.deepEqual(await resolveReviewerIdentity(fake(INSTALLATION)), { kind: 'bot', id: null });
+  });
+
+  // Gitea's /user answers login_name '@gitea-actions/<task-id>' while the review it posts reads back
+  // 'gitea-actions' (measured, Gitea 1.27.2). Matching the neighbouring field would disown our own
+  // review on every run and silently zero the round count.
+  test('the login is taken from `login`, never the task-scoped `login_name` beside it', async () => {
+    const gitea = fake({ user: { id: -2, login: 'gitea-actions', login_name: '@gitea-actions/6138' } });
+    assert.deepEqual(await resolveReviewerIdentity(gitea), { kind: 'login', login: 'gitea-actions', id: -2 });
   });
 
   // [LAW:no-silent-failure] 403 is not exclusive to "Resource not accessible by integration": a secondary
@@ -978,13 +996,13 @@ describe('resolveReviewerIdentity', () => {
     test('two distinct tokens yield both identities, so neither one\'s rounds are disowned', async () => {
       assert.deepEqual(
         await resolveReviewerIdentities([fake(PAT), fake(INSTALLATION)]),
-        [{ kind: 'login', login: 'release-bot' }, { kind: 'bot' }],
+        [{ kind: 'login', login: 'release-bot', id: 7 }, { kind: 'bot', id: null }],
       );
     });
 
     test('the ordinary single-token run collapses to one identity and one compare', async () => {
-      assert.deepEqual(await resolveReviewerIdentities([fake(INSTALLATION), fake(INSTALLATION)]), [{ kind: 'bot' }]);
-      assert.deepEqual(await resolveReviewerIdentities([fake(PAT), fake(PAT)]), [{ kind: 'login', login: 'release-bot' }]);
+      assert.deepEqual(await resolveReviewerIdentities([fake(INSTALLATION), fake(INSTALLATION)]), [{ kind: 'bot', id: null }]);
+      assert.deepEqual(await resolveReviewerIdentities([fake(PAT), fake(PAT)]), [{ kind: 'login', login: 'release-bot', id: 7 }]);
     });
 
     test('one unresolvable token fails the whole set — a partial identity is not a lenient one', async () => {

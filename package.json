@@ -1,6 +1,6 @@
 {
   "name": "copirate-code-review-agent",
-  "version": "1.50.1",
+  "version": "1.51.1",
   "description": "AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER",
   "license": "MIT",
   "repository": {
@@ -13,7 +13,7 @@
     "node": ">=24"
   },
   "scripts": {
-    "build": "ncc build src/index.js -o dist --license licenses.txt",
+    "build": "ncc build src/index.js -o dist --license licenses.txt && ncc build src/dismiss-index.js -o dismiss-block/dist --license licenses.txt",
     "test": "node --test",
     "review:local": "node scripts/local-review.js",
     "review:case": "node eval/run-case.js",
