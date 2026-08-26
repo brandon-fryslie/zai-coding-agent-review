@@ -110,7 +110,7 @@ inputs:
     required: false
     default: ${{ github.token }}
   GITHUB_REVIEW_TOKEN:
-    description: "Token for all GitHub API calls; enables submitting approvals."
+    description: "Token the action POSTS under (review, not-reviewed notice, block dismissals); reads stay on GITHUB_TOKEN. Enables submitting formal approvals."
     required: false
   PR_NUMBER:
     description: "Pull request number to review."

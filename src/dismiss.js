@@ -2,7 +2,7 @@
 const core = require('@actions/core');
 const github = require('@actions/github');
 const {
-  resolveReviewTarget, summarizePriorReviews, hasDeclinedRevisit, selectTransport,
+  resolveReviewTarget, summarizePriorReviews, hasDeclinedRevisit, selectTransport, resolveReviewerIdentities,
   releaseUnrevisitableBlocks, parseReviewerName, prIsFromFork, NOT_REVIEWED_REASONS,
 } = require('./transport');
 
@@ -89,38 +89,71 @@ async function run() {
   const dismissOctokit = github.getOctokit(dismissToken);
   const reviewerName = parseReviewerName(core.getInput('ZAI_REVIEWER_NAME'));
 
-  let prior;
-  try {
-    prior = await summarizePriorReviews(octokit, owner, repo, pullNumber);
-  } catch (e) {
-    core.setFailed(`Failed to read PR #${pullNumber}'s prior reviews: ${e.message}`);
-    return;
-  }
-
   // [LAW:no-silent-failure] home-copirate-review-itv-4-2 (round 4): `hasDeclinedRevisit` used to trust
   // `prior.latestArtifact` from body content alone — the round-cap marker is a public, literal string, so
   // any account with read access could post a review ending in it and have this run treat that as the
   // review action's own decision to give up, releasing every genuinely outstanding block with the Admin
   // credential below. The fix is to ask who THIS run itself would trust to have posted that notice, and
   // require the artifact's actual author to match: `reviewOctokit` is built from the same credential
-  // (`GITHUB_REVIEW_TOKEN`, or its `GITHUB_TOKEN` fallback) that `run.js` posts round-cap notices under, so
-  // asking it "who am I" (`GET /user`, served by GitHub and Gitea alike) answers the identity a genuine
-  // notice was posted as, without hardcoding a bot username that would break the documented user-PAT
-  // `GITHUB_REVIEW_TOKEN` path this repo already supports.
+  // (`GITHUB_REVIEW_TOKEN`, or its `GITHUB_TOKEN` fallback) that `run.js` posts round-cap notices under.
+  // The answer is the resolved identity SET below, not that one credential alone: a notice can predate the
+  // credential posting now, and the set is what covers that. Never a hardcoded bot username, which would
+  // break the documented user-PAT `GITHUB_REVIEW_TOKEN` path this repo already supports.
+  //
+  // The ids that comparison needs exist only on the login arm, taken from the `/user` payload the login
+  // itself came from. On the installation arm there is no successful `/user` at all — the identity is
+  // confirmed structurally and carries `id: null`, so `hasDeclinedRevisit` finds nothing to match and this
+  // run releases nothing. That is the same safe direction as a failed resolution, reached by a different
+  // road, and it is why the null is a carried VALUE rather than something to paper over here.
   //
   // A failure here is NOT a reason to fall back to trusting body content — it is treated as "cannot verify",
-  // which `hasDeclinedRevisit` already refuses to release on (`trustedReviewerId == null`). The safe
-  // direction is a block that stays up one run longer, not one a forgery could talk this run into dropping.
-  let trustedReviewerId = null;
+  // and this run releases nothing. The safe direction is a block that stays up one run longer, not one a
+  // forgery could talk this run into dropping.
+  //
+  // [LAW:one-source-of-truth] ONE resolution answers both questions this action asks about identity: which
+  // reviews on the PR are the review action's own (`summarizePriorReviews`' author gate) and which id a
+  // genuine round-cap notice was posted under (`hasDeclinedRevisit`). This used to be two independent
+  // `GET /user` calls on the same credential, which is two clocks: they can disagree — one 503s, or a
+  // rotation lands between them — and nothing would say which answer was right.
+  //
+  // [LAW:no-silent-failure] Unlike `run.js`, an unresolvable identity here is a WARNING and an early
+  // return, not a red run. The difference is what each action loses: `run.js` cannot enforce a round cap
+  // without knowing its own rounds, so guessing there uncaps spend. This action's whole job is optional
+  // cleanup on an `if: always()` step, so "do nothing this push" is a complete, correct outcome — and
+  // reddening every Gitea push over a transient identity hiccup would be noise reported as a defect.
+  // [LAW:one-source-of-truth] The set covers EVERY credential that can have posted an artifact on this
+  // PR, exactly as `run.js` does — not just the one posting now. Resolving `reviewOctokit` alone looks
+  // sufficient and is the bug this action exists to prevent, one level down: add `GITHUB_REVIEW_TOKEN`
+  // to a repo with a live PR (the transition the README recommends) and every round, block and notice
+  // posted earlier under the default `GITHUB_TOKEN` fails the author gate, drops out of `prior.reviews`,
+  // and leaves `releasable` empty. The round-cap notice still verifies, so this action would report
+  // "nothing outstanding" and walk away from precisely the deadlock it was written to clear.
+  //
+  // The same set answers BOTH questions this action asks — which reviews are ours, and whether the
+  // round-cap notice is ours — so there is no second, narrower notion of "trusted" to drift from the
+  // first. An earlier revision passed only the posting credential's id to `hasDeclinedRevisit`, which
+  // reintroduced the deadlock for a notice posted BEFORE `GITHUB_REVIEW_TOKEN` was added.
+  const distinctTokens = [...new Set([reviewToken || token, token])];
+  let identities;
   try {
-    const { data: self } = await reviewOctokit.rest.users.getAuthenticated();
-    trustedReviewerId = self?.id ?? null;
+    identities = await resolveReviewerIdentities(
+      [reviewOctokit, ...distinctTokens.slice(1).map(t => github.getOctokit(t))],
+    );
   } catch (e) {
     core.warning(
       `Could not verify the review action's own identity via GITHUB_REVIEW_TOKEN (or its GITHUB_TOKEN `
       + `fallback): ${e.message}. Treating PR #${pullNumber}'s round-cap notice, if any, as unverifiable — `
       + 'no block will be released this run.',
     );
+    return;
+  }
+
+  let prior;
+  try {
+    prior = await summarizePriorReviews(octokit, owner, repo, pullNumber, identities);
+  } catch (e) {
+    core.setFailed(`Failed to read PR #${pullNumber}'s prior reviews: ${e.message}`);
+    return;
   }
 
   // [LAW:dataflow-not-control-flow] "Which of this action's blocks may this run release?" is a VALUE, and
@@ -139,7 +172,7 @@ async function run() {
   // round-cap notice standing as the newest agent artifact AND carrying the identity this run trusts.
   // [LAW:one-source-of-truth] one decision, made once by the review run, recorded once on the PR, read
   // here rather than recomputed.
-  const declinedRevisit = hasDeclinedRevisit(prior.latestArtifact, trustedReviewerId);
+  const declinedRevisit = hasDeclinedRevisit(prior.latestArtifact, identities);
   const releasable = declinedRevisit ? prior.reviews : [];
 
   // [LAW:types-are-the-program] The gate above is what makes this sentence TRUE rather than merely hopeful.
@@ -162,7 +195,7 @@ async function run() {
   // than leaving an operator to guess whether this action ran at all. Failures are reported by the release
   // itself. The three are distinguished in the same order `hasDeclinedRevisit` checks them: a notice that
   // isn't a round-cap one at all, a genuine round-cap notice this run could not attribute to a trusted
-  // identity (an unverifiable `trustedReviewerId`, or a mismatched/absent `postedBy`), and nothing
+  // identity (no resolved identity carried an id, or the notice's `postedBy` was absent or matched none), and nothing
   // outstanding to release even though the notice checked out.
   if (outcome === 'nothing-to-release') {
     let reason;

@@ -140,9 +140,21 @@ describe('parseMaxRounds', () => {
 });
 
 describe('summarizePriorReviews', () => {
+  // The identity a default-GITHUB_TOKEN run resolves to, and the author its reviews carry (measured:
+  // login github-actions[bot], type Bot).
+  const BOT_IDENTITY = [{ kind: 'bot' }];
+  const OURS = { login: 'github-actions[bot]', type: 'Bot' };
   // A fake octokit whose listReviews returns fixed pages; asserts the marker filter, cost sum, pagination.
+  // A fixture is authored by US unless it names its own author: these cases exercise the BODY gate, so
+  // the author gate must not be the thing filtering them. The author gate itself — a stranger's forged
+  // REVIEW_MARKER, the same body under our own account, the identity-change transition — is exercised in
+  // test/skip-notice.test.js, which owns that concern; nothing in this file varies the author.
   const fakeOctokit = (pages) => ({
-    rest: { pulls: { listReviews: async ({ page }) => ({ data: pages[page - 1] || [] }) } },
+    rest: {
+      pulls: {
+        listReviews: async ({ page }) => ({ data: (pages[page - 1] || []).map(r => ({ user: OURS, ...r })) }),
+      },
+    },
   });
   const withCost = (usd) => `verdict\n\n${costMarker({ basis: 'dollars', usd })}\n\n${REVIEW_MARKER}`;
   const unknownCost = () => `verdict\n\n${costMarker(null)}\n\n${REVIEW_MARKER}`;
@@ -156,7 +168,7 @@ describe('summarizePriorReviews', () => {
       { body: `another round\n\n${REVIEW_MARKER}\n` }, // trailing whitespace tolerated
       { body: null }, // dismissed/empty review body
     ]]);
-    assert.equal((await summarizePriorReviews(octokit, 'o', 'r', 1)).count, 2);
+    assert.equal((await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY)).count, 2);
   });
 
   test('a human review that merely QUOTES the marker mid-body is not counted', async () => {
@@ -164,7 +176,7 @@ describe('summarizePriorReviews', () => {
       { body: `I see the action posts \`${REVIEW_MARKER}\` — but here is my own comment.` },
       { body: `real round\n\n${REVIEW_MARKER}` },
     ]]);
-    assert.equal((await summarizePriorReviews(octokit, 'o', 'r', 1)).count, 1);
+    assert.equal((await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY)).count, 1);
   });
 
   test('sums the per-round cost markers into the PR cost total', async () => {
@@ -174,7 +186,7 @@ describe('summarizePriorReviews', () => {
       { body: unknownCost() },              // counted as an unknown-cost round
       { body: 'a human review, no marker' }, // not a round, no cost
     ]]);
-    const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1);
+    const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
     assert.equal(count, 3); // three marker-bearing reviews
     assert.equal(Number(cost.billed.usd.toFixed(2)), 0.08);
     assert.equal(cost.billed.count, 2);
@@ -186,7 +198,7 @@ describe('summarizePriorReviews', () => {
       { body: `here is what the bot posts: ${costMarker({ basis: 'dollars', usd: 999 })} — my own note` }, // no REVIEW_MARKER
       { body: withCost(0.04) },
     ]]);
-    const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1);
+    const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
     assert.equal(count, 1);                 // only the real agent round
     assert.equal(Number(cost.billed.usd.toFixed(2)), 0.04); // the human's $999 marker is NOT summed
     assert.equal(cost.billed.count, 1);
@@ -197,7 +209,7 @@ describe('summarizePriorReviews', () => {
       { body: `old verdict\n\n${REVIEW_MARKER}` }, // agent round, but no cost marker
       { body: withCost(0.04) },
     ]]);
-    const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1);
+    const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
     assert.equal(count, 2);
     assert.equal(cost.billed.count, 1);
     assert.equal(cost.billed.unknownCount, 1); // the markerless agent round is an honest unknown
@@ -213,7 +225,7 @@ describe('summarizePriorReviews', () => {
       { body: withNotionalCost(40) },
       { body: withNotionalCost(23.59) },
     ]]);
-    const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1);
+    const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
     assert.equal(count, 3);                                  // every round counted, whatever paid for it
     assert.equal(Number(cost.billed.usd.toFixed(2)), 1.20);  // the $63.59 of list price is NOT in here
     assert.equal(cost.billed.count, 1);
@@ -223,7 +235,7 @@ describe('summarizePriorReviews', () => {
   });
 
   test('returns zeroes when the PR has no reviews', async () => {
-    const { count, cost, reviews } = await summarizePriorReviews(fakeOctokit([[]]), 'o', 'r', 1);
+    const { count, cost, reviews } = await summarizePriorReviews(fakeOctokit([[]]), 'o', 'r', 1, BOT_IDENTITY);
     assert.equal(count, 0);
     assert.deepEqual(cost, ZERO_TALLIES);
     assert.deepEqual(reviews, []);
@@ -238,7 +250,7 @@ describe('summarizePriorReviews', () => {
       { id: 22, body: 'a human review, no marker', state: 'CHANGES_REQUESTED' },
       { id: 33, body: withCost(0.02), state: 'COMMENTED' },
     ]]);
-    const { reviews } = await summarizePriorReviews(octokit, 'o', 'r', 1);
+    const { reviews } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
     // Verbatim, not normalized: these GitHub-shaped fixtures carry no `dismissed` key, and the loop
     // reports that absence rather than coercing it to `false`. Interpreting absence is the recognition
     // rule's job, and coercing here would put half that rule in a function that promises not to interpret.
@@ -255,14 +267,14 @@ describe('summarizePriorReviews', () => {
       { id: 11, body: `round\n\n${REVIEW_MARKER}`, state: 'CHANGES_REQUESTED' },
       { id: 22, body: 'a human review, no marker', state: 'CHANGES_REQUESTED' },
     ]]);
-    const { reviews } = await summarizePriorReviews(octokit, 'o', 'r', 1);
+    const { reviews } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
     assert.deepEqual(reviews.filter(isOutstandingBlock).map(r => r.id), [11]);
   });
 
   test('exhausts pagination — a full first page forces a second fetch (count AND cost span pages)', async () => {
     const full = Array.from({ length: 100 }, () => ({ body: withCost(0.01) }));
     const octokit = fakeOctokit([full, [{ body: withCost(0.01) }, { body: 'no marker' }]]);
-    const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1);
+    const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
     assert.equal(count, 101);
     assert.equal(cost.billed.count, 101);              // cost summed across BOTH pages, not just page 1
     assert.equal(Number(cost.billed.usd.toFixed(2)), 1.01);  // 101 × $0.01

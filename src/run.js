@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { filterFiles, buildReviewAnchors, diffChurn, excludedPathList } = require('./diff');
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = require('./transport');
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentities, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = require('./transport');
 const { buildReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
@@ -362,7 +362,13 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   }
 
   const octokit = github.getOctokit(token);
-  const reviewOctokit = github.getOctokit(reviewToken || token);
+  // [LAW:one-source-of-truth] "Which token posts the review" is decided HERE, once, and every consumer
+  // reads this value. The identity set resolved below must name the account that actually posts, so a
+  // second `reviewToken || token` spelled out at that call site would be a rival source: change the
+  // fallback in one and the identity set silently stops covering the real poster — reintroducing the
+  // very "our own block isn't ours" deadlock this identity gate exists to close.
+  const postingToken = reviewToken || token;
+  const reviewOctokit = github.getOctokit(postingToken);
 
   // [LAW:single-enforcer] One PR fetch, one place that decides fork eligibility. The PR object
   // also feeds config-file label/body selection below, so it is fetched once here.
@@ -406,6 +412,30 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     return;
   }
 
+  // [LAW:parse-dont-validate] Who this run posts as, resolved ONCE. It is what makes every marker below
+  // attributable: without it, any account with read access could end a review body with REVIEW_MARKER
+  // and forge a round — and enough forged rounds push a PR past its cap so it is never reviewed again.
+  //
+  // [LAW:one-source-of-truth] The DISTINCT tokens this run holds, deduped here where the token strings
+  // live. The review token posts and the default token reads, and they are the same account until an
+  // operator sets GITHUB_REVIEW_TOKEN — at which point earlier rounds of a live PR were posted by the
+  // OTHER one. Resolving both is what keeps those rounds ours across that change; resolving only the
+  // poster would disown them, resetting the count and stranding an outstanding block outside the set
+  // releaseUnrevisitableBlocks can release. Identical tokens resolve once, so the ordinary run pays for
+  // exactly one probe.
+  //
+  // Deliberately placed AFTER the fork gate. That gate decides from the already-fetched `pr` and nothing
+  // else, on purpose: putting an API call in front of it would let a transient failure red a fork PR's
+  // run, which is precisely the guarantee the fork path was built not to have.
+  let identities;
+  try {
+    const distinctTokens = [...new Set([postingToken, token])];
+    identities = await resolveReviewerIdentities(distinctTokens.map(t => github.getOctokit(t)));
+  } catch (e) {
+    core.setFailed(e.message);
+    return;
+  }
+
   // [LAW:no-silent-failure] Name the prior-review summary as the failure point, matching the PR fetch
   // above — a bare throw would surface only the generic top-level message, hiding which step failed. A
   // listReviews error fails the run loud rather than silently skipping the cap. ONE fetch feeds three
@@ -418,7 +448,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   // again depend on nothing but `pr`.
   let prior;
   try {
-    prior = await summarizePriorReviews(octokit, owner, repo, pullNumber);
+    prior = await summarizePriorReviews(octokit, owner, repo, pullNumber, identities);
   } catch (e) {
     core.setFailed(`Failed to summarize prior reviews for PR #${pullNumber}: ${e.message}`);
     return;
