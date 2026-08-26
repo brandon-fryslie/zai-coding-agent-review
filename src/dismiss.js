@@ -95,9 +95,10 @@ async function run() {
   // review action's own decision to give up, releasing every genuinely outstanding block with the Admin
   // credential below. The fix is to ask who THIS run itself would trust to have posted that notice, and
   // require the artifact's actual author to match: `reviewOctokit` is built from the same credential
-  // (`GITHUB_REVIEW_TOKEN`, or its `GITHUB_TOKEN` fallback) that `run.js` posts round-cap notices under, so
-  // resolving ITS identity answers who a genuine notice was posted as — without hardcoding a bot username,
-  // which would break the documented user-PAT `GITHUB_REVIEW_TOKEN` path this repo already supports.
+  // (`GITHUB_REVIEW_TOKEN`, or its `GITHUB_TOKEN` fallback) that `run.js` posts round-cap notices under.
+  // The answer is the resolved identity SET below, not that one credential alone: a notice can predate the
+  // credential posting now, and the set is what covers that. Never a hardcoded bot username, which would
+  // break the documented user-PAT `GITHUB_REVIEW_TOKEN` path this repo already supports.
   //
   // The ids that comparison needs exist only on the login arm, taken from the `/user` payload the login
   // itself came from. On the installation arm there is no successful `/user` at all — the identity is

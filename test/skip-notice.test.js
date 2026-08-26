@@ -1013,11 +1013,16 @@ describe('resolveReviewerIdentity', () => {
   });
 
   describe('resolveReviewerIdentities', () => {
+    // Membership, not order. The contract is "both identities are in the set"; which slot each lands in
+    // is deliberately not promised (see resolveReviewerIdentities), so asserting the array shape would
+    // pin an implementation detail the source just finished declaring free. [LAW:behavior-not-structure]
     test('two distinct tokens yield both identities, so neither one\'s rounds are disowned', async () => {
-      assert.deepEqual(
-        await resolveReviewerIdentities([fake(PAT), fake(INSTALLATION)]),
-        [{ kind: 'login', login: 'release-bot', id: 7 }, { kind: 'bot', id: null }],
+      const byKind = new Map(
+        (await resolveReviewerIdentities([fake(PAT), fake(INSTALLATION)])).map(i => [i.kind, i]),
       );
+      assert.equal(byKind.size, 2);
+      assert.deepEqual(byKind.get('login'), { kind: 'login', login: 'release-bot', id: 7 });
+      assert.deepEqual(byKind.get('bot'), { kind: 'bot', id: null });
     });
 
     test('the ordinary single-token run collapses to one identity and one compare', async () => {

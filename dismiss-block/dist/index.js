@@ -30336,9 +30336,10 @@ async function run() {
   // review action's own decision to give up, releasing every genuinely outstanding block with the Admin
   // credential below. The fix is to ask who THIS run itself would trust to have posted that notice, and
   // require the artifact's actual author to match: `reviewOctokit` is built from the same credential
-  // (`GITHUB_REVIEW_TOKEN`, or its `GITHUB_TOKEN` fallback) that `run.js` posts round-cap notices under, so
-  // resolving ITS identity answers who a genuine notice was posted as — without hardcoding a bot username,
-  // which would break the documented user-PAT `GITHUB_REVIEW_TOKEN` path this repo already supports.
+  // (`GITHUB_REVIEW_TOKEN`, or its `GITHUB_TOKEN` fallback) that `run.js` posts round-cap notices under.
+  // The answer is the resolved identity SET below, not that one credential alone: a notice can predate the
+  // credential posting now, and the set is what covers that. Never a hardcoded bot username, which would
+  // break the documented user-PAT `GITHUB_REVIEW_TOKEN` path this repo already supports.
   //
   // The ids that comparison needs exist only on the login arm, taken from the `/user` payload the login
   // itself came from. On the installation arm there is no successful `/user` at all — the identity is
@@ -31429,7 +31430,14 @@ function matchesIdentity(identity, user) {
 // ever hit (found in review of home-copirate-review-itv-4-2, round 4).
 //
 // The comparison is by `postedBy.id`, not `.login` — a login can be renamed out from under a comparison,
-// an id cannot — and BOTH sides must be present: `latestArtifact.postedBy.id == null` (a fixture, or a
+// an id cannot. That the two sides are even comparable is a MEASURED fact on both hosts, not an
+// assumption: this compares an id read off a REVIEW against an id read off `/user`, which are different
+// endpoints and could have disagreed. On Gitea (2026-08-26, 1.27.2) `/user` answers `id: -2` for the
+// runner token and the review it posts reads back `user.id: -2` — the same integer, so a pre-PAT notice
+// is matchable at all. Were a host to omit `user.id` on reviews, `postedBy.id` would be null, this would
+// answer "unverifiable", and the deadlock would persist quietly — which is why the fact is recorded here
+// rather than assumed from the login agreeing.
+// BOTH sides must be present: `latestArtifact.postedBy.id == null` (a fixture, or a
 // host that omitted `user`) and an identity carrying no id (the bot arm, which cannot name its own app)
 // are each treated as "unverifiable", not "not a mismatch" — `undefined === undefined` would otherwise let
 // two absent identities forge a match. [LAW:no-defensive-null-guards] this is the real precondition, not a
