@@ -125,7 +125,7 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | `LEDGER_ISSUE` | — | Issue number of the append-only daily cost ledger the budget gradient reads and writes (typically `${{ vars.LEDGER_ISSUE }}`). Required when `DAILY_BUDGET_USD` is set. |
 | `DIFFICULTY_SCALING` | `false` (off) | Scale review effort to change difficulty — see [Difficulty scaling](#difficulty-scaling). An easy diff draws fewer review rounds; a complex diff reasons harder each round. PR mode only. |
 | `DEPENDENCY_DIFF` | `false` (off) | Fetch upstream commit/file context for a `go.mod` version bump — see [Dependency diff context](#dependency-diff-context). PR mode only. |
-| `GITHUB_TOKEN` | `${{ github.token }}` | Token for GitHub API access (fetching the diff, posting the review). Defaults to the workflow's automatic token, which needs `pull-requests: write`. |
+| `GITHUB_TOKEN` | `${{ github.token }}` | Token for reading the PR (diff, prior reviews, spend ledger), and for posting when `GITHUB_REVIEW_TOKEN` is unset. Defaults to the workflow's automatic token, which needs `pull-requests: write`. |
 | `GITHUB_REVIEW_TOKEN` | — | Token the action **posts** under when set — the review, the not-reviewed notice, and block dismissals. Reads (diff, prior reviews, ledger) stay on `GITHUB_TOKEN`. Required to submit a **formal approval** (see [Approvals](#approvals)). |
 | `PR_NUMBER` | from event | PR number. Auto-detected on `pull_request` events; pass explicitly on others (e.g. `workflow_run`). |
 | `HEAD_SHA` | from event | Head SHA the review anchors to. Auto-detected on `pull_request` events. |

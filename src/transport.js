@@ -307,9 +307,11 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
 // low-stakes: it is the sole gate `dismiss-block` uses to fire an Admin-credentialed dismissal, so on the
 // coarse arm "some bot on this repo" is not a good enough answer to release a genuinely outstanding
 // REQUEST_CHANGES with no round cap ever hit (home-copirate-review-itv-4-2, round 4). It therefore adds an
-// EXACT requirement on top of this gate — `postedBy.id` against the identity the caller itself resolved —
-// rather than widening the model for the other four. Strength is layered per consumer, at the consumer;
-// the author gate stays one enforcer with one meaning. [LAW:single-enforcer]
+// IDENTITY requirement on top of this gate — `postedBy.id` against the ids of the identities the caller
+// resolved — rather than widening the model for the other four. It is as exact as those identities allow
+// and no more, which on a shared-account host is not very; the residual is stated at `hasDeclinedRevisit`
+// itself rather than promised here. Strength is layered per consumer, at the consumer; the author gate
+// stays one enforcer with one meaning. [LAW:single-enforcer]
 const NOT_REVIEWED_MARKER_RE = new RegExp(
   `${NOT_REVIEWED_MARKER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([a-z-]+) -->$`,
 );
