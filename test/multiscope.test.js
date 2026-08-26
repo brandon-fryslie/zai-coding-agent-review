@@ -18,6 +18,7 @@ const { buildReviewInput, buildRepoReviewInput, buildPrScoutInput, buildRepoScou
 const { parseScopeValue, parseFindingValue, dedupeFindings } = require('../src/review');
 const { TransientError } = require('../src/failover');
 const { DeadlineExceededError } = require('../src/deadline');
+const { totalInputTokens } = require('../src/usage');
 
 const TOOL_NAMES = {
   requestChange: 'mcp__review_collector__request_change',
@@ -147,28 +148,60 @@ describe('dedupeFindings', () => {
 describe('sumUsage', () => {
   test('sums tokens and priced cost across spawns', () => {
     const total = sumUsage([
-      { inputTokens: 10, outputTokens: 5, cost: { basis: 'dollars', usd: 0.1 } },
-      { inputTokens: 20, outputTokens: 7, cost: { basis: 'dollars', usd: 0.2 } },
+      { tokens: { inputCacheMiss: 10, inputCacheHit: 0, output: 5 }, cost: { basis: 'dollars', usd: 0.1 } },
+      { tokens: { inputCacheMiss: 20, inputCacheHit: 0, output: 7 }, cost: { basis: 'dollars', usd: 0.2 } },
     ]);
-    assert.equal(total.inputTokens, 30);
-    assert.equal(total.outputTokens, 12);
+    assert.equal(totalInputTokens(total.tokens), 30);
+    assert.equal(total.tokens.output, 12);
     assert.equal(total.cost.basis, 'dollars');
     assert.ok(Math.abs(total.cost.usd - 0.3) < 1e-9);
   });
 
   test('any unpriced spawn makes the total unpriced, carrying its reason', () => {
     const total = sumUsage([
-      { inputTokens: 10, outputTokens: 5, cost: { basis: 'dollars', usd: 0.1 } },
-      { inputTokens: 20, outputTokens: 7, cost: { basis: 'unpriced', reason: 'no-price' } },
+      { tokens: { inputCacheMiss: 10, inputCacheHit: 0, output: 5 }, cost: { basis: 'dollars', usd: 0.1 } },
+      { tokens: { inputCacheMiss: 20, inputCacheHit: 0, output: 7 }, cost: { basis: 'unpriced', reason: 'no-price' } },
     ]);
     assert.equal(total.cost.basis, 'unpriced');
     assert.equal(total.cost.reason, 'no-price');
-    assert.equal(total.inputTokens, 30); // tokens still sum
+    assert.equal(totalInputTokens(total.tokens), 30); // tokens still sum
+  });
+
+  // The classes must sum INDEPENDENTLY. Every other case here uses inputCacheHit: 0, which a fold
+  // that added the hits into the miss class would still pass — and that fold would reprice a review
+  // at up to 30x the true rate, silently, since the two classes are the whole point of the record.
+  test('each token class sums into its own class, never into another', () => {
+    const total = sumUsage([
+      { tokens: { inputCacheMiss: 10, inputCacheHit: 300, output: 5 }, cost: { basis: 'dollars', usd: 0.1 } },
+      { tokens: { inputCacheMiss: 20, inputCacheHit: 4000, output: 7 }, cost: { basis: 'dollars', usd: 0.2 } },
+    ]);
+    assert.deepEqual(total.tokens, { inputCacheMiss: 30, inputCacheHit: 4300, output: 12 });
+    assert.equal(totalInputTokens(total.tokens), 4330);
+  });
+
+  // The pass's span is the ENVELOPE of its spawns' — earliest start, latest end — because workers run
+  // in waves and overlap. Taking the first or last spawn's own span would understate the window a
+  // later repricing has to place inside a rate epoch.
+  test('the span is the envelope of every spawn, not the first or last one', () => {
+    const usage = (from, to) => ({ tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 1 }, span: { from, to }, cost: { basis: 'dollars', usd: 0 } });
+    const total = sumUsage([
+      usage('2026-08-22T03:40:00.000Z', '2026-08-22T03:45:00.000Z'),
+      usage('2026-08-22T03:30:00.000Z', '2026-08-22T03:35:00.000Z'), // starts earliest, ends early
+      usage('2026-08-22T03:42:00.000Z', '2026-08-22T04:01:00.000Z'), // ends latest
+    ]);
+    assert.deepEqual(total.span, { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T04:01:00.000Z' });
+  });
+
+  test('a spawn that recorded no span contributes none, and all-absent folds to undefined', () => {
+    const spanless = { tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 1 }, cost: { basis: 'dollars', usd: 0 } };
+    const spanned = { ...spanless, span: { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:35:00.000Z' } };
+    assert.deepEqual(sumUsage([spanless, spanned]).span, { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:35:00.000Z' });
+    assert.equal(sumUsage([spanless, spanless]).span, undefined); // never a fabricated window
   });
 
   test('excludes null usages but still sums the present ones', () => {
-    const total = sumUsage([null, { inputTokens: 4, outputTokens: 2, cost: { basis: 'dollars', usd: 0.05 } }]);
-    assert.equal(total.inputTokens, 4);
+    const total = sumUsage([null, { tokens: { inputCacheMiss: 4, inputCacheHit: 0, output: 2 }, cost: { basis: 'dollars', usd: 0.05 } }]);
+    assert.equal(totalInputTokens(total.tokens), 4);
     assert.equal(total.cost.usd, 0.05);
   });
 
@@ -176,10 +209,10 @@ describe('sumUsage', () => {
   // pass total is notional too — and carries no `usd` field for a spend fold to reach for.
   test('a subscription pass sums to a notional total, never a spend total', () => {
     const total = sumUsage([
-      { inputTokens: 10, outputTokens: 5, cost: { basis: 'subscription', notionalUsd: 18.86 } },
-      { inputTokens: 20, outputTokens: 7, cost: { basis: 'subscription', notionalUsd: 7.28 } },
+      { tokens: { inputCacheMiss: 10, inputCacheHit: 0, output: 5 }, cost: { basis: 'subscription', notionalUsd: 18.86 } },
+      { tokens: { inputCacheMiss: 20, inputCacheHit: 0, output: 7 }, cost: { basis: 'subscription', notionalUsd: 7.28 } },
     ]);
-    assert.equal(total.inputTokens, 30);
+    assert.equal(totalInputTokens(total.tokens), 30);
     assert.equal(total.cost.basis, 'subscription');
     assert.ok(Math.abs(total.cost.notionalUsd - 26.14) < 1e-9);
     assert.equal('usd' in total.cost, false);
@@ -694,11 +727,11 @@ describe('runMultiScopePass — convergence sweeps', () => {
   });
 
   test('usage sums across every sweep spawn — the footer covers the whole convergence loop', async () => {
-    const usage = { inputTokens: 10, outputTokens: 1, cost: { basis: 'dollars', usd: 0.01 } };
+    const usage = { tokens: { inputCacheMiss: 10, inputCacheHit: 0, output: 1 }, cost: { basis: 'dollars', usd: 0.01 } };
     const { registry } = sweepRegistry((name) => oneBug(name), usage);
     const review = await runMultiScopePass(args(registry, 3));
     // 1 scout + 2 scopes × 2 layers (initial + the converging sweep) = 5 spawns.
-    assert.equal(review.usage.inputTokens, 50);
+    assert.equal(totalInputTokens(review.usage.tokens), 50);
     assert.ok(Math.abs(review.usage.cost.usd - 0.05) < 1e-9);
   });
 

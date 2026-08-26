@@ -12,6 +12,7 @@ const {
 } = require('../src/engine/claude-code');
 // The vendor URL lives in PRESETS now — a fact about z.ai, not about the claude-code CLI.
 const { PRESETS } = require('../src/provider');
+const { totalInputTokens } = require('../src/usage');
 const ZAI_ANTHROPIC_BASE_URL = PRESETS.zai.defaultBaseUrl;
 
 // [LAW:verifiable-goals] AC for T3: existing ZAI_* inputs produce a byte-identical
@@ -492,8 +493,8 @@ describe('parseResultEnvelope — robust to json and stream-json', () => {
     ].join('\n');
     assert.doesNotThrow(() => assertSucceeded(stream));
     const usage = extractUsage(stream, { ...BASE_CONFIG, endpoint: { ...BASE_CONFIG.endpoint, baseUrl: 'https://api.deepseek.com/anthropic' }, model: 'deepseek-v4-pro' });
-    assert.equal(usage.inputTokens, 100);
-    assert.equal(usage.outputTokens, 10);
+    assert.equal(totalInputTokens(usage.tokens), 100);
+    assert.equal(usage.tokens.output, 10);
   });
 
   test('a multi-line stream with no terminal result is a failure (assertSucceeded throws)', () => {

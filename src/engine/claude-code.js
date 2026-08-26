@@ -216,24 +216,25 @@ function assertSucceeded(stdout) {
 }
 
 // [LAW:effects-at-boundaries] Pure: reads usage from the JSON envelope and returns a Usage value,
-// or null when usage is absent. The input count sums all input-side fields (fresh + cache read +
-// cache write) so it reflects the total prompt tokens the run processed.
+// or null when usage is absent. The input-side fields are sorted into THE TOKEN RECORD's two input
+// classes rather than summed into one count — see the bucketing note in the body for which field
+// bills at which rate — and totalInputTokens re-derives the whole prompt count from them.
 // total_cost_usd is Claude Code's own CLIENT-SIDE estimate (tokens × its bundled ANTHROPIC price
 // table), not a billed charge — so the renderer marks every available cost line "est.".
 function extractUsage(stdout, config) {
   const env = parseResultEnvelope(stdout);
   if (!env || !env.usage) return null;
   const u = env.usage;
-  const freshInput = u.input_tokens ?? 0;
-  const cacheRead = u.cache_read_input_tokens ?? 0;
-  const cacheWrite = u.cache_creation_input_tokens ?? 0;
-  const inputTokens = freshInput + cacheRead + cacheWrite;
-  const outputTokens = u.output_tokens ?? 0;
-  // [LAW:types-are-the-program] Anthropic-style buckets → the price-table shape: cache reads bill at
-  // the discounted cached rate, fresh + cache writes at the full input rate. cachedInputTokens is the
-  // cached subset of inputTokens, exactly what computeCostUsd expects.
-  const cost = costFromEnvelope(env, config, { inputTokens, cachedInputTokens: cacheRead, outputTokens });
-  return { inputTokens, outputTokens, cost };
+  // [LAW:parse-dont-validate] Anthropic's three input buckets are already disjoint, so this is a
+  // rename into THE TOKEN RECORD (src/usage.js) rather than a subtraction: cache READS bill at the
+  // discounted cached rate; fresh input and cache WRITES both bill at the full input rate, which is
+  // what puts them in one class together.
+  const tokens = {
+    inputCacheMiss: (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0),
+    inputCacheHit: u.cache_read_input_tokens ?? 0,
+    output: u.output_tokens ?? 0,
+  };
+  return { tokens, cost: costFromEnvelope(env, config, tokens) };
 }
 
 // [LAW:types-are-the-program] cost is a discriminated value (see THE COST VALUE in src/usage.js),

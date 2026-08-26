@@ -3,7 +3,7 @@ const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS } =
 const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = require('./deadline');
 const { defaultEffortProfile, maxTier } = require('./effort');
 const { dedupeFindings, dedupeAssessments, parseScopeValue } = require('./review');
-const { sumCost } = require('./usage');
+const { sumCost, emptyTokens, addTokens } = require('./usage');
 const { renderDependencyDiffNote } = require('./dependency-diff');
 const { NO_EXCLUSIONS, excludedPathList } = require('./diff');
 const {
@@ -72,9 +72,29 @@ function workerFocusText(scope, context) {
 function sumUsage(usages) {
   const present = usages.filter(Boolean);
   if (present.length === 0) return null;
-  const inputTokens = present.reduce((sum, u) => sum + u.inputTokens, 0);
-  const outputTokens = present.reduce((sum, u) => sum + u.outputTokens, 0);
-  return { inputTokens, outputTokens, cost: sumCost(present.map(u => u.cost)) };
+  return {
+    tokens: present.map(u => u.tokens).reduce(addTokens, emptyTokens()),
+    // The pass's SPAN is the envelope of its spawns' spans — earliest start, latest end — which is
+    // the honest answer for a scheduler that runs workers in waves: the pass occupied that window,
+    // and a restatement that needs to know which price epoch applies can see whether the window sits
+    // inside one or straddles a boundary. Collapsing it to a single instant would hide the straddle.
+    // [LAW:no-silent-failure] A spawn that recorded no span contributes none, exactly as a spawn
+    // that recorded no usage contributes no tokens.
+    span: sumSpan(present.map(u => u.span)),
+    cost: sumCost(present.map(u => u.cost)),
+  };
+}
+
+// [LAW:effects-at-boundaries] Pure: fold spans by min-start/max-end. ISO-8601 UTC timestamps are
+// lexicographically ordered, so string comparison IS chronological order and no Date round-trip is
+// needed. All-absent folds to undefined — a recorded absence, never a fabricated window.
+function sumSpan(spans) {
+  const present = spans.filter(Boolean);
+  if (present.length === 0) return undefined;
+  return {
+    from: present.reduce((min, s) => (s.from < min ? s.from : min), present[0].from),
+    to: present.reduce((max, s) => (s.to > max ? s.to : max), present[0].to),
+  };
 }
 
 // [LAW:effects-at-boundaries] Pure: the aggregated review summary. It names every scope reviewed and

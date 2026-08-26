@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { classifyTransient } = require('../failover');
+const { emptyTokens, addTokens } = require('../usage');
 const { makeCliAdapter } = require('./cli');
 
 // [LAW:no-ambient-temporal-coupling] Pin off '@latest' — the same trap claude-code hit: an unowned,
@@ -180,8 +181,7 @@ function assertSucceeded(stdout) {
 function extractUsage(stdout) {
   let sawTokens = false;
   let sawCost = false;
-  let inputTokens = 0;
-  let outputTokens = 0;
+  let total = emptyTokens();
   let usd = 0;
   for (const line of stdout.split('\n')) {
     const trimmed = line.trim();
@@ -193,10 +193,15 @@ function extractUsage(stdout) {
     if (tokens) {
       sawTokens = true;
       const cache = tokens.cache || {};
-      // All input-side counts (fresh + cache read + cache write) sum into inputTokens; reasoning
-      // tokens are generated output, so they sum into outputTokens alongside the visible output.
-      inputTokens += (tokens.input ?? 0) + (cache.read ?? 0) + (cache.write ?? 0);
-      outputTokens += (tokens.output ?? 0) + (tokens.reasoning ?? 0);
+      // [LAW:parse-dont-validate] OpenCode's step counts → THE TOKEN RECORD's disjoint classes
+      // (src/usage.js). Cache READS are the discounted class; fresh input and cache WRITES are both
+      // billed at the full input rate, so they share the miss class. Reasoning tokens are generated
+      // output, so they join the visible output rather than any input class.
+      total = addTokens(total, {
+        inputCacheMiss: (tokens.input ?? 0) + (cache.write ?? 0),
+        inputCacheHit: cache.read ?? 0,
+        output: (tokens.output ?? 0) + (tokens.reasoning ?? 0),
+      });
     }
     if (Number.isFinite(cost)) {
       // [LAW:types-are-the-program] finite, not typeof==='number' (which accepts NaN) — a NaN self-
@@ -209,7 +214,7 @@ function extractUsage(stdout) {
   const cost = sawCost
     ? { basis: 'dollars', usd }
     : { basis: 'unpriced', reason: 'not-reported' };
-  return { inputTokens, outputTokens, cost };
+  return { tokens: total, cost };
 }
 
 // [LAW:single-enforcer] The shared transient vocabulary (429/529/network drop) is classified once in

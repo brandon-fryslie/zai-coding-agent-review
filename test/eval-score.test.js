@@ -93,9 +93,15 @@ test('parseProduced accepts the raw merged-findings shape and rejects malformed'
 });
 
 test('parseUsage passes cost through and tolerates missing fields', () => {
+  const tokens = { inputCacheMiss: 80, inputCacheHit: 20, output: 20 };
+  const span = { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T04:01:00.000Z' };
+  assert.deepEqual(parseUsage(JSON.stringify({ tokens, span, cost: { basis: 'dollars', usd: 0.01 } }), 'u'),
+    { tokens, span, cost: { basis: 'dollars', usd: 0.01 } });
+  assert.deepEqual(parseUsage('{}', 'u'), { tokens: null, span: null, cost: null });
+  // A run captured before the token split carries a COLLAPSED inputTokens/outputTokens pair, which
+  // cannot be repriced — it records as absent tokens, never as zero ones. [LAW:no-silent-failure]
   assert.deepEqual(parseUsage(JSON.stringify({ inputTokens: 100, outputTokens: 20, cost: { basis: 'dollars', usd: 0.01 } }), 'u'),
-    { inputTokens: 100, outputTokens: 20, cost: { basis: 'dollars', usd: 0.01 } });
-  assert.deepEqual(parseUsage('{}', 'u'), { inputTokens: null, outputTokens: null, cost: null });
+    { tokens: null, span: null, cost: { basis: 'dollars', usd: 0.01 } });
   // A wrong-typed usage.json is rejected loudly, never silently treated as {} (all-null).
   assert.throws(() => parseUsage('123', 'u'), /not a JSON object/);
   assert.throws(() => parseUsage('null', 'u'), /not a JSON object/);
@@ -220,7 +226,7 @@ test('scoreRun produces a timestamp-free, re-runnable scorecard', async () => {
     { path: 'a.ts', line: 10, body: 'null pointer at close()', severity: 'blocking' },
     { path: 'q.ts', line: 1, body: 'novel unrelated thing', severity: 'advisory' },
   ]), 'f');
-  const args = { expected: EXPECTED_V, produced, usage: { inputTokens: 1, outputTokens: 2, cost: { basis: 'dollars', usd: 0.5 } }, meta: { case: 'demo', config: { model: 'm' } }, judge: keywordJudge, matcherLabel: 'fake' };
+  const args = { expected: EXPECTED_V, produced, usage: { tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 2 }, span: null, cost: { basis: 'dollars', usd: 0.5 } }, meta: { case: 'demo', config: { model: 'm' } }, judge: keywordJudge, matcherLabel: 'fake' };
   const a = await scoreRun(args);
   const b = await scoreRun(args);
   assert.deepEqual(a, b); // deterministic given the same judge

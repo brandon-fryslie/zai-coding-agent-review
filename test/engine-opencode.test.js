@@ -12,6 +12,7 @@ const {
   extractUsage,
 } = require('../src/engine/opencode');
 const { TransientError } = require('../src/failover');
+const { totalInputTokens } = require('../src/usage');
 
 // Minimal config matching the ReviewConfig shape used by opencode configs. The model carries the
 // `<provider>/<model>` prefix OpenCode uses to resolve the provider whose endpoint we override.
@@ -201,8 +202,11 @@ describe('extractUsage', () => {
     ].join('\n');
     const usage = extractUsage(stdout);
     // input = 15329 + 0 + 0 + 578 + 14848 + 0 = 30755 ; output = 300 + 234 + 414 + 355 = 1303
-    assert.equal(usage.inputTokens, 30755);
-    assert.equal(usage.outputTokens, 1303);
+    assert.equal(totalInputTokens(usage.tokens), 30755);
+    assert.equal(usage.tokens.output, 1303);
+    // …and the input total is split into THE TOKEN RECORD's disjoint classes: cache reads are the
+    // discounted class, fresh input + cache writes the full-rate one. 15329 + 578 miss, 14848 hit.
+    assert.deepEqual(usage.tokens, { inputCacheMiss: 15907, inputCacheHit: 14848, output: 1303 });
   });
 
   test('cost is the summed self-reported USD on a dollars basis', () => {
@@ -228,8 +232,8 @@ describe('extractUsage', () => {
       '{"type":"step_finish","part":{"reason":"stop","tokens":{"input":20,"output":5}}}',
     ].join('\n');
     const usage = extractUsage(stdout);
-    assert.equal(usage.inputTokens, 120);
-    assert.equal(usage.outputTokens, 15);
+    assert.equal(totalInputTokens(usage.tokens), 120);
+    assert.equal(usage.tokens.output, 15);
     assert.equal(usage.cost.basis, 'unpriced');
     assert.equal(usage.cost.reason, 'not-reported');
   });

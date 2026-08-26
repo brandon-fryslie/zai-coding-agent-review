@@ -32381,24 +32381,25 @@ function assertSucceeded(stdout) {
 }
 
 // [LAW:effects-at-boundaries] Pure: reads usage from the JSON envelope and returns a Usage value,
-// or null when usage is absent. The input count sums all input-side fields (fresh + cache read +
-// cache write) so it reflects the total prompt tokens the run processed.
+// or null when usage is absent. The input-side fields are sorted into THE TOKEN RECORD's two input
+// classes rather than summed into one count — see the bucketing note in the body for which field
+// bills at which rate — and totalInputTokens re-derives the whole prompt count from them.
 // total_cost_usd is Claude Code's own CLIENT-SIDE estimate (tokens × its bundled ANTHROPIC price
 // table), not a billed charge — so the renderer marks every available cost line "est.".
 function extractUsage(stdout, config) {
   const env = parseResultEnvelope(stdout);
   if (!env || !env.usage) return null;
   const u = env.usage;
-  const freshInput = u.input_tokens ?? 0;
-  const cacheRead = u.cache_read_input_tokens ?? 0;
-  const cacheWrite = u.cache_creation_input_tokens ?? 0;
-  const inputTokens = freshInput + cacheRead + cacheWrite;
-  const outputTokens = u.output_tokens ?? 0;
-  // [LAW:types-are-the-program] Anthropic-style buckets → the price-table shape: cache reads bill at
-  // the discounted cached rate, fresh + cache writes at the full input rate. cachedInputTokens is the
-  // cached subset of inputTokens, exactly what computeCostUsd expects.
-  const cost = costFromEnvelope(env, config, { inputTokens, cachedInputTokens: cacheRead, outputTokens });
-  return { inputTokens, outputTokens, cost };
+  // [LAW:parse-dont-validate] Anthropic's three input buckets are already disjoint, so this is a
+  // rename into THE TOKEN RECORD (src/usage.js) rather than a subtraction: cache READS bill at the
+  // discounted cached rate; fresh input and cache WRITES both bill at the full input rate, which is
+  // what puts them in one class together.
+  const tokens = {
+    inputCacheMiss: (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0),
+    inputCacheHit: u.cache_read_input_tokens ?? 0,
+    output: u.output_tokens ?? 0,
+  };
+  return { tokens, cost: costFromEnvelope(env, config, tokens) };
 }
 
 // [LAW:types-are-the-program] cost is a discriminated value (see THE COST VALUE in src/usage.js),
@@ -32575,8 +32576,15 @@ function makeCliAdapter(spec) {
         try {
           const home = spec.materializeHome({ config, instructionsPath, collector });
           try {
+            // [LAW:effects-at-boundaries] The clock is an effect, so the spawn's time SPAN is
+            // stamped HERE — the one place that owns the child's lifetime — and extractUsage stays
+            // a pure function of the engine's output. The span exists because time is becoming a
+            // pricing input (DeepSeek's peak/off-peak windows), and a cost that cannot say WHEN its
+            // tokens were spent cannot be repriced any more than one that cannot say how many.
+            const from = new Date().toISOString();
             const output = await runEngine(spec, config, prompt, home, collector, cwd, deadline);
-            const usage = spec.extractUsage(output, config);
+            const raw = spec.extractUsage(output, config);
+            const usage = raw && { ...raw, span: { from, to: new Date().toISOString() } };
             const review = readCollectedReview(collector.recordsPath);
             // [LAW:dataflow-not-control-flow] scopes (a scout run), findings (a worker run), and
             // dependency assessments (a worker that reviewed a go.mod bump) are all carried through as
@@ -32797,17 +32805,26 @@ function extractUsage(stdout, config) {
     if (event.type === 'turn.completed' && event.usage) usage = event.usage;
   }
   if (!usage || (usage.input_tokens == null && usage.output_tokens == null)) return null;
+  // [LAW:parse-dont-validate] OpenAI reports an input total that INCLUDES its cached subset, so this
+  // is the one place that overlap is resolved into THE TOKEN RECORD's disjoint classes (src/usage.js).
+  // The clamp belongs here, at the vendor boundary, and nowhere downstream: a foreign payload
+  // reporting more cached than total tokens is the only way that state can arise, so absorbing it
+  // where the foreign shape is read is what lets every consumer take the classes at face value.
   const inputTokens = usage.input_tokens ?? 0;
-  const outputTokens = usage.output_tokens ?? 0;
-  const cachedInputTokens = usage.cached_input_tokens ?? 0;
-  const costUsd = computeCostUsd({ inputTokens, outputTokens, cachedInputTokens }, config.model);
+  const inputCacheHit = Math.min(usage.cached_input_tokens ?? 0, inputTokens);
+  const tokens = {
+    inputCacheMiss: inputTokens - inputCacheHit,
+    inputCacheHit,
+    output: usage.output_tokens ?? 0,
+  };
+  const costUsd = computeCostUsd(tokens, config.model);
   // [LAW:types-are-the-program] cost is a discriminated value. Codex reports no USD, so a null
   // here means exactly one thing — the model is absent from the price table — and the adapter
   // declares that reason at the point it knows it, rather than the boundary re-deriving it.
   // The basis is always 'dollars': codex declares credentialKinds ['api-key'], so no codex run can
   // ever be billed to a subscription and this adapter has no notional arm to reach.
   const cost = costUsd == null ? { basis: 'unpriced', reason: 'no-price' } : { basis: 'dollars', usd: costUsd };
-  return { inputTokens, outputTokens, cost };
+  return { tokens, cost };
 }
 
 // [LAW:single-enforcer] The shared transient vocabulary (429/529/network drop) is classified once in
@@ -32868,6 +32885,7 @@ const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 const os = __nccwpck_require__(857);
 const { classifyTransient } = __nccwpck_require__(2887);
+const { emptyTokens, addTokens } = __nccwpck_require__(9614);
 const { makeCliAdapter } = __nccwpck_require__(2890);
 
 // [LAW:no-ambient-temporal-coupling] Pin off '@latest' — the same trap claude-code hit: an unowned,
@@ -33045,8 +33063,7 @@ function assertSucceeded(stdout) {
 function extractUsage(stdout) {
   let sawTokens = false;
   let sawCost = false;
-  let inputTokens = 0;
-  let outputTokens = 0;
+  let total = emptyTokens();
   let usd = 0;
   for (const line of stdout.split('\n')) {
     const trimmed = line.trim();
@@ -33058,10 +33075,15 @@ function extractUsage(stdout) {
     if (tokens) {
       sawTokens = true;
       const cache = tokens.cache || {};
-      // All input-side counts (fresh + cache read + cache write) sum into inputTokens; reasoning
-      // tokens are generated output, so they sum into outputTokens alongside the visible output.
-      inputTokens += (tokens.input ?? 0) + (cache.read ?? 0) + (cache.write ?? 0);
-      outputTokens += (tokens.output ?? 0) + (tokens.reasoning ?? 0);
+      // [LAW:parse-dont-validate] OpenCode's step counts → THE TOKEN RECORD's disjoint classes
+      // (src/usage.js). Cache READS are the discounted class; fresh input and cache WRITES are both
+      // billed at the full input rate, so they share the miss class. Reasoning tokens are generated
+      // output, so they join the visible output rather than any input class.
+      total = addTokens(total, {
+        inputCacheMiss: (tokens.input ?? 0) + (cache.write ?? 0),
+        inputCacheHit: cache.read ?? 0,
+        output: (tokens.output ?? 0) + (tokens.reasoning ?? 0),
+      });
     }
     if (Number.isFinite(cost)) {
       // [LAW:types-are-the-program] finite, not typeof==='number' (which accepts NaN) — a NaN self-
@@ -33074,7 +33096,7 @@ function extractUsage(stdout) {
   const cost = sawCost
     ? { basis: 'dollars', usd }
     : { basis: 'unpriced', reason: 'not-reported' };
-  return { inputTokens, outputTokens, cost };
+  return { tokens: total, cost };
 }
 
 // [LAW:single-enforcer] The shared transient vocabulary (429/529/network drop) is classified once in
@@ -33859,15 +33881,20 @@ const { costMarker, parseCost, emptyTallies, tallyCost } = __nccwpck_require__(9
 const LEDGER_MARKER = '<!-- agent-review-cost-ledger-entry -->';
 
 // [LAW:effects-at-boundaries] Pure: the body of one ledger entry — the sentinel then the reused cost
-// marker. `cost` is the same discriminated value costMarker already consumes (see THE COST VALUE in
-// src/usage.js), so an unpriced cost writes an honest `unknown` marker: the entry still exists (a
-// review happened), its cost is simply counted as unknown on read, never fabricated as zero.
+// marker. `usage` is the same value costMarker consumes at the review sink — the token record, the
+// span, and the discriminated cost (see THE TOKEN RECORD and THE COST VALUE in src/usage.js) — so an
+// unpriced cost writes a marker carrying no figure: the entry still exists (a review happened), its
+// cost is simply counted as unknown on read, never fabricated as zero.
+// The entry records the SAME facts the PR review's own marker does — tokens, model, provider, span —
+// because the day's ledger is exactly as repriceable-after-the-fact as the review is, and writing a
+// poorer record here would have made the ledger the one place a corrected price table could not
+// reach. [LAW:one-source-of-truth] one marker writer, one record, two sinks.
 // [LAW:dataflow-not-control-flow] The append is UNCONDITIONAL for every basis — a subscription review
 // records an entry like any other, and its exclusion from the day's dollars is the marker NAME
 // costMarker chose, never a caller that skips appendCost. A skipped append would make the
 // subscription's consumption invisible instead of merely unbilled. [LAW:no-silent-failure]
-function ledgerEntryBody(cost) {
-  return `${LEDGER_MARKER}\n${costMarker(cost)}`;
+function ledgerEntryBody(usage, config) {
+  return `${LEDGER_MARKER}\n${costMarker(usage, config)}`;
 }
 
 // [LAW:effects-at-boundaries] Pure: the UTC calendar date ('YYYY-MM-DD') of an ISO timestamp or Date.
@@ -33932,12 +33959,12 @@ async function readSpentToday(octokit, owner, repo, issueNumber, now) {
 // posted AFTER the review submits (the cost is known only then). One create, no read-modify-write.
 // [LAW:no-silent-failure] an API error propagates so the boundary warns loudly and continues (the
 // ledger then under-counts — a known lower bound), never a silent drop.
-async function appendCost(octokit, owner, repo, issueNumber, cost) {
+async function appendCost(octokit, owner, repo, issueNumber, usage, config) {
   await octokit.rest.issues.createComment({
     owner,
     repo,
     issue_number: issueNumber,
-    body: ledgerEntryBody(cost),
+    body: ledgerEntryBody(usage, config),
   });
 }
 
@@ -33961,7 +33988,7 @@ const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS } =
 const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = __nccwpck_require__(6757);
 const { defaultEffortProfile, maxTier } = __nccwpck_require__(4652);
 const { dedupeFindings, dedupeAssessments, parseScopeValue } = __nccwpck_require__(1565);
-const { sumCost } = __nccwpck_require__(9614);
+const { sumCost, emptyTokens, addTokens } = __nccwpck_require__(9614);
 const { renderDependencyDiffNote } = __nccwpck_require__(9838);
 const { NO_EXCLUSIONS, excludedPathList } = __nccwpck_require__(9898);
 const {
@@ -34030,9 +34057,29 @@ function workerFocusText(scope, context) {
 function sumUsage(usages) {
   const present = usages.filter(Boolean);
   if (present.length === 0) return null;
-  const inputTokens = present.reduce((sum, u) => sum + u.inputTokens, 0);
-  const outputTokens = present.reduce((sum, u) => sum + u.outputTokens, 0);
-  return { inputTokens, outputTokens, cost: sumCost(present.map(u => u.cost)) };
+  return {
+    tokens: present.map(u => u.tokens).reduce(addTokens, emptyTokens()),
+    // The pass's SPAN is the envelope of its spawns' spans — earliest start, latest end — which is
+    // the honest answer for a scheduler that runs workers in waves: the pass occupied that window,
+    // and a restatement that needs to know which price epoch applies can see whether the window sits
+    // inside one or straddles a boundary. Collapsing it to a single instant would hide the straddle.
+    // [LAW:no-silent-failure] A spawn that recorded no span contributes none, exactly as a spawn
+    // that recorded no usage contributes no tokens.
+    span: sumSpan(present.map(u => u.span)),
+    cost: sumCost(present.map(u => u.cost)),
+  };
+}
+
+// [LAW:effects-at-boundaries] Pure: fold spans by min-start/max-end. ISO-8601 UTC timestamps are
+// lexicographically ordered, so string comparison IS chronological order and no Date round-trip is
+// needed. All-absent folds to undefined — a recorded absence, never a fabricated window.
+function sumSpan(spans) {
+  const present = spans.filter(Boolean);
+  if (present.length === 0) return undefined;
+  return {
+    from: present.reduce((min, s) => (s.from < min ? s.from : min), present[0].from),
+    to: present.reduce((max, s) => (s.to > max ? s.to : max), present[0].to),
+  };
 }
 
 // [LAW:effects-at-boundaries] Pure: the aggregated review summary. It names every scope reviewed and
@@ -36095,7 +36142,7 @@ function buildReviewFooter(usage, configUsed, priorCost = null) {
   if (warning) core.warning(warning);
   const costLine = renderCostLine(usage, configUsed, priorCost);
   if (costLine) core.info(costLine.replace(/^_|_$/g, ''));
-  const marker = costMarker(usage && usage.cost);
+  const marker = costMarker(usage, configUsed);
   return [buildAttributionFooter(configUsed), costLine, marker].filter(Boolean).join('\n\n');
 }
 
@@ -36671,7 +36718,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   // aborted for a bookkeeping write. The cost VALUE is the one the footer already reported — never re-estimated.
   if (ledgerIssue !== null) {
     try {
-      await appendCost(octokit, owner, repo, ledgerIssue, review.usage && review.usage.cost);
+      await appendCost(octokit, owner, repo, ledgerIssue, review.usage, configUsed);
     } catch (e) {
       core.warning(
         `Budget: failed to append this review's cost to ledger issue #${ledgerIssue} (${e.message}) — `
@@ -38290,24 +38337,62 @@ const PRICES_PER_MILLION = {
   'glm-4.6': { input: 0.60, cachedInput: 0.11, output: 2.20 },
 };
 
+// [LAW:types-are-the-program] THE TOKEN RECORD — the PRIMARY FACT behind every cost figure, and the
+// one shape every adapter parses its vendor's raw counts into:
+//
+//   { inputCacheMiss, inputCacheHit, output }
+//
+// The three classes are DISJOINT — one billing rate each, summing to the run's whole token count —
+// because that is the only shape a cost can be re-derived from later. The predecessor carried a
+// COLLAPSED input total plus its cached SUBSET, which is why this function used to open with
+// `Math.max(0, inputTokens - cachedInputTokens)`: an overlapping pair admits `cached > total`, so
+// every consumer had to subtract and clamp. Disjoint classes delete that question rather than
+// guarding it, and the price is then a plain dot product of three counts against three rates.
+//
+// Why it matters beyond tidiness: the two input rates differ by up to ~30x, and reviews run ~92%
+// cache-hit. DeepSeek's real rates as of 2026-08-16 are miss $0.66/M and hit $0.022/M off-peak —
+// figures quoted here as the MOTIVE for the split, NOT as what PRICES_PER_MILLION holds. That table
+// is still the stale 2026-07-10 row and correcting it is zai-cost-truth-p5o.1's job, deliberately
+// separate: recording a repriceable fact and repricing from a correct table are two changes, and
+// landing them together would leave no way to tell a bad record from a bad rate. What this record
+// buys is precisely that the correction can be applied RETROACTIVELY when it lands. A fused total
+// cannot be — auditing PR #108 had to BORROW a cache-hit ratio measured from an unrelated local run
+// to restate CI costs at all. [FRAMING:representation]
+// the stored figure must be able to answer the question later, not merely print a number today; a
+// cost is DERIVED, the tokens are primary, and the primary fact is what must be durable.
+function totalInputTokens(tokens) {
+  return tokens.inputCacheMiss + tokens.inputCacheHit;
+}
+
+function emptyTokens() {
+  return { inputCacheMiss: 0, inputCacheHit: 0, output: 0 };
+}
+
+function addTokens(a, b) {
+  return {
+    inputCacheMiss: a.inputCacheMiss + b.inputCacheMiss,
+    inputCacheHit: a.inputCacheHit + b.inputCacheHit,
+    output: a.output + b.output,
+  };
+}
+
 // [LAW:effects-at-boundaries] Pure: tokens + model -> USD, no IO. Returns null (cost unknown)
 // when the model has no price-table entry — never a fabricated zero, so a missing price surfaces
 // as "unknown" rather than a confident-but-wrong $0.00. [LAW:no-silent-failure]
-// inputTokens is the FULL input count (cached included); the cached subset (cachedInputTokens) is
-// billed at the discounted cachedInput rate, the remainder at the input rate. Each adapter buckets
-// its own raw usage into this shape (codex: cached_input_tokens; claude-code: cache_read at the
-// cached rate, fresh + cache_creation at the full rate). output_tokens is priced at the output rate.
-function computeCostUsd({ inputTokens, outputTokens, cachedInputTokens = 0 }, model) {
+// One rate per class, no subtraction: each adapter has already parsed its vendor's overlapping
+// counts into the disjoint record above (see THE TOKEN RECORD), so by the time tokens arrive here
+// the classes are exactly the billing buckets.
+function computeCostUsd(tokens, model) {
   const price = PRICES_PER_MILLION[model];
   if (!price) return null;
-  const nonCachedInput = Math.max(0, inputTokens - cachedInputTokens);
   const total =
-    nonCachedInput * price.input +
-    cachedInputTokens * price.cachedInput +
-    outputTokens * price.output;
+    tokens.inputCacheMiss * price.input +
+    tokens.inputCacheHit * price.cachedInput +
+    tokens.output * price.output;
   const usd = total / 1_000_000;
   // [LAW:types-are-the-program] Non-finite input (a NaN token count) yields no usable price, not a NaN
-  // "cost": return null so the caller renders it unavailable, keeping available:true ⟹ finite usd.
+  // "cost": return null so the caller renders it unavailable, keeping a finite figure on every
+  // dollars-basis cost.
   return Number.isFinite(usd) ? usd : null;
 }
 
@@ -38347,22 +38432,43 @@ function isSubscription(config) {
 // impostors: default to "not Anthropic" so every foreign endpoint is excluded by construction, not
 // one vendor at a time — which is also why an absent baseUrl answers NO: a config that cannot say
 // where it points has not earned Anthropic's billing basis.
+// [LAW:one-source-of-truth] ONE extraction of "which host does this config's money go to", read by
+// both consumers below. Two `new URL(baseUrl).hostname` sites would be two clocks: the billing-basis
+// whitelist and the recorded provider identity would eventually disagree about what host a config
+// points at, and the disagreement would show up as a review attributed to one vendor and priced as
+// another. Returns null for an absent or unparseable base URL — a typed absence, not a guess.
+function endpointHost(config) {
+  const baseUrl = config.endpoint && config.endpoint.baseUrl;
+  if (!baseUrl) return null;
+  try {
+    return new URL(baseUrl).hostname;
+  } catch {
+    return null;
+  }
+}
+
 function isAnthropicEndpoint(config) {
   // Every endpoint now carries a real baseUrl — an OAuth credential's is PINNED in the preset table
   // rather than absent — so this is a plain hostname whitelist with no special case for a missing URL
   // and none for a subscription. A pinned Anthropic host simply passes the same check every other
   // endpoint takes. [LAW:one-type-per-behavior]
-  const baseUrl = config.endpoint && config.endpoint.baseUrl;
-  if (!baseUrl) return false;
-  try {
-    // [LAW:types-are-the-program] Match the anthropic.com domain exactly — the apex or a true
-    // subdomain — never a bare `endsWith('anthropic.com')`, which a lookalike host like
-    // `notanthropic.com` would satisfy and be wrongly trusted as Anthropic's billing basis.
-    const host = new URL(baseUrl).hostname;
-    return host === 'anthropic.com' || host.endsWith('.anthropic.com');
-  } catch {
-    return false;
-  }
+  // [LAW:types-are-the-program] Match the anthropic.com domain exactly — the apex or a true
+  // subdomain — never a bare `endsWith('anthropic.com')`, which a lookalike host like
+  // `notanthropic.com` would satisfy and be wrongly trusted as Anthropic's billing basis.
+  const host = endpointHost(config);
+  return host === 'anthropic.com' || (host !== null && host.endsWith('.anthropic.com'));
+}
+
+// [LAW:one-source-of-truth] THE PROVIDER IDENTITY recorded with every cost: the endpoint HOST, which
+// is a fact about where the money actually went rather than a label someone chose. That is exactly
+// the property the ledger needs — `PROVIDER: auto` and `PROVIDER: deepseek` resolve to the same host
+// and so record the same identity (they ARE the same money), while deepseek and z.ai record
+// different ones. Deriving it from the resolved endpoint rather than from a name is also what makes
+// it available in config-file mode, which has no PROVIDER input at all and where `config.name` is
+// free text a consumer picked. A consumer who repoints a provider at a proxy records the proxy: that
+// is not a defect, it is who was billed. [FRAMING:representation]
+function providerIdentity(config) {
+  return endpointHost(config);
 }
 
 function formatTokenCount(n) {
@@ -38377,23 +38483,72 @@ function reviewerTag(config) {
 // round sums prior rounds from a typed value — never by re-parsing the rendered "Cost: $X" prose, which
 // would be a representation re-parsing itself. Rendered as an HTML comment (invisible, like REVIEW_MARKER)
 // and placed in the footer BEFORE REVIEW_MARKER, so the trailing-marker round-count contract is untouched.
-// An unavailable or absent cost records 'unknown' — the round is still counted, its cost just isn't summed.
-// [LAW:types-are-the-program] The value is a strict non-negative decimal (digits, one optional
-// fractional part) or the literal 'unknown' — NOT a loose `[0-9.]+`, which would match '.', '1.2.3',
-// or '123..456', all of which Number() turns into NaN. Cost is non-negative by construction, so no
-// leading '-'; no exponent, so no Infinity. The producer (costMarker) always emits toFixed(6), which
-// satisfies this; the strict pattern rejects a corrupted marker at the boundary.
+// An unavailable or absent cost records a marker carrying NO figure field — the round is still
+// counted, its cost just isn't summed. (The literal 'unknown' is the legacy spelling of that same
+// state, still read below; the writer no longer emits it.)
+// [LAW:types-are-the-program] The marker payload has exactly two forms, and BOTH are real data in
+// the world — this is a widening, not a migration:
+//
+//   RECORD  {"usd":0.65,"tokens":{...},"model":"…","provider":"…","from":"…","to":"…"}
+//   LEGACY  0.651731  |  unknown
+//
+// LEGACY is every marker posted before this feature. Those reviews are permanent — a PR's round
+// count and running total are read back off its own history — so the legacy form is a first-class
+// variant that parses into the same Cost value it always did, never an error and never a silent
+// zero. [LAW:no-silent-failure] A past round whose cost is genuinely unknown must read as unknown.
+//
+// The legacy alternative stays a strict non-negative decimal (digits, one optional fractional part)
+// or the literal 'unknown' — NOT a loose `[0-9.]+`, which would match '.', '1.2.3', or '123..456',
+// all of which Number() turns into NaN. Cost is non-negative by construction, so no leading '-'; no
+// exponent, so no Infinity.
+//
+// The RECORD alternative admits no '>' at all, which is what makes it safe to embed in an HTML
+// comment: '-->' contains '>', so an encoded payload CANNOT terminate the comment early. That is a
+// property of the grammar rather than a rule the writer must remember — see encodePayload.
 // [LAW:one-source-of-truth] ONE value grammar, shared by both marker names below, so a marker that
 // the notional reader accepts can never be one the spend reader would have rejected.
-const MARKER_VALUE = '([0-9]+(?:\\.[0-9]+)?|unknown)';
+const MARKER_VALUE = '([0-9]+(?:\\.[0-9]+)?|unknown|\\{[^>]*\\})';
+
+// [LAW:parse-dont-validate] The one crossing between a cost record and marker text, in both
+// directions. Neither '>' nor a '--' pair can occur in JSON OUTSIDE a string literal, so replacing
+// each with its six-character unicode escape is exact: it can only ever rewrite characters inside
+// strings, and JSON.parse restores them byte-for-byte. Escaping beats rejecting a model id that
+// contains one — a rejection would either crash a legitimate config or silently drop the record,
+// and the payload is data we already own end to end.
+//
+// Two characters, two DIFFERENT hazards, and only the first is about breaking out:
+//   '>'  — without it '-->' cannot be spelled, so an encoded payload cannot terminate its own
+//          comment and leak the rest of the marker into the review body as visible text.
+//   '--' — a comment terminator needs a '>', so a bare pair can never end the comment for OUR
+//          reader. It is escaped because "the marker is INVISIBLE" is a claim about somebody
+//          else's markdown renderer: CommonMark ≤0.29 forbade '--' inside a comment outright, and
+//          while both hosts here render under the relaxed rule today, an invariant this module
+//          asserts should not quietly depend on which revision a host happens to ship.
+// [LAW:types-are-the-program] Cheaper to make the byte unrepresentable than to track a third
+// party's parser version.
+function encodePayload(record) {
+  return JSON.stringify(record).replace(/>/g, '\\u003e').replace(/--/g, '-\\u002d');
+}
+
+// Returns null for a payload that is not a parseable record — a corrupted or hand-edited marker is
+// read as "no figure recorded", the same as 'unknown', never as a crash on someone else's PR.
+// [LAW:no-silent-failure] the round still counts; only its figure is unknown.
+function decodePayload(raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
 
 // [LAW:types-are-the-program] THE SPEND EXCLUSION, MADE STRUCTURAL. A subscription review writes a
-// DIFFERENTLY NAMED marker, so every spend reader — parseCostMarker here, sumCostToday in ledger.js,
-// summarizePriorReviews in transport.js — has literally nothing to match in its body. The notional
-// dollars are kept out of the daily spend by the regex, not by a guard someone must remember to
-// write, and a future reader who adds a fourth spend fold inherits the exclusion for free.
-const COST_MARKER_RE = new RegExp(`<!-- agent-review-cost-usd:${MARKER_VALUE} -->`, 'g');
-
+// DIFFERENTLY NAMED marker carrying a DIFFERENTLY NAMED figure field, so every spend reader —
+// parseCostMarker here, sumCostToday in ledger.js, summarizePriorReviews in transport.js — has
+// literally nothing to read on it: no `usd` under either name. The notional dollars are kept out of
+// the daily spend by the shape, not by a guard someone must remember to write, and a future reader
+// who adds a fourth spend fold inherits the exclusion for free.
+//
 // [LAW:one-source-of-truth] ONE table of what each basis IS, for accounting purposes: which marker
 // name carries it, which tally bucket it lands in, and where its figure lives. A separate table per
 // consumer could drift — a basis marked notional by the writer and billed by the tally would put
@@ -38402,15 +38557,50 @@ const COST_MARKER_RE = new RegExp(`<!-- agent-review-cost-usd:${MARKER_VALUE} --
 // render and the same fold then run for every basis. No arm skips writing a marker, so every review
 // round stays countable — a subscription round is a round whose SPEND is known to be zero, not a
 // missing one. An absent cost (no usage at all) is accounted as an unpriced one.
+//
+// `field` is the record key the figure is written under, and it carries THE SPEND EXCLUSION one
+// level deeper than the marker name does: inside the payload the notional dollars are `notionalUsd`,
+// so even a reader that decoded a record and went looking for `usd` finds nothing on a subscription
+// round. Same discipline as the two marker names, applied to the two field names.
+//
+// THE AUTH KIND IS THIS COLUMN, NOT A FIELD. zai-billing-xl0.3 needs to bucket spend by auth method
+// (api-key vs subscription), and the basis already answers it exactly: costFromEnvelope resolves
+// `subscription` from, and only from, an oauth credential, so subscription ⟺ oauth and
+// dollars|unpriced ⟺ api-key, with no third case. Storing an `auth` field beside the basis would be
+// a second clock for one fact — free to drift, and the direction it drifts is a review attributed to
+// the wrong payment method inside a total. [LAW:one-source-of-truth] Read it off the parsed basis.
+//
+// `toCost` is the read-side inverse of `figure`: a decoded figure (or null) back into the same
+// discriminated Cost the writer held. It lives in the table for the reason every other column does —
+// so "which basis is this" is answered once, and the answer carries everything that follows from it.
 const BASIS = {
-  dollars: { marker: 'agent-review-cost-usd', bucket: 'billed', figure: c => c.usd },
-  subscription: { marker: 'agent-review-notional-usd', bucket: 'notional', figure: c => c.notionalUsd },
-  unpriced: { marker: 'agent-review-cost-usd', bucket: 'billed', figure: () => null },
+  dollars: {
+    marker: 'agent-review-cost-usd', bucket: 'billed', field: 'usd', figure: c => c.usd,
+    toCost: f => (f === null ? { basis: 'unpriced', reason: 'not-reported' } : { basis: 'dollars', usd: f }),
+  },
+  subscription: {
+    marker: 'agent-review-notional-usd', bucket: 'notional', field: 'notionalUsd', figure: c => c.notionalUsd,
+    toCost: f => ({ basis: 'subscription', notionalUsd: f }),
+  },
+  // A write-side-only row: unpriced shares the dollars marker NAME (that is what keeps an unpriced
+  // round inside the spend accounting as a round of unknown cost), so a body never reads back to
+  // here — the dollars row's toCost resolves a figureless dollars marker to exactly this basis.
+  unpriced: {
+    marker: 'agent-review-cost-usd', bucket: 'billed', field: 'usd', figure: () => null,
+    toCost: f => BASIS.dollars.toCost(f),
+  },
 };
 
 function basisOf(cost) {
   return BASIS[cost && cost.basis] || BASIS.unpriced;
 }
+
+// [LAW:one-source-of-truth] The reader's inverse of the writer's marker-name choice, derived from
+// the same table rather than restated, so a name the writer emits is always a name the reader knows.
+const BASIS_BY_MARKER = {
+  [BASIS.dollars.marker]: BASIS.dollars,
+  [BASIS.subscription.marker]: BASIS.subscription,
+};
 
 // [LAW:one-source-of-truth] Both marker names in ONE alternation, built from the BASIS table the
 // writer picks them from — so the reader can never recognize a name the writer stopped emitting.
@@ -38421,14 +38611,55 @@ function basisOf(cost) {
 const ANY_MARKER_RE = new RegExp(
   `<!-- (${BASIS.dollars.marker}|${BASIS.subscription.marker}):${MARKER_VALUE} -->`, 'g');
 
-// [LAW:types-are-the-program] The marker never carries a non-number: a finite figure renders as a
-// decimal, everything else (an unpriced cost, an unreported notional, or a non-finite number from a
-// broken upstream) as 'unknown' — symmetric with parseMarker's finiteness guard below, so the
-// round-trip can never smuggle a NaN.
-function costMarker(cost) {
+// [LAW:parse-dont-validate] THE COST RECORD — the crossing from a live run's values into the durable
+// facts a marker carries, and the one place absence is recorded AS absence. A fact that was never
+// observed (no usage at all; a config that names no model; an endpoint with no parseable host) is
+// written as NO FIELD AT ALL — one spelling of absence, not two, since `recorded` collapses every
+// reader-predicate null to an omitted key. The reader recovers an absence, never a zero. That distinction is the whole ticket: a figure of 0 asserts the review was free,
+// while a missing figure asserts nothing and can still be restated later. [LAW:no-silent-failure]
+//
+// The figure is quantized to 6 decimal places, exactly as the legacy marker was, so the recorded
+// dollars stay byte-stable across a re-render. It is NOT what a later audit reprices from — that is
+// what `tokens` + `model` are for, at full precision — it is the figure this run believed at the
+// time, kept so a restatement can be compared against it.
+// [LAW:single-enforcer] EVERY field is screened through the SAME predicate its reader uses — the
+// figure and each token class through `recordedQuantity`, each string fact through `recordedString`
+// — so the set of records this function can emit IS the set `parseCostRecord` accepts. A predicate
+// applied on one side only is not one rule but two: the writer emits something the reader silently
+// refuses, and the marker round-trips to a DIFFERENT value than it was written from. A record that
+// disagrees with itself is worse than no record. Screening only the figure was exactly that bug one
+// field wide — a negative token count still went out to be rejected on the way back in.
+// [LAW:types-are-the-program] So an unpriced cost, an unreported notional, a NaN from a broken
+// upstream, a nonsensical negative, and a config naming no model all reach the same honest end: an
+// absent field, which is what "not recorded" looks like.
+function costRecord(usage, config) {
+  const cost = usage && usage.cost;
   const basis = basisOf(cost);
-  const figure = basis.figure(cost);
-  return `<!-- ${basis.marker}:${Number.isFinite(figure) ? figure.toFixed(6) : 'unknown'} -->`;
+  const figure = recordedQuantity(basis.figure(cost));
+  const span = (usage && usage.span) || {};
+  return {
+    [basis.field]: recorded(figure === null ? null : Number(figure.toFixed(6))),
+    tokens: recorded(usage ? recordedTokens(usage.tokens) : null),
+    model: recorded(recordedString(config.model)),
+    provider: recorded(recordedString(providerIdentity(config))),
+    // The pass's time SPAN, not one instant. A review's spawns run over many minutes and time is
+    // about to become a pricing input (DeepSeek's peak windows begin at 01:00/06:00 UTC), so a
+    // single timestamp would silently misprice every review that straddles a boundary. Two ends let
+    // a restatement price exactly when they fall in one window, and say so when they do not.
+    from: recorded(recordedString(span.from)),
+    to: recorded(recordedString(span.to)),
+  };
+}
+
+// The reader's predicates answer `null` for "nothing recorded"; the writer spells that as an ABSENT
+// field. Both read back as an absence, so this is presentation rather than meaning — but it keeps the
+// payload a record of facts rather than a roll-call of gaps, on a string paid for at every sink.
+function recorded(v) {
+  return v === null ? undefined : v;
+}
+
+function costMarker(usage, config) {
+  return `<!-- ${basisOf(usage && usage.cost).marker}:${encodePayload(costRecord(usage, config))} -->`;
 }
 
 // [LAW:single-enforcer] ONE rule for which marker in a body is authoritative: the LAST one. It lives
@@ -38441,40 +38672,86 @@ function lastMatch(body, re) {
   return matches.length === 0 ? null : matches[matches.length - 1];
 }
 
-// [LAW:one-source-of-truth] ONE coercion from a captured marker value to the value the folds consume,
-// shared by every reader, so a body one reader scores as 'unknown' can never be a number to another.
-function markerValue(raw) {
-  if (raw === 'unknown') return 'unknown';
-  const n = Number(raw);
-  // [LAW:no-silent-failure] belt to the strict regex: a value that does not parse to a finite number
-  // is null (→ counted as an unknown-cost round), never a NaN summed into and poisoning the PR total.
-  return Number.isFinite(n) ? n : null;
+// [LAW:one-source-of-truth] ONE decoding from a captured payload to the facts every reader consumes.
+// The two payload forms — a record, and the bare figure every marker posted before this feature
+// carries — collapse to the SAME shape here, the legacy one simply carrying fewer facts. That is why
+// no reader downstream asks which form it was handed: a legacy round is not a special case, it is a
+// round whose tokens, model, provider and timing were never recorded. [LAW:dataflow-not-control-flow]
+// An unparseable payload yields no facts at all, so a corrupted or hand-edited marker reads as an
+// unknown-cost round rather than throwing on someone else's PR. [LAW:no-silent-failure]
+function payloadFacts(raw, field) {
+  if (raw.startsWith('{')) return decodePayload(raw) || {};
+  const n = Number(raw); // 'unknown' -> NaN, and the strict grammar admits nothing else non-numeric
+  return Number.isFinite(n) ? { [field]: n } : {};
 }
 
-function parseMarker(body, re) {
-  const m = lastMatch(body, re);
-  return m === null ? null : markerValue(m[1]);
+// [LAW:parse-dont-validate] Facts arrive as decoded JSON, which is to say as `unknown` — a body can
+// be hand-edited and a marker can be quoted from anywhere. Each accessor returns the fact or a typed
+// absence, never a half-value: `tokens` in particular is all-three-or-nothing, because two of three
+// classes cannot reprice anything and a partial record priced as if complete would understate the
+// run, which is the failure this ticket exists to end.
+function recordedString(v) {
+  return typeof v === 'string' && v !== '' ? v : null;
 }
 
-// The spend reader. Matches ONLY the dollars/unpriced marker name, so a subscription review is
-// invisible to it by construction — see THE SPEND EXCLUSION above.
-function parseCostMarker(body) {
-  return parseMarker(body, COST_MARKER_RE);
+// [LAW:parse-dont-validate] A recorded quantity — dollars or a token count — is a NON-NEGATIVE finite
+// number or nothing. The legacy grammar enforced this structurally: its value pattern admits no
+// leading '-', so a negative figure could not be spelled. The record payload is JSON and could, so
+// the sign check moves here rather than being lost in the widening. A hand-edited
+// `{"usd":-999999}` would SUBTRACT from the PR total and the daily ledger — the one direction a
+// corrupted marker must never be able to move a total, since under-counting spend is what releases a
+// budget gate rather than tripping it. A negative here is not a smaller number, it is a differently
+// signed claim, and it is rejected as unrecordable rather than tallied. [LAW:no-silent-failure]
+function recordedQuantity(v) {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
 }
 
-// [LAW:parse-dont-validate] Read a review body's marker back into the SAME Cost value costMarker
-// wrote, so the two folds that consume markers (the daily ledger, the PR total) tally a typed value
-// instead of each re-deciding what a raw marker string means. Returns null for a body carrying no
-// marker at all — a pre-feature review round, whose cost is genuinely unknown rather than zero.
-function parseCost(body) {
+function recordedTokens(v) {
+  if (v === null || typeof v !== 'object') return null;
+  const tokens = {
+    inputCacheMiss: recordedQuantity(v.inputCacheMiss),
+    inputCacheHit: recordedQuantity(v.inputCacheHit),
+    output: recordedQuantity(v.output),
+  };
+  return Object.values(tokens).every(n => n !== null) ? tokens : null;
+}
+
+// [LAW:parse-dont-validate] THE ONE READER. Every marker consumer below is this function plus a
+// projection, so a body one of them scores as unknown can never be a figure to another. Returns null
+// for a body carrying no marker at all — a human review, or a round predating cost reporting.
+function parseCostRecord(body) {
   const m = lastMatch(body, ANY_MARKER_RE);
   if (m === null) return null;
   const [, name, raw] = m;
-  const value = markerValue(raw);
-  if (name === BASIS.subscription.marker) {
-    return { basis: 'subscription', notionalUsd: typeof value === 'number' ? value : null };
-  }
-  return typeof value === 'number' ? { basis: 'dollars', usd: value } : { basis: 'unpriced', reason: 'not-reported' };
+  const basis = BASIS_BY_MARKER[name];
+  const facts = payloadFacts(raw, basis.field);
+  const figure = facts[basis.field];
+  return {
+    cost: basis.toCost(recordedQuantity(figure)),
+    tokens: recordedTokens(facts.tokens),
+    model: recordedString(facts.model),
+    provider: recordedString(facts.provider),
+    from: recordedString(facts.from),
+    to: recordedString(facts.to),
+  };
+}
+
+// Read a review body's marker back into the SAME Cost value costMarker wrote, so the two folds that
+// consume markers (the daily ledger, the PR total) tally a typed value instead of each re-deciding
+// what a raw marker string means.
+function parseCost(body) {
+  const record = parseCostRecord(body);
+  return record === null ? null : record.cost;
+}
+
+// The spend reader: the dollars figure alone, 'unknown' when a spend-basis marker recorded none, and
+// null when the body carries no spend marker at all. A subscription review is invisible to it by
+// construction — its record lands on the notional basis, which has no `usd` — see THE SPEND
+// EXCLUSION above.
+function parseCostMarker(body) {
+  const record = parseCostRecord(body);
+  if (record === null || record.cost.basis === 'subscription') return null;
+  return record.cost.basis === 'dollars' ? record.cost.usd : 'unknown';
 }
 
 // [LAW:one-source-of-truth] SUMMING IS THE ONE PLACE the "never add across bases" rule lives. A
@@ -38599,7 +38876,13 @@ const COST_IS_ESTIMATE = { dollars: true, subscription: true, unpriced: false };
 function renderCostLine(usage, config, priorCost = null) {
   if (!usage) return '';
   const tag = reviewerTag(config);
-  const tokens = `${formatTokenCount(usage.inputTokens)} in / ${formatTokenCount(usage.outputTokens)} out tokens`;
+  // The human line stays one clause per quantity: the input total a reader already expects, with the
+  // cache-hit share named beside it in the SAME unit rather than as a derived percentage — an
+  // absolute count has no undefined case at zero input and states the fact instead of a ratio of it.
+  // The disjoint classes are the record's job (see THE TOKEN RECORD); this is a rendering of them.
+  const inputTokens = totalInputTokens(usage.tokens);
+  const tokens = `${formatTokenCount(inputTokens)} in (${formatTokenCount(usage.tokens.inputCacheHit)} cached)`
+    + ` / ${formatTokenCount(usage.tokens.output)} out tokens`;
   const prTotal = renderPrTotal(usage.cost, priorCost);
   const estimate = COST_IS_ESTIMATE[usage.cost.basis] ? ' · est.' : '';
   return `_${COST_PHRASE[usage.cost.basis](usage.cost)} · ${tokens} · ${tag}${estimate}${prTotal}_`;
@@ -38631,11 +38914,17 @@ function costWarning(usage, config) {
 module.exports = {
   PRICES_PER_MILLION,
   computeCostUsd,
+  totalInputTokens,
+  emptyTokens,
+  addTokens,
   renderCostLine,
   renderPrTotal,
   costMarker,
+  costRecord,
   parseCostMarker,
   parseCost,
+  parseCostRecord,
+  providerIdentity,
   sumCost,
   emptyTallies,
   tallyCost,

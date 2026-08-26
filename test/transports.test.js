@@ -156,9 +156,19 @@ describe('summarizePriorReviews', () => {
       },
     },
   });
-  const withCost = (usd) => `verdict\n\n${costMarker({ basis: 'dollars', usd })}\n\n${REVIEW_MARKER}`;
-  const unknownCost = () => `verdict\n\n${costMarker(null)}\n\n${REVIEW_MARKER}`;
-  const withNotionalCost = (notionalUsd) => `verdict\n\n${costMarker({ basis: 'subscription', notionalUsd })}\n\n${REVIEW_MARKER}`;
+  // The config each recorded round was written under — costMarker records its model and endpoint host
+  // beside the figure. These tests are about the PR's TALLIES, so one config and one token record serve
+  // every round; only the cost varies.
+  const CONFIG = {
+    name: 'deepseek',
+    engine: 'claude-code',
+    model: 'deepseek-v4-pro',
+    endpoint: { apiType: 'anthropic-messages', baseUrl: 'https://api.deepseek.com/anthropic', credential: { kind: 'api-key', value: 'k' } },
+  };
+  const usageOf = (cost) => ({ tokens: { inputCacheMiss: 10, inputCacheHit: 0, output: 5 }, cost });
+  const withCost = (usd) => `verdict\n\n${costMarker(usageOf({ basis: 'dollars', usd }), CONFIG)}\n\n${REVIEW_MARKER}`;
+  const unknownCost = () => `verdict\n\n${costMarker(null, CONFIG)}\n\n${REVIEW_MARKER}`;
+  const withNotionalCost = (notionalUsd) => `verdict\n\n${costMarker(usageOf({ basis: 'subscription', notionalUsd }), CONFIG)}\n\n${REVIEW_MARKER}`;
   const ZERO_TALLIES = { billed: { usd: 0, count: 0, unknownCount: 0 }, notional: { usd: 0, count: 0, unknownCount: 0 } };
 
   test('counts only reviews whose body ENDS with the marker (the trailing sentinel)', async () => {
@@ -195,7 +205,7 @@ describe('summarizePriorReviews', () => {
 
   test('a human review that QUOTES a cost marker is excluded from BOTH count and cost (one gate)', async () => {
     const octokit = fakeOctokit([[
-      { body: `here is what the bot posts: ${costMarker({ basis: 'dollars', usd: 999 })} — my own note` }, // no REVIEW_MARKER
+      { body: `here is what the bot posts: ${costMarker(usageOf({ basis: 'dollars', usd: 999 }), CONFIG)} — my own note` }, // no REVIEW_MARKER
       { body: withCost(0.04) },
     ]]);
     const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);

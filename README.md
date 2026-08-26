@@ -445,7 +445,7 @@ Every review reports its estimated USD cost in the attribution footer and the ru
 So a subscription review reports its list price everywhere a cost is reported, labelled as what it is:
 
 ```
-Not billed (Claude subscription) · $18.4100 at Anthropic list price · 12,231,000 in / 82,000 out tokens · claude-code/claude-sonnet-5 · est. · PR list-price total $63.5900 across 4 rounds
+Not billed (Claude subscription) · $18.4100 at Anthropic list price · 12,231,000 in (11,290,000 cached) / 82,000 out tokens · claude-code/claude-sonnet-5 · est. · PR list-price total $63.5900 across 4 rounds
 ```
 
 and it contributes **$0.00** to spend. Concretely:

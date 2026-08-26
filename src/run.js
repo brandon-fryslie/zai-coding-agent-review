@@ -133,7 +133,7 @@ function buildReviewFooter(usage, configUsed, priorCost = null) {
   if (warning) core.warning(warning);
   const costLine = renderCostLine(usage, configUsed, priorCost);
   if (costLine) core.info(costLine.replace(/^_|_$/g, ''));
-  const marker = costMarker(usage && usage.cost);
+  const marker = costMarker(usage, configUsed);
   return [buildAttributionFooter(configUsed), costLine, marker].filter(Boolean).join('\n\n');
 }
 
@@ -709,7 +709,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   // aborted for a bookkeeping write. The cost VALUE is the one the footer already reported — never re-estimated.
   if (ledgerIssue !== null) {
     try {
-      await appendCost(octokit, owner, repo, ledgerIssue, review.usage && review.usage.cost);
+      await appendCost(octokit, owner, repo, ledgerIssue, review.usage, configUsed);
     } catch (e) {
       core.warning(
         `Budget: failed to append this review's cost to ledger issue #${ledgerIssue} (${e.message}) — `

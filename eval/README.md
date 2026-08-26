@@ -196,8 +196,13 @@ eval/out/<case-name>/<timestamp>-run<i>/
                     'blocking'/'advisory' strings; the scorer reads both). This is what the scorer
                     (copirate-eval-harness-2fk.3) matches against expected.json.
   summary.txt     — the aggregated multi-scope review summary.
-  usage.json      — { inputTokens, outputTokens, cost } (cost is the existing discriminated
-                    value: { available:true, usd } or { available:false, reason }).
+  usage.json      — { tokens, span, cost }. tokens is the disjoint token record
+                    { inputCacheMiss, inputCacheHit, output }; span is { from, to } ISO
+                    timestamps bounding the pass; cost is the basis-discriminated value
+                    ({ basis:'dollars', usd } | { basis:'subscription', notionalUsd: number|null } |
+                    { basis:'unpriced', reason }). A run captured before the token split
+                    carries a collapsed inputTokens/outputTokens pair instead, and reads
+                    back as tokens: null — absent, never zero.
   meta.json       — provenance: case, timestamp, run index, the resolved engine config, findingCount.
   transcripts/    — the full per-spawn session transcripts (scout + one per scope).
 ```
