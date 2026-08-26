@@ -31,9 +31,10 @@ const { costMarker, parseCost, emptyTallies, tallyCost } = require('./usage');
 const LEDGER_MARKER = '<!-- agent-review-cost-ledger-entry -->';
 
 // [LAW:effects-at-boundaries] Pure: the body of one ledger entry — the sentinel then the reused cost
-// marker. `cost` is the same discriminated value costMarker already consumes (see THE COST VALUE in
-// src/usage.js), so an unpriced cost writes a marker carrying no figure: the entry still exists (a
-// review happened), its cost is simply counted as unknown on read, never fabricated as zero.
+// marker. `usage` is the same value costMarker consumes at the review sink — the token record, the
+// span, and the discriminated cost (see THE TOKEN RECORD and THE COST VALUE in src/usage.js) — so an
+// unpriced cost writes a marker carrying no figure: the entry still exists (a review happened), its
+// cost is simply counted as unknown on read, never fabricated as zero.
 // The entry records the SAME facts the PR review's own marker does — tokens, model, provider, span —
 // because the day's ledger is exactly as repriceable-after-the-fact as the review is, and writing a
 // poorer record here would have made the ledger the one place a corrected price table could not

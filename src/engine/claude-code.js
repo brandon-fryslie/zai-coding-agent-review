@@ -216,8 +216,9 @@ function assertSucceeded(stdout) {
 }
 
 // [LAW:effects-at-boundaries] Pure: reads usage from the JSON envelope and returns a Usage value,
-// or null when usage is absent. The input count sums all input-side fields (fresh + cache read +
-// cache write) so it reflects the total prompt tokens the run processed.
+// or null when usage is absent. The input-side fields are sorted into THE TOKEN RECORD's two input
+// classes rather than summed into one count — see the bucketing note in the body for which field
+// bills at which rate — and totalInputTokens re-derives the whole prompt count from them.
 // total_cost_usd is Claude Code's own CLIENT-SIDE estimate (tokens × its bundled ANTHROPIC price
 // table), not a billed charge — so the renderer marks every available cost line "est.".
 function extractUsage(stdout, config) {

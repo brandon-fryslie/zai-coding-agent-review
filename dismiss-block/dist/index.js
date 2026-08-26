@@ -32293,10 +32293,15 @@ const PRICES_PER_MILLION = {
 // every consumer had to subtract and clamp. Disjoint classes delete that question rather than
 // guarding it, and the price is then a plain dot product of three counts against three rates.
 //
-// Why it matters beyond tidiness: the two input rates differ by up to ~30x (DeepSeek 2026-08-16:
-// miss $0.66/M, hit $0.022/M off-peak), and reviews run ~92% cache-hit. A recorded total that fuses
-// them cannot be repriced when the table is later corrected — auditing PR #108 had to BORROW a
-// cache-hit ratio measured from an unrelated local run to restate CI costs at all. [FRAMING:representation]
+// Why it matters beyond tidiness: the two input rates differ by up to ~30x, and reviews run ~92%
+// cache-hit. DeepSeek's real rates as of 2026-08-16 are miss $0.66/M and hit $0.022/M off-peak —
+// figures quoted here as the MOTIVE for the split, NOT as what PRICES_PER_MILLION holds. That table
+// is still the stale 2026-07-10 row and correcting it is zai-cost-truth-p5o.1's job, deliberately
+// separate: recording a repriceable fact and repricing from a correct table are two changes, and
+// landing them together would leave no way to tell a bad record from a bad rate. What this record
+// buys is precisely that the correction can be applied RETROACTIVELY when it lands. A fused total
+// cannot be — auditing PR #108 had to BORROW a cache-hit ratio measured from an unrelated local run
+// to restate CI costs at all. [FRAMING:representation]
 // the stored figure must be able to answer the question later, not merely print a number today; a
 // cost is DERIVED, the tokens are primary, and the primary fact is what must be durable.
 function totalInputTokens(tokens) {
@@ -32422,7 +32427,9 @@ function reviewerTag(config) {
 // round sums prior rounds from a typed value — never by re-parsing the rendered "Cost: $X" prose, which
 // would be a representation re-parsing itself. Rendered as an HTML comment (invisible, like REVIEW_MARKER)
 // and placed in the footer BEFORE REVIEW_MARKER, so the trailing-marker round-count contract is untouched.
-// An unavailable or absent cost records 'unknown' — the round is still counted, its cost just isn't summed.
+// An unavailable or absent cost records a marker carrying NO figure field — the round is still
+// counted, its cost just isn't summed. (The literal 'unknown' is the legacy spelling of that same
+// state, still read below; the writer no longer emits it.)
 // [LAW:types-are-the-program] The marker payload has exactly two forms, and BOTH are real data in
 // the world — this is a widening, not a migration:
 //
@@ -32447,13 +32454,24 @@ function reviewerTag(config) {
 const MARKER_VALUE = '([0-9]+(?:\\.[0-9]+)?|unknown|\\{[^>]*\\})';
 
 // [LAW:parse-dont-validate] The one crossing between a cost record and marker text, in both
-// directions. JSON cannot contain a '>' outside a string literal, so escaping every '>' as the
-// six-character JSON unicode escape is exact: it can only rewrite characters INSIDE strings, JSON.parse
-// restores them byte-for-byte, and the result provably cannot spell '-->'. Escaping beats
-// rejecting a model id that happens to contain '>' — a rejection would either crash a legitimate
-// config or silently drop the record, and the payload is data we already own end to end.
+// directions. Neither '>' nor a '--' pair can occur in JSON OUTSIDE a string literal, so replacing
+// each with its six-character unicode escape is exact: it can only ever rewrite characters inside
+// strings, and JSON.parse restores them byte-for-byte. Escaping beats rejecting a model id that
+// contains one — a rejection would either crash a legitimate config or silently drop the record,
+// and the payload is data we already own end to end.
+//
+// Two characters, two DIFFERENT hazards, and only the first is about breaking out:
+//   '>'  — without it '-->' cannot be spelled, so an encoded payload cannot terminate its own
+//          comment and leak the rest of the marker into the review body as visible text.
+//   '--' — a comment terminator needs a '>', so a bare pair can never end the comment for OUR
+//          reader. It is escaped because "the marker is INVISIBLE" is a claim about somebody
+//          else's markdown renderer: CommonMark ≤0.29 forbade '--' inside a comment outright, and
+//          while both hosts here render under the relaxed rule today, an invariant this module
+//          asserts should not quietly depend on which revision a host happens to ship.
+// [LAW:types-are-the-program] Cheaper to make the byte unrepresentable than to track a third
+// party's parser version.
 function encodePayload(record) {
-  return JSON.stringify(record).replace(/>/g, '\\u003e');
+  return JSON.stringify(record).replace(/>/g, '\\u003e').replace(/--/g, '-\\u002d');
 }
 
 // Returns null for a payload that is not a parseable record — a corrupted or hand-edited marker is
@@ -32605,10 +32623,26 @@ function recordedString(v) {
   return typeof v === 'string' && v !== '' ? v : null;
 }
 
+// [LAW:parse-dont-validate] A recorded quantity — dollars or a token count — is a NON-NEGATIVE finite
+// number or nothing. The legacy grammar enforced this structurally: its value pattern admits no
+// leading '-', so a negative figure could not be spelled. The record payload is JSON and could, so
+// the sign check moves here rather than being lost in the widening. A hand-edited
+// `{"usd":-999999}` would SUBTRACT from the PR total and the daily ledger — the one direction a
+// corrupted marker must never be able to move a total, since under-counting spend is what releases a
+// budget gate rather than tripping it. A negative here is not a smaller number, it is a differently
+// signed claim, and it is rejected as unrecordable rather than tallied. [LAW:no-silent-failure]
+function recordedQuantity(v) {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
+}
+
 function recordedTokens(v) {
   if (v === null || typeof v !== 'object') return null;
-  const tokens = { inputCacheMiss: v.inputCacheMiss, inputCacheHit: v.inputCacheHit, output: v.output };
-  return Object.values(tokens).every(n => typeof n === 'number' && Number.isFinite(n)) ? tokens : null;
+  const tokens = {
+    inputCacheMiss: recordedQuantity(v.inputCacheMiss),
+    inputCacheHit: recordedQuantity(v.inputCacheHit),
+    output: recordedQuantity(v.output),
+  };
+  return Object.values(tokens).every(n => n !== null) ? tokens : null;
 }
 
 // [LAW:parse-dont-validate] THE ONE READER. Every marker consumer below is this function plus a
@@ -32622,7 +32656,7 @@ function parseCostRecord(body) {
   const facts = payloadFacts(raw, basis.field);
   const figure = facts[basis.field];
   return {
-    cost: basis.toCost(Number.isFinite(figure) ? figure : null),
+    cost: basis.toCost(recordedQuantity(figure)),
     tokens: recordedTokens(facts.tokens),
     model: recordedString(facts.model),
     provider: recordedString(facts.provider),

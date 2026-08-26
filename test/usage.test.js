@@ -499,6 +499,34 @@ describe('cost marker — the recorded facts re-derive the cost (zai-cost-truth-
     assert.deepEqual(record.cost, { basis: 'dollars', usd: 0.25 });
   });
 
+  // [LAW:parse-dont-validate] The legacy grammar forbade a negative figure STRUCTURALLY — its value
+  // pattern admits no leading '-'. The record payload is JSON and could spell one, so the widening
+  // must not lose the guarantee: a hand-edited negative would SUBTRACT from the PR total and the
+  // daily ledger, and under-counted spend is what RELEASES a budget gate rather than tripping it.
+  test('a negative figure is unrecordable, never a credit against the PR total', () => {
+    const negative = '<!-- agent-review-cost-usd:{"usd":-999999} -->';
+    assert.deepEqual(parseCost(negative), { basis: 'unpriced', reason: 'not-reported' });
+    assert.equal(parseCostMarker(negative), 'unknown');
+    // and it cannot come back as a negative list price either
+    assert.deepEqual(parseCost('<!-- agent-review-notional-usd:{"notionalUsd":-5} -->'), { basis: 'subscription', notionalUsd: null });
+  });
+
+  test('a negative token count makes the whole record unrepriceable, never a negative charge', () => {
+    const body = '<!-- agent-review-cost-usd:{"usd":1,"tokens":{"inputCacheMiss":-5,"inputCacheHit":10,"output":2}} -->';
+    assert.equal(parseCostRecord(body).tokens, null);
+  });
+
+  // A comment terminator needs a '>', which is escaped, so a bare '--' can never end the comment for
+  // OUR reader. It is escaped anyway because "the marker is invisible" is a claim about somebody
+  // else's markdown renderer, and CommonMark <=0.29 forbade '--' inside a comment outright.
+  test('no bare "--" survives into the payload', () => {
+    const hostile = { ...DEEPSEEK_CONFIG, model: 'a--b----c' };
+    const marker = costMarker(usageOf({ basis: 'dollars', usd: 0.25 }), hostile);
+    const payload = marker.slice(marker.indexOf(':{') + 1, marker.lastIndexOf(' -->'));
+    assert.ok(!payload.includes('--'), `payload must carry no bare "--": ${payload}`);
+    assert.equal(parseCostRecord(marker).model, 'a--b----c'); // …and it still round-trips exactly
+  });
+
   // A record whose token classes are incomplete cannot reprice anything, and pricing two of three
   // classes as if they were all of them would understate the run — the same lie in a smaller font.
   test('a partial token record reads as no token record at all', () => {

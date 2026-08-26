@@ -167,6 +167,38 @@ describe('sumUsage', () => {
     assert.equal(totalInputTokens(total.tokens), 30); // tokens still sum
   });
 
+  // The classes must sum INDEPENDENTLY. Every other case here uses inputCacheHit: 0, which a fold
+  // that added the hits into the miss class would still pass — and that fold would reprice a review
+  // at up to 30x the true rate, silently, since the two classes are the whole point of the record.
+  test('each token class sums into its own class, never into another', () => {
+    const total = sumUsage([
+      { tokens: { inputCacheMiss: 10, inputCacheHit: 300, output: 5 }, cost: { basis: 'dollars', usd: 0.1 } },
+      { tokens: { inputCacheMiss: 20, inputCacheHit: 4000, output: 7 }, cost: { basis: 'dollars', usd: 0.2 } },
+    ]);
+    assert.deepEqual(total.tokens, { inputCacheMiss: 30, inputCacheHit: 4300, output: 12 });
+    assert.equal(totalInputTokens(total.tokens), 4330);
+  });
+
+  // The pass's span is the ENVELOPE of its spawns' — earliest start, latest end — because workers run
+  // in waves and overlap. Taking the first or last spawn's own span would understate the window a
+  // later repricing has to place inside a rate epoch.
+  test('the span is the envelope of every spawn, not the first or last one', () => {
+    const usage = (from, to) => ({ tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 1 }, span: { from, to }, cost: { basis: 'dollars', usd: 0 } });
+    const total = sumUsage([
+      usage('2026-08-22T03:40:00.000Z', '2026-08-22T03:45:00.000Z'),
+      usage('2026-08-22T03:30:00.000Z', '2026-08-22T03:35:00.000Z'), // starts earliest, ends early
+      usage('2026-08-22T03:42:00.000Z', '2026-08-22T04:01:00.000Z'), // ends latest
+    ]);
+    assert.deepEqual(total.span, { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T04:01:00.000Z' });
+  });
+
+  test('a spawn that recorded no span contributes none, and all-absent folds to undefined', () => {
+    const spanless = { tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 1 }, cost: { basis: 'dollars', usd: 0 } };
+    const spanned = { ...spanless, span: { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:35:00.000Z' } };
+    assert.deepEqual(sumUsage([spanless, spanned]).span, { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:35:00.000Z' });
+    assert.equal(sumUsage([spanless, spanless]).span, undefined); // never a fabricated window
+  });
+
   test('excludes null usages but still sums the present ones', () => {
     const total = sumUsage([null, { tokens: { inputCacheMiss: 4, inputCacheHit: 0, output: 2 }, cost: { basis: 'dollars', usd: 0.05 } }]);
     assert.equal(totalInputTokens(total.tokens), 4);
