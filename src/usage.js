@@ -315,30 +315,40 @@ const ANY_MARKER_RE = new RegExp(
 // dollars stay byte-stable across a re-render. It is NOT what a later audit reprices from — that is
 // what `tokens` + `model` are for, at full precision — it is the figure this run believed at the
 // time, kept so a restatement can be compared against it.
-// [LAW:single-enforcer] The writer screens the figure through the SAME `recordedQuantity` the reader
-// does, so what this function can emit is exactly what `parseCostRecord` will accept. A predicate
-// applied on only one side is not one rule but two: the writer would emit a negative or non-finite
-// figure that the reader then silently refuses, and the marker would round-trip to a DIFFERENT value
-// than the one it was written from — a record that disagrees with itself is worse than no record.
+// [LAW:single-enforcer] EVERY field is screened through the SAME predicate its reader uses — the
+// figure and each token class through `recordedQuantity`, each string fact through `recordedString`
+// — so the set of records this function can emit IS the set `parseCostRecord` accepts. A predicate
+// applied on one side only is not one rule but two: the writer emits something the reader silently
+// refuses, and the marker round-trips to a DIFFERENT value than it was written from. A record that
+// disagrees with itself is worse than no record. Screening only the figure was exactly that bug one
+// field wide — a negative token count still went out to be rejected on the way back in.
 // [LAW:types-are-the-program] So an unpriced cost, an unreported notional, a NaN from a broken
-// upstream, and a nonsensical negative all reach the same honest end: no figure field at all.
+// upstream, a nonsensical negative, and a config naming no model all reach the same honest end: an
+// absent field, which is what "not recorded" looks like.
 function costRecord(usage, config) {
   const cost = usage && usage.cost;
   const basis = basisOf(cost);
   const figure = recordedQuantity(basis.figure(cost));
   const span = (usage && usage.span) || {};
   return {
-    [basis.field]: figure === null ? undefined : Number(figure.toFixed(6)),
-    tokens: usage ? usage.tokens : undefined,
-    model: config.model,
-    provider: providerIdentity(config),
+    [basis.field]: recorded(figure === null ? null : Number(figure.toFixed(6))),
+    tokens: recorded(usage ? recordedTokens(usage.tokens) : null),
+    model: recorded(recordedString(config.model)),
+    provider: recorded(recordedString(providerIdentity(config))),
     // The pass's time SPAN, not one instant. A review's spawns run over many minutes and time is
     // about to become a pricing input (DeepSeek's peak windows begin at 01:00/06:00 UTC), so a
     // single timestamp would silently misprice every review that straddles a boundary. Two ends let
     // a restatement price exactly when they fall in one window, and say so when they do not.
-    from: span.from,
-    to: span.to,
+    from: recorded(recordedString(span.from)),
+    to: recorded(recordedString(span.to)),
   };
+}
+
+// The reader's predicates answer `null` for "nothing recorded"; the writer spells that as an ABSENT
+// field. Both read back as an absence, so this is presentation rather than meaning — but it keeps the
+// payload a record of facts rather than a roll-call of gaps, on a string paid for at every sink.
+function recorded(v) {
+  return v === null ? undefined : v;
 }
 
 function costMarker(usage, config) {

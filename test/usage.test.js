@@ -514,12 +514,36 @@ describe('cost marker — the recorded facts re-derive the cost (zai-cost-truth-
   // [LAW:single-enforcer] The writer screens through the same predicate the reader does, so the set
   // of figures costMarker can emit IS the set parseCostRecord accepts. Applied on one side only, a
   // marker would round-trip to a different value than it was written from.
-  test('the writer cannot emit a figure the reader would refuse', () => {
+  test('the writer cannot emit a figure the reader would refuse — on either basis', () => {
     for (const bad of [-1, -0.000001, NaN, Infinity, -Infinity]) {
-      const marker = costMarker(usageOf({ basis: 'dollars', usd: bad }), DEEPSEEK_CONFIG);
-      assert.ok(!marker.includes('"usd"'), `${bad} must not be written as a figure: ${marker}`);
-      assert.deepEqual(parseCost(marker), { basis: 'unpriced', reason: 'not-reported' });
+      const dollars = costMarker(usageOf({ basis: 'dollars', usd: bad }), DEEPSEEK_CONFIG);
+      assert.ok(!dollars.includes('"usd"'), `${bad} must not be written as a figure: ${dollars}`);
+      assert.deepEqual(parseCost(dollars), { basis: 'unpriced', reason: 'not-reported' });
+
+      // The notional arm carries the SAME guarantee. Screening one basis and not the other would be
+      // the asymmetry this test exists to forbid, one arm over.
+      const notional = costMarker(usageOf({ basis: 'subscription', notionalUsd: bad }), SUBSCRIPTION_CONFIG);
+      assert.ok(!notional.includes('"notionalUsd"'), `${bad} must not be written as a list price: ${notional}`);
+      assert.deepEqual(parseCost(notional), { basis: 'subscription', notionalUsd: null });
     }
+  });
+
+  // The claim is about the WHOLE record, not just the figure: every field the writer emits must be
+  // one the reader accepts. Screening the figure alone still let a negative token count go out to be
+  // refused on the way back in — a marker that round-trips to something other than what it recorded.
+  test('the writer cannot emit a token record the reader would refuse', () => {
+    const negative = { tokens: { inputCacheMiss: -5, inputCacheHit: 10, output: 2 }, cost: { basis: 'dollars', usd: 1 } };
+    const marker = costMarker(negative, DEEPSEEK_CONFIG);
+    assert.ok(!marker.includes('tokens'), `an unrecordable token record must not be written: ${marker}`);
+    assert.equal(parseCostRecord(marker).tokens, null);
+  });
+
+  // A config naming no model is reachable in config-file mode; the writer must not emit a field the
+  // reader would score as absent anyway.
+  test('a config naming no model records no model, not an empty one', () => {
+    const marker = costMarker(usageOf({ basis: 'dollars', usd: 1 }), { ...DEEPSEEK_CONFIG, model: '' });
+    assert.ok(!marker.includes('"model"'), `an empty model must not be written: ${marker}`);
+    assert.equal(parseCostRecord(marker).model, null);
   });
 
   test('a negative token count makes the whole record unrepriceable, never a negative charge', () => {
