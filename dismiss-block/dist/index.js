@@ -32558,8 +32558,8 @@ const ANY_MARKER_RE = new RegExp(
 // [LAW:parse-dont-validate] THE COST RECORD — the crossing from a live run's values into the durable
 // facts a marker carries, and the one place absence is recorded AS absence. A fact that was never
 // observed (no usage at all; a config that names no model; an endpoint with no parseable host) is
-// written as no field at all or as an explicit null — either way the reader recovers an absence, and
-// never a zero. That distinction is the whole ticket: a figure of 0 asserts the review was free,
+// written as NO FIELD AT ALL — one spelling of absence, not two, since `recorded` collapses every
+// reader-predicate null to an omitted key. The reader recovers an absence, never a zero. That distinction is the whole ticket: a figure of 0 asserts the review was free,
 // while a missing figure asserts nothing and can still be restated later. [LAW:no-silent-failure]
 //
 // The figure is quantized to 6 decimal places, exactly as the legacy marker was, so the recorded
