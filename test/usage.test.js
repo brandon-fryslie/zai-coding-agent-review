@@ -112,6 +112,16 @@ describe('computeCostUsd', () => {
     assert.equal(computeCostUsd({ inputCacheMiss: 100, inputCacheHit: 0, output: 100 }, 'gpt-unknown', OFF_PEAK), null);
   });
 
+  test('a model named after an inherited property is absent from the table, not a schedule', () => {
+    // A model id is a config value, so it can be any string. A bare index answers Object.prototype's
+    // own members for these, which is truthy and is not a schedule — the lookup must ask about own
+    // keys or a review dies reading `.tiers` off a function.
+    const tokens = { inputCacheMiss: 100, inputCacheHit: 0, output: 100 };
+    for (const model of ['__proto__', 'constructor', 'toString', 'hasOwnProperty', 'valueOf']) {
+      assert.equal(computeCostUsd(tokens, model, OFF_PEAK), null, `${model} must price as unknown`);
+    }
+  });
+
   test('every default model the providers ship has a price-table entry', () => {
     for (const model of ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'deepseek-v4-pro', 'glm-5.1']) {
       assert.ok(PRICES_PER_MILLION[model], `missing price for ${model}`);
@@ -156,8 +166,11 @@ describe('time-varying rates', () => {
   });
 
   // [LAW:verifiable-goals] THE SECOND ACCEPTANCE CRITERION — a pass whose spawns straddle 04:00 UTC
-  // bills each spawn at its own tier. Driven through the ADAPTER, because per-spawn pricing is a
-  // property of the seam (makeCliAdapter hands each spawn its own start instant), not of the table.
+  // bills each spawn at its own tier. Driven through the adapter's extractUsage, the layer that turns
+  // an instant into a priced spawn, and then through the real sumCost the pass total uses. The other
+  // half of the seam — that makeCliAdapter gives each spawn its OWN instant, and the same one it
+  // records as span.from — is not asserted here: it is driven against a live spawn in
+  // test/engine-cli.test.js, because nothing at this layer could tell one clock read from two.
   test('a pass straddling 04:00 UTC bills each spawn at its own tier, and the sum is not repriced', () => {
     const stdout = JSON.stringify({ type: 'result', usage: { input_tokens: 1_000_000, output_tokens: 1_000_000 } });
     const before = claudeExtractUsage(stdout, DEEPSEEK_CONFIG, new Date('2026-08-20T03:50:00.000Z')); // peak
@@ -418,7 +431,8 @@ describe('renderCostLine', () => {
   });
 });
 
-// The measured token split of a real review (PR #108, deepseek-v4-pro, 2026-08-22 peak window) —
+// The measured token split of a real review (PR #108, deepseek-v4-pro, 2026-08-22, a Saturday and so
+// off-peak under the Monday-Friday schedule whatever the hour) —
 // the run whose collapsed footer forced an audit to BORROW a cache-hit ratio from an unrelated local
 // run. Using the real numbers keeps the round-trip test honest about magnitude: 91.8% of this input
 // is cache-hit, priced ~30x below the miss class, so a marker that fused them could not reprice.

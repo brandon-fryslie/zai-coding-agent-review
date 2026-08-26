@@ -78,10 +78,13 @@ const PRICES_PER_MILLION = {
 // guarding it, and the price is then a plain dot product of three counts against three rates.
 //
 // Why it matters beyond tidiness: the two input rates differ by up to ~30x, and reviews run ~92%
-// cache-hit, so the class this workload leans on hardest is the one whose rate moved 1114% at
-// DeepSeek's 2026-08-16 repricing. This record is what let that correction land RETROACTIVELY: every
-// review posted from 1.53.0 on records its own disjoint counts, its model and its span, so the
-// corrected schedule below reprices it exactly. A fused total cannot be repriced — auditing PR #108
+// cache-hit, so the class this workload leans on hardest is the one DeepSeek's 2026-08-16 repricing
+// moved hardest — +507% at the off-peak rate and +1114% at the peak one (0.003625 -> 0.022 / 0.044),
+// against ~52% for the miss class. This record is what let that correction land RETROACTIVELY: every
+// review posted from 1.53.0 on records its own disjoint counts, its model and its span. A pass whose
+// recorded span falls wholly inside one rate window reprices EXACTLY from those facts; one that
+// straddles a window boundary reprices to a range, because the marker holds the pass ENVELOPE and
+// not each spawn's own instant (see computeCostUsd). A fused total cannot be repriced — auditing PR #108
 // had to BORROW a cache-hit ratio measured from an unrelated local run to restate CI costs at all.
 // Reviews posted BEFORE 1.53.0 carry a bare figure and are a permanent, honest gap: they must be
 // restated as unknown, never quietly repriced as if their tokens had been recorded.
@@ -160,7 +163,11 @@ function ratesAt(entry, instant) {
 // the classes are exactly the billing buckets.
 function computeCostUsd(tokens, model, at) {
   const instant = utcInstant(at);
-  const entry = PRICES_PER_MILLION[model];
+  // [LAW:parse-dont-validate] `Object.hasOwn`, never a bare index: a model id is a config value, and
+  // a bare lookup answers Object.prototype's members for the likes of `constructor` or `toString` —
+  // handing back something truthy that is not a schedule, which then reads `.tiers` off a function
+  // and throws mid-review. The question is "is this model IN the table", and only own-keys answer it.
+  const entry = Object.hasOwn(PRICES_PER_MILLION, model) ? PRICES_PER_MILLION[model] : null;
   if (!entry) return null;
   const price = ratesAt(entry, instant);
   const total =
@@ -398,7 +405,8 @@ const ANY_MARKER_RE = new RegExp(
 //
 // The figure is quantized to 6 decimal places, exactly as the legacy marker was, so the recorded
 // dollars stay byte-stable across a re-render. It is NOT what a later audit reprices from — that is
-// what `tokens` + `model` are for, at full precision — it is the figure this run believed at the
+// what `tokens` + `model` + the span are for, at full precision, all three being inputs to
+// `computeCostUsd` now that a rate varies by time of day — it is the figure this run believed at the
 // time, kept so a restatement can be compared against it.
 // [LAW:single-enforcer] EVERY field is screened through the SAME predicate its reader uses — the
 // figure and each token class through `recordedQuantity`, each string fact through `recordedString`
@@ -420,10 +428,10 @@ function costRecord(usage, config) {
     tokens: recorded(usage ? recordedTokens(usage.tokens) : null),
     model: recorded(recordedString(config.model)),
     provider: recorded(recordedString(providerIdentity(config))),
-    // The pass's time SPAN, not one instant. A review's spawns run over many minutes and time is
-    // about to become a pricing input (DeepSeek's peak windows begin at 01:00/06:00 UTC), so a
-    // single timestamp would silently misprice every review that straddles a boundary. Two ends let
-    // a restatement price exactly when they fall in one window, and say so when they do not.
+    // The pass's time SPAN, not one instant. A review's spawns run over many minutes and time IS a
+    // pricing input (DeepSeek's peak windows begin at 01:00/06:00 UTC), so a single timestamp would
+    // silently misprice every review that straddles a boundary. Two ends let a restatement price
+    // exactly when they fall in one window, and say so when they do not.
     from: recorded(recordedString(span.from)),
     to: recorded(recordedString(span.to)),
   };
