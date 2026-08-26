@@ -126,7 +126,7 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | `DIFFICULTY_SCALING` | `false` (off) | Scale review effort to change difficulty — see [Difficulty scaling](#difficulty-scaling). An easy diff draws fewer review rounds; a complex diff reasons harder each round. PR mode only. |
 | `DEPENDENCY_DIFF` | `false` (off) | Fetch upstream commit/file context for a `go.mod` version bump — see [Dependency diff context](#dependency-diff-context). PR mode only. |
 | `GITHUB_TOKEN` | `${{ github.token }}` | Token for GitHub API access (fetching the diff, posting the review). Defaults to the workflow's automatic token, which needs `pull-requests: write`. |
-| `GITHUB_REVIEW_TOKEN` | — | Token used for all GitHub calls when set; required to submit a **formal approval** (see [Approvals](#approvals)). |
+| `GITHUB_REVIEW_TOKEN` | — | Token the action **posts** under when set — the review, the not-reviewed notice, and block dismissals. Reads (diff, prior reviews, ledger) stay on `GITHUB_TOKEN`. Required to submit a **formal approval** (see [Approvals](#approvals)). |
 | `PR_NUMBER` | from event | PR number. Auto-detected on `pull_request` events; pass explicitly on others (e.g. `workflow_run`). |
 | `HEAD_SHA` | from event | Head SHA the review anchors to. Auto-detected on `pull_request` events. |
 
@@ -178,7 +178,7 @@ It resolves every token that can *post a review* — the review token and the de
 
 **Fork skips need a trigger whose token can write.** On `pull_request` a fork PR gets a read-only `GITHUB_TOKEN` — GitHub grants no write scope there, whatever the workflow's `permissions:` block says — so the notice cannot post. The run warns loudly in its log and stays green; the PR itself says nothing. Trigger on `workflow_run` if you need fork skips visible.
 
-`GITHUB_REVIEW_TOKEN` does not help here, despite being used for every other GitHub call when set. On a `pull_request` event from a fork, GitHub passes **no repository secrets** to the runner at all — `GITHUB_TOKEN` is the one exception, and it arrives read-only. The secret resolves to an empty string on exactly the runs that would need it. That same rule is why `workflow_run` works: it runs in the base repository's context, where secrets are available.
+`GITHUB_REVIEW_TOKEN` does not help here, despite being the token the action posts under when set. On a `pull_request` event from a fork, GitHub passes **no repository secrets** to the runner at all — `GITHUB_TOKEN` is the one exception, and it arrives read-only. The secret resolves to an empty string on exactly the runs that would need it. That same rule is why `workflow_run` works: it runs in the base repository's context, where secrets are available.
 
 Do not reach for `pull_request_target` to solve this. It hands a write-scoped token and your secrets to a job running in the base branch's context — and the Quickstart above checks out `${{ github.event.pull_request.head.sha }}`, which on a fork PR is the contributor's code. Combining the two is the "pwn request" pattern: any step that builds, tests, or lints that checkout executes attacker-controlled code holding a token that can push to your repository. A fork skip staying invisible on the PR is a far smaller problem than that.
 

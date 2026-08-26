@@ -30337,9 +30337,14 @@ async function run() {
   // credential below. The fix is to ask who THIS run itself would trust to have posted that notice, and
   // require the artifact's actual author to match: `reviewOctokit` is built from the same credential
   // (`GITHUB_REVIEW_TOKEN`, or its `GITHUB_TOKEN` fallback) that `run.js` posts round-cap notices under, so
-  // asking it "who am I" (`GET /user`, served by GitHub and Gitea alike) answers the identity a genuine
-  // notice was posted as, without hardcoding a bot username that would break the documented user-PAT
-  // `GITHUB_REVIEW_TOKEN` path this repo already supports.
+  // resolving ITS identity answers who a genuine notice was posted as — without hardcoding a bot username,
+  // which would break the documented user-PAT `GITHUB_REVIEW_TOKEN` path this repo already supports.
+  //
+  // The id that comparison needs exists only on the login arm, where it comes from the `/user` payload the
+  // login itself came from. On the installation arm there is no successful `/user` at all — the identity is
+  // confirmed structurally and carries `id: null`, so `hasDeclinedRevisit` reads "unverifiable" and this
+  // run releases nothing. That is the same safe direction as a failed resolution, reached by a different
+  // road, and it is why the null is a carried VALUE rather than something to paper over here.
   //
   // A failure here is NOT a reason to fall back to trusting body content — it is treated as "cannot verify",
   // and this run releases nothing. The safe direction is a block that stays up one run longer, not one a
