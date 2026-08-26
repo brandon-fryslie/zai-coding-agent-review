@@ -511,6 +511,17 @@ describe('cost marker — the recorded facts re-derive the cost (zai-cost-truth-
     assert.deepEqual(parseCost('<!-- agent-review-notional-usd:{"notionalUsd":-5} -->'), { basis: 'subscription', notionalUsd: null });
   });
 
+  // [LAW:single-enforcer] The writer screens through the same predicate the reader does, so the set
+  // of figures costMarker can emit IS the set parseCostRecord accepts. Applied on one side only, a
+  // marker would round-trip to a different value than it was written from.
+  test('the writer cannot emit a figure the reader would refuse', () => {
+    for (const bad of [-1, -0.000001, NaN, Infinity, -Infinity]) {
+      const marker = costMarker(usageOf({ basis: 'dollars', usd: bad }), DEEPSEEK_CONFIG);
+      assert.ok(!marker.includes('"usd"'), `${bad} must not be written as a figure: ${marker}`);
+      assert.deepEqual(parseCost(marker), { basis: 'unpriced', reason: 'not-reported' });
+    }
+  });
+
   test('a negative token count makes the whole record unrepriceable, never a negative charge', () => {
     const body = '<!-- agent-review-cost-usd:{"usd":1,"tokens":{"inputCacheMiss":-5,"inputCacheHit":10,"output":2}} -->';
     assert.equal(parseCostRecord(body).tokens, null);

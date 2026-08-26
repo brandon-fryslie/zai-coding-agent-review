@@ -32566,15 +32566,20 @@ const ANY_MARKER_RE = new RegExp(
 // dollars stay byte-stable across a re-render. It is NOT what a later audit reprices from — that is
 // what `tokens` + `model` are for, at full precision — it is the figure this run believed at the
 // time, kept so a restatement can be compared against it.
-// [LAW:types-are-the-program] A non-finite figure (an unpriced cost, an unreported notional, or a
-// broken upstream) writes no figure field at all, so a NaN can never round-trip as a number.
+// [LAW:single-enforcer] The writer screens the figure through the SAME `recordedQuantity` the reader
+// does, so what this function can emit is exactly what `parseCostRecord` will accept. A predicate
+// applied on only one side is not one rule but two: the writer would emit a negative or non-finite
+// figure that the reader then silently refuses, and the marker would round-trip to a DIFFERENT value
+// than the one it was written from — a record that disagrees with itself is worse than no record.
+// [LAW:types-are-the-program] So an unpriced cost, an unreported notional, a NaN from a broken
+// upstream, and a nonsensical negative all reach the same honest end: no figure field at all.
 function costRecord(usage, config) {
   const cost = usage && usage.cost;
   const basis = basisOf(cost);
-  const figure = basis.figure(cost);
+  const figure = recordedQuantity(basis.figure(cost));
   const span = (usage && usage.span) || {};
   return {
-    [basis.field]: Number.isFinite(figure) ? Number(figure.toFixed(6)) : undefined,
+    [basis.field]: figure === null ? undefined : Number(figure.toFixed(6)),
     tokens: usage ? usage.tokens : undefined,
     model: config.model,
     provider: providerIdentity(config),

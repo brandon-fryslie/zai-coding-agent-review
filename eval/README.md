@@ -199,7 +199,7 @@ eval/out/<case-name>/<timestamp>-run<i>/
   usage.json      — { tokens, span, cost }. tokens is the disjoint token record
                     { inputCacheMiss, inputCacheHit, output }; span is { from, to } ISO
                     timestamps bounding the pass; cost is the basis-discriminated value
-                    ({ basis:'dollars', usd } | { basis:'subscription', notionalUsd } |
+                    ({ basis:'dollars', usd } | { basis:'subscription', notionalUsd: number|null } |
                     { basis:'unpriced', reason }). A run captured before the token split
                     carries a collapsed inputTokens/outputTokens pair instead, and reads
                     back as tokens: null — absent, never zero.
