@@ -181,7 +181,7 @@ function assertSucceeded(stdout) {
 // The cumulative turn usage rides on the final turn.completed event; later events overwrite
 // earlier ones so the last wins. An absent/empty usage object (no token fields) is reported as
 // no usage (null), not as a $0.00 run. [LAW:dataflow-not-control-flow]
-function extractUsage(stdout, config) {
+function extractUsage(stdout, config, startedAt) {
   let usage = null;
   for (const line of stdout.split('\n')) {
     const trimmed = line.trim();
@@ -203,7 +203,9 @@ function extractUsage(stdout, config) {
     inputCacheHit,
     output: usage.output_tokens ?? 0,
   };
-  const costUsd = computeCostUsd(tokens, config.model);
+  // `startedAt` is the spawn's start instant, supplied by makeCliAdapter — the price table is a
+  // schedule, so the rate is selected by WHEN this spawn ran, not by a clock read in here.
+  const costUsd = computeCostUsd(tokens, config.model, startedAt);
   // [LAW:types-are-the-program] cost is a discriminated value. Codex reports no USD, so a null
   // here means exactly one thing — the model is absent from the price table — and the adapter
   // declares that reason at the point it knows it, rather than the boundary re-deriving it.

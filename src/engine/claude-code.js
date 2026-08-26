@@ -221,7 +221,7 @@ function assertSucceeded(stdout) {
 // bills at which rate — and totalInputTokens re-derives the whole prompt count from them.
 // total_cost_usd is Claude Code's own CLIENT-SIDE estimate (tokens × its bundled ANTHROPIC price
 // table), not a billed charge — so the renderer marks every available cost line "est.".
-function extractUsage(stdout, config) {
+function extractUsage(stdout, config, startedAt) {
   const env = parseResultEnvelope(stdout);
   if (!env || !env.usage) return null;
   const u = env.usage;
@@ -234,7 +234,7 @@ function extractUsage(stdout, config) {
     inputCacheHit: u.cache_read_input_tokens ?? 0,
     output: u.output_tokens ?? 0,
   };
-  return { tokens, cost: costFromEnvelope(env, config, tokens) };
+  return { tokens, cost: costFromEnvelope(env, config, tokens, startedAt) };
 }
 
 // [LAW:types-are-the-program] cost is a discriminated value (see THE COST VALUE in src/usage.js),
@@ -255,7 +255,10 @@ function extractUsage(stdout, config) {
 // typeof==='number' (which accepts NaN), so a garbage total_cost_usd becomes an unreported figure and
 // never a NaN that later renders "$NaN" or poisons a total. The invariant is enforced here at the
 // source so no downstream consumer needs its own guard.
-function costFromEnvelope(env, config, buckets) {
+// `startedAt` reaches only the price-table arm, and that is the whole story of which figures vary with
+// time: the two arms above take Claude Code's own Anthropic-priced number, which already knows when it
+// was computed. Only the arm that prices from OUR table needs to say when the tokens were spent.
+function costFromEnvelope(env, config, buckets, startedAt) {
   if (isSubscription(config)) {
     return {
       basis: 'subscription',
@@ -267,7 +270,7 @@ function costFromEnvelope(env, config, buckets) {
       ? { basis: 'dollars', usd: env.total_cost_usd }
       : { basis: 'unpriced', reason: 'not-reported' };
   }
-  const usd = computeCostUsd(buckets, config.model);
+  const usd = computeCostUsd(buckets, config.model, startedAt);
   return usd == null ? { basis: 'unpriced', reason: 'no-price' } : { basis: 'dollars', usd };
 }
 

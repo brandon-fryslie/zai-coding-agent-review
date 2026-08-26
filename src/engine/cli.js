@@ -77,15 +77,20 @@ function makeCliAdapter(spec) {
         try {
           const home = spec.materializeHome({ config, instructionsPath, collector });
           try {
-            // [LAW:effects-at-boundaries] The clock is an effect, so the spawn's time SPAN is
-            // stamped HERE — the one place that owns the child's lifetime — and extractUsage stays
-            // a pure function of the engine's output. The span exists because time is becoming a
-            // pricing input (DeepSeek's peak/off-peak windows), and a cost that cannot say WHEN its
-            // tokens were spent cannot be repriced any more than one that cannot say how many.
-            const from = new Date().toISOString();
+            // [LAW:effects-at-boundaries] The clock is an effect, so the spawn's start instant is
+            // read HERE — the one place that owns the child's lifetime — and handed to extractUsage
+            // as a VALUE, which keeps every adapter a pure function of the engine's output and the
+            // instant it was given. Time is a pricing input (DeepSeek's peak/off-peak windows), so
+            // this spawn is priced at the tier it actually ran in rather than at whatever tier the
+            // pass happened to start in.
+            // [LAW:one-source-of-truth] The priced instant and the recorded span.from are the SAME
+            // Date. Two `new Date()` reads would be two clocks, free to disagree about which side of
+            // a boundary a spawn fell on — a review whose recorded span says off-peak and whose
+            // figure says peak, with nothing to say which one lied.
+            const startedAt = new Date();
             const output = await runEngine(spec, config, prompt, home, collector, cwd, deadline);
-            const raw = spec.extractUsage(output, config);
-            const usage = raw && { ...raw, span: { from, to: new Date().toISOString() } };
+            const raw = spec.extractUsage(output, config, startedAt);
+            const usage = raw && { ...raw, span: { from: startedAt.toISOString(), to: new Date().toISOString() } };
             const review = readCollectedReview(collector.recordsPath);
             // [LAW:dataflow-not-control-flow] scopes (a scout run), findings (a worker run), and
             // dependency assessments (a worker that reviewed a go.mod bump) are all carried through as
