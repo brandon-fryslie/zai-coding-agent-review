@@ -993,8 +993,13 @@ describe('resolveReviewerIdentity', () => {
   // the round count, the failure this design ranks as worse than the forgery it prevents.
   test('a 403 that is NOT an installation token throws — it never falls through to the bot arm', async () => {
     const rateLimited = fake({ user: refuse(403, 'You have exceeded a secondary rate limit'), installation: refuse(403, 'not an installation') });
+    // BOTH causes must reach the operator. The refusal used to assert "not an installation token
+    // either" whichever way the probe failed, which is a stronger claim than the code holds — a
+    // transient probe failure says nothing about the token's kind, and that message lands exactly when
+    // someone is trying to find out what broke.
     await assert.rejects(() => resolveReviewerIdentity(rateLimited), /secondary rate limit/);
-    await assert.rejects(() => resolveReviewerIdentity(rateLimited), /not an installation token either/);
+    await assert.rejects(() => resolveReviewerIdentity(rateLimited), /not an installation/);
+    await assert.rejects(() => resolveReviewerIdentity(rateLimited), /could not be confirmed as either kind/);
   });
 
   test('a bad credential throws rather than resolving to anything', async () => {

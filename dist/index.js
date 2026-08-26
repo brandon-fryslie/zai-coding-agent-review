@@ -37245,11 +37245,17 @@ async function resolveReviewerIdentity(octokit) {
   } catch (userError) {
     try {
       await octokit.request('GET /installation/repositories', { per_page: 1 });
-    } catch {
+    } catch (probeError) {
+      // [LAW:no-silent-failure] BOTH causes are named, because the probe failing does not establish that
+      // the token is not an installation one — a secondary rate limit, a 5xx or a network fault reaches
+      // here too, and the old message asserted "not an installation token either" in every case. That is
+      // a stronger claim than the code holds, printed at the one moment an operator is trying to find out
+      // what actually broke: the arms are measured facts, and the diagnostic must not out-run them.
       throw new Error(
         `Could not resolve this run's own reviewer identity. GET /user was refused (${userError.message}) `
-        + 'and this token is not an installation token either, so its prior reviews cannot be told from a '
-        + 'forged one. Refusing to guess: one wrong answer trusts a stranger, the other uncaps review spend.',
+        + `and the installation-token confirmation also failed (${probeError.message}), so this token could `
+        + 'not be confirmed as either kind and its prior reviews cannot be told from a forged one. Refusing '
+        + 'to guess: one wrong answer trusts a stranger, the other uncaps review spend.',
       );
     }
     // `id: null` is a MEASURED fact, not an omission: the same probe run that produced these arms found
