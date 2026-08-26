@@ -6,7 +6,7 @@ inputs:
     required: false
     default: ${{ github.token }}
   GITHUB_REVIEW_TOKEN:
-    description: "The review step's own bot identity (e.g. secrets.COPIRATE_REVIEW_TOKEN). Used to verify that a round-cap notice on the PR was actually posted by this identity before trusting it to release anything, and to post a failure notice if the dismissal below is refused. Pass the same value given to the review step."
+    description: "The review step's own bot identity (e.g. secrets.COPIRATE_REVIEW_TOKEN). Resolved, together with GITHUB_TOKEN, into the set of identities this run trusts; a round-cap notice on the PR must have been posted by one of them before anything is released. Also used to post a failure notice if the dismissal below is refused. Pass the same value given to the review step."
     required: false
   DISMISS_TOKEN:
     description: "Required. Credential for a repo-Admin account, used ONLY for the dismiss-review call. GITHUB_REVIEW_TOKEN's write access 403s this call on Gitea (measured live against Gitea 1.27.1); no token scope substitutes for the collaborator role."

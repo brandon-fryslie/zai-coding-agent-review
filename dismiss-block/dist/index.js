@@ -31419,7 +31419,7 @@ function matchesIdentity(identity, user) {
 // holds no block on it to release. Matching the reason by name keeps that distinction in the enumeration
 // rather than in a string literal typed a second time. [LAW:one-source-of-truth]
 //
-// [LAW:no-silent-failure] `trustedReviewerId` is the ONE author gate this codebase's marker-trust model
+// [LAW:no-silent-failure] `trustedIdentities` is the ONE author gate this codebase's marker-trust model
 // (see `parseAgentArtifact` above) does not skip, because this is the one caller a forged marker actually
 // hurts: `dismiss-block` fires an Admin-credentialed dismissal off this return value alone, and body
 // content says nothing about who posted it. On a public repo any account with read access can submit a
@@ -31446,6 +31446,19 @@ function matchesIdentity(identity, user) {
 // this whole mechanism exists to clear. A notice posted by ANY credential the run still holds is ours.
 //
 // It is never a hardcoded bot name, which would break the documented user-PAT `GITHUB_REVIEW_TOKEN` path.
+//
+// WHAT THE SET COSTS, stated rather than glossed. Widening from one id to the set means this gate is only
+// as exact as the WEAKEST identity in it, and a repo can never not hold its default token — so on Gitea,
+// where that token's identity is the instance-shared `gitea-actions` (id -2, measured), an operator who
+// adds a PAT specifically to get an exact gate does not fully get one: a `gitea-actions`-authored notice
+// still verifies. The narrow alternative was tried and is worse — it answers "not ours" for a notice
+// posted before the PAT existed, which is the deadlock this action exists to clear, arriving by the exact
+// transition the README recommends. So the trade is taken deliberately, in the direction that keeps the
+// mechanism working, and the residual is bounded rather than unbounded: `act_runner` scopes a job's token
+// to its own repo, so posting as `gitea-actions` on THIS repo's PR takes a workflow run in THIS repo —
+// push access, whose holder can already do considerably worse than dismiss a block. That is the same
+// reasoning the round-cap marker's own trust note applies to a same-repo PR. What would actually raise
+// this arm is a per-repo Gitea identity to pin, which the host does not currently offer.
 function hasDeclinedRevisit(latestArtifact, trustedIdentities) {
   return Boolean(latestArtifact)
     && latestArtifact.kind === 'not-reviewed'
