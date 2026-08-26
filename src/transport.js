@@ -435,6 +435,11 @@ async function resolveReviewerIdentity(octokit) {
 // The single probe an ordinary run actually pays for is bought one level up, where run.js dedups the
 // token STRINGS before a client is built from either; a caller that hands this function two clients on
 // one token pays two probes, and that is a fact about the caller, not a promise broken here.
+// The result is ORDER-PRESERVING, and that is part of the contract rather than an implementation
+// detail: identities[i] is the identity of the first octokit that resolved to it, so passing the
+// posting credential first makes identities[0] "the account this run posts as". dismiss-block reads it
+// that way to get the id hasDeclinedRevisit compares; without the guarantee it would have to scan for
+// "whichever identity carries an id", which picks the wrong account as soon as both tokens are PATs.
 async function resolveReviewerIdentities(octokits) {
   const identities = [];
   for (const octokit of octokits) {
@@ -471,6 +476,12 @@ function isOwnArtifact(identities, user) {
 // [LAW:no-silent-failure] An EMPTY identity set is refused rather than answering "nothing is ours". That
 // answer is byte-identical to a PR with no prior rounds, so accepting it would zero the round cap and the
 // cost totals at once — the outcome this whole design ranks as worse than the forgery it defends against.
+// [LAW:no-silent-failure] A non-empty set of MALFORMED identities is refused on the same terms as an
+// empty one, and for the same reason the empty check was hoisted here in the first place: the
+// unknown-kind refusal lives inside the per-review matcher, so on a PR with zero prior reviews the
+// pagination loop never runs and `[{kind:'nonsense'}]` used to sail through to a clean `count: 0` — the
+// zeroed round cap wearing the shape of a legitimate answer, reached through the shape hole instead of
+// the empty one. Every element is proved recognizable BEFORE any row is read.
 function requireIdentities(identities) {
   if (!Array.isArray(identities) || identities.length === 0) {
     throw new Error(
@@ -478,35 +489,56 @@ function requireIdentities(identities) {
       + 'the round cap and the cost totals would be wrong.',
     );
   }
+  identities.forEach(matcherFor);
   return identities;
 }
 
-// [LAW:dataflow-not-control-flow] The branch is the identity type's own discriminator, and the default
-// arm THROWS rather than answering. An unknown kind is a programming error, and the two ways to be wrong
-// here are both silent and both expensive, so this refuses to have a lenient direction at all.
-function matchesIdentity(identity, user) {
-  switch (identity && identity.kind) {
-    // Exact. A stranger cannot post a review as us, so a forged marker under their own login is simply
-    // not ours — the check is on the account, which the host stamps, not on anything the body can claim.
-    case 'login': return user?.login === identity.login;
-    // Structural, and DELIBERATELY COARSER than the login arm: it admits any Bot, so what it buys is not
-    // "this action's own installation" but "the forger must be a privileged app already installed on this
-    // repo" — Dependabot, Renovate, a sibling workflow on the default GITHUB_TOKEN. That is a large
-    // reduction from "any account with read access", not an elimination, and it is stated here rather
-    // than overclaimed because the residual is the part a future maintainer needs.
-    //
-    // It is not pinned to an account id because it CANNOT be: the measurement behind this design found
-    // that an installation token cannot name its own app (/app and /repos/{o}/{r}/installation are
-    // JWT-only, no response header carries one). The only pinnable value would be a hardcoded
-    // github-actions[bot], which rejects the own reviews of any consumer using actions/create-github-app-
-    // token — silently zeroing their round count, the failure ranked worse than the forgery. Pinning
-    // waits on a way to learn the app identity, not on someone deciding it would be nice.
-    case 'bot': return user?.type === 'Bot';
-    default: throw new Error(
+// [LAW:one-source-of-truth] ONE enumeration of the identity kinds, with two readers: matchesIdentity
+// applies a matcher, requireIdentities merely demands one exists. A `switch` here would have been the
+// enumeration written twice — the arms in one place and "which kinds are legal" re-derived wherever
+// validation happened — which is exactly how the malformed-set hole above opened.
+// [LAW:dataflow-not-control-flow] the kind selects a VALUE (the matcher), it does not steer control flow.
+//
+// A Map, not an object literal: `IDENTITY_MATCHERS['toString']` on a plain object answers with an
+// inherited function, so `{kind: 'toString'}` would pass validation and then match against nothing.
+// The lookup must see only the keys actually put in it.
+const IDENTITY_MATCHERS = new Map([
+  // Exact. A stranger cannot post a review as us, so a forged marker under their own login is simply
+  // not ours — the check is on the account, which the host stamps, not on anything the body can claim.
+  // On `login`, never the host's neighbouring `login_name`: Gitea serves that as '@gitea-actions/<task>'
+  // from /user and 'gitea-actions' on the review (measured), so matching it disowns our own review.
+  ['login', (identity, user) => user?.login === identity.login],
+  // Structural, and DELIBERATELY COARSER than the login arm: it admits any Bot, so what it buys is not
+  // "this action's own installation" but "the forger must be a privileged app already installed on this
+  // repo" — Dependabot, Renovate, a sibling workflow on the default GITHUB_TOKEN. That is a large
+  // reduction from "any account with read access", not an elimination, and it is stated here rather
+  // than overclaimed because the residual is the part a future maintainer needs.
+  //
+  // It is not pinned to an account id because it CANNOT be: the measurement behind this design found
+  // that an installation token cannot name its own app (/app and /repos/{o}/{r}/installation are
+  // JWT-only, no response header carries one). The only pinnable value would be a hardcoded
+  // github-actions[bot], which rejects the own reviews of any consumer using actions/create-github-app-
+  // token — silently zeroing their round count, the failure ranked worse than the forgery. Pinning
+  // waits on a way to learn the app identity, not on someone deciding it would be nice.
+  ['bot', (identity, user) => user?.type === 'Bot'],
+]);
+
+// [LAW:parse-dont-validate] Returns the matcher or throws — never a boolean the caller could ignore, and
+// never a permissive default. An unrecognized kind is a programming error, and both ways of being wrong
+// here are silent and expensive, so there is no lenient direction at all.
+function matcherFor(identity) {
+  const matcher = IDENTITY_MATCHERS.get(identity && identity.kind);
+  if (!matcher) {
+    throw new Error(
       `Unknown reviewer identity kind: ${JSON.stringify(identity && identity.kind)}. `
       + 'Prior reviews cannot be attributed, so the round cap and cost totals would both be wrong.',
     );
   }
+  return matcher;
+}
+
+function matchesIdentity(identity, user) {
+  return matcherFor(identity)(identity, user);
 }
 
 // "Has this action announced, on this pull request, that it will not look at it again?" — read off the

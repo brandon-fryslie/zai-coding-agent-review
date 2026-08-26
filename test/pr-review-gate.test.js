@@ -280,6 +280,25 @@ describe('a run holding both GITHUB_TOKEN and GITHUB_REVIEW_TOKEN', () => {
     assert.match(host.reviews[0].body, /not-reviewed:round-cap/);
   });
 
+  // The SYMMETRIC half, and the reason both exist. The test above pins the round to the installation
+  // token, so it fails when `token` is dropped from the set but still PASSES when `postingToken` is —
+  // it can only see one of the two ways the glue breaks. This one pins the round to the PAT that posts
+  // now, so between them either omission fails a test. Rounds posted under a newly-added
+  // GITHUB_REVIEW_TOKEN are the half that matters most: they are the recent ones.
+  test('a round posted under the POSTING credential is still counted as ours', async () => {
+    host.priorReviews = [{
+      id: 12,
+      state: 'COMMENTED',
+      // What fakeOctokit resolves 'gh-review-token' to on the PAT arm.
+      user: { login: 'gh-review-token-account', type: 'User' },
+      body: `an earlier round\n\n${REVIEW_MARKER}`,
+    }];
+    await reviewCappedAtOne();
+    assert.equal(engineSpawns.length, 0, 'the PAT-authored round was disowned: the cap did not bind');
+    assert.equal(host.reviews.length, 1);
+    assert.match(host.reviews[0].body, /not-reviewed:round-cap/);
+  });
+
   // The gate's own failure arm, through the orchestrator. resolveReviewerIdentity throwing is not a
   // degraded mode this run can continue in: with no identity, the round count and the cost totals are
   // both unattributable, and every direction out is a lie — trusting all bodies restores the forgery,

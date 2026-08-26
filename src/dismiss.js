@@ -115,9 +115,24 @@ async function run() {
   // without knowing its own rounds, so guessing there uncaps spend. This action's whole job is optional
   // cleanup on an `if: always()` step, so "do nothing this push" is a complete, correct outcome — and
   // reddening every Gitea push over a transient identity hiccup would be noise reported as a defect.
+  // [LAW:one-source-of-truth] The set covers EVERY credential that can have posted an artifact on this
+  // PR, exactly as `run.js` does — not just the one posting now. Resolving `reviewOctokit` alone looks
+  // sufficient and is the bug this action exists to prevent, one level down: add `GITHUB_REVIEW_TOKEN`
+  // to a repo with a live PR (the transition the README recommends) and every round, block and notice
+  // posted earlier under the default `GITHUB_TOKEN` fails the author gate, drops out of `prior.reviews`,
+  // and leaves `releasable` empty. The round-cap notice still verifies, so this action would report
+  // "nothing outstanding" and walk away from precisely the deadlock it was written to clear.
+  //
+  // The posting credential is passed FIRST because `resolveReviewerIdentities` preserves input order
+  // (collapsing later duplicates), so `identities[0]` is the identity of the account `run.js` posts
+  // round-cap notices under — the one `hasDeclinedRevisit` must compare against. Reading "whichever
+  // identity happens to carry an id" would pick the wrong account the moment both tokens are PATs.
+  const distinctTokens = [...new Set([reviewToken || token, token])];
   let identities;
   try {
-    identities = await resolveReviewerIdentities([reviewOctokit]);
+    identities = await resolveReviewerIdentities(
+      [reviewOctokit, ...distinctTokens.slice(1).map(t => github.getOctokit(t))],
+    );
   } catch (e) {
     core.warning(
       `Could not verify the review action's own identity via GITHUB_REVIEW_TOKEN (or its GITHUB_TOKEN `
@@ -126,7 +141,7 @@ async function run() {
     );
     return;
   }
-  const trustedReviewerId = identities.find(i => i.id != null)?.id ?? null;
+  const trustedReviewerId = identities[0].id;
 
   let prior;
   try {

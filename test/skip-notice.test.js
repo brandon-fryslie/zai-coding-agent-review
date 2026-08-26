@@ -358,6 +358,21 @@ describe('an untrusted PR cannot silence its own notice', () => {
     await assert.rejects(() => summarizePriorReviews(pr.octokit, 'o', 'r', PR, undefined), /No reviewer identity/);
   });
 
+  // The same hole one shape over: the unknown-kind refusal lives in the per-review matcher, so a
+  // MALFORMED but non-empty set slipped past the empty check and then never met the matcher on a PR with
+  // no rows — returning the same clean `count: 0`. Emptiness was never the point; unattributability was.
+  test('a malformed identity set throws on a PR with no prior reviews, exactly as an empty one does', async () => {
+    const pr = fakePr();
+    assert.equal(pr.reviews.length, 0);
+    for (const bad of [[{ kind: 'nonsense' }], [null], [{}], [{ kind: 'toString' }]]) {
+      await assert.rejects(
+        () => summarizePriorReviews(pr.octokit, 'o', 'r', PR, bad),
+        /Unknown reviewer identity kind/,
+        `a set of ${JSON.stringify(bad)} must be refused, not answered`,
+      );
+    }
+  });
+
   // [LAW:verifiable-goals] The identity-change transition. Adding GITHUB_REVIEW_TOKEN to a repo with a
   // live PR is a step the README recommends, and a single-value identity disowned every round posted
   // before it — resetting the count and, worse, dropping an outstanding REQUEST_CHANGES out of the set

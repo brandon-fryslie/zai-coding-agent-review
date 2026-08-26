@@ -39,7 +39,7 @@ const ourBlock = (id, state) => ({ id, state, user: TRUSTED_USER, body: `Finding
 const capNotice = (id, authorId = TRUSTED_BOT_ID) => ({
   id,
   state: 'COMMENTED',
-  user: authorId === TRUSTED_BOT_ID ? TRUSTED_USER : { id: authorId, login: 'attacker' },
+  user: authorId === TRUSTED_BOT_ID ? TRUSTED_USER : { id: authorId, login: authorId === ATTACKER_ID ? 'attacker' : 'release-bot' },
   body: `Not reviewed.\n\n${NOT_REVIEWED_MARKER_PREFIX}${NOT_REVIEWED_REASONS.ROUND_CAP} -->`,
 });
 
@@ -55,6 +55,9 @@ let prFixture;
 // asks "who am I" as before trusting any round-cap notice. A test that wants the whoami call itself to
 // fail (a transient host error, not a forgery) sets this to a thrown Error instead of an id object.
 let whoami;
+// Identities for credentials beyond the default 'gh-token' — set only by tests that model a second
+// posting account (the mid-flight GITHUB_REVIEW_TOKEN transition).
+let extraIdentities;
 
 // One shared `reviews` store, read and written by whichever token's fake calls it — the same shape a
 // live Gitea PR has one truth regardless of which of this action's credentials is asking.
@@ -80,8 +83,11 @@ function fakeOctokitFor(token) {
         // whoami call made against the wrong credential fails loudly instead of quietly answering anyway.
         getAuthenticated: async () => {
           if (whoami instanceof Error) throw whoami;
-          if (token !== 'gh-token') throw new Error(`401 Unauthorized: no such identity for token ${token}`);
-          return { data: whoami };
+          if (token === 'gh-token') return { data: whoami };
+          // Any other credential must be given an identity explicitly by the test that introduces it, so
+          // a whoami call made against a token the suite never meant to resolve still fails loudly.
+          if (extraIdentities[token]) return { data: extraIdentities[token] };
+          throw new Error(`401 Unauthorized: no such identity for token ${token}`);
         },
       },
     },
@@ -102,6 +108,12 @@ function fakeOctokitFor(token) {
         writeCalls.push(params);
         throw new Error("403 Forbidden: doer's Permission denied, needs repo Admin");
       }
+      if (route === 'GET /installation/repositories') {
+        // These fakes model user-style credentials: /user answers, so the installation probe is never
+        // consulted. It refuses anyway, so a token that reached it would fail loudly rather than being
+        // silently promoted to the coarse bot arm.
+        throw new Error('403 You must authenticate with an installation access token');
+      }
       throw new Error(`404 Not Found: no route "${route}" for token ${token}`);
     },
   };
@@ -113,6 +125,7 @@ beforeEach(() => {
   adminCalls = [];
   prFixture = { head: { repo: { id: 100 } }, base: { repo: { id: 100 } } };
   whoami = { id: TRUSTED_BOT_ID, login: 'copirate-bot' };
+  extraIdentities = {};
 });
 
 github.getOctokit = token => fakeOctokitFor(token);
@@ -285,6 +298,24 @@ describe('the dismiss-block action', () => {
 
     // If this run cannot establish its own identity, it must not fall back to trusting the notice's body
     // content — the exact behavior this whole gate exists to remove. The safe failure is "release nothing".
+    // The identity set must cover EVERY credential that can have posted here, not just the one posting
+    // now. Adding GITHUB_REVIEW_TOKEN to a repo with a live PR is the transition the README recommends;
+    // resolving only that token makes the author gate disown the block the DEFAULT token posted earlier,
+    // `releasable` comes back empty, and this action reports "nothing outstanding" while walking away
+    // from exactly the deadlock it exists to clear. Fails if dismiss.js resolves one octokit again.
+    test('a block posted under the old token is still released after GITHUB_REVIEW_TOKEN is added', async () => {
+      const PAT_ID = 4242;
+      extraIdentities['pat-token'] = { id: PAT_ID, login: 'release-bot' };
+      setInputs({ INPUT_GITHUB_REVIEW_TOKEN: 'pat-token' });
+      // The block predates the change, so it carries the DEFAULT token's account; the notice was posted
+      // after it, under the PAT that posts now.
+      reviews.push(ourBlock(101, 'CHANGES_REQUESTED'), capNotice(102, PAT_ID));
+      const said = await runCapturingFailures();
+      assert.deepEqual(said, []);
+      assert.equal(adminCalls.length, 1, 'the older-token block was recognized as ours and released');
+      assert.equal(reviews[0].state, 'DISMISSED');
+    });
+
     test('a failed identity lookup leaves the block up rather than falling back to trusting body content', async () => {
       setInputs();
       whoami = new Error('503 Service Unavailable');
