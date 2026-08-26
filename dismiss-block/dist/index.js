@@ -30340,9 +30340,9 @@ async function run() {
   // resolving ITS identity answers who a genuine notice was posted as — without hardcoding a bot username,
   // which would break the documented user-PAT `GITHUB_REVIEW_TOKEN` path this repo already supports.
   //
-  // The id that comparison needs exists only on the login arm, where it comes from the `/user` payload the
-  // login itself came from. On the installation arm there is no successful `/user` at all — the identity is
-  // confirmed structurally and carries `id: null`, so `hasDeclinedRevisit` reads "unverifiable" and this
+  // The ids that comparison needs exist only on the login arm, taken from the `/user` payload the login
+  // itself came from. On the installation arm there is no successful `/user` at all — the identity is
+  // confirmed structurally and carries `id: null`, so `hasDeclinedRevisit` finds nothing to match and this
   // run releases nothing. That is the same safe direction as a failed resolution, reached by a different
   // road, and it is why the null is a carried VALUE rather than something to paper over here.
   //
@@ -30369,10 +30369,10 @@ async function run() {
   // and leaves `releasable` empty. The round-cap notice still verifies, so this action would report
   // "nothing outstanding" and walk away from precisely the deadlock it was written to clear.
   //
-  // The posting credential is passed FIRST because `resolveReviewerIdentities` preserves input order
-  // (collapsing later duplicates), so `identities[0]` is the identity of the account `run.js` posts
-  // round-cap notices under — the one `hasDeclinedRevisit` must compare against. Reading "whichever
-  // identity happens to carry an id" would pick the wrong account the moment both tokens are PATs.
+  // The same set answers BOTH questions this action asks — which reviews are ours, and whether the
+  // round-cap notice is ours — so there is no second, narrower notion of "trusted" to drift from the
+  // first. An earlier revision passed only the posting credential's id to `hasDeclinedRevisit`, which
+  // reintroduced the deadlock for a notice posted BEFORE `GITHUB_REVIEW_TOKEN` was added.
   const distinctTokens = [...new Set([reviewToken || token, token])];
   let identities;
   try {
@@ -30387,7 +30387,6 @@ async function run() {
     );
     return;
   }
-  const trustedReviewerId = identities[0].id;
 
   let prior;
   try {
@@ -30413,7 +30412,7 @@ async function run() {
   // round-cap notice standing as the newest agent artifact AND carrying the identity this run trusts.
   // [LAW:one-source-of-truth] one decision, made once by the review run, recorded once on the PR, read
   // here rather than recomputed.
-  const declinedRevisit = hasDeclinedRevisit(prior.latestArtifact, trustedReviewerId);
+  const declinedRevisit = hasDeclinedRevisit(prior.latestArtifact, identities);
   const releasable = declinedRevisit ? prior.reviews : [];
 
   // [LAW:types-are-the-program] The gate above is what makes this sentence TRUE rather than merely hopeful.
@@ -30436,7 +30435,7 @@ async function run() {
   // than leaving an operator to guess whether this action ran at all. Failures are reported by the release
   // itself. The three are distinguished in the same order `hasDeclinedRevisit` checks them: a notice that
   // isn't a round-cap one at all, a genuine round-cap notice this run could not attribute to a trusted
-  // identity (an unverifiable `trustedReviewerId`, or a mismatched/absent `postedBy`), and nothing
+  // identity (no resolved identity carried an id, or the notice's `postedBy` was absent or matched none), and nothing
   // outstanding to release even though the notice checked out.
   if (outcome === 'nothing-to-release') {
     let reason;
@@ -31292,11 +31291,12 @@ async function resolveReviewerIdentity(octokit) {
 // The single probe an ordinary run actually pays for is bought one level up, where run.js dedups the
 // token STRINGS before a client is built from either; a caller that hands this function two clients on
 // one token pays two probes, and that is a fact about the caller, not a promise broken here.
-// The result is ORDER-PRESERVING, and that is part of the contract rather than an implementation
-// detail: identities[i] is the identity of the first octokit that resolved to it, so passing the
-// posting credential first makes identities[0] "the account this run posts as". dismiss-block reads it
-// that way to get the id hasDeclinedRevisit compares; without the guarantee it would have to scan for
-// "whichever identity carries an id", which picks the wrong account as soon as both tokens are PATs.
+// Deliberately NO contract about which element is which. An earlier revision promised that identities[0]
+// is "the account this run posts as" so dismiss-block could pull one id out of the set — and that
+// narrowing was itself the bug (see hasDeclinedRevisit): the set exists precisely because a PR outlives
+// any single credential, so every consumer asks the whole set or asks the wrong question. With no
+// consumer needing a distinguished element, promising one would be a constraint on every future edit
+// bought for nothing. [LAW:carrying-cost] The set is unordered in meaning; the array is just its carrier.
 async function resolveReviewerIdentities(octokits) {
   const identities = [];
   for (const octokit of octokits) {
@@ -31430,20 +31430,29 @@ function matchesIdentity(identity, user) {
 //
 // The comparison is by `postedBy.id`, not `.login` — a login can be renamed out from under a comparison,
 // an id cannot — and BOTH sides must be present: `latestArtifact.postedBy.id == null` (a fixture, or a
-// host that omitted `user`) and `trustedReviewerId == null` (the caller's own identity lookup failed) are
-// each treated as "unverifiable", not "not a mismatch" — `undefined === undefined` would otherwise let two
-// absent identities forge a match. [LAW:no-defensive-null-guards] this is the real precondition, not a
+// host that omitted `user`) and an identity carrying no id (the bot arm, which cannot name its own app)
+// are each treated as "unverifiable", not "not a mismatch" — `undefined === undefined` would otherwise let
+// two absent identities forge a match. [LAW:no-defensive-null-guards] this is the real precondition, not a
 // defensive habit: an identity check that can be satisfied by both sides being silent is not a check.
-// `trustedReviewerId` is what the CALLER's own credential resolves to (`dismiss-block`'s `GITHUB_REVIEW_TOKEN`,
-// the same identity `run.js` posts round-cap notices under) — never a hardcoded bot name, which would
-// break the documented user-PAT `GITHUB_REVIEW_TOKEN` path this repo already supports.
-function hasDeclinedRevisit(latestArtifact, trustedReviewerId) {
+//
+// [LAW:one-source-of-truth] It takes the SAME identity set the author gate takes, never one id narrowed
+// out of it at the call site. That narrowing was a real bug: the set exists because a PR outlives the
+// credential that reviewed it, so reducing it to "the credential posting now" re-creates, one question
+// over, exactly what the set was built to prevent. Concretely — the sequence this action exists for — a
+// Gitea PR hits its cap under the default `gitea-actions` token, the notice AND the block are posted
+// under it, the release fails for lack of Admin, and only THEN is `GITHUB_REVIEW_TOKEN` added and
+// dismiss-block wired up. The old notice is still `latestArtifact` and still passes the author gate, but
+// comparing it against the new PAT's id alone answers "not ours" and releases nothing, leaving the deadlock
+// this whole mechanism exists to clear. A notice posted by ANY credential the run still holds is ours.
+//
+// It is never a hardcoded bot name, which would break the documented user-PAT `GITHUB_REVIEW_TOKEN` path.
+function hasDeclinedRevisit(latestArtifact, trustedIdentities) {
   return Boolean(latestArtifact)
     && latestArtifact.kind === 'not-reviewed'
     && latestArtifact.reason === NOT_REVIEWED_REASONS.ROUND_CAP
     && latestArtifact.postedBy?.id != null
-    && trustedReviewerId != null
-    && latestArtifact.postedBy.id === trustedReviewerId;
+    && Array.isArray(trustedIdentities)
+    && trustedIdentities.some(i => i?.id != null && i.id === latestArtifact.postedBy.id);
 }
 
 // [LAW:one-source-of-truth] A completed review round IS a posted review carrying REVIEW_MARKER, and its

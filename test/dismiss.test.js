@@ -316,6 +316,23 @@ describe('the dismiss-block action', () => {
       assert.equal(reviews[0].state, 'DISMISSED');
     });
 
+    // The MIRROR of the case above, and the sequence this action actually exists for: on Gitea the cap is
+    // hit under the default token, so the block AND the notice are both posted under it, run.js's own
+    // release 403s for lack of Admin, and only THEN is GITHUB_REVIEW_TOKEN added and dismiss-block wired
+    // up. The notice is older than the credential now posting. Verifying it against only that credential
+    // answers "not ours" and releases nothing — the deadlock returns through the action built to clear it.
+    // Fails if the trusted set is narrowed to the posting identity.
+    test('a notice posted before GITHUB_REVIEW_TOKEN was added still counts as our own decision', async () => {
+      extraIdentities['pat-token'] = { id: 4242, login: 'release-bot' };
+      setInputs({ INPUT_GITHUB_REVIEW_TOKEN: 'pat-token' });
+      // Both artifacts predate the credential change: default-token account throughout.
+      reviews.push(ourBlock(101, 'CHANGES_REQUESTED'), capNotice(102, TRUSTED_BOT_ID));
+      const said = await runCapturingFailures();
+      assert.deepEqual(said, []);
+      assert.equal(adminCalls.length, 1, 'the pre-existing notice was disowned by the new credential');
+      assert.equal(reviews[0].state, 'DISMISSED');
+    });
+
     test('a failed identity lookup leaves the block up rather than falling back to trusting body content', async () => {
       setInputs();
       whoami = new Error('503 Service Unavailable');

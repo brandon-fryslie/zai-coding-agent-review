@@ -99,9 +99,9 @@ async function run() {
   // resolving ITS identity answers who a genuine notice was posted as — without hardcoding a bot username,
   // which would break the documented user-PAT `GITHUB_REVIEW_TOKEN` path this repo already supports.
   //
-  // The id that comparison needs exists only on the login arm, where it comes from the `/user` payload the
-  // login itself came from. On the installation arm there is no successful `/user` at all — the identity is
-  // confirmed structurally and carries `id: null`, so `hasDeclinedRevisit` reads "unverifiable" and this
+  // The ids that comparison needs exist only on the login arm, taken from the `/user` payload the login
+  // itself came from. On the installation arm there is no successful `/user` at all — the identity is
+  // confirmed structurally and carries `id: null`, so `hasDeclinedRevisit` finds nothing to match and this
   // run releases nothing. That is the same safe direction as a failed resolution, reached by a different
   // road, and it is why the null is a carried VALUE rather than something to paper over here.
   //
@@ -128,10 +128,10 @@ async function run() {
   // and leaves `releasable` empty. The round-cap notice still verifies, so this action would report
   // "nothing outstanding" and walk away from precisely the deadlock it was written to clear.
   //
-  // The posting credential is passed FIRST because `resolveReviewerIdentities` preserves input order
-  // (collapsing later duplicates), so `identities[0]` is the identity of the account `run.js` posts
-  // round-cap notices under — the one `hasDeclinedRevisit` must compare against. Reading "whichever
-  // identity happens to carry an id" would pick the wrong account the moment both tokens are PATs.
+  // The same set answers BOTH questions this action asks — which reviews are ours, and whether the
+  // round-cap notice is ours — so there is no second, narrower notion of "trusted" to drift from the
+  // first. An earlier revision passed only the posting credential's id to `hasDeclinedRevisit`, which
+  // reintroduced the deadlock for a notice posted BEFORE `GITHUB_REVIEW_TOKEN` was added.
   const distinctTokens = [...new Set([reviewToken || token, token])];
   let identities;
   try {
@@ -146,7 +146,6 @@ async function run() {
     );
     return;
   }
-  const trustedReviewerId = identities[0].id;
 
   let prior;
   try {
@@ -172,7 +171,7 @@ async function run() {
   // round-cap notice standing as the newest agent artifact AND carrying the identity this run trusts.
   // [LAW:one-source-of-truth] one decision, made once by the review run, recorded once on the PR, read
   // here rather than recomputed.
-  const declinedRevisit = hasDeclinedRevisit(prior.latestArtifact, trustedReviewerId);
+  const declinedRevisit = hasDeclinedRevisit(prior.latestArtifact, identities);
   const releasable = declinedRevisit ? prior.reviews : [];
 
   // [LAW:types-are-the-program] The gate above is what makes this sentence TRUE rather than merely hopeful.
@@ -195,7 +194,7 @@ async function run() {
   // than leaving an operator to guess whether this action ran at all. Failures are reported by the release
   // itself. The three are distinguished in the same order `hasDeclinedRevisit` checks them: a notice that
   // isn't a round-cap one at all, a genuine round-cap notice this run could not attribute to a trusted
-  // identity (an unverifiable `trustedReviewerId`, or a mismatched/absent `postedBy`), and nothing
+  // identity (no resolved identity carried an id, or the notice's `postedBy` was absent or matched none), and nothing
   // outstanding to release even though the notice checked out.
   if (outcome === 'nothing-to-release') {
     let reason;
