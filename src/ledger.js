@@ -32,14 +32,18 @@ const LEDGER_MARKER = '<!-- agent-review-cost-ledger-entry -->';
 
 // [LAW:effects-at-boundaries] Pure: the body of one ledger entry — the sentinel then the reused cost
 // marker. `cost` is the same discriminated value costMarker already consumes (see THE COST VALUE in
-// src/usage.js), so an unpriced cost writes an honest `unknown` marker: the entry still exists (a
+// src/usage.js), so an unpriced cost writes a marker carrying no figure: the entry still exists (a
 // review happened), its cost is simply counted as unknown on read, never fabricated as zero.
+// The entry records the SAME facts the PR review's own marker does — tokens, model, provider, span —
+// because the day's ledger is exactly as repriceable-after-the-fact as the review is, and writing a
+// poorer record here would have made the ledger the one place a corrected price table could not
+// reach. [LAW:one-source-of-truth] one marker writer, one record, two sinks.
 // [LAW:dataflow-not-control-flow] The append is UNCONDITIONAL for every basis — a subscription review
 // records an entry like any other, and its exclusion from the day's dollars is the marker NAME
 // costMarker chose, never a caller that skips appendCost. A skipped append would make the
 // subscription's consumption invisible instead of merely unbilled. [LAW:no-silent-failure]
-function ledgerEntryBody(cost) {
-  return `${LEDGER_MARKER}\n${costMarker(cost)}`;
+function ledgerEntryBody(usage, config) {
+  return `${LEDGER_MARKER}\n${costMarker(usage, config)}`;
 }
 
 // [LAW:effects-at-boundaries] Pure: the UTC calendar date ('YYYY-MM-DD') of an ISO timestamp or Date.
@@ -104,12 +108,12 @@ async function readSpentToday(octokit, owner, repo, issueNumber, now) {
 // posted AFTER the review submits (the cost is known only then). One create, no read-modify-write.
 // [LAW:no-silent-failure] an API error propagates so the boundary warns loudly and continues (the
 // ledger then under-counts — a known lower bound), never a silent drop.
-async function appendCost(octokit, owner, repo, issueNumber, cost) {
+async function appendCost(octokit, owner, repo, issueNumber, usage, config) {
   await octokit.rest.issues.createComment({
     owner,
     repo,
     issue_number: issueNumber,
-    body: ledgerEntryBody(cost),
+    body: ledgerEntryBody(usage, config),
   });
 }
 

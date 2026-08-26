@@ -191,17 +191,26 @@ function extractUsage(stdout, config) {
     if (event.type === 'turn.completed' && event.usage) usage = event.usage;
   }
   if (!usage || (usage.input_tokens == null && usage.output_tokens == null)) return null;
+  // [LAW:parse-dont-validate] OpenAI reports an input total that INCLUDES its cached subset, so this
+  // is the one place that overlap is resolved into THE TOKEN RECORD's disjoint classes (src/usage.js).
+  // The clamp belongs here, at the vendor boundary, and nowhere downstream: a foreign payload
+  // reporting more cached than total tokens is the only way that state can arise, so absorbing it
+  // where the foreign shape is read is what lets every consumer take the classes at face value.
   const inputTokens = usage.input_tokens ?? 0;
-  const outputTokens = usage.output_tokens ?? 0;
-  const cachedInputTokens = usage.cached_input_tokens ?? 0;
-  const costUsd = computeCostUsd({ inputTokens, outputTokens, cachedInputTokens }, config.model);
+  const inputCacheHit = Math.min(usage.cached_input_tokens ?? 0, inputTokens);
+  const tokens = {
+    inputCacheMiss: inputTokens - inputCacheHit,
+    inputCacheHit,
+    output: usage.output_tokens ?? 0,
+  };
+  const costUsd = computeCostUsd(tokens, config.model);
   // [LAW:types-are-the-program] cost is a discriminated value. Codex reports no USD, so a null
   // here means exactly one thing — the model is absent from the price table — and the adapter
   // declares that reason at the point it knows it, rather than the boundary re-deriving it.
   // The basis is always 'dollars': codex declares credentialKinds ['api-key'], so no codex run can
   // ever be billed to a subscription and this adapter has no notional arm to reach.
   const cost = costUsd == null ? { basis: 'unpriced', reason: 'no-price' } : { basis: 'dollars', usd: costUsd };
-  return { inputTokens, outputTokens, cost };
+  return { tokens, cost };
 }
 
 // [LAW:single-enforcer] The shared transient vocabulary (429/529/network drop) is classified once in

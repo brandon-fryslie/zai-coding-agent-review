@@ -196,7 +196,8 @@ eval/out/<case-name>/<timestamp>-run<i>/
                     'blocking'/'advisory' strings; the scorer reads both). This is what the scorer
                     (copirate-eval-harness-2fk.3) matches against expected.json.
   summary.txt     — the aggregated multi-scope review summary.
-  usage.json      — { inputTokens, outputTokens, cost } (cost is the existing discriminated
+  usage.json      — { tokens, span, cost } (tokens is the disjoint cache-miss/hit/output
+                    record; cost is the existing discriminated
                     value: { available:true, usd } or { available:false, reason }).
   meta.json       — provenance: case, timestamp, run index, the resolved engine config, findingCount.
   transcripts/    — the full per-spawn session transcripts (scout + one per scope).

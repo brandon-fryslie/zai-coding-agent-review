@@ -182,8 +182,13 @@ function parseProduced(raw, label) {
 function parseUsage(raw, label) {
   const json = parseJsonObject(raw, label);
   return {
-    inputTokens: Number.isFinite(json.inputTokens) ? json.inputTokens : null,
-    outputTokens: Number.isFinite(json.outputTokens) ? json.outputTokens : null,
+    // The disjoint token record and the pass's time span, passed through as written (see THE TOKEN
+    // RECORD in src/usage.js). The scorer neither prices nor validates them — it reduces `cost` and
+    // echoes the rest — so a run captured before the split, which carries a collapsed
+    // inputTokens/outputTokens pair instead, records its tokens as absent rather than as zero.
+    // [LAW:no-silent-failure] a baseline that cannot be repriced must say so, not report free tokens.
+    tokens: json.tokens ?? null,
+    span: json.span ?? null,
     cost: json.cost ?? null,
   };
 }
@@ -681,7 +686,7 @@ async function main() {
     const produced = parseProduced(fs.readFileSync(path.join(runDir, 'findings.json'), 'utf8'), path.join(runDir, 'findings.json'));
     const usage = fs.existsSync(path.join(runDir, 'usage.json'))
       ? parseUsage(fs.readFileSync(path.join(runDir, 'usage.json'), 'utf8'), path.join(runDir, 'usage.json'))
-      : { inputTokens: null, outputTokens: null, cost: null };
+      : { tokens: null, span: null, cost: null };
 
     process.stderr.write(`Scoring ${path.basename(runDir)} (${produced.length} finding(s))…\n`);
     const scorecard = await scoreRun({ expected, produced, usage, meta, judge, matcherLabel });

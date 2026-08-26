@@ -121,8 +121,17 @@ describe('resolveBudgetedEffort', () => {
     },
   });
 
-  const ledgerComment = (usd, created_at) => ({ body: ledgerEntryBody({ basis: 'dollars', usd }), created_at });
-  const subscriptionLedgerComment = (notionalUsd, created_at) => ({ body: ledgerEntryBody({ basis: 'subscription', notionalUsd }), created_at });
+  // The config each ledger entry was written under — ledgerEntryBody records its model and endpoint
+  // host beside the figure. What the gate rations on is the figure's BASIS, so one config serves both.
+  const LEDGER_CONFIG = {
+    name: 'deepseek',
+    engine: 'claude-code',
+    model: 'deepseek-v4-pro',
+    endpoint: { apiType: 'anthropic-messages', baseUrl: 'https://api.deepseek.com/anthropic', credential: { kind: 'api-key', value: 'k' } },
+  };
+  const ledgerUsage = (cost) => ({ tokens: { inputCacheMiss: 10, inputCacheHit: 0, output: 5 }, cost });
+  const ledgerComment = (usd, created_at) => ({ body: ledgerEntryBody(ledgerUsage({ basis: 'dollars', usd }), LEDGER_CONFIG), created_at });
+  const subscriptionLedgerComment = (notionalUsd, created_at) => ({ body: ledgerEntryBody(ledgerUsage({ basis: 'subscription', notionalUsd }), LEDGER_CONFIG), created_at });
 
   // [LAW:verifiable-goals] AC for zai-billing-xl0.2, end to end through the seam that actually
   // rations. The two halves of this test are the SAME day and the SAME dollar figure, differing only

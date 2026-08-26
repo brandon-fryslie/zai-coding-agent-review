@@ -224,16 +224,16 @@ function extractUsage(stdout, config) {
   const env = parseResultEnvelope(stdout);
   if (!env || !env.usage) return null;
   const u = env.usage;
-  const freshInput = u.input_tokens ?? 0;
-  const cacheRead = u.cache_read_input_tokens ?? 0;
-  const cacheWrite = u.cache_creation_input_tokens ?? 0;
-  const inputTokens = freshInput + cacheRead + cacheWrite;
-  const outputTokens = u.output_tokens ?? 0;
-  // [LAW:types-are-the-program] Anthropic-style buckets → the price-table shape: cache reads bill at
-  // the discounted cached rate, fresh + cache writes at the full input rate. cachedInputTokens is the
-  // cached subset of inputTokens, exactly what computeCostUsd expects.
-  const cost = costFromEnvelope(env, config, { inputTokens, cachedInputTokens: cacheRead, outputTokens });
-  return { inputTokens, outputTokens, cost };
+  // [LAW:parse-dont-validate] Anthropic's three input buckets are already disjoint, so this is a
+  // rename into THE TOKEN RECORD (src/usage.js) rather than a subtraction: cache READS bill at the
+  // discounted cached rate; fresh input and cache WRITES both bill at the full input rate, which is
+  // what puts them in one class together.
+  const tokens = {
+    inputCacheMiss: (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0),
+    inputCacheHit: u.cache_read_input_tokens ?? 0,
+    output: u.output_tokens ?? 0,
+  };
+  return { tokens, cost: costFromEnvelope(env, config, tokens) };
 }
 
 // [LAW:types-are-the-program] cost is a discriminated value (see THE COST VALUE in src/usage.js),

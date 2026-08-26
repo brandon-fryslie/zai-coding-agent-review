@@ -2,13 +2,25 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const { LEDGER_MARKER, ledgerEntryBody, sumCostToday, readSpentToday, appendCost } = require('../src/index.js');
-const { costMarker } = require('../src/usage');
+const { costMarker, parseCost } = require('../src/usage');
+
+// The resolved config every entry here is written under — costMarker records its model and endpoint
+// host alongside the figure. These tests are about the DAY'S ACCOUNTING, not the recorded facts, so
+// one config serves them all.
+const CONFIG = {
+  name: 'deepseek',
+  engine: 'claude-code',
+  model: 'deepseek-v4-pro',
+  endpoint: { apiType: 'anthropic-messages', baseUrl: 'https://api.deepseek.com/anthropic', credential: { kind: 'api-key', value: 'k' } },
+};
+// A Usage value carrying the cost under test; the tokens are incidental here.
+const usageOf = cost => ({ tokens: { inputCacheMiss: 10, inputCacheHit: 0, output: 5 }, cost });
 
 // A machine-written ledger entry: the sentinel then the reused cost marker.
-const entry = (usd, created_at) => ({ body: ledgerEntryBody({ basis: 'dollars', usd }), created_at });
-const unknownEntry = (created_at) => ({ body: ledgerEntryBody({ basis: 'unpriced', reason: 'no-price' }), created_at });
+const entry = (usd, created_at) => ({ body: ledgerEntryBody(usageOf({ basis: 'dollars', usd }), CONFIG), created_at });
+const unknownEntry = (created_at) => ({ body: ledgerEntryBody(usageOf({ basis: 'unpriced', reason: 'no-price' }), CONFIG), created_at });
 // A review billed to Claude subscription quota: $0 spent, a known Anthropic list price.
-const subscriptionEntry = (notionalUsd, created_at) => ({ body: ledgerEntryBody({ basis: 'subscription', notionalUsd }), created_at });
+const subscriptionEntry = (notionalUsd, created_at) => ({ body: ledgerEntryBody(usageOf({ basis: 'subscription', notionalUsd }), CONFIG), created_at });
 
 const ZERO_TALLIES = { billed: { usd: 0, count: 0, unknownCount: 0 }, notional: { usd: 0, count: 0, unknownCount: 0 } };
 
@@ -17,13 +29,16 @@ const NOON = new Date('2026-07-11T12:00:00Z'); // today (UTC) = 2026-07-11
 describe('ledgerEntryBody', () => {
   test('leads with the sentinel, then the reused cost marker (one representation, not a second)', () => {
     assert.equal(
-      ledgerEntryBody({ basis: 'dollars', usd: 0.05 }),
-      `${LEDGER_MARKER}\n${costMarker({ basis: 'dollars', usd: 0.05 })}`,
+      ledgerEntryBody(usageOf({ basis: 'dollars', usd: 0.05 }), CONFIG),
+      `${LEDGER_MARKER}\n${costMarker(usageOf({ basis: 'dollars', usd: 0.05 }), CONFIG)}`,
     );
   });
 
   test('an unavailable cost writes an honest `unknown` marker, never a fabricated zero', () => {
-    assert.equal(ledgerEntryBody({ basis: 'unpriced', reason: 'no-price' }), `${LEDGER_MARKER}\n<!-- agent-review-cost-usd:unknown -->`);
+    const body = ledgerEntryBody(usageOf({ basis: 'unpriced', reason: 'no-price' }), CONFIG);
+    assert.ok(body.startsWith(`${LEDGER_MARKER}\n`), `entry must lead with the sentinel: ${body}`);
+    // The figure is absent from the record, so it reads back as an unknown-cost round — never $0.
+    assert.deepEqual(parseCost(body), { basis: 'unpriced', reason: 'not-reported' });
   });
 });
 
@@ -51,7 +66,7 @@ describe('sumCostToday', () => {
   });
 
   test('[LAW:single-enforcer] a comment NOT leading with the sentinel is excluded even if it carries a cost marker (human quote)', () => {
-    const humanQuote = { body: `I see the bot posts ${LEDGER_MARKER} ${costMarker({ basis: 'dollars', usd: 999 })} — my own note`, created_at: '2026-07-11T10:00:00Z' };
+    const humanQuote = { body: `I see the bot posts ${LEDGER_MARKER} ${costMarker(usageOf({ basis: 'dollars', usd: 999 }), CONFIG)} — my own note`, created_at: '2026-07-11T10:00:00Z' };
     const { billed } = sumCostToday([humanQuote], NOON);
     assert.equal(billed.usd, 0); // the human's $999 is NOT summed
     assert.equal(billed.count, 0);
@@ -60,7 +75,7 @@ describe('sumCostToday', () => {
 
   test('leading whitespace before the sentinel is tolerated (trimStart)', () => {
     const { billed } = sumCostToday([
-      { body: `\n  ${ledgerEntryBody({ basis: 'dollars', usd: 0.07 })}`, created_at: '2026-07-11T10:00:00Z' },
+      { body: `\n  ${ledgerEntryBody(usageOf({ basis: 'dollars', usd: 0.07 }), CONFIG)}`, created_at: '2026-07-11T10:00:00Z' },
     ], NOON);
     assert.equal(billed.count, 1);
   });
@@ -163,19 +178,20 @@ describe('appendCost', () => {
 
   test('posts exactly one comment carrying the sentinel + cost marker to the ledger issue', async () => {
     const calls = [];
-    await appendCost(capturingOctokit(calls), 'o', 'r', 42, { basis: 'dollars', usd: 0.05 });
+    await appendCost(capturingOctokit(calls), 'o', 'r', 42, usageOf({ basis: 'dollars', usd: 0.05 }), CONFIG);
     assert.equal(calls.length, 1);
     assert.deepEqual(
       { owner: calls[0].owner, repo: calls[0].repo, issue_number: calls[0].issue_number },
       { owner: 'o', repo: 'r', issue_number: 42 },
     );
-    assert.equal(calls[0].body, `${LEDGER_MARKER}\n${costMarker({ basis: 'dollars', usd: 0.05 })}`);
+    assert.equal(calls[0].body, `${LEDGER_MARKER}\n${costMarker(usageOf({ basis: 'dollars', usd: 0.05 }), CONFIG)}`);
   });
 
   test('an unavailable cost still appends an entry, marked unknown (a review happened; its cost is unknown)', async () => {
     const calls = [];
-    await appendCost(capturingOctokit(calls), 'o', 'r', 42, { basis: 'unpriced', reason: 'not-reported' });
-    assert.equal(calls[0].body, `${LEDGER_MARKER}\n<!-- agent-review-cost-usd:unknown -->`);
+    await appendCost(capturingOctokit(calls), 'o', 'r', 42, usageOf({ basis: 'unpriced', reason: 'not-reported' }), CONFIG);
+    assert.ok(calls[0].body.startsWith(`${LEDGER_MARKER}\n`), `entry must lead with the sentinel: ${calls[0].body}`);
+    assert.deepEqual(parseCost(calls[0].body), { basis: 'unpriced', reason: 'not-reported' });
   });
 
   // [LAW:dataflow-not-control-flow] The append is UNCONDITIONAL: a subscription review records an
@@ -184,14 +200,16 @@ describe('appendCost', () => {
   // merely unbilled — the ticket names that as a BAD approach explicitly.
   test('a subscription review still appends an entry, carrying its notional marker', async () => {
     const calls = [];
-    await appendCost(capturingOctokit(calls), 'o', 'r', 42, { basis: 'subscription', notionalUsd: 63.59 });
+    await appendCost(capturingOctokit(calls), 'o', 'r', 42, usageOf({ basis: 'subscription', notionalUsd: 63.59 }), CONFIG);
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].body, `${LEDGER_MARKER}\n<!-- agent-review-notional-usd:63.590000 -->`);
+    assert.ok(calls[0].body.startsWith(`${LEDGER_MARKER}\n`), `entry must lead with the sentinel: ${calls[0].body}`);
+    assert.match(calls[0].body, /<!-- agent-review-notional-usd:/); // the notional NAME, invisible to every spend fold
+    assert.deepEqual(parseCost(calls[0].body), { basis: 'subscription', notionalUsd: 63.59 });
   });
 
   test('[LAW:no-silent-failure] an API error propagates — the module never swallows a failed append', async () => {
     const octokit = { rest: { issues: { createComment: async () => { throw new Error('403 issues:write missing'); } } } };
-    await assert.rejects(() => appendCost(octokit, 'o', 'r', 42, { basis: 'dollars', usd: 0.05 }), /issues:write/);
+    await assert.rejects(() => appendCost(octokit, 'o', 'r', 42, usageOf({ basis: 'dollars', usd: 0.05 }), CONFIG), /issues:write/);
   });
 
   test('round-trips through the ledger: an appended entry is summed by readSpentToday on the same day', async () => {
@@ -204,8 +222,8 @@ describe('appendCost', () => {
         },
       },
     };
-    await appendCost(octokit, 'o', 'r', 42, { basis: 'dollars', usd: 0.05 });
-    await appendCost(octokit, 'o', 'r', 42, { basis: 'dollars', usd: 0.03 });
+    await appendCost(octokit, 'o', 'r', 42, usageOf({ basis: 'dollars', usd: 0.05 }), CONFIG);
+    await appendCost(octokit, 'o', 'r', 42, usageOf({ basis: 'dollars', usd: 0.03 }), CONFIG);
     const { billed } = await readSpentToday(octokit, 'o', 'r', 42, NOON);
     assert.equal(Number(billed.usd.toFixed(2)), 0.08);
     assert.equal(billed.count, 2);

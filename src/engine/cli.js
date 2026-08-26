@@ -77,8 +77,15 @@ function makeCliAdapter(spec) {
         try {
           const home = spec.materializeHome({ config, instructionsPath, collector });
           try {
+            // [LAW:effects-at-boundaries] The clock is an effect, so the spawn's time SPAN is
+            // stamped HERE — the one place that owns the child's lifetime — and extractUsage stays
+            // a pure function of the engine's output. The span exists because time is becoming a
+            // pricing input (DeepSeek's peak/off-peak windows), and a cost that cannot say WHEN its
+            // tokens were spent cannot be repriced any more than one that cannot say how many.
+            const from = new Date().toISOString();
             const output = await runEngine(spec, config, prompt, home, collector, cwd, deadline);
-            const usage = spec.extractUsage(output, config);
+            const raw = spec.extractUsage(output, config);
+            const usage = raw && { ...raw, span: { from, to: new Date().toISOString() } };
             const review = readCollectedReview(collector.recordsPath);
             // [LAW:dataflow-not-control-flow] scopes (a scout run), findings (a worker run), and
             // dependency assessments (a worker that reviewed a go.mod bump) are all carried through as
