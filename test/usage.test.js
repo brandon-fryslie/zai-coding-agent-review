@@ -211,9 +211,32 @@ describe('time-varying rates', () => {
   test('pricing needs the instant as a value: a missing or invalid one throws, never prices at standard', () => {
     // The failure this replaces is silent: NaN coordinates match no window, so a caller that forgot
     // to thread the instant would have billed every peak review at half rate with nothing to notice.
-    assert.throws(() => priceFromTable(TOKENS, 'deepseek-v4-pro'), /start instant/);
-    assert.throws(() => priceFromTable(TOKENS, 'deepseek-v4-pro', new Date('nonsense')), /start instant/);
-    assert.throws(() => priceFromTable(TOKENS, 'deepseek-v4-pro', '2026-08-20T02:30:00Z'), /start instant/);
+    //
+    // Each case varies ONLY `at`, on a spawn that is otherwise well-formed. The predecessor passed
+    // TOKENS — a bare token record — in the SPAWN position and put the instant in a third argument
+    // the 2-arity function never receives, so all three cases collapsed into one: every call threw on
+    // the same missing `.at`, and neither the Invalid Date nor the string was ever reached. A test
+    // that passes for a reason other than the one it names asserts nothing. [LAW:behavior-not-structure]
+    const wellFormed = spawnFromTokens(new Date('2026-08-20T02:30:00Z'), TOKENS);
+    const withInstant = (at) => ({ ...wellFormed, at });
+
+    assert.throws(() => priceFromTable({ tokens: TOKENS, context: wellFormed.context }, 'deepseek-v4-pro'), /start instant/);
+    assert.throws(() => priceFromTable(withInstant(new Date('nonsense')), 'deepseek-v4-pro'), /start instant/);
+    assert.throws(() => priceFromTable(withInstant('2026-08-20T02:30:00Z'), 'deepseek-v4-pro'), /start instant/);
+
+    // The control: the same spawn WITH a real instant prices, so the three throws above are
+    // attributable to `at` alone and not to anything else about the fixture.
+    assert.equal(priceFromTable(wellFormed, 'deepseek-v4-pro').basis, 'dollars');
+  });
+
+  test('pricing needs the context interval too: a spawn missing it throws for every model, not just context-tiered ones', () => {
+    // The regression this guards: `context` used to pass through spawnFacts unparsed, so a hand-rolled
+    // `{at, tokens}` priced CLEANLY against every flat or time-tiered model and only detonated against
+    // a context-tiered one. The same threading bug was invisible in most of the table and fatal in one
+    // corner of it — so both a time-tiered and a context-tiered model are asserted here.
+    const at = new Date('2026-08-20T02:30:00Z');
+    assert.throws(() => priceFromTable({ at, tokens: TOKENS }, 'deepseek-v4-pro'), /context/);
+    assert.throws(() => priceFromTable({ at, tokens: TOKENS }, 'gpt-5.6-sol'), /context/);
   });
 });
 

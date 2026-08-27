@@ -38735,8 +38735,35 @@ function spawnFacts(spawn) {
   return {
     day: spawn.at.getUTCDay(),
     hour: spawn.at.getUTCHours() + spawn.at.getUTCMinutes() / 60,
-    context: spawn.context,
+    context: contextInterval(spawn.context),
   };
+}
+
+// The context interval is established HERE, beside the instant, because this function is the spawn's
+// parse boundary and a boundary that establishes one of its two facts is not a boundary. Passing
+// `context` through unparsed made a caller's threading bug MODEL-DEPENDENT: a hand-rolled
+// `{at, tokens}` priced cleanly against every flat or time-tiered model, whose tiers never consult
+// the axis, and only detonated against a context-tiered one — so the identical defect was invisible
+// in most of the table and fatal in one corner of it. That asymmetry is precisely what `instantMs`
+// throws to prevent, and it is worth no less on the sibling field. [LAW:parse-dont-validate]
+//
+// What this establishes is that the interval is PRESENT, never that it is priceable. Those are two
+// different facts and only the first is a caller's bug: a spawn whose bounds are non-finite because
+// its TOKEN COUNTS were is a real domain value, and the schedule already answers it correctly —
+// no tier's range can contain a NaN, so it falls through to `schedule-gap`, which is exactly what a
+// spawn nothing can price should report. Throwing there would turn an honest "this cannot be priced"
+// into a crash mid-review. `typeof` is the discriminator rather than Number.isFinite precisely
+// because NaN IS a number: it arrived through the interval, whereas an absent bound never had one.
+// [LAW:parse-dont-validate]
+function contextInterval(context) {
+  const { min, max } = context ?? {};
+  if (typeof min !== 'number' || typeof max !== 'number') {
+    throw new TypeError(
+      "price lookup needs the spawn's context as a {min, max} token interval "
+      + `(build it with spawnFromTokens); got ${JSON.stringify(context) ?? String(context)}`,
+    );
+  }
+  return { min, max };
 }
 
 // [LAW:effects-at-boundaries] Pure: a spawn + a model -> a cost, with no IO and no clock read. The
@@ -38798,7 +38825,7 @@ function priceFromTable(spawn, model) {
 //
 //   { basis: 'dollars',      usd }                                 real money; the ONLY arm a spend fold reads
 //   { basis: 'subscription', notionalUsd: number | null }          plan quota; Anthropic LIST PRICE, never spend
-//   { basis: 'unpriced',     reason: 'no-price'|'not-reported' }   dollars, but the figure is unrecoverable
+//   { basis: 'unpriced',     reason: 'no-price'|'schedule-gap'|'not-reported' }   dollars, but the figure is unrecoverable
 //
 // The old two-arm shape ({available:true,usd} | {available:false,reason}) could not express a
 // subscription run at all: `available:false` says "we do not know", when in fact we know the number
