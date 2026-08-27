@@ -1,0 +1,108 @@
+name: Eval
+
+# THE QUALITY GATE, DELIVERED (copirate-eval-harness-2fk.6): run eval/compare.js — replay the frozen
+# golden suite against this checkout's src/ and verdict it against the committed baseline — where
+# reviewers look: a check that reds on DEGRADED, with the verdict table in the run's Step Summary.
+#
+# EVERY RUN SPENDS REAL PROVIDER CREDITS — compare.js prints the exact estimate (the baseline's own
+# recorded $/full-run × N) before spending; that print is the one authoritative figure, so no dollar
+# amount is repeated here to drift from it. This is why there is NO unconditional per-PR trigger and
+# never will be: a PR buys a run only by wearing the 'eval' label, and everything else is a human
+# pressing the dispatch button.
+#
+# The ticket sketched dispatch inputs for a cases filter and an N override. They are deliberately
+# absent: compare.js derives N and the case set FROM the baseline and refuses any deviation — a
+# candidate at a different N or over a subset measures a different population than the gate floor
+# was computed from ([LAW:no-silent-failure], enforced in compareVerdict). Inputs the gate would
+# reject are not inputs. [LAW:no-mode-explosion]
+
+on:
+  workflow_dispatch:
+  pull_request:
+    # 'labeled' is in the set so attaching the label to an already-open PR buys the run — without
+    # it, a label added after opening would do nothing until the next push.
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: read
+
+# Two suite runs interleaved would race their provider rate-limits and double-spend to answer one
+# question. One group for the whole workflow: at most one run in flight, later triggers queue (and
+# GitHub keeps only the newest pending run per group, which is the right economy for a paid suite).
+concurrency:
+  group: eval
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    # Dispatch always runs (a human pressed the button — that IS the spend approval). A PR runs only
+    # when it is from THIS repo (GitHub withholds secrets from fork pull_request events, so a fork run
+    # could only burn setup time before failing on empty credentials in a way that reads like a
+    # misconfigured secret — skip it honestly up front), only while wearing the 'eval' label, and a
+    # 'labeled' event buys a run only when the label being added is 'eval' itself — otherwise attaching
+    # any unrelated label to an eval-labeled PR would silently re-spend the whole suite.
+    # [LAW:no-silent-failure]
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       contains(github.event.pull_request.labels.*.name, 'eval') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'eval'))
+    runs-on: ubuntu-latest
+    # A suite is N full reviews per case, serial per case: ~1 hour observed at N=5. Triple headroom
+    # so API congestion (observed stretching single reviews 3-5×) times out loudly here rather than
+    # at GitHub's 6-hour default.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # Full history, not the fetch-depth:1 default: compare.js resolves the newest committed
+          # baseline by commit-graph order, and with more than one baseline committed (there are two)
+          # a shallow clone collapses that ranking to a tie it refuses (exit 2). Verified empirically
+          # in 2fk.5. On a pull_request this checks out the PR merge ref — the candidate under gate
+          # is the PR as it would land, which is the thing the check protects.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Gate the candidate against the frozen baseline
+        env:
+          # Every credential a golden case's pinned provider can use (deepseek/zai/openai — the set
+          # run-case.js's buildProviderInputs wires; CLAUDE_CODE_OAUTH_TOKEN is deliberately not
+          # among them) is forwarded; each case's pin selects which one is actually read, so
+          # re-freezing the baseline onto another of these providers is a data change in eval/ —
+          # this workflow needs no edit. DEEPSEEK_API_KEY also serves the default llm matcher's
+          # judge (score.js reads it unconditionally for that).
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        # A fixed --out (not compare.js's timestamped default) so the summary and artifact steps
+        # below address the same path without plumbing an output between steps; the runner's
+        # workspace is fresh per job, so compare.js's stale-artifact refusal can never fire on it.
+        run: node eval/compare.js --out eval/out/candidate-ci
+
+      - name: Publish the verdict to the Step Summary
+        # always(): a DEGRADED gate exits 1 but has already written verdict.md — the red run's
+        # summary is exactly the one reviewers most need to see. When the gate aborted before
+        # comparing (incomparable baseline, replay failure — exit 2, no verdict.md), say so loudly
+        # instead of publishing an empty summary. [LAW:no-silent-failure]
+        if: always()
+        run: >-
+          cat eval/out/candidate-ci/verdict.md >> "$GITHUB_STEP_SUMMARY" ||
+          echo '**No verdict was produced** — the gate aborted before comparing; see the "Gate the candidate" step log.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload candidate artifacts
+        # always(): the artifacts of a DEGRADED or aborted run (per-run findings, scorecards,
+        # engine transcripts, verdict.{md,json}) are the evidence for diagnosing it.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: eval-candidate
+          path: eval/out/candidate-ci
+          # An abort before the first replay legitimately leaves nothing to upload; the summary
+          # step above already reported that state, so an empty upload warns rather than double-fails.
+          if-no-files-found: warn
