@@ -2,11 +2,33 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { spanMs, sumMs, describeSchedule } = require('../src/schedule');
+const { spawnRecord, spanMs, sumMs, describeSchedule } = require('../src/schedule');
 
 const at = (min) => `2026-08-22T03:${String(min).padStart(2, '0')}:00.000Z`;
 const span = (fromMin, toMin) => ({ from: at(fromMin), to: at(toMin) });
 const MIN = 60_000;
+
+// The one owner of the SpawnRecord shape: a drifted producer fails at the mint, never as a
+// silently-wrong breakdown. [LAW:one-source-of-truth]
+describe('spawnRecord', () => {
+  test('mints scout and worker records', () => {
+    assert.deepEqual(spawnRecord({ phase: 'scout' }, 'completed', null), { phase: 'scout', outcome: 'completed', usage: null });
+    assert.deepEqual(
+      spawnRecord({ phase: 'worker', scope: 's1', pass: 2 }, 'retried', { span: span(0, 1) }),
+      { phase: 'worker', scope: 's1', pass: 2, outcome: 'retried', usage: { span: span(0, 1) } },
+    );
+  });
+  test('rejects an unknown phase loudly', () => {
+    assert.throws(() => spawnRecord({ phase: 'sweeper' }, 'completed', null), /unknown phase "sweeper"/);
+  });
+  test('rejects a worker tag missing its scope name or pass index', () => {
+    assert.throws(() => spawnRecord({ phase: 'worker', scope: 's1' }, 'completed', null), /non-negative pass index/);
+    assert.throws(() => spawnRecord({ phase: 'worker', pass: 0 }, 'completed', null), /scope name/);
+  });
+  test('rejects an outcome outside the vocabulary', () => {
+    assert.throws(() => spawnRecord({ phase: 'scout' }, 'killed', null), /unknown outcome "killed"/);
+  });
+});
 
 describe('spanMs', () => {
   test('a span is its duration in milliseconds', () => {
@@ -115,6 +137,13 @@ describe('describeSchedule', () => {
     });
     assert.equal(d.scoutMs, null); // no scout record at all
     assert.deepEqual(d.passes[0].spawns, [{ scope: 's1', outcome: 'failed', ms: null }]);
+  });
+
+  test('a record with a phase outside the vocabulary fails the derive loudly, never vanishing', () => {
+    assert.throws(
+      () => describeSchedule({ scopeConcurrency: 1, sweepCap: 0, scopeCount: 1, spawns: [{ phase: 'sweeper', outcome: 'completed', usage: null }] }),
+      /unknown phase "sweeper"/,
+    );
   });
 
   test('a scout retried before settling reports the summed spawn time of all its attempts', () => {

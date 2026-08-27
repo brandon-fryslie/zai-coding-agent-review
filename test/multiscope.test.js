@@ -1447,6 +1447,13 @@ describe('runMultiScopePass — the pass records its phase and schedule', () => 
     return { get: () => adapter };
   }
 
+  test('a non-positive maxConcurrent is refused loudly — the recorded schedule must match what the pool did', async () => {
+    // The pool would silently clamp 0 to one lane, but the schedule records scopeConcurrency AS USED
+    // and the wave derivation divides by it — so the pass gate refuses the value before either lies.
+    await assert.rejects(runMultiScopePass(passArgs(makeRegistry(), { maxConcurrent: 0 })), /positive integer maxConcurrent/);
+    await assert.rejects(runMultiScopePass(passArgs(makeRegistry(), { maxConcurrent: 2.5 })), /positive integer maxConcurrent/);
+  });
+
   test('a clean pass records one tagged record per spawn, plus the scheduling facts as used', async () => {
     const review = await runMultiScopePass(passArgs(makeRegistry()));
     const { schedule } = review;

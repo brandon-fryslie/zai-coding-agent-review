@@ -4,6 +4,7 @@ const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = require('./deadlin
 const { defaultEffortProfile, maxTier } = require('./effort');
 const { dedupeFindings, dedupeAssessments, parseScopeValue } = require('./review');
 const { sumCost, emptyTokens, addTokens } = require('./usage');
+const { spawnRecord } = require('./schedule');
 const { renderDependencyDiffNote } = require('./dependency-diff');
 const { NO_EXCLUSIONS, excludedPathList } = require('./diff');
 const {
@@ -377,6 +378,13 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   if (!Number.isInteger(sweepCap) || sweepCap < 0) {
     throw new Error(`runMultiScopePass requires a non-negative integer sweepCap (got ${JSON.stringify(sweepCap)}); it comes from the effort profile.`);
   }
+  // [LAW:single-enforcer] Same checkpoint for the concurrency: the pool would silently clamp a
+  // nonsensical value to 1, but the schedule records scopeConcurrency AS USED and describeSchedule
+  // divides by it — a 0 or negative here would make the recorded schedule disagree with what the
+  // pool actually did (and derive Infinity waves). One loud gate keeps record and behavior one fact.
+  if (!Number.isInteger(maxConcurrent) || maxConcurrent < 1) {
+    throw new Error(`runMultiScopePass requires a positive integer maxConcurrent (got ${JSON.stringify(maxConcurrent)}); it comes from the effort profile.`);
+  }
   const adapter = registry.get(config.engine);
 
   // [LAW:decomposition] Every engine spawn in this pass goes through one transient-retry seam, so a
@@ -391,7 +399,9 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // exhausted retry) with its span before the error escapes to whoever absorbs it. The pass total
   // AND the schedule both derive from this one list, so no phase can appear in one and be forgotten
   // by the other. [LAW:one-source-of-truth] `tag` is the record's identity — { phase: 'scout' } or
-  // { phase: 'worker', scope, pass } — a value, never re-parsed from the human-facing label.
+  // { phase: 'worker', scope, pass } — a value, never re-parsed from the human-facing label. Every
+  // record is minted through spawnRecord (src/schedule.js), the one owner of the record shape, so a
+  // drifted tag or outcome fails loudly here rather than silently corrupting the derived breakdown.
   const spawnRecords = [];
   const spanOnlyUsage = (err) => (err.span ? { span: err.span } : null);
   const spawn = async (buildPromptFor, label, tag) => {
@@ -409,17 +419,17 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
             // [LAW:no-silent-failure] A retried attempt burned real time; it appears as its own
             // record (span-only — a failed spawn reports no tokens) rather than vanishing into
             // the retry loop. err.span is absent when the failure predated the spawn: nothing ran.
-            spawnRecords.push({ ...tag, outcome: 'retried', usage: spanOnlyUsage(err) });
+            spawnRecords.push(spawnRecord(tag, 'retried', spanOnlyUsage(err)));
             log(`${label}: transient error (attempt ${attempt}/${limit}), retrying in ${Math.round(delay / 1000)}s: ${err.message}`);
           },
         },
       );
-      spawnRecords.push({ ...tag, outcome: 'completed', usage: result.usage });
+      spawnRecords.push(spawnRecord(tag, 'completed', result.usage));
       return result;
     } catch (err) {
       // The settling failure's burned time is recorded BEFORE the error escapes — a deadline-killed
       // worker is absorbed as 'unreviewed' by the pool downstream, but its record is already here.
-      spawnRecords.push({ ...tag, outcome: 'failed', usage: spanOnlyUsage(err) });
+      spawnRecords.push(spawnRecord(tag, 'failed', spanOnlyUsage(err)));
       throw err;
     }
   };
