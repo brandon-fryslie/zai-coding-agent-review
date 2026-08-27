@@ -740,7 +740,7 @@ describe('costWarning', () => {
   test('no-price names the price table and the model to add', () => {
     const w = costWarning({ tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 1 }, cost: { basis: 'unpriced', reason: 'no-price' } }, { ...CODEX_CONFIG, model: 'gpt-future' });
     assert.match(w, /price-table entry for codex\/gpt-future/);
-    assert.match(w, /PRICES_PER_MILLION/);
+    assert.match(w, /PRICE_SOURCES/);
   });
 
   test('not-reported names the engine, never the price table — the codex/claude causes do not conflate', () => {
