@@ -58,6 +58,8 @@ Usage: node scripts/local-review.js [options]
 function parseArgs(argv) {
   const opts = { provider: 'auto', range: 'HEAD~1 HEAD', repo: process.cwd(), mode: 'pr', scope: '', workers: 4 };
   const known = new Set(['provider', 'range', 'diff', 'repo', 'mode', 'scope', 'workers', 'model', 'base-url', 'config', 'use']);
+  // The options that pick between two sources via truthiness downstream — see the rejection below.
+  const NON_EMPTY_OPTIONS = new Set(['config', 'use', 'diff', 'base-url', 'model', 'provider']);
   const written = new Set(); // flag names the caller actually typed, for exclusivity checks below
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -68,12 +70,14 @@ function parseArgs(argv) {
     if (!known.has(name)) throw new Error(`Unknown option: --${name}`);
     const value = eq === -1 ? argv[++i] : arg.slice(eq + 1);
     if (value === undefined) throw new Error(`Option --${name} requires a value.`);
-    // [LAW:parse-dont-validate] An empty value is almost always an unset shell variable (`--config
-    // "$CFG"`), and every downstream discriminator on these options is a truthiness check — an empty
-    // string would slip past all of them (the --config exclusivity guard, the --diff vs --range pick,
-    // the pinned-base-url guard) and silently select the OTHER source. Reject it once here, at the
-    // parse boundary, so empty is unrepresentable inland and truthiness checks stay exact.
-    if (value === '') throw new Error(`Option --${name} requires a non-empty value.`);
+    // [LAW:parse-dont-validate] For these options an empty value is almost always an unset shell
+    // variable (`--config "$CFG"`), and every downstream discriminator on them is a truthiness
+    // check — an empty string would slip past all of them (the --config exclusivity guard, the
+    // --diff vs --range pick, the pinned-base-url guard, the model override) and silently select
+    // the OTHER source. Reject it here, at the parse boundary, so empty is unrepresentable inland
+    // and those truthiness checks stay exact. The set is only the two-source options: for the rest
+    // (scope, repo, range, mode, workers) empty either equals the default or already fails loudly.
+    if (value === '' && NON_EMPTY_OPTIONS.has(name)) throw new Error(`Option --${name} requires a non-empty value.`);
     written.add(name);
     opts[name === 'base-url' ? 'baseUrl' : name] = value;
   }

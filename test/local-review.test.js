@@ -178,14 +178,19 @@ test('formatReport renders every credential kind PRESETS can produce', () => {
   }
 });
 
-test('parseArgs rejects an empty value for any option', () => {
-  // [LAW:parse-dont-validate] An empty value (typically an unset shell var: --config "$CFG") would
-  // slip past every downstream truthiness discriminator and silently select the other source —
-  // reject it at the parse boundary so empty is unrepresentable inland.
+test('parseArgs rejects an empty value for the two-source options only', () => {
+  // [LAW:parse-dont-validate] For these options an empty value (typically an unset shell var:
+  // --config "$CFG") would slip past the downstream truthiness discriminator and silently select
+  // the other source — rejected at the parse boundary so empty is unrepresentable inland.
   assert.throws(() => parseArgs(['--config', '']), /--config requires a non-empty value/);
   assert.throws(() => parseArgs(['--config=', '--model', 'm']), /--config requires a non-empty value/);
   assert.throws(() => parseArgs(['--diff', '']), /--diff requires a non-empty value/);
   assert.throws(() => parseArgs(['--base-url=']), /--base-url requires a non-empty value/);
+  assert.throws(() => parseArgs(['--model', '']), /--model requires a non-empty value/);
+  // For options whose empty value equals omitting the flag, `--flag "$UNSET_VAR"` stays legal —
+  // a wrapper passing --scope "$SCOPE" unconditionally must not hard-fail when SCOPE is unset.
+  assert.equal(parseArgs(['--scope', '']).scope, '');
+  assert.equal(parseArgs(['--repo', '']).repo, '');
 });
 
 // --- resolveConfigChain: both sources produce the same ordered-ReviewConfig-chain shape ---

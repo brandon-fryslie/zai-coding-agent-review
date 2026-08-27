@@ -4,7 +4,7 @@ const path = require('path');
 const os = require('os');
 const { classifyTransient } = require('../failover');
 const { emptyTokens, addTokens } = require('../usage');
-const { makeCliAdapter } = require('./cli');
+const { makeCliAdapter, removeQuietly } = require('./cli');
 
 // [LAW:no-ambient-temporal-coupling] Pin off '@latest' — the same trap claude-code hit: an unowned,
 // time-varying input that lets an upstream npm release break a run with nothing here changing. Pinned
@@ -109,24 +109,32 @@ function buildOpencodeConfig(config, collectorSpawn, agentsPath) {
 // from $XDG_CONFIG_HOME/opencode/opencode.json (verified live, 2026-06-14).
 function materializeHome({ config, instructionsPath, collector }) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zai-reviewer-opencode-home-'));
-  const cfgDir = path.join(home, 'opencode');
-  fs.mkdirSync(cfgDir, { recursive: true });
+  // [LAW:no-silent-failure] A throw below (bad model shape, unreadable collector config, failed
+  // copy) escapes before cli.js ever receives `home`, so its finally-cleanup can't run — without
+  // this, every such failure silently abandons the just-created temp dir.
+  try {
+    const cfgDir = path.join(home, 'opencode');
+    fs.mkdirSync(cfgDir, { recursive: true });
 
-  // [LAW:single-enforcer] Instructions are copied from the one shared source, as AGENTS.md.
-  const agentsPath = path.join(cfgDir, 'AGENTS.md');
-  fs.copyFileSync(instructionsPath, agentsPath);
+    // [LAW:single-enforcer] Instructions are copied from the one shared source, as AGENTS.md.
+    const agentsPath = path.join(cfgDir, 'AGENTS.md');
+    fs.copyFileSync(instructionsPath, agentsPath);
 
-  // [LAW:one-source-of-truth] createReviewCollector owns the spawn argv and records path; read its
-  // computed spec rather than recomputing the node binary / dist entry reference.
-  const mcpCfg = JSON.parse(fs.readFileSync(collector.mcpConfigPath, 'utf8'));
-  const collectorSpawn = mcpCfg.mcpServers.review_collector;
+    // [LAW:one-source-of-truth] createReviewCollector owns the spawn argv and records path; read its
+    // computed spec rather than recomputing the node binary / dist entry reference.
+    const mcpCfg = JSON.parse(fs.readFileSync(collector.mcpConfigPath, 'utf8'));
+    const collectorSpawn = mcpCfg.mcpServers.review_collector;
 
-  fs.writeFileSync(
-    path.join(cfgDir, 'opencode.json'),
-    JSON.stringify(buildOpencodeConfig(config, collectorSpawn, agentsPath), null, 2),
-    'utf8',
-  );
-  return home;
+    fs.writeFileSync(
+      path.join(cfgDir, 'opencode.json'),
+      JSON.stringify(buildOpencodeConfig(config, collectorSpawn, agentsPath), null, 2),
+      'utf8',
+    );
+    return home;
+  } catch (err) {
+    removeQuietly(home, 'temp HOME');
+    throw err;
+  }
 }
 
 // [LAW:effects-at-boundaries] Pure: returns a full spawn spec from the validated ReviewConfig.

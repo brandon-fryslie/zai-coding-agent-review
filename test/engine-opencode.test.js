@@ -6,6 +6,7 @@ const {
   OPENCODE_TIMEOUT_MS,
   MCP_SERVER_NAME,
   buildOpencodeConfig,
+  materializeHome,
   buildCommand,
   assertSucceeded,
   classifyError,
@@ -397,5 +398,32 @@ describe('buildOpencodeConfig — model id shape guard', () => {
       () => buildOpencodeConfig({ ...BASE_CONFIG, model: '/gpt-5.4-mini' }, MOCK_COLLECTOR_SPAWN, MOCK_AGENTS_PATH),
       /opencode requires a '<provider>\/<model>' model id/,
     );
+  });
+});
+
+describe('materializeHome — no abandoned temp dir on failure', () => {
+  // [LAW:no-silent-failure] A throw during materialization (here: the model-shape guard) escapes
+  // before cli.js receives `home`, so its finally-cleanup can never run — materializeHome itself
+  // must remove the dir it created, or every such failure leaks one temp dir per worker.
+  test('removes its temp home when config materialization throws', () => {
+    const fs = require('fs');
+    const os = require('os');
+    const path = require('path');
+    const fixtures = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-leak-test-'));
+    const instructionsPath = path.join(fixtures, 'instructions.md');
+    fs.writeFileSync(instructionsPath, '# review instructions');
+    const mcpConfigPath = path.join(fixtures, 'mcp.json');
+    fs.writeFileSync(mcpConfigPath, JSON.stringify({ mcpServers: { review_collector: MOCK_COLLECTOR_SPAWN } }));
+    const homes = () => fs.readdirSync(os.tmpdir()).filter(d => d.startsWith('zai-reviewer-opencode-home-')).sort();
+    const before = homes();
+    try {
+      assert.throws(
+        () => materializeHome({ config: { ...BASE_CONFIG, model: 'bare-model' }, instructionsPath, collector: { mcpConfigPath } }),
+        /opencode requires a '<provider>\/<model>' model id/,
+      );
+      assert.deepEqual(homes(), before);
+    } finally {
+      fs.rmSync(fixtures, { recursive: true, force: true });
+    }
   });
 });
