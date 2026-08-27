@@ -16,6 +16,7 @@ core.warning = (m) => { warnings.push(String(m)); };
 core.info = () => {};
 
 const { buildReviewFooter } = require('../src/run');
+const { parseCostRecord } = require('../src/usage');
 const { renderRepoReport } = require('../src/report');
 
 beforeEach(() => { warnings = []; });
@@ -62,6 +63,24 @@ describe('the pr-mode footer', () => {
     assert.match(footer, /_Timing: 17m01s total · spawn breakdown unavailable — this run recorded no schedule_/);
   });
 
+  // zai-timing-31d.2 — the posted body is the only store that survives to the next run, so the
+  // figure a human reads and the figure a machine reads must be ONE figure. Asserting them together
+  // is what forbids the drift: a footer that rendered 10m00s while recording something else would
+  // make the PR's cumulative total disagree with the reviews it was summed from.
+  test('the posted footer records the same total it rendered, invisibly, for the next run to read', () => {
+    const footer = buildReviewFooter(null, CONFIG, null, { schedule: SCHEDULE, totalMs: 10 * MIN });
+    assert.match(footer, /_Timing: 10m00s total/);
+    assert.equal(parseCostRecord(footer).totalMs, 10 * MIN);
+  });
+
+  // The record is not collateral damage of the render: the breakdown is the fragile part (it formats
+  // a schedule), while the total is a number the run's clock minted. A pass that recorded no schedule
+  // still knows how long it took, and the next run still gets its summand. [LAW:no-silent-failure]
+  test('a review whose breakdown could not render still records its duration', () => {
+    const footer = buildReviewFooter(null, CONFIG, null, { schedule: null, totalMs: 3 * MIN });
+    assert.equal(parseCostRecord(footer).totalMs, 3 * MIN);
+  });
+
   test('a timing render failure omits the block loudly and never fails the review', () => {
     // [LAW:no-silent-failure] time is diagnostics; findings are the product. A wiring bug (no
     // totalMs minted) surfaces as a warning naming the cause, and the footer still carries the
@@ -72,6 +91,16 @@ describe('the pr-mode footer', () => {
     const timingWarnings = warnings.filter(w => w.includes('Timing'));
     assert.equal(timingWarnings.length, 1);
     assert.match(timingWarnings[0], /Timing breakdown unavailable/);
+  });
+
+  // The strongest form of "time never fails a review": no timing envelope at all. A caller that
+  // forgot it, or a path built before this epic, must still get its attribution and its cost — the
+  // parts that are the product — with the timing reported as the gap it is. [LAW:no-silent-failure]
+  test('a footer built with no timing envelope at all still posts, loudly missing its timing', () => {
+    const footer = buildReviewFooter(null, CONFIG);
+    assert.match(footer, /_Reviewed by config `zai`/);
+    assert.equal(parseCostRecord(footer).totalMs, null);
+    assert.equal(warnings.filter(w => w.includes('Timing breakdown unavailable')).length, 1);
   });
 });
 

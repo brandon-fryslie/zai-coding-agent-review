@@ -2,7 +2,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const { LEDGER_MARKER, ledgerEntryBody, sumCostToday, readSpentToday, appendCost } = require('../src/index.js');
-const { costMarker, parseCost } = require('../src/usage');
+const { costMarker, parseCost, parseCostRecord } = require('../src/usage');
 
 // The resolved config every entry here is written under — costMarker records its model and endpoint
 // host alongside the figure. These tests are about the DAY'S ACCOUNTING, not the recorded facts, so
@@ -32,6 +32,15 @@ describe('ledgerEntryBody', () => {
       ledgerEntryBody(usageOf({ basis: 'dollars', usd: 0.05 }), CONFIG),
       `${LEDGER_MARKER}\n${costMarker(usageOf({ basis: 'dollars', usd: 0.05 }), CONFIG)}`,
     );
+  });
+
+  // zai-timing-31d.2 — an entry records what a review SPENT; it has no round of its own to time, and
+  // an absent duration is what that looks like. A ledger entry claiming a wall clock would put a
+  // second, unrelated summand in front of any reader folding durations out of marker-bearing bodies.
+  test('an entry records no duration — a spend line has no wall clock of its own', () => {
+    const record = parseCostRecord(ledgerEntryBody(usageOf({ basis: 'dollars', usd: 0.05 }), CONFIG));
+    assert.equal(record.totalMs, null);
+    assert.deepEqual(record.cost, { basis: 'dollars', usd: 0.05 }); // …and it still records the spend
   });
 
   test('an unavailable cost writes an honest `unknown` marker, never a fabricated zero', () => {

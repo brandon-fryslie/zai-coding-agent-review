@@ -802,6 +802,68 @@ describe('cost marker — the recorded facts re-derive the cost (zai-cost-truth-
   });
 });
 
+// zai-timing-31d.2 — the round's wall clock is recorded beside its cost, in the SAME marker, so a
+// later run can sum a PR's agent time from bodies it did not write. The review bodies are the only
+// store that survives across runs; a duration that renders for humans and is then thrown away leaves
+// the cumulative total (zai-timing-31d.3) with nothing to add up.
+describe('duration record (zai-timing-31d.2)', () => {
+  // [LAW:verifiable-goals] THE ACCEPTANCE CRITERION: a known duration in, the same duration out.
+  test('a recorded duration round-trips through the marker exactly', () => {
+    const totalMs = 17 * 60_000 + 1_000; // the 17m01s run the epic was opened over
+    const record = parseCostRecord(costMarker(usageOf({ basis: 'dollars', usd: 1.5 }), DEEPSEEK_CONFIG, totalMs));
+    assert.equal(record.totalMs, totalMs);
+    // …and it rides the EXISTING marker rather than a second one of its own.
+    assert.equal(costMarker(usageOf({ basis: 'dollars', usd: 1.5 }), DEEPSEEK_CONFIG, totalMs).match(/<!--/g).length, 1);
+  });
+
+  // The duration must not disturb the facts already recorded: this marker is read by the daily
+  // ledger and the PR spend total, and a round whose cost stopped parsing because it learned to
+  // report its time would trade the product for the diagnostics. [LAW:no-silent-failure]
+  test('recording a duration leaves the cost, tokens, model and span untouched', () => {
+    const record = parseCostRecord(costMarker(usageOf({ basis: 'dollars', usd: 1.5 }), DEEPSEEK_CONFIG, 5_000));
+    assert.deepEqual(record.cost, { basis: 'dollars', usd: 1.5 });
+    assert.deepEqual(record.tokens, SAMPLE_TOKENS);
+    assert.equal(record.model, 'deepseek-v4-pro');
+    assert.equal(record.from, SAMPLE_SPAN.from);
+  });
+
+  // A subscription round is timed like any other — agent time is spent whether or not it is billed.
+  test('a subscription round records its duration too', () => {
+    const marker = costMarker(usageOf({ basis: 'subscription', notionalUsd: 63.59 }), SUBSCRIPTION_CONFIG, 90_000);
+    assert.equal(parseCostRecord(marker).totalMs, 90_000);
+  });
+
+  // [LAW:no-silent-failure] The three shapes of "no duration recorded" — a sink with no round to
+  // time (the ledger), a review posted before this feature, and a body carrying no marker at all.
+  // Each reads as an explicit absence. A zero would assert the round was instantaneous, and a throw
+  // would let one old body break a total summed across every round of a PR.
+  test('a round that recorded no duration reads as an absence, never a zero and never a throw', () => {
+    assert.equal(parseCostRecord(costMarker(usageOf({ basis: 'dollars', usd: 1 }), DEEPSEEK_CONFIG, null)).totalMs, null);
+    assert.equal(parseCostRecord('<!-- agent-review-cost-usd:0.651731 -->').totalMs, null);
+    assert.equal(parseCostRecord('a review body with no marker in it at all'), null);
+  });
+
+  // [LAW:single-enforcer] The writer screens through the same predicate as the reader, so the set of
+  // durations costMarker can emit IS the set parseCostRecord accepts — the discipline the figure and
+  // the token counts already hold, extended to the one field this ticket adds. A duration written to
+  // be refused on the way back in is a marker that round-trips to something it never recorded.
+  test('the writer cannot emit a duration the reader would refuse', () => {
+    for (const bad of [-1, -60_000, NaN, Infinity, -Infinity, '5000', undefined]) {
+      const marker = costMarker(usageOf({ basis: 'dollars', usd: 1 }), DEEPSEEK_CONFIG, bad);
+      assert.ok(!marker.includes('totalMs'), `${String(bad)} must not be written as a duration: ${marker}`);
+      assert.equal(parseCostRecord(marker).totalMs, null);
+    }
+    // A hand-edited negative cannot drive a PR's cumulative time DOWN either.
+    assert.equal(parseCostRecord('<!-- agent-review-cost-usd:{"usd":1,"totalMs":-999999} -->').totalMs, null);
+  });
+
+  // A run finishing inside the clock's resolution is a real 0, distinct from "not recorded" — the
+  // one figure this field must NOT collapse into its absence.
+  test('a recorded zero is a duration, not an absence', () => {
+    assert.equal(parseCostRecord(costMarker(usageOf({ basis: 'dollars', usd: 1 }), DEEPSEEK_CONFIG, 0)).totalMs, 0);
+  });
+});
+
 describe('sumCost', () => {
   test('adds dollars to dollars', () => {
     assert.deepEqual(sumCost([{ basis: 'dollars', usd: 0.1 }, { basis: 'dollars', usd: 0.2 }]), { basis: 'dollars', usd: 0.1 + 0.2 });
