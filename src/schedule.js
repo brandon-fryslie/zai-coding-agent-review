@@ -232,12 +232,22 @@ function scopeText(str) {
 // as a nonsense total. schedule may be null — the recorded absence (e.g. a review produced without
 // a pass envelope) — and renders as the explicit gap, never as a silently omitted line.
 // [LAW:no-silent-failure]
-function renderTimingBreakdown(schedule, totalMs) {
+//
+// `prTime` is the PR's cumulative-agent-time clause (zai-timing-31d.3), arriving ALREADY RENDERED as
+// a plain string: the fold that produces it reads review markers, which is src/usage.js's concern,
+// and this module stays dependency-free so every sink can import it. [LAW:one-way-deps] Its empty
+// string is not a mode — repo mode and a PR's first review both pass it, and it simply contributes
+// no clause to the same head every line is built from. [LAW:dataflow-not-control-flow]
+function renderTimingBreakdown(schedule, totalMs, prTime = '') {
   if (!Number.isFinite(totalMs) || totalMs < 0) {
     throw new Error(`renderTimingBreakdown: totalMs must be a non-negative finite number (got ${JSON.stringify(totalMs)})`);
   }
+  // The head EVERY timing line shares — this run's own wall clock, then the PR's cumulative total
+  // where there is one. Built once, so the schedule-less line cannot drift from the full one.
+  // [LAW:one-source-of-truth]
+  const head = [`_Timing: ${formatMs(totalMs)} total`, prTime].filter(Boolean).join(' · ');
   if (schedule == null) {
-    return `_Timing: ${formatMs(totalMs)} total · spawn breakdown unavailable — this run recorded no schedule_`;
+    return `${head} · spawn breakdown unavailable — this run recorded no schedule_`;
   }
   const d = describeSchedule(schedule);
   const workerRows = d.passes.flatMap(p => p.spawns.map(s => ({ pass: p.pass, ...s })));
@@ -253,7 +263,7 @@ function renderTimingBreakdown(schedule, totalMs) {
   const slowestClause = slowest ? `slowest scope: ${scopeText(slowest.scope)} (${formatMs(slowest.ms)})` : 'slowest scope: unclocked';
   const scheduleSentence =
     `${d.scopeCount} scope(s) at concurrency ${d.scopeConcurrency} over ${d.passes.length} pass(es) = ${d.waveCount} wave(s)`;
-  const line = `_Timing: ${formatMs(totalMs)} total · ${phaseClause('spawns', allDurations)} (${spawnCount} attempt(s))`
+  const line = `${head} · ${phaseClause('spawns', allDurations)} (${spawnCount} attempt(s))`
     + ` — ${phases} · ${slowestClause} · ${scheduleSentence}_`;
   const rows = [
     ...d.scouts.map(s => `| scout | — | ${s.outcome} | ${formatMs(s.ms)} |`),

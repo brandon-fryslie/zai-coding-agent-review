@@ -1,5 +1,10 @@
 'use strict';
 
+// [LAW:one-way-deps] The one import here, and it points downhill: src/schedule.js owns duration
+// formatting (formatMs) and depends on nothing, so every sink can import it. The PR-time clause
+// below is rendered where the marker fold that feeds it lives, rather than splitting the two.
+const { formatMs } = require('./schedule');
+
 // Per-run token/cost reporting.
 //
 // [LAW:decomposition] Two cohesive concerns live here: the price table (a representation that
@@ -905,33 +910,62 @@ function sumCost(costs) {
   return { basis: 'dollars', usd: costs.reduce((sum, c) => sum + c.usd, 0) };
 }
 
-// [LAW:one-type-per-behavior] A per-basis TALLY — {usd, count, unknownCount} — is one accounting
-// shape instantiated twice, over different units, and the two instances are never added together.
-// Both marker folds (the PR total in transport.js, the daily ledger in ledger.js) tally into this,
-// so "how do you count a round whose figure is missing" is answered once for both.
-// [LAW:no-silent-failure] A cost whose figure is absent raises unknownCount rather than vanishing,
-// so each total is honestly reported as a lower bound (rendered with a '+') instead of a partial
-// sum passed off as complete. A body with no marker at all (a pre-feature round) is a dollars-basis
+// [LAW:one-type-per-behavior] A TALLY — {total, count, unknownCount} — is ONE accounting shape,
+// instantiated over every unit this action sums across a PR's rounds: dollars actually spent,
+// Anthropic list price, and (zai-timing-31d.3) milliseconds of agent time. The field is named for
+// its ROLE and not for a unit, because there is one rule here and it is unit-blind; each render
+// site supplies the unit it means ('$' below, formatMs for time). A second copy of this rule per
+// unit is how "how do you count a round whose figure is missing" would come to have two answers.
+// [LAW:no-silent-failure] A figure that is absent raises unknownCount rather than vanishing, so
+// every total is honestly reported as a lower bound (rendered with a '+') instead of a partial sum
+// passed off as complete. That is the whole reason the shape carries two counts: a round that
+// happened but reported nothing must stay visible as a round.
+function emptyTally() {
+  return { total: 0, count: 0, unknownCount: 0 };
+}
+
+// [LAW:single-enforcer] THE fold. Every quantity summed across rounds passes through here, so the
+// treatment of an unrecorded figure cannot differ between cost and time.
+//
+// What counts as countable is NOT decided here: it is `recordedQuantity`, the same predicate the
+// marker boundary screens with, so the sign rule has ONE definition rather than one per site. The
+// three producers that reach this fold are genuinely different — a marker's parsed `totalMs`, a
+// live-computed cost figure, and the run's own raw duration — and only the first has already been
+// screened. Routing all three through the one predicate makes the guarantee a property of the fold
+// instead of a promise each caller has to keep. [LAW:one-source-of-truth]
+//
+// So a negative from ANY source lands in unknownCount: a total that could be driven DOWN by one bad
+// figure would report a PR as cheaper in money or in time than its rounds actually cost, and
+// under-counting is the direction that releases a budget gate rather than tripping it. An
+// unrepresentable quantity is an absence, never a zero and never a subtraction. [LAW:no-silent-failure]
+function tallyQuantity(tally, n) {
+  const q = recordedQuantity(n);
+  if (q === null) {
+    tally.unknownCount++;
+  } else {
+    tally.total += q;
+    tally.count++;
+  }
+  return tally;
+}
+
+// The per-basis pair the two COST folds share (the PR total in transport.js, the daily ledger in
+// ledger.js). The two bases are never added together: a dollar of spend and a notional list-price
+// dollar are different units. A body with no marker at all (a pre-feature round) is a dollars-basis
 // round of unknown cost — never a free one.
 function emptyTallies() {
-  return {
-    billed: { usd: 0, count: 0, unknownCount: 0 },
-    notional: { usd: 0, count: 0, unknownCount: 0 },
-  };
+  return { billed: emptyTally(), notional: emptyTally() };
 }
 
 function tallyCost(tallies, cost) {
   const basis = basisOf(cost);
-  const tally = tallies[basis.bucket];
-  const figure = basis.figure(cost);
-  if (Number.isFinite(figure)) {
-    tally.usd += figure;
-    tally.count++;
-  } else {
-    tally.unknownCount++;
-  }
+  tallyQuantity(tallies[basis.bucket], basis.figure(cost));
   return tallies;
 }
+
+// A DURATION is a single tally where a cost is a pair: time has one unit, so there is no basis to
+// select and the primitive above is folded directly. The rounds it counts are defined by whoever
+// folds it (transport.js), not here. [LAW:one-source-of-truth]
 
 function tallyRounds(tally) {
   return tally.count + tally.unknownCount;
@@ -945,7 +979,7 @@ function renderTally(label, tally) {
   if (rounds === 0) return null;
   const approx = tally.unknownCount > 0 ? '+' : '';
   const note = tally.unknownCount > 0 ? `, ${tally.unknownCount} with unknown cost` : '';
-  return `PR ${label} $${tally.usd.toFixed(4)}${approx} across ${rounds} rounds${note}`;
+  return `PR ${label} $${tally.total.toFixed(4)}${approx} across ${rounds} rounds${note}`;
 }
 
 // [LAW:effects-at-boundaries] Pure: the " · PR total ..." clause appended to the cost line, or '' when
@@ -970,6 +1004,33 @@ function renderPrTotal(thisCost, priorCost) {
     renderTally('list-price total', totals.notional),
   ].filter(Boolean);
   return clauses.length === 0 ? '' : ` · ${clauses.join(' · ')}`;
+}
+
+// [LAW:effects-at-boundaries] Pure: the "PR time ..." clause the timing line carries, or '' when
+// there is nothing cumulative to say — repo mode (no cross-run store, so priorDuration is null) and
+// the first review of a PR (no prior rounds) both render the run's own total alone, unchanged.
+// [LAW:one-type-per-behavior] renderPrTotal's mold over the second unit: this run folded into the
+// prior rounds' tally, rendered as a lower bound. The unit is supplied HERE — formatMs — because the
+// tally itself is unit-blind.
+//
+// WHAT A ROUND WITHOUT A RECORD COSTS THE FIGURE, stated rather than hidden. Every round posted
+// before durations were recorded (zai-timing-31d.2, merged b3b919c) reports no totalMs, so it lands
+// in unknownCount and the total renders '16m15s+ across 5 rounds, 2 unrecorded' — a lower bound with
+// the missing rounds NAMED. It is never a sum passed off as complete, and never a zero, which would
+// assert those rounds were instant. [LAW:no-silent-failure]
+//
+// Such a round is also NEVER backfilled from its record's from/to span. That span is the SPAWN
+// window; the run also fetches a diff, waits on a scout and posts a review, none of it inside a
+// spawn. Measured on the live run that reviewed PR #138: totalMs 225201 ms against a span of
+// 223475 ms, and the gap grows with diff size. Deriving one from the other is a silent fallback to a
+// different measurement wearing the real one's name. An unrecorded round is unrecorded.
+function renderPrTime(thisMs, priorDuration) {
+  if (!priorDuration) return '';
+  if (tallyRounds(priorDuration) === 0) return '';
+  const total = tallyQuantity({ ...priorDuration }, thisMs);
+  const approx = total.unknownCount > 0 ? '+' : '';
+  const note = total.unknownCount > 0 ? `, ${total.unknownCount} unrecorded` : '';
+  return `PR time ${formatMs(total.total)}${approx} across ${tallyRounds(total)} rounds${note}`;
 }
 
 // [LAW:dataflow-not-control-flow] The basis selects a PHRASE; every cost line is then assembled by
@@ -1075,6 +1136,7 @@ module.exports = {
   addTokens,
   renderCostLine,
   renderPrTotal,
+  renderPrTime,
   costMarker,
   costRecord,
   parseCostMarker,
@@ -1084,6 +1146,8 @@ module.exports = {
   sumCost,
   emptyTallies,
   tallyCost,
+  emptyTally,
+  tallyQuantity,
   costWarning,
   formatTokenCount,
   isAnthropicEndpoint,

@@ -16,7 +16,7 @@ const { assessDifficulty } = require('./difficulty');
 const { difficultyCandidates, parseDifficultyScaling } = require('./difficulty-policy');
 const { readSpentToday, appendCost } = require('./ledger');
 const { parseDependencyDiffFlag, parseGoModBumps, fetchUpstreamChangeSummary, unresolvedSummary, renderDependencyReviewSection } = require('./dependency-diff');
-const { renderCostLine, costWarning, costMarker } = require('./usage');
+const { renderCostLine, costWarning, costMarker, renderPrTime } = require('./usage');
 const { renderTimingBreakdown } = require('./schedule');
 const { renderRepoReport } = require('./report');
 const registry = require('./engine/registry');
@@ -129,13 +129,14 @@ async function preflightChain(chain) {
 // line carries a running PR total, and a machine-readable cost marker is embedded so the NEXT round can
 // sum this one. Repo mode passes no priorCost — the single-round line stands, and the (harmless) marker
 // simply isn't read by anyone. [LAW:dataflow-not-control-flow]
-// [LAW:types-are-the-program] The timing envelope is DESTRUCTURED at the seam, into the two facts it
-// carries, because both of them are read in different places below — one inside the render's try, one
+// [LAW:types-are-the-program] The timing envelope is DESTRUCTURED at the seam, into the three facts it
+// carries, because they are read in different places below — two inside the render's try, one
 // outside it. Reaching into `timing` at each use made an absent envelope a THROWN review at whichever
 // use happened to sit outside the try, which is precisely the trade this epic forbids: time is
-// diagnostics, findings are the product. Named here, an absent envelope is an absent schedule and an
-// absent total — two values the renderer already knows how to report as gaps. [LAW:no-silent-failure]
-function buildReviewFooter(usage, configUsed, priorCost, { schedule = null, totalMs } = {}) {
+// diagnostics, findings are the product. Named here, an absent envelope is an absent schedule, an
+// absent total and an absent prior duration — three values the renderer already knows how to report
+// as gaps, the last of them as no cumulative clause at all. [LAW:no-silent-failure]
+function buildReviewFooter(usage, configUsed, priorCost, { schedule = null, totalMs, priorDuration = null } = {}) {
   const warning = costWarning(usage, configUsed);
   if (warning) core.warning(warning);
   const costLine = renderCostLine(usage, configUsed, priorCost);
@@ -146,9 +147,14 @@ function buildReviewFooter(usage, configUsed, priorCost, { schedule = null, tota
   // a render failure omits the block LOUDLY — a warning naming the cause — and never fails the
   // review. [LAW:no-silent-failure] An absent schedule is not a failure: it renders as an explicit
   // gap inside renderTimingBreakdown.
+  // The PR's cumulative agent time (zai-timing-31d.3) is rendered INSIDE the try with the block it
+  // joins: it reads the same prior-review markers the cost total does, and if that rendering fails
+  // the whole timing block is omitted loudly rather than a review being lost to a diagnostic.
+  // priorDuration is null in repo mode — no cross-run store to read — and the clause is then empty,
+  // so the line reports this run alone. [LAW:no-silent-failure]
   let timingBlock = null;
   try {
-    timingBlock = renderTimingBreakdown(schedule, totalMs);
+    timingBlock = renderTimingBreakdown(schedule, totalMs, renderPrTime(totalMs, priorDuration));
     core.info(timingBlock.split('\n')[0].replace(/^_|_$/g, ''));
   } catch (e) {
     core.warning(`Timing breakdown unavailable (${e.message}) — the review is posted without it.`);
@@ -227,9 +233,11 @@ async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, c
   try {
     const ledger = await readSpentToday(octokit, owner, repo, issueNumber, now);
     // [LAW:types-are-the-program] The gradient rations DOLLARS, so it reads the `billed` tally and
-    // nothing else. Subscription rounds are tallied separately under `notional` and have no `usd`
-    // field here to pick up — they cannot throttle a budget against money that was never spent.
-    spentToday = ledger.billed.usd;
+    // nothing else. A subscription round's marker lands it in `notional`, a tally this line never
+    // reads — it cannot throttle a budget against money that was never spent. The tally shape is
+    // unit-blind (see emptyTally in src/usage.js); the unit is whatever the BUCKET means, which is
+    // why the bucket and not a field name is what keeps list price out of the day's spend.
+    spentToday = ledger.billed.total;
     if (ledger.billed.unknownCount > 0) {
       core.warning(
         `Budget: ledger issue #${issueNumber} has ${ledger.billed.unknownCount} entr(ies) with unknown cost — `
@@ -252,7 +260,7 @@ async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, c
         : '';
       core.info(
         `Budget: ${notionalRounds} of today's review(s) were billed to Claude subscription quota, not `
-        + `dollars — $${ledger.notional.usd.toFixed(4)} at Anthropic list price${unreported}. It is `
+        + `dollars — $${ledger.notional.total.toFixed(4)} at Anthropic list price${unreported}. It is `
         + "excluded from the day's dollar spend and summed into nothing.",
       );
     }
@@ -728,7 +736,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   const dependencySection = renderDependencyReviewSection(dependencySummaries, review.assessments);
   // totalMs is read HERE, at the last instant before the sink, so the total covers everything the
   // run did up to submission — the same clock startedAt came from, read once. [LAW:one-source-of-truth]
-  const footer = buildReviewFooter(review.usage, configUsed, prior.cost, { schedule: review.schedule, totalMs: Date.now() - startedAt });
+  const footer = buildReviewFooter(review.usage, configUsed, prior.cost, { schedule: review.schedule, totalMs: Date.now() - startedAt, priorDuration: prior.duration });
   await submitReview(
     reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
     // [LAW:dataflow-not-control-flow] Coverage is stated, never inferred: the engine's own gap
