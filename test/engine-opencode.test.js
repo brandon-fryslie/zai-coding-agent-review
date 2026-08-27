@@ -373,3 +373,29 @@ describe('config validation rejects reasoning on a real opencode config (T8 AC)'
     );
   });
 });
+
+describe('buildOpencodeConfig — model id shape guard', () => {
+  // [LAW:no-silent-failure] A model without the `<provider>/<model>` prefix would emit a nonsensical
+  // `models: { '': {} }` catalog entry and fail deep inside the run; the adapter fails at config time
+  // with the shape named instead.
+  test('rejects a bare model name (no provider prefix)', () => {
+    assert.throws(
+      () => buildOpencodeConfig({ ...BASE_CONFIG, model: 'gpt-5.4-mini' }, MOCK_COLLECTOR_SPAWN, MOCK_AGENTS_PATH),
+      /opencode requires a '<provider>\/<model>' model id \(got 'gpt-5.4-mini'\)/,
+    );
+  });
+
+  test('rejects a trailing-slash model (empty model id)', () => {
+    assert.throws(
+      () => buildOpencodeConfig({ ...BASE_CONFIG, model: 'openai/' }, MOCK_COLLECTOR_SPAWN, MOCK_AGENTS_PATH),
+      /opencode requires a '<provider>\/<model>' model id/,
+    );
+  });
+
+  test('rejects a leading-slash model (empty provider id)', () => {
+    assert.throws(
+      () => buildOpencodeConfig({ ...BASE_CONFIG, model: '/gpt-5.4-mini' }, MOCK_COLLECTOR_SPAWN, MOCK_AGENTS_PATH),
+      /opencode requires a '<provider>\/<model>' model id/,
+    );
+  });
+});

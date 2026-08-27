@@ -48,6 +48,13 @@ function buildOpencodeConfig(config, collectorSpawn, agentsPath) {
   // Everything after the provider prefix, slashes included — HF-style ids like
   // `mlx-community/Qwen3-…` are one model name, not nesting.
   const modelId = config.model.split('/').slice(1).join('/');
+  // [LAW:no-silent-failure] The `<provider>/<model>` shape is OpenCode's own resolution rule, so this
+  // adapter is its one enforcer — src/config.js validates engine-independent facts only. Without this,
+  // a bare model name would emit a nonsensical `models: { '': {} }` catalog entry and fail deep inside
+  // the run instead of at config time.
+  if (!providerId || !modelId) {
+    throw new Error(`opencode requires a '<provider>/<model>' model id (got '${config.model}').`);
+  }
   return {
     $schema: 'https://opencode.ai/config.json',
     model: config.model,

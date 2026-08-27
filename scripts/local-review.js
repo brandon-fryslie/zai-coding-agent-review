@@ -68,6 +68,12 @@ function parseArgs(argv) {
     if (!known.has(name)) throw new Error(`Unknown option: --${name}`);
     const value = eq === -1 ? argv[++i] : arg.slice(eq + 1);
     if (value === undefined) throw new Error(`Option --${name} requires a value.`);
+    // [LAW:parse-dont-validate] An empty value is almost always an unset shell variable (`--config
+    // "$CFG"`), and every downstream discriminator on these options is a truthiness check — an empty
+    // string would slip past all of them (the --config exclusivity guard, the --diff vs --range pick,
+    // the pinned-base-url guard) and silently select the OTHER source. Reject it once here, at the
+    // parse boundary, so empty is unrepresentable inland and truthiness checks stay exact.
+    if (value === '') throw new Error(`Option --${name} requires a non-empty value.`);
     written.add(name);
     opts[name === 'base-url' ? 'baseUrl' : name] = value;
   }
@@ -237,8 +243,9 @@ async function main() {
 
   const repo = path.resolve(opts.repo);
   const chain = resolveConfigChain(opts);
-  // The report is headed by the selected config; on failover the per-session transcripts still name
-  // the config that actually ran each attempt.
+  // The announce line below names the SELECTED config — all that exists before the run. The report is
+  // attributed to configUsed, the config that actually produced the review after failover, exactly as
+  // run.js attributes the posted footer. [LAW:one-source-of-truth]
   const config = chain[0];
   const files = opts.mode === 'pr' ? loadDiffFiles(opts) : [];
   const instructionsPath = path.join(__dirname, '..', 'review-agent', 'instructions.md');
@@ -251,7 +258,7 @@ async function main() {
     : buildRepoMaterial({ scope: opts.scope, excludePatterns: [], reviewedRepoRoot: repo });
 
   process.stderr.write(`Running multi-scope ${opts.mode} review: ${config.name} (${config.model}) over ${opts.mode === 'pr' ? `${files.length} file(s)` : 'whole repo'}…\n`);
-  const { review } = await runMultiScope({
+  const { review, configUsed } = await runMultiScope({
     // The --workers flag is this dev tool's one effort knob; it produces a profile with that scope
     // concurrency, spread over the default so it stays complete as the profile grows fields.
     chain, material, registry, instructionsPath,
@@ -259,7 +266,7 @@ async function main() {
     log: msg => process.stderr.write(`[local-review] ${msg}\n`),
   });
 
-  const report = formatReport({ config, mode: opts.mode, files, result: review, sessions: readSessions(TRANSCRIPT_DIR), repo });
+  const report = formatReport({ config: configUsed, mode: opts.mode, files, result: review, sessions: readSessions(TRANSCRIPT_DIR), repo });
   process.stdout.write(`\n${report}\n`);
 }
 
@@ -270,4 +277,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, formatReport };
+module.exports = { parseArgs, formatReport, resolveConfigChain };
