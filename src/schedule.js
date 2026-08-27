@@ -161,6 +161,17 @@ function formatMs(ms) {
   return `${s}s`;
 }
 
+// [LAW:effects-at-boundaries] Pure: the live run log's running-total clause (zai-timing-31d.7) —
+// wall clock spent so far, set against the budget the run was minted with. Both arguments are
+// nullable ABSENCES with renderings, never fabricated zeros: an unknown start renders the elapsed
+// as 'unclocked' (formatMs's word for time we cannot count), and a null budget renders '(no
+// budget)' rather than inventing a bound. [LAW:dataflow-not-control-flow] one clause shape,
+// selected by the values — the no-budget run logs through the same line, not around it.
+function renderRunningTotal(elapsedMs, budgetMs) {
+  const elapsed = `elapsed ${formatMs(elapsedMs)}`;
+  return budgetMs == null ? `${elapsed} (no budget)` : `${elapsed} of ${formatMs(budgetMs)} budget`;
+}
+
 // [LAW:dataflow-not-control-flow] One clause shape for every phase, selected by the VALUES of its
 // durations, not by branches that skip the phase: no records at all is 'missing' (the explicit gap
 // the ticket demands for an absent phase), all-unclocked is 'unclocked', a partial clock renders
@@ -250,4 +261,4 @@ function renderTimingBreakdown(schedule, totalMs) {
   return `${line}\n\n${details}`;
 }
 
-module.exports = { spawnRecord, scheduleRecord, spanMs, sumMs, describeSchedule, formatMs, renderTimingBreakdown };
+module.exports = { spawnRecord, scheduleRecord, spanMs, sumMs, describeSchedule, formatMs, passLabel, renderRunningTotal, renderTimingBreakdown };

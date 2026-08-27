@@ -4,7 +4,7 @@ const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = require('./deadlin
 const { defaultEffortProfile, maxTier } = require('./effort');
 const { dedupeFindings, dedupeAssessments, parseScopeValue } = require('./review');
 const { sumCost, emptyTokens, addTokens } = require('./usage');
-const { spawnRecord, scheduleRecord } = require('./schedule');
+const { spawnRecord, scheduleRecord, spanMs, formatMs, passLabel, renderRunningTotal } = require('./schedule');
 const { renderDependencyDiffNote } = require('./dependency-diff');
 const { NO_EXCLUSIONS, excludedPathList } = require('./diff');
 const {
@@ -215,7 +215,11 @@ async function runScopeWorker({ scope, context, material, spawn, log, priorFindi
   // Dropping assessments here would silently strip the whole feature: the aggregation's `|| []` fallback
   // would fire on every worker and every bump would render "unassessed". [LAW:no-silent-failure]
   const { summary, findings, assessments, usage } = await spawn(buildPromptFor, label, { phase: 'worker', scope: scope.name, pass });
-  log(`${label} done — ${findings.length} finding(s)`);
+  // [LAW:one-source-of-truth] The elapsed time is the SAME host-stamped span the schedule records
+  // for this spawn, formatted through the same spanMs/formatMs derivation the posted breakdown
+  // uses — the live line and the footer cannot disagree. A null usage (an adapter that reported
+  // nothing) renders 'unclocked', the recorded absence, never a fabricated figure (zai-timing-31d.7).
+  log(`${label} done — ${findings.length} finding(s) — ${formatMs(spanMs(usage?.span))}`);
   return { name: scope.name, summary, findings, assessments, usage };
 }
 
@@ -370,7 +374,11 @@ function uniquelyNamed(scopes) {
 // once the budget is spent, delivers everything already collected, and reports the coverage gap as
 // data (unreviewedScopes, budgetExhausted). [LAW:no-ambient-temporal-coupling] the deadline is a
 // value minted once at the run boundary, never a clock read scattered through callers.
-async function runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, sweepCap, log, sleepFn = sleep, deadline = null, now = Date.now }) {
+// `startedAt` (epoch ms, null = unknown) is the run's start instant from that SAME mint — the live
+// log's running totals count from it, so they agree with the footer's total by construction. A
+// caller without one (null) logs 'elapsed unclocked' rather than minting a second start here:
+// timing is diagnostics and never invents a clock. [LAW:one-source-of-truth]
+async function runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, sweepCap, log, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
   // [LAW:no-silent-failure] A missing/malformed sweep bound must not decide anything by accident: an
   // undefined cap would make the convergence loop's `pass <= sweepCap` false on pass 0 and the review
   // would "succeed" having run NO workers at all. The bound comes from the effort profile (its one
@@ -440,6 +448,10 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // a scout that planned zero scopes fails loud here rather than running zero workers and "succeeding"
   // having reviewed nothing.
   const scoutResult = await spawn(material.buildScoutPrompt, 'scout', { phase: 'scout' });
+  // The scout's elapsed time lands the moment it settles — BEFORE the zero-scope gate, so a run
+  // that dies planning still logged where its first two minutes went (zai-timing-31d.7). Same
+  // span-in-hand derivation as the worker done line. [LAW:one-source-of-truth]
+  log(`scout done — ${formatMs(spanMs(scoutResult.usage?.span))}`);
   if (scoutResult.scopes.length === 0) {
     throw new Error(`Scout planned no scopes (no add_scope calls). Scout summary:\n${scoutResult.summary}`);
   }
@@ -478,6 +490,14 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // direction), which is why the loop is BOUNDED by sweepCap rather than trusting convergence alone.
   // The predicate is uniform across passes: a pass-0 with zero findings converges immediately (a clean
   // change), since a sweep after it would re-run a byte-identical prompt — a re-roll, not a hunt.
+  // [LAW:one-source-of-truth] The live log's running total derives from the run's ONE mint
+  // (startedAt and the deadline spent from it) plus the injected clock — never a second clock read
+  // here. The budget's size is (deadline - startedAt) because both came from the same mint; either
+  // absence propagates as the typed null renderRunningTotal knows the words for.
+  const runningTotal = () => renderRunningTotal(
+    startedAt == null ? null : now() - startedAt,
+    startedAt == null || deadline == null ? null : deadline - startedAt,
+  );
   const initialResults = [];
   const allResults = [];
   const sweeps = [];
@@ -505,6 +525,13 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     const skipped = scopes.filter((s, i) => outcomes[i].status === 'unreviewed');
     for (const s of skipped) log(`${sweepLabelPrefix(pass)}scope '${s.name}' not reviewed — time budget exhausted`);
     if (skipped.length > 0) budgetExhausted = true;
+    // The pass boundary is a real event this loop owns, so the running total lands here LIVE, while
+    // the run is still going (zai-timing-31d.7) — before the pass-0 empty-handed throw below, so
+    // even a run that dies here logged where its wall clock went. Waves are deliberately NOT logged:
+    // the pool is lane-based, waves exist only as describeSchedule's post-hoc derivation, and a
+    // "wave done" line would fake an event no scheduler observed — the per-scope done lines above
+    // are the intra-pass live signal. [LAW:one-source-of-truth]
+    log(`${passLabel(pass)} workers done — ${runningTotal()}`);
     if (pass === 0) {
       // An unreviewed scope at pass 0 is a COVERAGE gap, carried as data to the summary and the
       // verdict; at a sweep it merely curtails convergence — pass 0's judgments of record stand.
@@ -580,14 +607,14 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
 // engine clamps it per its range (resolveReasoningTier) and `configUsed` (hence the attribution footer)
 // automatically reports the raised tier. [LAW:dataflow-not-control-flow] a null proposed tier folds to
 // each config's own reasoning (byte-identical), so an omitted/default `effort` leaves the chain untouched.
-function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), log = () => {}, sleepFn = sleep, deadline = null, now = Date.now }) {
+function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), log = () => {}, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
   const maxConcurrent = effort.scopeConcurrency;
   const sweepCap = effort.sweepCap;
   const effectiveChain = chain.map(config => ({
     ...config,
     reasoning: maxTier(config.reasoning ?? null, effort.reasoningTier ?? null),
   }));
-  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, sweepCap, log, sleepFn, deadline, now });
+  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, sweepCap, log, sleepFn, deadline, now, startedAt });
   // [LAW:no-ambient-temporal-coupling] ONE sleepFn and ONE clock own the whole pass's retry timing:
   // both are forwarded to produceReview, so the pass-level gates, the spawn-level retry clamp, and
   // config-level failover all measure the budget on the same injected `now` — a fake clock in a test

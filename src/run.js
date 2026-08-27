@@ -351,7 +351,8 @@ async function resolveDependencySummaries(octokit, filteredFiles, dependencyDiff
 // dependency fetch) spend from it implicitly because it is absolute.
 // `startedAt` (epoch ms) is the run's start instant from that SAME mint — the timing footer's
 // total is (now - startedAt), so it counts preflight, the diff fetch and host I/O, time no spawn
-// owns. The entry default covers direct callers (tests, embedding): for them THIS boundary is the
+// owns; the engine's live per-pass running totals count from the same instant (zai-timing-31d.7).
+// The entry default covers direct callers (tests, embedding): for them THIS boundary is the
 // run boundary, so the mint moves here rather than a second clock appearing anywhere inland.
 // [LAW:no-ambient-temporal-coupling]
 async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadline, startedAt = Date.now()) {
@@ -694,7 +695,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
   const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline,
+    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, startedAt,
   });
   warnBudgetExhausted(review);
 
@@ -768,7 +769,7 @@ async function runRepoReview(reviewerName, excludePatterns, effort, deadline, st
     + `${scope ? ` (scope: ${scope})` : ' (whole repository)'}...`,
   );
   const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline,
+    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, startedAt,
   });
   warnBudgetExhausted(review);
 

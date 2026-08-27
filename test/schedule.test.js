@@ -224,6 +224,31 @@ describe('formatMs', () => {
   });
 });
 
+// The live run log's running-total clause (zai-timing-31d.7): one clause shape, absences rendered
+// as their words — never a fabricated '0s' elapsed or an invented budget. [LAW:no-silent-failure]
+describe('renderRunningTotal', () => {
+  const { renderRunningTotal } = require('../src/schedule');
+  test('renders elapsed against the budget at formatMs density', () => {
+    assert.equal(renderRunningTotal(392_000, 900_000), 'elapsed 6m32s of 15m00s budget');
+  });
+  test('a run with no budget says so, through the same clause', () => {
+    assert.equal(renderRunningTotal(392_000, null), 'elapsed 6m32s (no budget)');
+  });
+  test('an unknown start renders the recorded absence, never a second clock read', () => {
+    assert.equal(renderRunningTotal(null, null), 'elapsed unclocked (no budget)');
+    assert.equal(renderRunningTotal(null, 900_000), 'elapsed unclocked of 15m00s budget');
+  });
+});
+
+// Exported vocabulary for the live log's pass lines: the same labels the breakdown table uses.
+describe('passLabel', () => {
+  const { passLabel } = require('../src/schedule');
+  test('pass 0 is the review of record; later passes are sweeps', () => {
+    assert.equal(passLabel(0), 'review');
+    assert.equal(passLabel(2), 'sweep 2');
+  });
+});
+
 describe('renderTimingBreakdown', () => {
   const { renderTimingBreakdown } = require('../src/schedule');
   const worker = (scope, pass, fromMin, toMin, outcome = 'completed') =>
