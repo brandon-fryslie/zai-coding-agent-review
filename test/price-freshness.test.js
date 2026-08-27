@@ -36,6 +36,7 @@ describe('stalePriceSources', () => {
     assert.equal(stale.length, 1);
     assert.equal(stale[0].source.vendor, 'Testco');
     assert.equal(stale[0].ageDays, 75);
+    assert.equal(stale[0].reason, 'overdue');
   });
 
   test('a source verified within the threshold is not reported', () => {
@@ -61,6 +62,14 @@ describe('stalePriceSources', () => {
   test('a verifiedOn dated in the future is reported, not treated as permanently fresh', () => {
     const ahead = new Date(NOW.getTime() + 30 * DAY_MS).toISOString().slice(0, 10);
     assert.equal(stalePriceSources([sourceVerifiedOn(ahead)], NOW).length, 1);
+  });
+
+  // The two failures carry different remedies — re-read the page vs. fix the date — so the reason
+  // travels with the age rather than being re-derived from its sign by whoever renders it.
+  test('the reason distinguishes a future date from an overdue one', () => {
+    const ahead = new Date(NOW.getTime() + 30 * DAY_MS).toISOString().slice(0, 10);
+    assert.equal(stalePriceSources([sourceVerifiedOn(ahead)], NOW)[0].reason, 'future-dated');
+    assert.equal(stalePriceSources([sourceVerifiedOn(daysBefore(90))], NOW)[0].reason, 'overdue');
   });
 
   // [LAW:no-silent-failure] An unreadable date yields a NaN age, and NaN is younger than every
@@ -152,7 +161,8 @@ describe('check-price-freshness.js', () => {
     const past = new Date(newestVerification + (PRICE_VERIFICATION_MAX_AGE_DAYS + 1) * DAY_MS + 3_600_000);
     const { code, output } = runCheckAt(past);
     assert.equal(code, 1);
-    assert.match(output, /overdue for verification/);
+    assert.match(output, /cannot be treated as verified/);
+    assert.match(output, /days ago/);
     for (const source of PRICE_SOURCES) {
       assert.match(output, new RegExp(source.vendor.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
       assert.ok(output.includes(source.url), `${source.vendor}'s page must be named`);
@@ -161,6 +171,19 @@ describe('check-price-freshness.js', () => {
     // weekday drifts as expensively as one changing a number, and a reader told only to check the
     // prices would re-date the source without looking at its windows.
     assert.match(output, /days of week|days-of-week/);
+  });
+
+  // A clock behind every verification date makes every source future-dated. The report must say so
+  // rather than describing them as under-verified and printing a negative age — the remedy is to fix
+  // the date, not to re-read the page, and a check that names the wrong defect wastes the one thing it
+  // was built to buy.
+  test('a future-dated source is reported as such, never as an age of "-N days ago"', () => {
+    const before = new Date(Math.min(
+      ...PRICE_SOURCES.map(s => Date.parse(`${s.verifiedOn}T00:00:00Z`))) - 5 * DAY_MS);
+    const { code, output } = runCheckAt(before);
+    assert.equal(code, 1);
+    assert.match(output, /in the FUTURE/);
+    assert.doesNotMatch(output, /-\d+ days ago/);
   });
 
   test('exits zero while every source is inside the threshold', () => {

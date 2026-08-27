@@ -61,10 +61,22 @@ const PRICE_SOURCES = [
     verifiedOn: '2026-08-26',
     // Reconciled 2026-08-26, and what the reconciliation FOUND is recorded here rather than collapsed
     // into the date: the page's flagship table now lists only gpt-5.6-{sol,terra,luna}, so these three
-    // rows are no longer on it. They remain live and unchanged at these exact figures per OpenAI's own
-    // model docs and several third-party trackers, which is why they stay — but "checked, still true,
-    // no longer on the headline table" is a different fact from "read straight off the page", and a
-    // bare date would have hidden the difference. [FRAMING:representation]
+    // rows are no longer on it. Nor are they on developers.openai.com/api/docs/pricing,
+    // .../docs/models, or platform.openai.com/docs/pricing — all four were checked. They remain live
+    // and unchanged at these exact figures per several third-party trackers, which is why they stay —
+    // but "checked, still true, no longer on any page we can name" is a different fact from "read
+    // straight off the page", and a bare date would have hidden the difference.
+    // [FRAMING:representation]
+    //
+    // SO THIS GROUP HAS A BLIND SPOT, and it is stated rather than left for someone to discover: the
+    // freshness check scores a source by WHEN it was last reconciled, never by WHETHER `url` can still
+    // answer for the rows underneath. These three can therefore read "fresh" for thirty days while the
+    // prices they assert drift somewhere this table cannot see. The check is not lying — the
+    // reconciliation genuinely happened, and opening `url` genuinely re-discovers this — but it is
+    // weaker here than for DeepSeek and z.ai, whose pages price every row they carry. Making "no page
+    // prices this row" a fact the TABLE carries, rather than a paragraph a human has to read, is
+    // zai-cost-truth-p5o.5 along with the question of whether these rows should exist at all.
+    // [LAW:no-silent-failure]
     // The gpt-5.6 rows are deliberately NOT added yet: OpenAI prices them differently for short and
     // long context, and a `tiers` window is keyed by an INSTANT, so a long-context run would price at
     // the short-context rate — a fresh silent misprice inside the mechanism built to end them. That
@@ -178,19 +190,34 @@ function verifiedOnMs(source) {
 // so the shipped table is one INPUT to this rule and never a hidden dependency a caller must
 // neutralize to test it.
 //
-// Freshness is a bounded interval [0, maxAgeDays] rather than a one-sided "not too old": a
-// `verifiedOn` dated in the FUTURE — a typo, or a date bumped without opening the page — would
-// otherwise read as permanently fresh and silence the check for good. Ages are whole elapsed days,
-// floored, so the boundary is exact: at maxAgeDays a source is still fresh, at maxAgeDays + 1 it is
-// not. Each stale source is returned WITH its age, since the report has to name how far gone it is.
+// Each returned source carries its age AND the REASON it is not fresh, because those are two
+// different problems with two different remedies and only the code that computed the age knows which
+// one it found. A reporter left to re-derive it from `ageDays < 0` would be a second opinion about
+// what the number means — and the two drift the first time this threshold gains a nuance, at which
+// point the report starts describing the wrong defect. [LAW:types-are-the-program]
 function stalePriceSources(sources, at, maxAgeDays = PRICE_VERIFICATION_MAX_AGE_DAYS) {
   const now = instantMs(at, 'price-table freshness needs the current instant as a Date');
-  const aged = sources.map(source => ({
-    source,
-    ageDays: Math.floor((now - verifiedOnMs(source)) / MS_PER_DAY),
-  }));
-  const isFresh = ({ ageDays }) => ageDays >= 0 && ageDays <= maxAgeDays;
-  return aged.filter(entry => !isFresh(entry));
+  return sources
+    .map((source) => {
+      const ageDays = Math.floor((now - verifiedOnMs(source)) / MS_PER_DAY);
+      return { source, ageDays, reason: stalenessOf(ageDays, maxAgeDays) };
+    })
+    .filter(entry => entry.reason !== null);
+}
+
+// Freshness is a bounded interval [0, maxAgeDays] rather than a one-sided "not too old", so the two
+// ways a date can fail are named rather than merged. `overdue` is the ordinary case. `future-dated` is
+// a typo or a date bumped without opening the page, and folding it into "overdue" would report a
+// source as under-verified when the real fault is a date ahead of the clock — the opposite defect,
+// with an age that renders as "-30 days ago". Left un-checked entirely it is worse than a bad message:
+// a future date is younger than every threshold, so it reads as permanently fresh and silences this
+// check for good. [LAW:no-silent-failure]
+// Ages are whole elapsed days, floored, so the boundary is exact: at maxAgeDays a source is still
+// fresh, at maxAgeDays + 1 it is not. `null` is the fresh arm — a typed absence, not a third reason.
+function stalenessOf(ageDays, maxAgeDays) {
+  if (ageDays < 0) return 'future-dated';
+  if (ageDays > maxAgeDays) return 'overdue';
+  return null;
 }
 
 // [LAW:types-are-the-program] THE TOKEN RECORD — the PRIMARY FACT behind every cost figure, and the

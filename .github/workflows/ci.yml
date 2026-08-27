@@ -5,12 +5,18 @@ on:
     branches: [main]
   pull_request:
   # The price table goes stale by the calendar, not by anyone touching the repo — that is the whole
-  # shape of the failure it guards. A quiet week must still be able to red, so the checks run weekly
-  # as well as on every change; a failed scheduled run mails the repo owner, which is a human seeing
-  # it without going looking. Without this trigger a repo nobody touched for a month would be silent
+  # shape of the failure it guards. A quiet day must still be able to red, so the checks run daily as
+  # well as on every change; a failed scheduled run mails the repo owner, which is a human seeing it
+  # without going looking. Without this trigger a repo nobody touched for a month would be silent
   # about a table that had been wrong for a month. [LAW:no-silent-failure]
+  #
+  # DAILY rather than weekly, and the cadence is load-bearing: the age threshold is evaluated only when
+  # the check runs, so the real silent-drift bound is the threshold PLUS the gap between runs. At 30
+  # days and a weekly cron that is up to 37 — precisely the interval that already burned us (DeepSeek
+  # repriced 37 days after the last verification), so the backstop would have reproduced the worst case
+  # it exists to bound. A daily gap keeps the true bound at 31.
   schedule:
-    - cron: '17 6 * * 1'
+    - cron: '17 6 * * *'
 
 jobs:
   test:
