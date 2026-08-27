@@ -29,7 +29,7 @@ const { spawnSync, execFileSync } = require('child_process');
 const {
   parseCaseSummary, parseCaseEngine, buildBaseline, parseBaseline, sameEngine, evaluateGate,
 } = require('./baseline');
-const { matcherLabel, findRunDirs, parseMeta } = require('./score');
+const { matcherLabel, parseExpected } = require('./score');
 
 const USAGE = `Gate a candidate (the current working tree) against a frozen eval baseline: replay the golden
 suite N times, score it, and print a DEGRADED / OK / IMPROVED verdict. Non-zero exit on DEGRADED.
@@ -274,13 +274,28 @@ function renderVerdictMarkdown(verdict, meta = {}) {
 // Effects (main) — resolve the baseline, spawn the replay+score CLIs, reduce, compare, exit.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
 
-// The ISO commit date of the last commit that touched `filePath`, or null if git can't answer (not a repo,
-// the file was never committed, git unavailable). A tie-break signal only — falls back to name order when
-// unavailable, same as when it's absent.
-function lastCommitIso(filePath) {
+// Every commit SHA in `gitCwd`'s history, git's own default order (newest first) — the commit GRAPH's
+// parent→child order, not a timestamp. Two baselines frozen back to back land in the SAME second (%cI is
+// second-granularity), so comparing ISO timestamp strings ties exactly the pair this tie-break exists to
+// distinguish; the commit graph never ties, because a child's parent pointer fixes its position regardless
+// of clock resolution. Empty (not a repo, no commits, git unavailable) is a legitimate value, not an error
+// — every downstream rank then resolves to null, the same as "uncommitted."
+function commitOrder(gitCwd) {
   try {
-    const out = execFileSync('git', ['log', '-1', '--format=%cI', '--', filePath], { cwd: __dirname }).toString().trim();
-    return out || null;
+    return execFileSync('git', ['log', '--format=%H'], { cwd: gitCwd }).toString().split('\n').filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+// filePath's position in `order` (0 = most recent commit in the repo), or null if git can't place it (not
+// a repo, the file was never committed, git unavailable). Lower rank = more recently touched.
+function lastCommitRank(filePath, gitCwd, order) {
+  try {
+    const sha = execFileSync('git', ['log', '-1', '--format=%H', '--', filePath], { cwd: gitCwd }).toString().trim();
+    if (!sha) return null;
+    const idx = order.indexOf(sha);
+    return idx === -1 ? null : idx;
   } catch {
     return null;
   }
@@ -289,14 +304,17 @@ function lastCommitIso(filePath) {
 // Resolve a --baseline argument (a dir or a baseline.json path) to the baseline.json file. With no
 // argument, pick the newest committed baseline under eval/baseline/. Dirs are `<date>-<shortsha>`; two
 // baselines frozen on the same UTC date (plausible mid-tuning: freeze, tweak a case, re-freeze) tie on a
-// bare name sort, breaking on the arbitrary short-SHA string — no relation to actual recency. A prior fix
-// tie-broke by each baseline's own `generatedAt`, but that carries the SAME `YYYY-MM-DD` string the dir
-// name is built from (buildBaseline: `generatedAt: provenance.date`; the dir name: `${date}-${sha}`) — no
-// finer granularity, so a same-date pair always ties on it too and falls through to the same arbitrary
-// sort it was meant to fix. Tie-break by the git commit history of each baseline.json instead — the actual
-// chronological order they were committed in, independent of the date string encoded in either the file or
-// the dir name. [LAW:no-silent-failure]
-function resolveBaselineJsonPath(arg) {
+// bare name sort, breaking on the arbitrary short-SHA string — no relation to actual recency. Two prior
+// fixes both failed on this same scenario: `generatedAt` carries the identical `YYYY-MM-DD` string the dir
+// name is already built from (no finer granularity); comparing each commit's ISO timestamp still ties
+// when — as is common for a scripted freeze/re-freeze — both commits land in the same second. Rank by
+// position in the commit GRAPH instead (commitOrder/lastCommitRank): unambiguous even for same-second
+// commits, since a child's parent pointer fixes order regardless of clock resolution. An UNCOMMITTED
+// baseline.json (rank null — no commit touches it yet, the exact "just froze it, about to gate" moment)
+// ranks as MORE recent than even the latest real commit, not less: a bare `|| ''`-style fallback would sort
+// it as older than everything, silently gating a freshly-frozen baseline against a stale committed one with
+// no error. [LAW:no-silent-failure]
+function resolveBaselineJsonPath(arg, gitCwd = __dirname) {
   if (arg) {
     const resolved = path.resolve(arg);
     if (!fs.existsSync(resolved)) throw new Error(`--baseline path not found: ${resolved}.`);
@@ -306,18 +324,20 @@ function resolveBaselineJsonPath(arg) {
   }
   const root = path.resolve('eval/baseline');
   if (!fs.existsSync(root)) throw new Error(`No baseline dir at ${root} and no --baseline given. Freeze one with eval/baseline.js first.`);
+  const order = commitOrder(gitCwd);
   const candidates = fs.readdirSync(root, { withFileTypes: true })
     .filter(e => e.isDirectory() && fs.existsSync(path.join(root, e.name, 'baseline.json')))
     .map((e) => {
       const jsonPath = path.join(root, e.name, 'baseline.json');
-      return { name: e.name, jsonPath, committedAt: lastCommitIso(jsonPath) };
+      return { name: e.name, jsonPath, rank: lastCommitRank(jsonPath, gitCwd, order) };
     })
     .sort((a, b) => {
-      if (a.committedAt !== b.committedAt) return (a.committedAt || '').localeCompare(b.committedAt || '');
-      return a.name.localeCompare(b.name);
+      const key = (c) => (c.rank === null ? -1 : c.rank); // uncommitted (-1) ranks before even the newest real commit (0)
+      if (key(a) !== key(b)) return key(a) - key(b); // ascending: index 0 (most recent) sorts first
+      return b.name.localeCompare(a.name); // last-resort tie among mutually-unresolvable dirs
     });
   if (candidates.length === 0) throw new Error(`No committed baseline (a dir with baseline.json) under ${root}.`);
-  return candidates[candidates.length - 1].jsonPath;
+  return candidates[0].jsonPath;
 }
 
 // Spawn a dev CLI (run-case.js / score.js) with stdio inherited so its progress streams live, and abort the
@@ -372,6 +392,23 @@ function main() {
   const casesDir = path.resolve(opts.casesDir);
   const runCaseScript = path.join(__dirname, 'run-case.js');
   const scoreScript = path.join(__dirname, 'score.js');
+
+  // 2b. Fail BEFORE spending on a denominator that's already known to mismatch: each case's pooled
+  //     inventory opportunity count is a PURE function of its current expected.json (findings annotated
+  //     must-find, any round) — it does not depend on what the candidate engine produces, so it costs
+  //     nothing to check here, before the first replay. compareVerdict's own check (below, via
+  //     compareVerdict) remains the universal backstop — it is the ONLY check reachable under
+  //     --reuse-candidate, where there is no pre-loop to guard. [LAW:no-silent-failure]
+  if (!opts.reuseCandidate) {
+    const currentOpportunities = repeats * baseline.cases.reduce((sum, { case: name }) => {
+      const expectedPath = path.join(casesDir, name, 'expected.json');
+      const expected = parseExpected(fs.readFileSync(expectedPath, 'utf8'), expectedPath);
+      return sum + expected.findings.filter(f => f.annotation === 'must-find').length;
+    }, 0);
+    if (currentOpportunities !== baseline.pooledInventoryMustFind.opportunities) {
+      throw new Error(`Incomparable: the golden suite's current pooled inventory opportunities (${currentOpportunities}) differ from the baseline's (${baseline.pooledInventoryMustFind.opportunities}) — expected.json changed since the baseline was frozen. Re-freeze the baseline before gating against this expected.json.`);
+    }
+  }
 
   // 3. Candidate artifact root — isolated from the baseline's own eval/out/<case> runs so score.js never
   //    pools baseline + candidate run dirs together. Under eval/out/ (git-ignored) by default.

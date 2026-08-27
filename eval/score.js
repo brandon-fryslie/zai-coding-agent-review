@@ -724,9 +724,9 @@ module.exports = {
   normalizeBody, pairCandidates, computeMetrics, scoreRun, aggregateRuns, renderTable,
   makeLexicalJudge, jaccard, wordSet, findRunDirs,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, callJudge, loadCache,
-  // The pinned judge model, so the compare gate (2fk.5) can build the exact matcher label the scorer
-  // records ('llm/<JUDGE_MODEL>') and reject a matcher mismatch against the baseline BEFORE spending a
-  // full suite run — not only in the post-run buildBaseline consistency check. [LAW:one-source-of-truth]
+  // The pinned judge model. Since `matcherLabel` below became the single producer of the 'llm/<model>'
+  // label format, compare.js no longer needs this directly (it gets the label through matcherLabel); this
+  // stays exported for the test suite, which asserts against the exact model name in expected strings.
   JUDGE_MODEL,
   // The single producer of the label FORMAT itself (not just the model name) — compare.js's
   // expectedMatcherLabel is an alias of this, not a second copy of the template. [LAW:one-source-of-truth]

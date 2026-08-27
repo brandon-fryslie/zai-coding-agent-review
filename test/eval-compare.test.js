@@ -1,10 +1,14 @@
 'use strict';
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execFileSync } = require('child_process');
 
 const {
   parseArgs, parsePositiveInt, expectedMatcherLabel, estimateCandidateCostUsd,
-  compareVerdict, renderVerdictMarkdown,
+  compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath,
 } = require('../eval/compare');
 const { buildBaseline, parseBaseline } = require('../eval/baseline');
 const { JUDGE_MODEL } = require('../eval/score');
@@ -249,4 +253,70 @@ test('renderVerdictMarkdown OK path names no cases and reads clean', () => {
   assert.match(md, /## Eval verdict — 🟢 OK/);
   assert.match(md, /\*\*VERDICT: OK\*\*/);
   assert.doesNotMatch(md, /Localized to/);
+});
+
+// ── resolveBaselineJsonPath (effect code — a real temp git repo, not a pure-core fixture) ──────────────
+//
+// This function has been rewritten three times across review rounds (bare name sort → generatedAt
+// tie-break → git-commit-time tie-break), each prior version wrong in a different, subtle way. A real
+// integration test against actual git history is what a mocked/pure fixture cannot catch — the whole bug
+// class is "does this correctly read real git state," which a fixture can only assert the code CLAIMS to
+// do. gitCwd is a seam specifically so this can point git at a disposable temp repo instead of asserting
+// against (or fabricating commits into) this repo's own history.
+
+function withTempGitRepo(fn) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'compare-baseline-'));
+  const prevCwd = process.cwd();
+  try {
+    execFileSync('git', ['init', '-q'], { cwd: tmp });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: tmp });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: tmp });
+    process.chdir(tmp);
+    fn(tmp);
+  } finally {
+    process.chdir(prevCwd);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+function writeBaselineDir(tmp, dirName) {
+  const dir = path.join(tmp, 'eval', 'baseline', dirName);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'baseline.json'), JSON.stringify({ marker: dirName }));
+  return dir;
+}
+
+function commitAll(tmp, message) {
+  execFileSync('git', ['add', '-A'], { cwd: tmp });
+  execFileSync('git', ['commit', '-q', '-m', message], { cwd: tmp });
+}
+
+test('resolveBaselineJsonPath tie-breaks a same-date pair by actual commit order, not directory name', () => {
+  withTempGitRepo((tmp) => {
+    // Same date prefix on both — a bare name sort OR a generatedAt tie-break (which carries the identical
+    // date string) would pick whichever name sorts last ('zzz...' > 'aaa...'), regardless of which was
+    // actually frozen more recently. Committing 'aaa' SECOND (chronologically later) while it sorts FIRST
+    // by name proves the picked winner comes from real commit order, not the name.
+    writeBaselineDir(tmp, '2026-08-01-zzz9999');
+    commitAll(tmp, 'freeze zzz (first, older)');
+    writeBaselineDir(tmp, '2026-08-01-aaa1111');
+    commitAll(tmp, 'freeze aaa (second, newer)');
+
+    const picked = resolveBaselineJsonPath(null, tmp);
+    assert.match(picked, /2026-08-01-aaa1111/);
+  });
+});
+
+test('resolveBaselineJsonPath picks an uncommitted baseline over any committed one — freshly frozen, not yet committed, is the newest', () => {
+  withTempGitRepo((tmp) => {
+    writeBaselineDir(tmp, '2026-08-09-committed');
+    commitAll(tmp, 'freeze, committed');
+    // Written to disk but never committed — the exact "just ran eval/baseline.js, about to gate against
+    // it" moment. Its name looks OLDER than the committed one to prove the win comes from being
+    // uncommitted, not from the name.
+    writeBaselineDir(tmp, '2020-01-01-uncommitted');
+
+    const picked = resolveBaselineJsonPath(null, tmp);
+    assert.match(picked, /2020-01-01-uncommitted/);
+  });
 });
