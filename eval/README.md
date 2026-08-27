@@ -474,7 +474,9 @@ committed baselines by commit-graph order, which a shallow clone collapses to a 
 forwards every credential a golden case's pinned provider can use (`DEEPSEEK_API_KEY`,
 `ZAI_API_KEY`, `OPENAI_API_KEY` — the set `run-case.js` wires); the cases' pinned engine selects
 which one is read, so re-freezing the baseline onto another of these providers changes no workflow
-line. Runs share one concurrency group — a second trigger
+line — but `DEEPSEEK_API_KEY` stays required regardless of the pins: the default `llm` matcher's
+judge reads it unconditionally (`score.js`), and the current baseline's matcher is
+`llm/deepseek-v4-flash`. Runs share one concurrency group — a second trigger
 queues rather than interleaving spend.
 
 ### The gate's own validation (the sabotage test)
