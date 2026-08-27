@@ -152,25 +152,29 @@ test('compareVerdict reports IMPROVED (informational) when the candidate exceeds
 });
 
 test('compareVerdict treats a candidate exactly AT the floor as OK (strictly-less gate)', () => {
-  // Construct a baseline whose gate floor equals a rate the candidate can hit exactly. Simplest: a
-  // candidate whose rate equals the baseline's own gate floor value — the comparator is `lt`, so equal
-  // is not degraded. We fabricate by loading a baseline and asking a candidate at its floor.
   const baseline = frozenBaseline(CASES_A());
-  const floor = baseline.pooledInventoryMustFind.gateFloor;
-  // evaluateGate compares candidate.found/opportunities directly (not the pre-rounded .rate field), so drive
-  // the boundary through the fraction it actually reads. Rather than solve integer fractions, assert the
-  // boundary property directly on the pure decision: a candidate rate == floor is NOT degraded, one epsilon
-  // below IS.
-  const atOpportunities = baseline.pooledInventoryMustFind.opportunities;
+  const floor = baseline.pooledInventoryMustFind.gateFloor; // rounded to ≤4 decimal places by buildBaseline
+  // Drive the boundary through TRUE equality with the fraction evaluateGate actually compares
+  // (found/opportunities), not an approximation. opportunities=10000 guarantees floor*opportunities is an
+  // integer (floor has ≤4 decimal digits), so found/opportunities reproduces floor exactly — unlike a
+  // Math.ceil()-rounded found, which lands strictly ABOVE the floor and never exercises true equality despite
+  // a test name/comment claiming it does. Also override baseline's own opportunities to the same value, so
+  // this construction still satisfies compareVerdict's candidate/baseline pooled-opportunities-match check.
+  const opportunities = 10000;
+  const found = Math.round(floor * opportunities);
+  assert.equal(found / opportunities, floor); // sanity: exact equality, not merely close
+  baseline.pooledInventoryMustFind.opportunities = opportunities;
+
   const atFloor = candidateSuite(CASES_A());
-  atFloor.suite.pooledInventoryMustFind.found = Math.ceil(floor * atOpportunities);
-  atFloor.suite.pooledInventoryMustFind.opportunities = atOpportunities;
-  atFloor.suite.pooledInventoryMustFind.rate = atFloor.suite.pooledInventoryMustFind.found / atOpportunities;
+  atFloor.suite.pooledInventoryMustFind.found = found;
+  atFloor.suite.pooledInventoryMustFind.opportunities = opportunities;
+  atFloor.suite.pooledInventoryMustFind.rate = found / opportunities;
   assert.equal(compareVerdict(baseline, atFloor).degraded, false);
+
   const below = candidateSuite(CASES_A());
-  below.suite.pooledInventoryMustFind.found = 0;
-  below.suite.pooledInventoryMustFind.opportunities = atOpportunities;
-  below.suite.pooledInventoryMustFind.rate = 0;
+  below.suite.pooledInventoryMustFind.found = found - 1;
+  below.suite.pooledInventoryMustFind.opportunities = opportunities;
+  below.suite.pooledInventoryMustFind.rate = (found - 1) / opportunities;
   assert.equal(compareVerdict(baseline, below).degraded, true);
 });
 

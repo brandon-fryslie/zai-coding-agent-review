@@ -24,7 +24,6 @@
 // main(), so importing this file for the pure-core tests performs no IO and spawns no subprocess.
 
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const { spawnSync, execFileSync } = require('child_process');
 const {
@@ -137,14 +136,26 @@ function compareVerdict(baseline, candidate) {
     throw new Error(`Incomparable: candidate was scored with matcher '${candidate.matcher}' but the baseline used '${baseline.matcher}'. Recall from two matchers isn't comparable.`);
   }
   // Same case SET — the pooled denominator must be over exactly the baseline's suite, or the rates measure
-  // different populations. Order-independent; names are unique per suite (buildBaseline enforces one case
-  // per dir upstream). A candidate missing a baseline case, or carrying one the baseline never froze, is refused.
+  // different populations. Order-independent; names are unique per suite (uniqueness comes from
+  // findGoldenCases's directory enumeration upstream in baseline.js's main(), not from buildBaseline
+  // itself). A candidate missing a baseline case, or carrying one the baseline never froze, is refused.
   const baseNames = baseline.cases.map(c => c.case).sort();
   const candNames = candidate.cases.map(c => c.case).sort();
   if (baseNames.length !== candNames.length || baseNames.some((n, i) => n !== candNames[i])) {
     const missing = baseNames.filter(n => !candNames.includes(n));
     const extra = candNames.filter(n => !baseNames.includes(n));
     throw new Error(`Incomparable case sets: ${missing.length ? `candidate is missing [${missing.join(', ')}]` : ''}${missing.length && extra.length ? '; ' : ''}${extra.length ? `candidate has extra [${extra.join(', ')}]` : ''}. The gate pools over the baseline's exact suite.`);
+  }
+  // Same pooled DENOMINATOR — expected.json is a living document (README: "The pooled inventory, and its
+  // eligibility rule"): inventory findings get curated into it over time, independent of re-freezing the
+  // baseline. If a case's expected.json gains or loses a must-find entry after the baseline was frozen, the
+  // candidate is scored against a different opportunity count than the gate floor was computed from — an
+  // apples-to-oranges comparison this file otherwise goes out of its way to refuse. This is a SUITE-total
+  // check, not a full per-case one (that would need parseBaseline to carry each case's raw opportunities,
+  // which its deliberately lossy gate subset does not — [LAW:carrying-cost]); it catches the realistic case
+  // (a case's inventory changed) but not a contrived net-zero add/remove across cases. [LAW:no-silent-failure]
+  if (candidate.suite.pooledInventoryMustFind.opportunities !== baseline.pooledInventoryMustFind.opportunities) {
+    throw new Error(`Incomparable: candidate's pooled inventory opportunities (${candidate.suite.pooledInventoryMustFind.opportunities}) differ from the baseline's (${baseline.pooledInventoryMustFind.opportunities}) — expected.json likely changed since the baseline was frozen. Re-freeze the baseline before gating against this expected.json.`);
   }
 
   // THE GATE — delegated to evaluateGate (baseline.js), the single place DEGRADATION_RULE is applied to a
@@ -193,6 +204,15 @@ function compareVerdict(baseline, candidate) {
   };
 }
 
+// Null-safe percent formatting — module scope so both the Markdown renderer and main()'s plain-text log
+// line share ONE formatter. parseBaseline allows a pooled `rate` to be null (a hand-edited or otherwise
+// non-buildBaseline-produced baseline.json), unlike gateFloor, which it requires; a bare `.toFixed(0)`
+// on that field would coerce null to 0 and print a misleading "0%" instead of surfacing the gap.
+// [LAW:one-source-of-truth]
+function pct(v) {
+  return v === null || v === undefined ? 'n/a' : `${(v * 100).toFixed(0)}%`;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
 // Rendering (pure). ONE renderer — Markdown — because the verdict table is meant to be pasted into a PR
 // body (this ticket) and rendered into a GitHub Step Summary (2fk.6), and it reads fine in a terminal too.
@@ -200,7 +220,6 @@ function compareVerdict(baseline, candidate) {
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
 
 function renderVerdictMarkdown(verdict, meta = {}) {
-  const pct = (v) => (v === null || v === undefined ? 'n/a' : `${(v * 100).toFixed(0)}%`);
   const usd = (v) => (v === null || v === undefined ? 'n/a' : `$${v.toFixed(4)}`);
   const signedPct = (v) => (v === null || v === undefined ? 'n/a' : `${v >= 0 ? '+' : ''}${(v * 100).toFixed(0)}%`);
   const p = verdict.pooled;
@@ -259,8 +278,11 @@ function renderVerdictMarkdown(verdict, meta = {}) {
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
 
 // Resolve a --baseline argument (a dir or a baseline.json path) to the baseline.json file. With no
-// argument, pick the newest committed baseline under eval/baseline/ (dirs are `<date>-<sha>`, so the
-// lexicographically greatest is the latest date). Aborts loudly if none exists or the path is wrong.
+// argument, pick the newest committed baseline under eval/baseline/. Dirs are `<date>-<shortsha>`; two
+// baselines frozen on the same UTC date (plausible mid-tuning: freeze, tweak a case, re-freeze) would tie
+// on a bare name sort, breaking on the arbitrary short-SHA string — no relation to actual recency. Tie-break
+// by each candidate's own `generatedAt` instead (buildBaseline always sets it), falling back to name order
+// only if a same-date pair somehow also ties on generatedAt. [LAW:no-silent-failure]
 function resolveBaselineJsonPath(arg) {
   if (arg) {
     const resolved = path.resolve(arg);
@@ -271,12 +293,20 @@ function resolveBaselineJsonPath(arg) {
   }
   const root = path.resolve('eval/baseline');
   if (!fs.existsSync(root)) throw new Error(`No baseline dir at ${root} and no --baseline given. Freeze one with eval/baseline.js first.`);
-  const dirs = fs.readdirSync(root, { withFileTypes: true })
+  const candidates = fs.readdirSync(root, { withFileTypes: true })
     .filter(e => e.isDirectory() && fs.existsSync(path.join(root, e.name, 'baseline.json')))
-    .map(e => e.name)
-    .sort();
-  if (dirs.length === 0) throw new Error(`No committed baseline (a dir with baseline.json) under ${root}.`);
-  return path.join(root, dirs[dirs.length - 1], 'baseline.json');
+    .map((e) => {
+      const jsonPath = path.join(root, e.name, 'baseline.json');
+      let generatedAt = null;
+      try { generatedAt = JSON.parse(fs.readFileSync(jsonPath, 'utf8')).generatedAt ?? null; } catch { /* malformed — sorts as oldest, name order breaks the tie */ }
+      return { name: e.name, jsonPath, generatedAt };
+    })
+    .sort((a, b) => {
+      if (a.generatedAt !== b.generatedAt) return (a.generatedAt || '').localeCompare(b.generatedAt || '');
+      return a.name.localeCompare(b.name);
+    });
+  if (candidates.length === 0) throw new Error(`No committed baseline (a dir with baseline.json) under ${root}.`);
+  return candidates[candidates.length - 1].jsonPath;
 }
 
 // Spawn a dev CLI (run-case.js / score.js) with stdio inherited so its progress streams live, and abort the
@@ -287,14 +317,16 @@ function runCli(scriptPath, args, label) {
   if (res.status !== 0) throw new Error(`${label} exited ${res.status === null ? `on signal ${res.signal}` : `with code ${res.status}`}.`);
 }
 
+// Two independent facts, two independent failures: a `status` failure (submodule/ownership issue, the
+// process being killed) must never discard a SHA `rev-parse` already obtained — that SHA feeds both the
+// rendered verdict and the candidate's `buildBaseline` provenance, so losing it downgrades a real, known
+// commit to the generic 'working-tree' label with no indication anything went wrong. [LAW:no-silent-failure]
 function gitShaAndDirty() {
-  try {
-    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: __dirname }).toString().trim();
-    const dirty = execFileSync('git', ['status', '--porcelain'], { cwd: __dirname }).toString().trim().length > 0;
-    return { sha, dirty };
-  } catch {
-    return { sha: null, dirty: false };
-  }
+  let sha = null;
+  try { sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: __dirname }).toString().trim(); } catch { /* no git / not a repo */ }
+  let dirty = false;
+  try { dirty = execFileSync('git', ['status', '--porcelain'], { cwd: __dirname }).toString().trim().length > 0; } catch { /* unknown — reported as clean, not fatal */ }
+  return { sha, dirty };
 }
 
 function main() {
@@ -314,7 +346,12 @@ function main() {
 
   // 2. Fail BEFORE spending an hour on a matcher that can't be compared: the candidate is scored with
   //    opts.matcher, which must yield the baseline's exact matcher label. [LAW:no-silent-failure]
-  if (baseline.matcher) {
+  //    Skipped entirely under --reuse-candidate: no scoring happens in THIS run, so opts.matcher (which
+  //    defaults to 'llm' whether or not the caller passed one) carries no meaning about what the reused
+  //    summaries were actually scored with — asserting it here can throw a spurious mismatch against a
+  //    validly-reused candidate. compareVerdict's own check (the candidate's ACTUAL recorded matcher,
+  //    read from the reused summaries) is the authoritative one for this path.
+  if (baseline.matcher && !opts.reuseCandidate) {
     const wouldBe = expectedMatcherLabel(opts.matcher);
     if (wouldBe !== baseline.matcher) {
       throw new Error(`Matcher mismatch: --matcher ${opts.matcher} scores as '${wouldBe}' but the baseline used '${baseline.matcher}'. Pass the matcher the baseline was built with.`);
@@ -333,7 +370,7 @@ function main() {
 
   process.stderr.write(`\nBaseline: ${baselineJsonPath}\n`);
   process.stderr.write(`  ${baseline.mainSha.slice(0, 7)} · engine ${baseline.engine ? `${baseline.engine.provider}/${baseline.engine.model}` : '(unpinned)'} · N=${repeats} · matcher ${baseline.matcher || '(none)'}\n`);
-  process.stderr.write(`  gate floor ${(baseline.pooledInventoryMustFind.gateFloor * 100).toFixed(0)}% (baseline pooled ${(baseline.pooledInventoryMustFind.rate * 100).toFixed(0)}%, ${baseline.pooledInventoryMustFind.found}/${baseline.pooledInventoryMustFind.opportunities})\n`);
+  process.stderr.write(`  gate floor ${pct(baseline.pooledInventoryMustFind.gateFloor)} (baseline pooled ${pct(baseline.pooledInventoryMustFind.rate)}, ${baseline.pooledInventoryMustFind.found}/${baseline.pooledInventoryMustFind.opportunities})\n`);
 
   if (opts.reuseCandidate) {
     process.stderr.write(`\nReusing candidate artifacts under ${candidateRoot} (no replay, no spend).\n`);
@@ -347,7 +384,21 @@ function main() {
     //    candidate covers exactly it (an added-since golden case can't be gated — the baseline doesn't cover it).
     for (const { case: name } of baseline.cases) {
       const caseDir = path.join(casesDir, name);
-      if (!fs.existsSync(path.join(caseDir, 'case.json'))) throw new Error(`Baseline case '${name}' has no frozen case at ${caseDir} — cannot replay it.`);
+      const caseJsonPath = path.join(caseDir, 'case.json');
+      if (!fs.existsSync(caseJsonPath)) throw new Error(`Baseline case '${name}' has no frozen case at ${caseDir} — cannot replay it.`);
+      // Engine drift, refused BEFORE the spend: run-case.js's own assertConfigMatchesPin only verifies the
+      // resolved config against THIS case.json's own pin — never against baseline.engine, the pin frozen at
+      // baseline-freeze time. If a case.json's engine pin drifted since freezing (without re-freezing the
+      // baseline), every case would pass its own per-case check and the FULL suite would replay and score
+      // at full cost, only for compareVerdict's sameEngine check to then discard the entire run. Checking
+      // here, before the first replay, matches this file's header claim ("refused before any spend where
+      // possible"). [LAW:no-silent-failure]
+      if (baseline.engine) {
+        const casePinEngine = parseCaseEngine(fs.readFileSync(caseJsonPath, 'utf8'), caseJsonPath);
+        if (!sameEngine(casePinEngine, baseline.engine)) {
+          throw new Error(`Incomparable: case '${name}' pins engine ${JSON.stringify(casePinEngine)} but the baseline pins ${JSON.stringify(baseline.engine)} — the case's pin drifted since the baseline was frozen. Re-freeze the baseline, or fix the case's pin, before gating.`);
+        }
+      }
       process.stderr.write(`\n─── ${name}: replaying ${repeats}× ───\n`);
       runCli(runCaseScript, [caseDir, '-n', String(repeats), '--out', candidateRoot, '--workers', String(opts.workers)], `run-case (${name})`);
       process.stderr.write(`\n─── ${name}: scoring ───\n`);
