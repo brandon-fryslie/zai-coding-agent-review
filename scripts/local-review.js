@@ -129,9 +129,20 @@ const AUTH_LABEL = {
   oauth: e => `oauth (subscription) → ${e.baseUrl} — billed to plan quota, not per token`,
 };
 
+// The timing summary line, or its explicit failure — one value either way, so the report always
+// carries a `timing:` line and a render bug reads as its own cause instead of a missing row.
+function renderTimingLine(schedule, totalMs) {
+  const { renderTimingBreakdown } = require('../src/schedule');
+  try {
+    return renderTimingBreakdown(schedule, totalMs).split('\n')[0].replace(/^_|_$/g, '');
+  } catch (e) {
+    return `unavailable (${e.message})`;
+  }
+}
+
 // [LAW:effects-at-boundaries] Pure: render the report string from values. Highlights the one signal
 // this tool exists for — explore-or-not, and whether exploration reached beyond the changed files.
-function formatReport({ config, mode, files, result, sessions, repo }) {
+function formatReport({ config, mode, files, result, sessions, repo, totalMs }) {
   const { renderCostLine } = require('../src/usage');
   const lines = [];
   lines.push('================ local-review report ================');
@@ -174,6 +185,13 @@ function formatReport({ config, mode, files, result, sessions, repo }) {
   // diagnostic cannot drift into disagreeing with production about what a run cost.
   const costLine = renderCostLine(result.usage, config);
   lines.push(costLine ? `usage: ${costLine.replace(/^_|_$/g, '')}` : 'usage: not reported');
+  // [LAW:one-source-of-truth] The action's OWN timing renderer, same rationale as the cost line
+  // above: the local breakdown cannot drift from what a production footer would say. The summary
+  // line is what a terminal reader wants; the <details> table is footer furniture, dropped here.
+  // [LAW:no-silent-failure] Same discipline as buildReviewFooter's boundary: a render failure is
+  // printed as the line's explicit gap, naming the cause — never a vanished line, and never an
+  // abort that costs the findings and session diagnostics this tool exists for.
+  lines.push(`timing: ${renderTimingLine(result.schedule ?? null, totalMs)}`);
   lines.push('=====================================================');
   return lines.join('\n');
 }
@@ -233,6 +251,10 @@ async function main() {
     process.stdout.write(USAGE);
     return;
   }
+  // The local run's one clock, minted at the run boundary exactly as run.js mints its own — so the
+  // reported total covers config resolution and diff parsing, time no spawn owns, the same way
+  // production's total covers preflight and host I/O. [LAW:no-ambient-temporal-coupling]
+  const startedAt = Date.now();
 
   // [LAW:no-ambient-temporal-coupling] main owns the ordering: create an isolated run dir and point
   // RUNNER_TEMP at it BEFORE the engine stack is required, so debug.js computes TRANSCRIPT_DIR against
@@ -270,7 +292,7 @@ async function main() {
     log: msg => process.stderr.write(`[local-review] ${msg}\n`),
   });
 
-  const report = formatReport({ config: configUsed, mode: opts.mode, files, result: review, sessions: readSessions(TRANSCRIPT_DIR), repo });
+  const report = formatReport({ config: configUsed, mode: opts.mode, files, result: review, sessions: readSessions(TRANSCRIPT_DIR), repo, totalMs: Date.now() - startedAt });
   process.stdout.write(`\n${report}\n`);
 }
 
