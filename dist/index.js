@@ -34225,14 +34225,19 @@ async function runScopeWorkers({ scopes, runOne, maxConcurrent, shouldStart = ()
     while (next < scopes.length && !firstError) {
       const i = next++;
       if (!shouldStart()) {
-        outcomes[i] = { status: 'unreviewed' };
+        // Refused before anything spawned: no time was burned, so there is no usage to carry.
+        outcomes[i] = { status: 'unreviewed', usage: null };
         continue;
       }
       try {
         outcomes[i] = { status: 'reviewed', result: await runOne(scopes[i]) };
       } catch (e) {
         if (e instanceof DeadlineExceededError) {
-          outcomes[i] = { status: 'unreviewed' };
+          // A killed spawn's burned time still counts (zai-timing-31d.4): runEngine stamps the span
+          // on the error, and it rides out of here as a span-only usage record — the same shape a
+          // token-less success produces, folded by the same sumUsage. [LAW:one-type-per-behavior]
+          // e.span is absent when the deadline gate refused the spawn outright: nothing ran, no usage.
+          outcomes[i] = { status: 'unreviewed', usage: e.span ? { span: e.span } : null };
           continue;
         }
         firstError = firstError || e;
@@ -34488,6 +34493,9 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   const allResults = [];
   const sweeps = [];
   const unreviewedScopes = [];
+  // Span-only usage records from deadline-killed spawns (null when nothing spawned) — folded into
+  // the pass total below so the envelope covers time a killed scope burned. [LAW:one-source-of-truth]
+  const unreviewedUsages = [];
   let budgetExhausted = false;
   let findings = [];
   for (let pass = 0; pass <= sweepCap; pass++) {
@@ -34510,6 +34518,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     });
     const results = outcomes.filter(o => o.status === 'reviewed').map(o => o.result);
     const skipped = scopes.filter((s, i) => outcomes[i].status === 'unreviewed');
+    unreviewedUsages.push(...outcomes.filter(o => o.status === 'unreviewed').map(o => o.usage));
     for (const s of skipped) log(`${labelPrefix}scope '${s.name}' not reviewed — time budget exhausted`);
     if (skipped.length > 0) budgetExhausted = true;
     if (pass === 0) {
@@ -34550,7 +34559,9 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     // any; dedupeAssessments (keyed by module) collapses the multi-go.mod case — and the sweep-pass
     // re-assessments, which collapse by the same module key. Non-dependency PR → [].
     assessments: dedupeAssessments(allResults.flatMap(r => r.assessments)),
-    usage: sumUsage([scoutResult.usage, ...allResults.map(r => r.usage)]),
+    // The unreviewed usages make the recorded envelope honest: a scope the deadline killed mid-spawn
+    // burned real wall clock, and its span widens the pass window exactly as a reviewed spawn's does.
+    usage: sumUsage([scoutResult.usage, ...allResults.map(r => r.usage), ...unreviewedUsages]),
     // [LAW:one-source-of-truth] The coverage gap as DATA, for the sinks: the PR sink withholds
     // approval when unreviewedScopes is non-empty (transport.submitReview), and run.js warns when
     // the budget bit at all. The summary text above derives from these same values, never the
