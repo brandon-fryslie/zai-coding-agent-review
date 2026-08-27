@@ -38,6 +38,10 @@ Usage: node scripts/local-review.js [options]
   --provider <name>   Provider: auto (default), deepseek, zai, codex, claude-subscription. Credential
                       read from the matching env var: DEEPSEEK_API_KEY / ZAI_API_KEY /
                       OPENAI_API_KEY / CLAUDE_CODE_OAUTH_TOKEN.
+  --config <file>     Load a CONFIG_FILE-format YAML (the same loader production runs use) instead of
+                      a provider preset. Mutually exclusive with --provider/--model/--base-url — those
+                      values live in the file.
+  --use <name>        Config name to select from --config (default: the file's 'default').
   --range <expr>      git diff range for the material (default: "HEAD~1 HEAD"). Ignored in repo mode.
   --diff <file>       Use a unified .diff file instead of computing one from --range.
   --repo <path>       Reviewed repo root (default: current directory). Read by the engine by absolute path.
@@ -53,7 +57,10 @@ Usage: node scripts/local-review.js [options]
 // that touch the world. `--flag value` and `--flag=value` both supported.
 function parseArgs(argv) {
   const opts = { provider: 'auto', range: 'HEAD~1 HEAD', repo: process.cwd(), mode: 'pr', scope: '', workers: 4 };
-  const known = new Set(['provider', 'range', 'diff', 'repo', 'mode', 'scope', 'workers', 'model', 'base-url']);
+  const known = new Set(['provider', 'range', 'diff', 'repo', 'mode', 'scope', 'workers', 'model', 'base-url', 'config', 'use']);
+  // The options that pick between two sources via truthiness downstream — see the rejection below.
+  const NON_EMPTY_OPTIONS = new Set(['config', 'use', 'diff', 'base-url', 'model', 'provider']);
+  const written = new Set(); // flag names the caller actually typed, for exclusivity checks below
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--help' || arg === '-h') return { help: true };
@@ -63,7 +70,27 @@ function parseArgs(argv) {
     if (!known.has(name)) throw new Error(`Unknown option: --${name}`);
     const value = eq === -1 ? argv[++i] : arg.slice(eq + 1);
     if (value === undefined) throw new Error(`Option --${name} requires a value.`);
+    // [LAW:parse-dont-validate] For these options an empty value is almost always an unset shell
+    // variable (`--config "$CFG"`), and every downstream discriminator on them is a truthiness
+    // check — an empty string would slip past all of them (the --config exclusivity guard, the
+    // --diff vs --range pick, the pinned-base-url guard, the model override) and silently select
+    // the OTHER source. Reject it here, at the parse boundary, so empty is unrepresentable inland
+    // and those truthiness checks stay exact. The set is only the two-source options: for the rest
+    // (scope, repo, range, mode, workers) empty either equals the default or already fails loudly.
+    if (value === '' && NON_EMPTY_OPTIONS.has(name)) throw new Error(`Option --${name} requires a non-empty value.`);
+    written.add(name);
     opts[name === 'base-url' ? 'baseUrl' : name] = value;
+  }
+  // [LAW:no-silent-failure] --config and the preset flags are two sources for the same facts
+  // (provider, model, endpoint). Accepting both and letting one win would leave the operator
+  // believing the loser took effect — reject the combination outright. [LAW:one-source-of-truth]
+  if (opts.config) {
+    const clash = ['provider', 'model', 'base-url'].filter(f => written.has(f));
+    if (clash.length > 0) {
+      throw new Error(`--config is mutually exclusive with ${clash.map(f => `--${f}`).join(', ')}: those values come from the config file.`);
+    }
+  } else if (opts.use) {
+    throw new Error('--use selects a config from --config; pass --config <file> with it.');
   }
   if (opts.mode !== 'pr' && opts.mode !== 'repo') throw new Error(`--mode must be 'pr' or 'repo' (got '${opts.mode}').`);
   // [LAW:no-silent-failure] A pinned provider reads no base URL — accepting the flag and quietly
@@ -153,15 +180,24 @@ function formatReport({ config, mode, files, result, sessions, repo }) {
 
 // The effectful helpers below lazily require their src deps, so importing this module never loads the
 // engine stack — only main() (or a helper it calls) does, after the run boundary is established.
-function resolveConfig(opts) {
+// [LAW:one-type-per-behavior] Both sources produce the SAME shape — an ordered ReviewConfig chain,
+// secrets resolved — so main() drives runMultiScope identically whichever way the config arrived.
+// --config goes through src/config.js loadConfig, the seam production CONFIG_FILE runs cross, so a
+// file that works here works verbatim in the action (and fails here exactly as it would there).
+// [LAW:one-source-of-truth]
+function resolveConfigChain(opts) {
+  if (opts.config) {
+    const { loadConfig } = require('../src/config');
+    return loadConfig(path.resolve(opts.config), opts.use, process.env);
+  }
   const { synthesizeProviderConfig } = require('../src/provider');
-  return synthesizeProviderConfig({
+  return [synthesizeProviderConfig({
     provider: opts.provider,
     openaiApiKey: process.env.OPENAI_API_KEY, openaiModel: opts.model, openaiBaseUrl: opts.baseUrl,
     zaiApiKey: process.env.ZAI_API_KEY, zaiModel: opts.model, zaiBaseUrl: opts.baseUrl,
     deepseekApiKey: process.env.DEEPSEEK_API_KEY, deepseekModel: opts.model, deepseekBaseUrl: opts.baseUrl,
     claudeCodeOauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN, claudeModel: opts.model,
-  });
+  })];
 }
 
 function loadDiffFiles(opts) {
@@ -210,7 +246,11 @@ async function main() {
   const registry = require('../src/engine/registry');
 
   const repo = path.resolve(opts.repo);
-  const config = resolveConfig(opts);
+  const chain = resolveConfigChain(opts);
+  // The announce line below names the SELECTED config — all that exists before the run. The report is
+  // attributed to configUsed, the config that actually produced the review after failover, exactly as
+  // run.js attributes the posted footer. [LAW:one-source-of-truth]
+  const config = chain[0];
   const files = opts.mode === 'pr' ? loadDiffFiles(opts) : [];
   const instructionsPath = path.join(__dirname, '..', 'review-agent', 'instructions.md');
 
@@ -222,15 +262,15 @@ async function main() {
     : buildRepoMaterial({ scope: opts.scope, excludePatterns: [], reviewedRepoRoot: repo });
 
   process.stderr.write(`Running multi-scope ${opts.mode} review: ${config.name} (${config.model}) over ${opts.mode === 'pr' ? `${files.length} file(s)` : 'whole repo'}…\n`);
-  const { review } = await runMultiScope({
+  const { review, configUsed } = await runMultiScope({
     // The --workers flag is this dev tool's one effort knob; it produces a profile with that scope
     // concurrency, spread over the default so it stays complete as the profile grows fields.
-    chain: [config], material, registry, instructionsPath,
+    chain, material, registry, instructionsPath,
     effort: { ...defaultEffortProfile(), scopeConcurrency: opts.workers },
     log: msg => process.stderr.write(`[local-review] ${msg}\n`),
   });
 
-  const report = formatReport({ config, mode: opts.mode, files, result: review, sessions: readSessions(TRANSCRIPT_DIR), repo });
+  const report = formatReport({ config: configUsed, mode: opts.mode, files, result: review, sessions: readSessions(TRANSCRIPT_DIR), repo });
   process.stdout.write(`\n${report}\n`);
 }
 
@@ -241,4 +281,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, formatReport };
+module.exports = { parseArgs, formatReport, resolveConfigChain };

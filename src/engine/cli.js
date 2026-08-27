@@ -49,7 +49,9 @@ function removeQuietly(dir, label) {
 // is why the cwd must NOT be the repo's parent (that would put the repo under cwd and re-open the
 // nested-memory vector for claude-code). The reviewer's own instructions load from the isolated home
 // (HOME/CODEX_HOME/XDG), keyed to env not cwd, so they are untouched. The repo stays readable by
-// absolute path (no per-engine read grant needed). [LAW:effects-at-boundaries]
+// absolute path — though a CLI's OWN directory-scoping rules may still demand a per-engine read
+// grant for paths outside cwd (opencode gates them as `external_directory`; its adapter allows it),
+// so verify the read path when writing a new adapter. [LAW:effects-at-boundaries]
 function makeCliAdapter(spec) {
   return {
     // [LAW:single-enforcer] The shared adapter interface: exactly what registry/run.js depend on.

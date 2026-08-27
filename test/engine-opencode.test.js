@@ -6,6 +6,7 @@ const {
   OPENCODE_TIMEOUT_MS,
   MCP_SERVER_NAME,
   buildOpencodeConfig,
+  materializeHome,
   buildCommand,
   assertSucceeded,
   classifyError,
@@ -50,6 +51,17 @@ describe('buildOpencodeConfig — generated opencode.json content', () => {
     assert.equal(provider.openai.options.apiKey, 'sk-test-key-xyz');
   });
 
+  test('the configured model is declared under the provider, so non-catalog models resolve', () => {
+    assert.deepEqual(cfg().provider.openai.models, { 'gpt-5.4-mini': {} });
+  });
+
+  test('a multi-segment model id (HF-style) keeps its inner slashes in the declaration', () => {
+    const config = { ...BASE_CONFIG, model: 'lmstudio/mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit' };
+    const provider = buildOpencodeConfig(config, MOCK_COLLECTOR_SPAWN, MOCK_AGENTS_PATH).provider;
+    assert.deepEqual(Object.keys(provider), ['lmstudio']);
+    assert.deepEqual(provider.lmstudio.models, { 'mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit': {} });
+  });
+
   test('permission block denies every mutating capability', () => {
     const perm = cfg().permission;
     assert.equal(perm.edit, 'deny');
@@ -64,6 +76,9 @@ describe('buildOpencodeConfig — generated opencode.json content', () => {
     assert.equal(perm.grep, 'allow');
     assert.equal(perm.glob, 'allow');
     assert.equal(perm.list, 'allow');
+    // The scratch-cwd design reads the repo by absolute path; without this OpenCode auto-rejects
+    // every repo read as external_directory and the session never reaches a stop.
+    assert.equal(perm.external_directory, 'allow');
   });
 
   test('instructions reference the AGENTS.md by absolute path', () => {
@@ -357,5 +372,58 @@ describe('config validation rejects reasoning on a real opencode config (T8 AC)'
         return true;
       },
     );
+  });
+});
+
+describe('buildOpencodeConfig — model id shape guard', () => {
+  // [LAW:no-silent-failure] A model without the `<provider>/<model>` prefix would emit a nonsensical
+  // `models: { '': {} }` catalog entry and fail deep inside the run; the adapter fails at config time
+  // with the shape named instead.
+  test('rejects a bare model name (no provider prefix)', () => {
+    assert.throws(
+      () => buildOpencodeConfig({ ...BASE_CONFIG, model: 'gpt-5.4-mini' }, MOCK_COLLECTOR_SPAWN, MOCK_AGENTS_PATH),
+      /opencode requires a '<provider>\/<model>' model id \(got 'gpt-5.4-mini'\)/,
+    );
+  });
+
+  test('rejects a trailing-slash model (empty model id)', () => {
+    assert.throws(
+      () => buildOpencodeConfig({ ...BASE_CONFIG, model: 'openai/' }, MOCK_COLLECTOR_SPAWN, MOCK_AGENTS_PATH),
+      /opencode requires a '<provider>\/<model>' model id/,
+    );
+  });
+
+  test('rejects a leading-slash model (empty provider id)', () => {
+    assert.throws(
+      () => buildOpencodeConfig({ ...BASE_CONFIG, model: '/gpt-5.4-mini' }, MOCK_COLLECTOR_SPAWN, MOCK_AGENTS_PATH),
+      /opencode requires a '<provider>\/<model>' model id/,
+    );
+  });
+});
+
+describe('materializeHome — no abandoned temp dir on failure', () => {
+  // [LAW:no-silent-failure] A throw during materialization (here: the model-shape guard) escapes
+  // before cli.js receives `home`, so its finally-cleanup can never run — materializeHome itself
+  // must remove the dir it created, or every such failure leaks one temp dir per worker.
+  test('removes its temp home when config materialization throws', () => {
+    const fs = require('fs');
+    const os = require('os');
+    const path = require('path');
+    const fixtures = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-leak-test-'));
+    const instructionsPath = path.join(fixtures, 'instructions.md');
+    fs.writeFileSync(instructionsPath, '# review instructions');
+    const mcpConfigPath = path.join(fixtures, 'mcp.json');
+    fs.writeFileSync(mcpConfigPath, JSON.stringify({ mcpServers: { review_collector: MOCK_COLLECTOR_SPAWN } }));
+    const homes = () => fs.readdirSync(os.tmpdir()).filter(d => d.startsWith('zai-reviewer-opencode-home-')).sort();
+    const before = homes();
+    try {
+      assert.throws(
+        () => materializeHome({ config: { ...BASE_CONFIG, model: 'bare-model' }, instructionsPath, collector: { mcpConfigPath } }),
+        /opencode requires a '<provider>\/<model>' model id/,
+      );
+      assert.deepEqual(homes(), before);
+    } finally {
+      fs.rmSync(fixtures, { recursive: true, force: true });
+    }
   });
 });

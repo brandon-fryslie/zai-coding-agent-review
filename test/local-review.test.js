@@ -2,7 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { summarizeSession } = require('../scripts/session-stats');
-const { parseArgs, formatReport } = require('../scripts/local-review');
+const { parseArgs, formatReport, resolveConfigChain } = require('../scripts/local-review');
 const { PRESETS } = require('../src/provider');
 
 // A claude-code stream-json transcript fragment: header line (non-JSON, skipped) + tool_use events.
@@ -63,6 +63,17 @@ test('parseArgs rejects bad input loudly', () => {
     () => parseArgs(['--provider', 'claude-subscription', '--base-url', 'http://x']),
     /--base-url does not apply to --provider 'claude-subscription': its endpoint is PINNED/,
   );
+});
+
+test('parseArgs keeps --config exclusive with the preset flags, and --use tied to --config', () => {
+  assert.equal(parseArgs(['--config', 'a.yml', '--use', 'mine']).use, 'mine');
+  assert.equal(parseArgs(['--config', 'a.yml']).use, undefined);
+  // [LAW:no-silent-failure] --config and the preset flags are two sources for the same facts;
+  // letting one silently win would leave the operator believing the loser took effect.
+  assert.throws(() => parseArgs(['--config', 'a.yml', '--model', 'm']), /--config is mutually exclusive with --model/);
+  assert.throws(() => parseArgs(['--config', 'a.yml', '--provider', 'zai']), /--config is mutually exclusive with --provider/);
+  assert.throws(() => parseArgs(['--config', 'a.yml', '--base-url', 'http://x']), /--config is mutually exclusive with --base-url/);
+  assert.throws(() => parseArgs(['--use', 'mine']), /--use selects a config from --config/);
 });
 
 // The default provider is 'auto', which ALIASES to a pinned provider — so the no-`--provider`
@@ -164,5 +175,86 @@ test('formatReport renders every credential kind PRESETS can produce', () => {
       result: { findings: [], summary: '', usage: null },
     });
     assert.match(report, new RegExp(`endpoint: ${kind}[^\\n]*https://h\\.example`), `credential kind '${kind}' has no AUTH_LABEL entry`);
+  }
+});
+
+test('parseArgs rejects an empty value for the two-source options only', () => {
+  // [LAW:parse-dont-validate] For these options an empty value (typically an unset shell var:
+  // --config "$CFG") would slip past the downstream truthiness discriminator and silently select
+  // the other source — rejected at the parse boundary so empty is unrepresentable inland.
+  assert.throws(() => parseArgs(['--config', '']), /--config requires a non-empty value/);
+  assert.throws(() => parseArgs(['--config=', '--model', 'm']), /--config requires a non-empty value/);
+  assert.throws(() => parseArgs(['--diff', '']), /--diff requires a non-empty value/);
+  assert.throws(() => parseArgs(['--base-url=']), /--base-url requires a non-empty value/);
+  assert.throws(() => parseArgs(['--model', '']), /--model requires a non-empty value/);
+  // For options whose empty value equals omitting the flag, `--flag "$UNSET_VAR"` stays legal —
+  // a wrapper passing --scope "$SCOPE" unconditionally must not hard-fail when SCOPE is unset.
+  assert.equal(parseArgs(['--scope', '']).scope, '');
+  assert.equal(parseArgs(['--repo', '']).repo, '');
+});
+
+// --- resolveConfigChain: both sources produce the same ordered-ReviewConfig-chain shape ---
+
+const CONFIG_FIXTURE = `
+version: 1
+default: primary
+fallback: [primary, backup]
+configs:
+  primary:
+    engine: claude-code
+    model: glm-5.1
+    endpoint: { apiType: anthropic-messages, baseUrl: "https://api.z.ai/api/anthropic", credentialEnv: LR_TEST_KEY }
+  backup:
+    engine: opencode
+    model: openai/gpt-5.4-mini
+    endpoint: { apiType: openai-chat, baseUrl: "https://api.openai.com/v1", credentialEnv: LR_TEST_KEY }
+`;
+
+function withConfigFixture(fn) {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-review-test-'));
+  const file = path.join(dir, 'review.yml');
+  fs.writeFileSync(file, CONFIG_FIXTURE);
+  const prev = process.env.LR_TEST_KEY;
+  process.env.LR_TEST_KEY = 'test-key-abc';
+  try {
+    return fn(file);
+  } finally {
+    if (prev === undefined) delete process.env.LR_TEST_KEY; else process.env.LR_TEST_KEY = prev;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('resolveConfigChain loads a config file through the production loader: full chain, secrets resolved', () => {
+  withConfigFixture(file => {
+    const chain = resolveConfigChain({ config: file });
+    assert.deepEqual(chain.map(c => c.name), ['primary', 'backup']);
+    assert.equal(chain[0].engine, 'claude-code');
+    assert.equal(chain[0].model, 'glm-5.1');
+    assert.equal(chain[0].endpoint.baseUrl, 'https://api.z.ai/api/anthropic');
+    assert.equal(chain[0].endpoint.credential.value, 'test-key-abc');
+    assert.equal(chain[1].engine, 'opencode');
+  });
+});
+
+test('resolveConfigChain honors --use: the selected config heads the chain', () => {
+  withConfigFixture(file => {
+    const chain = resolveConfigChain({ config: file, use: 'backup' });
+    assert.deepEqual(chain.map(c => c.name), ['backup', 'primary']);
+    assert.equal(chain[0].model, 'openai/gpt-5.4-mini');
+  });
+});
+
+test('resolveConfigChain without --config synthesizes a single-entry preset chain', () => {
+  const prev = process.env.ZAI_API_KEY;
+  process.env.ZAI_API_KEY = 'zai-test-key';
+  try {
+    const chain = resolveConfigChain({ provider: 'zai' });
+    assert.equal(chain.length, 1);
+    assert.equal(chain[0].endpoint.credential.value, 'zai-test-key');
+  } finally {
+    if (prev === undefined) delete process.env.ZAI_API_KEY; else process.env.ZAI_API_KEY = prev;
   }
 });
