@@ -43,8 +43,14 @@ const LEDGER_MARKER = '<!-- agent-review-cost-ledger-entry -->';
 // records an entry like any other, and its exclusion from the day's dollars is the marker NAME
 // costMarker chose, never a caller that skips appendCost. A skipped append would make the
 // subscription's consumption invisible instead of merely unbilled. [LAW:no-silent-failure]
+//
+// A ledger entry records what a review SPENT, and has no wall clock of its own to record: the day's
+// ledger is read by the budget gate, which asks about dollars, while agent time is asked about per PR
+// from the review bodies themselves. Passing null says that in the source rather than leaving the
+// argument off — an omitted argument reads as an oversight, and this one is a decision. The entry's
+// span still says when the spawns ran. [LAW:no-silent-failure]
 function ledgerEntryBody(usage, config) {
-  return `${LEDGER_MARKER}\n${costMarker(usage, config)}`;
+  return `${LEDGER_MARKER}\n${costMarker(usage, config, null)}`;
 }
 
 // [LAW:effects-at-boundaries] Pure: the UTC calendar date ('YYYY-MM-DD') of an ISO timestamp or Date.

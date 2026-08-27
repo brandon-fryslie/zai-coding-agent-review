@@ -32984,7 +32984,12 @@ const ANY_MARKER_RE = new RegExp(
 // [LAW:types-are-the-program] So an unpriced cost, an unreported notional, a NaN from a broken
 // upstream, a nonsensical negative, and a config naming no model all reach the same honest end: an
 // absent field, which is what "not recorded" looks like.
-function costRecord(usage, config) {
+//
+// THE RUN'S DURATION RIDES THIS RECORD, and does not get a marker of its own (zai-timing-31d.2). A
+// second grammar would be a second thing to find, a second thing to keep unhijackable by quoted
+// prose, and a second last-match rule — for a fact that is recorded at the same instant, by the same
+// writer, about the same round. [LAW:one-type-per-behavior] One marker, one payload, N facts.
+function costRecord(usage, config, totalMs) {
   const cost = usage && usage.cost;
   const basis = basisOf(cost);
   const figure = recordedQuantity(basis.figure(cost));
@@ -33000,6 +33005,16 @@ function costRecord(usage, config) {
     // exactly when they fall in one window, and say so when they do not.
     from: recorded(recordedString(span.from)),
     to: recorded(recordedString(span.to)),
+    // THE ROUND'S WALL CLOCK — and deliberately NOT `to - from`. The span above is the SPAWN
+    // window, which is what a repricing needs; this is the whole action, which is what an operator
+    // asked about when they said 25 minutes is unacceptable. The action fetches a diff, waits on a
+    // scout, posts a review — none of that is inside a spawn, and a reader who derived one of these
+    // two numbers from the other would report the model's time as the run's. [LAW:one-source-of-truth]
+    // Two facts about time, both recorded, neither standing in for the other.
+    // A round that recorded no duration (a ledger entry, a legacy review) omits the field, exactly
+    // as every other unobserved fact here does — never a zero, which would assert the round was
+    // instant. [LAW:no-silent-failure]
+    totalMs: recorded(recordedQuantity(totalMs)),
   };
 }
 
@@ -33010,8 +33025,12 @@ function recorded(v) {
   return v === null ? undefined : v;
 }
 
-function costMarker(usage, config) {
-  return `<!-- ${basisOf(usage && usage.cost).marker}:${encodePayload(costRecord(usage, config))} -->`;
+// `totalMs` is the round's wall clock, or null where the sink has no round to time — see the field's
+// note in costRecord. It is passed EXPLICITLY at every call site rather than defaulted here, so a
+// sink that stops recording a duration it has says so in its own source, instead of losing the fact
+// to an argument nobody wrote. [LAW:no-silent-failure]
+function costMarker(usage, config, totalMs) {
+  return `<!-- ${basisOf(usage && usage.cost).marker}:${encodePayload(costRecord(usage, config, totalMs))} -->`;
 }
 
 // [LAW:single-enforcer] ONE rule for which marker in a body is authoritative: the LAST one. It lives
@@ -33085,6 +33104,12 @@ function parseCostRecord(body) {
     provider: recordedString(facts.provider),
     from: recordedString(facts.from),
     to: recordedString(facts.to),
+    // Screened through the SAME predicate the writer used, so the set of durations costMarker can
+    // emit IS the set this accepts, and a marker round-trips to the duration it recorded.
+    // [LAW:single-enforcer] A hand-edited negative reads as no duration at all — a cumulative total
+    // (zai-timing-31d.3) that could be driven DOWN by one corrupted body would report a PR as
+    // cheaper in time than its rounds actually cost.
+    totalMs: recordedQuantity(facts.totalMs),
   };
 }
 

@@ -129,7 +129,13 @@ async function preflightChain(chain) {
 // line carries a running PR total, and a machine-readable cost marker is embedded so the NEXT round can
 // sum this one. Repo mode passes no priorCost — the single-round line stands, and the (harmless) marker
 // simply isn't read by anyone. [LAW:dataflow-not-control-flow]
-function buildReviewFooter(usage, configUsed, priorCost, timing) {
+// [LAW:types-are-the-program] The timing envelope is DESTRUCTURED at the seam, into the two facts it
+// carries, because both of them are read in different places below — one inside the render's try, one
+// outside it. Reaching into `timing` at each use made an absent envelope a THROWN review at whichever
+// use happened to sit outside the try, which is precisely the trade this epic forbids: time is
+// diagnostics, findings are the product. Named here, an absent envelope is an absent schedule and an
+// absent total — two values the renderer already knows how to report as gaps. [LAW:no-silent-failure]
+function buildReviewFooter(usage, configUsed, priorCost, { schedule = null, totalMs } = {}) {
   const warning = costWarning(usage, configUsed);
   if (warning) core.warning(warning);
   const costLine = renderCostLine(usage, configUsed, priorCost);
@@ -142,12 +148,19 @@ function buildReviewFooter(usage, configUsed, priorCost, timing) {
   // gap inside renderTimingBreakdown.
   let timingBlock = null;
   try {
-    timingBlock = renderTimingBreakdown(timing.schedule ?? null, timing.totalMs);
+    timingBlock = renderTimingBreakdown(schedule, totalMs);
     core.info(timingBlock.split('\n')[0].replace(/^_|_$/g, ''));
   } catch (e) {
     core.warning(`Timing breakdown unavailable (${e.message}) — the review is posted without it.`);
   }
-  const marker = costMarker(usage, configUsed);
+  // The SAME total the block above rendered for humans, recorded into the marker for machines
+  // (zai-timing-31d.2) — one figure, two audiences, so a PR's cumulative agent time is summed from
+  // what its reviews actually reported rather than from a second measurement. [LAW:one-source-of-truth]
+  // It rides the cost marker deliberately: see THE RUN'S DURATION RIDES THIS RECORD in src/usage.js.
+  // Recording is outside the try above on purpose — the render is the fragile part (formatting a
+  // schedule), while `totalMs` is a number the run's own clock minted, and a failed BLOCK must not
+  // also cost the next round its summand.
+  const marker = costMarker(usage, configUsed, totalMs);
   return [buildAttributionFooter(configUsed), costLine, timingBlock, marker].filter(Boolean).join('\n\n');
 }
 
