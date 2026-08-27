@@ -4,10 +4,11 @@ name: Eval
 # golden suite against this checkout's src/ and verdict it against the committed baseline — where
 # reviewers look: a check that reds on DEGRADED, with the verdict table in the run's Step Summary.
 #
-# EVERY RUN SPENDS REAL PROVIDER CREDITS (~$3.50 and ~1 hour at the current baseline's N=5 × 4 cases;
-# compare.js prints the exact estimate, derived from the baseline's recorded $/run, before spending).
-# That is why there is NO unconditional per-PR trigger and never will be: a PR buys a run only by
-# wearing the 'eval' label, and everything else is a human pressing the dispatch button.
+# EVERY RUN SPENDS REAL PROVIDER CREDITS — compare.js prints the exact estimate (the baseline's own
+# recorded $/full-run × N) before spending; that print is the one authoritative figure, so no dollar
+# amount is repeated here to drift from it. This is why there is NO unconditional per-PR trigger and
+# never will be: a PR buys a run only by wearing the 'eval' label, and everything else is a human
+# pressing the dispatch button.
 #
 # The ticket sketched dispatch inputs for a cases filter and an N override. They are deliberately
 # absent: compare.js derives N and the case set FROM the baseline and refuses any deviation — a
@@ -35,12 +36,16 @@ concurrency:
 jobs:
   gate:
     # Dispatch always runs (a human pressed the button — that IS the spend approval). A PR runs only
-    # while wearing the 'eval' label, and a 'labeled' event buys a run only when the label being added
-    # is 'eval' itself — otherwise attaching any unrelated label to an eval-labeled PR would silently
-    # re-spend the whole suite. [LAW:no-silent-failure]
+    # when it is from THIS repo (GitHub withholds secrets from fork pull_request events, so a fork run
+    # could only burn setup time before failing on empty credentials in a way that reads like a
+    # misconfigured secret — skip it honestly up front), only while wearing the 'eval' label, and a
+    # 'labeled' event buys a run only when the label being added is 'eval' itself — otherwise attaching
+    # any unrelated label to an eval-labeled PR would silently re-spend the whole suite.
+    # [LAW:no-silent-failure]
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (contains(github.event.pull_request.labels.*.name, 'eval') &&
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       contains(github.event.pull_request.labels.*.name, 'eval') &&
        (github.event.action != 'labeled' || github.event.label.name == 'eval'))
     runs-on: ubuntu-latest
     # A suite is N full reviews per case, serial per case: ~1 hour observed at N=5. Triple headroom
@@ -66,11 +71,12 @@ jobs:
 
       - name: Gate the candidate against the frozen baseline
         env:
-          # All provider credentials the action itself accepts are forwarded; each case's pinned
-          # engine selects which one is actually read (run-case.js builds provider inputs from the
-          # same env vars the production action uses), so re-freezing the baseline onto another
-          # provider is a data change in eval/ — this workflow needs no edit. DEEPSEEK_API_KEY also
-          # serves the default llm matcher's judge (score.js reads it unconditionally for that).
+          # Every credential a golden case's pinned provider can use (deepseek/zai/openai — the set
+          # run-case.js's buildProviderInputs wires; CLAUDE_CODE_OAUTH_TOKEN is deliberately not
+          # among them) is forwarded; each case's pin selects which one is actually read, so
+          # re-freezing the baseline onto another of these providers is a data change in eval/ —
+          # this workflow needs no edit. DEEPSEEK_API_KEY also serves the default llm matcher's
+          # judge (score.js reads it unconditionally for that).
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
