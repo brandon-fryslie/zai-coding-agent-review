@@ -307,30 +307,10 @@ describe('runScopeWorkers', () => {
     assert.deepEqual(outcomes.filter(o => o.status === 'reviewed').map(o => o.result.name), ['a', 'c']);
   });
 
-  // The time a killed spawn burned still counts (zai-timing-31d.4): runEngine stamps err.span, and
-  // the unreviewed outcome carries it out as a span-only usage record — the shape sumUsage folds.
-  test('a deadline-killed worker whose error carries a span surfaces it as a span-only usage', async () => {
-    const span = { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:35:00.000Z' };
-    const scopes = [{ name: 'a' }, { name: 'b' }];
-    const runOne = async (s) => {
-      if (s.name === 'b') {
-        const err = new DeadlineExceededError('killed at the deadline');
-        err.span = span;
-        throw err;
-      }
-      return { name: s.name };
-    };
-    const outcomes = await runScopeWorkers({ scopes, runOne, maxConcurrent: 2 });
-    assert.deepEqual(outcomes[1], { status: 'unreviewed', usage: { span } });
-  });
-
-  test('a spawn refused at the deadline gate (no err.span — nothing ran) carries a null usage', async () => {
-    const scopes = [{ name: 'a' }];
-    const runOne = async () => { throw new DeadlineExceededError('spawn refused: budget exhausted'); };
-    const outcomes = await runScopeWorkers({ scopes, runOne, maxConcurrent: 1 });
-    assert.deepEqual(outcomes[0], { status: 'unreviewed', usage: null });
-  });
-
+  // The time a killed spawn burned is deliberately NOT this pool's concern (zai-timing-31d.5): it
+  // is metered at the pass's spawn seam, which records err.span before the pool absorbs the error.
+  // The pass-level contract — a killed scope's elapsed time reaches the envelope and the schedule —
+  // is asserted in the wall-clock time budget and schedule suites below.
   test('once shouldStart says no, remaining scopes are unreviewed without spawning', async () => {
     const scopes = [{ name: 'a' }, { name: 'b' }, { name: 'c' }];
     const started = [];
@@ -1413,6 +1393,150 @@ describe('runMultiScopePass — wall-clock time budget', () => {
     assert.deepEqual(review.unreviewedScopes, []);
     assert.equal(review.budgetExhausted, false);
     assert.doesNotMatch(review.summary, /Time budget/);
+  });
+});
+
+// ── the pass records its phase and schedule (zai-timing-31d.5) ────────────────────────────────────
+// Every engine spawn ATTEMPT leaves one tagged record at the pass's spawn seam, and the pass total
+// usage folds from that same list — so a spawn in the schedule is in the total and vice versa. The
+// derivation of the reportable breakdown (scout time, per-scope times, sweep grouping, wave count)
+// is asserted in test/schedule.test.js over describeSchedule; here the contract is that the pass
+// RECORDS the right facts: tags, outcomes, spans, and the scheduling values as actually used.
+describe('runMultiScopePass — the pass records its phase and schedule', () => {
+  const SCOPES = [
+    { name: 'a', focus: 'fa', files: [] },
+    { name: 'b', focus: 'fb', files: [] },
+    { name: 'c', focus: 'fc', files: [] },
+  ];
+  const material = {
+    changedPaths: [],
+    buildScoutPrompt: () => 'SCOUT',
+    buildWorkerPrompt: (focusText, _tools, _files, priorFindings) => `${priorFindings.length > 0 ? 'SWEEP ' : ''}${focusText}`,
+  };
+  const config = { engine: 'fake', name: 'c1' };
+  const at = (min) => `2026-08-22T03:${String(min).padStart(2, '0')}:00.000Z`;
+  const span = (fromMin, toMin) => ({ from: at(fromMin), to: at(toMin) });
+  const passArgs = (registry, extra = {}) => ({
+    config, material, registry, instructionsPath: 'x', maxConcurrent: 2, sweepCap: 0, log: () => {}, sleepFn: async () => {}, ...extra,
+  });
+
+  // A fake engine with known per-spawn durations: the scout runs minutes 0–2; worker for scope s in
+  // pass p runs a span derived from its name and pass, so every record's clock is predictable.
+  function makeRegistry({ workerBehavior } = {}) {
+    const workerSpan = (scope, sweep) => span(sweep ? 20 : 10, (sweep ? 20 : 10) + 1 + SCOPES.findIndex(s => s.name === scope.name));
+    const adapter = {
+      async produceReview({ buildPromptFor }) {
+        const prompt = buildPromptFor({});
+        if (prompt === 'SCOUT') {
+          return { summary: 'ctx', findings: [], scopes: SCOPES, assessments: [], usage: { span: span(0, 2) } };
+        }
+        const sweep = prompt.startsWith('SWEEP ');
+        const scope = SCOPES.find(s => prompt.includes(`${s.name} — ${s.focus}`));
+        if (workerBehavior) {
+          const out = workerBehavior({ scope, sweep });
+          if (out) return out;
+        }
+        return {
+          summary: `sum-${scope.name}`,
+          findings: sweep ? [] : [{ path: `${scope.name}.js`, line: 1, body: `bug in ${scope.name}`, severity: 3 }],
+          assessments: [],
+          usage: { span: workerSpan(scope, sweep) },
+        };
+      },
+    };
+    return { get: () => adapter };
+  }
+
+  test('a non-positive maxConcurrent is refused loudly — the recorded schedule must match what the pool did', async () => {
+    // The pool would silently clamp 0 to one lane, but the schedule records scopeConcurrency AS USED
+    // and the wave derivation divides by it — so the pass gate refuses the value before either lies.
+    await assert.rejects(runMultiScopePass(passArgs(makeRegistry(), { maxConcurrent: 0 })), /positive integer maxConcurrent/);
+    await assert.rejects(runMultiScopePass(passArgs(makeRegistry(), { maxConcurrent: 2.5 })), /positive integer maxConcurrent/);
+  });
+
+  test('a clean pass records one tagged record per spawn, plus the scheduling facts as used', async () => {
+    const review = await runMultiScopePass(passArgs(makeRegistry()));
+    const { schedule } = review;
+    assert.equal(schedule.scopeConcurrency, 2);
+    assert.equal(schedule.sweepCap, 0);
+    assert.equal(schedule.scopeCount, 3);
+    // One scout record and one worker record per scope, all completed, tagged pass 0.
+    const scouts = schedule.spawns.filter(s => s.phase === 'scout');
+    assert.equal(scouts.length, 1);
+    assert.deepEqual(scouts[0], { phase: 'scout', outcome: 'completed', usage: { span: span(0, 2) } });
+    const workers = schedule.spawns.filter(s => s.phase === 'worker');
+    assert.deepEqual(workers.map(w => w.scope).sort(), ['a', 'b', 'c']);
+    assert.ok(workers.every(w => w.pass === 0 && w.outcome === 'completed' && w.usage.span));
+  });
+
+  test('the pass total usage folds from the schedule records — one list feeds both', async () => {
+    const review = await runMultiScopePass(passArgs(makeRegistry()));
+    // Envelope: earliest start is the scout (min 0), latest end the slowest worker (scope c, min 13).
+    assert.deepEqual(review.usage.span, { from: at(0), to: at(13) });
+    assert.deepEqual(review.usage.span, sumUsage(review.schedule.spawns.map(r => r.usage)).span);
+  });
+
+  test('convergence-sweep spawns are recorded under their own pass index', async () => {
+    const review = await runMultiScopePass(passArgs(makeRegistry(), { sweepCap: 2 }));
+    const passes = [...new Set(review.schedule.spawns.filter(s => s.phase === 'worker').map(s => s.pass))].sort();
+    assert.deepEqual(passes, [0, 1]); // sweep 1 added nothing, so the loop converged before sweep 2
+    const sweepWorkers = review.schedule.spawns.filter(s => s.phase === 'worker' && s.pass === 1);
+    assert.deepEqual(sweepWorkers.map(w => w.scope).sort(), ['a', 'b', 'c']);
+  });
+
+  // The gap PR #134 deferred (ticket comment on 31d.5): retryTransientSpawn kept only the settling
+  // attempt, so a transiently-failed-then-retried spawn lost its failed attempts' burned time.
+  test('a retried transient attempt appears as its own span-only record and widens the envelope', async () => {
+    let blipped = false;
+    const registry = makeRegistry({
+      workerBehavior: ({ scope, sweep }) => {
+        if (scope.name === 'b' && !sweep && !blipped) {
+          blipped = true;
+          const err = new TransientError('API Error: terminated');
+          err.span = span(30, 45); // the failed attempt burned 15 minutes, ending past every success
+          throw err;
+        }
+        return null;
+      },
+    });
+    const review = await runMultiScopePass(passArgs(registry));
+    const retried = review.schedule.spawns.filter(s => s.outcome === 'retried');
+    assert.deepEqual(retried, [{ phase: 'worker', scope: 'b', pass: 0, outcome: 'retried', usage: { span: span(30, 45) } }]);
+    // Scope b also settled successfully — two records for one scope, attempt count derivable.
+    assert.equal(review.schedule.spawns.filter(s => s.phase === 'worker' && s.scope === 'b').length, 2);
+    // The failed attempt's burned time reaches the pass envelope: its end is the latest instant.
+    assert.equal(review.usage.span.to, at(45));
+  });
+
+  // Accept (zai-timing-31d.5): a deadline-killed scope still contributes its elapsed time.
+  test('a deadline-killed scope leaves a failed record whose elapsed time reaches the pass total', async () => {
+    const registry = makeRegistry({
+      workerBehavior: ({ scope, sweep }) => {
+        if (scope.name === 'b' && !sweep) {
+          const err = new DeadlineExceededError('killed at the deadline');
+          err.span = span(10, 50); // burned 40 minutes before the kill — the latest instant in the pass
+          throw err;
+        }
+        return null;
+      },
+    });
+    const review = await runMultiScopePass(passArgs(registry, { deadline: Date.now() + 3_600_000 }));
+    assert.deepEqual(review.unreviewedScopes, ['b']);
+    const failed = review.schedule.spawns.filter(s => s.outcome === 'failed');
+    assert.deepEqual(failed, [{ phase: 'worker', scope: 'b', pass: 0, outcome: 'failed', usage: { span: span(10, 50) } }]);
+    assert.equal(review.usage.span.to, at(50));
+  });
+
+  test('a spawn the deadline gate refused outright (nothing ran) records a usage-less failure', async () => {
+    const registry = makeRegistry({
+      workerBehavior: ({ scope, sweep }) => {
+        if (scope.name === 'b' && !sweep) throw new DeadlineExceededError('spawn refused: budget exhausted');
+        return null;
+      },
+    });
+    const review = await runMultiScopePass(passArgs(registry, { deadline: Date.now() + 3_600_000 }));
+    const failed = review.schedule.spawns.filter(s => s.outcome === 'failed');
+    assert.deepEqual(failed, [{ phase: 'worker', scope: 'b', pass: 0, outcome: 'failed', usage: null }]);
   });
 });
 

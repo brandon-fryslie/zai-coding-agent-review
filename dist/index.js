@@ -34075,6 +34075,7 @@ const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = __nccwpck_require_
 const { defaultEffortProfile, maxTier } = __nccwpck_require__(4652);
 const { dedupeFindings, dedupeAssessments, parseScopeValue } = __nccwpck_require__(1565);
 const { sumCost, emptyTokens, addTokens } = __nccwpck_require__(9614);
+const { spawnRecord, scheduleRecord } = __nccwpck_require__(7932);
 const { renderDependencyDiffNote } = __nccwpck_require__(9838);
 const { NO_EXCLUSIONS, excludedPathList } = __nccwpck_require__(9898);
 const {
@@ -34223,13 +34224,14 @@ function composeSummary(scopes, workerResults, sweeps = [], budget = { exhausted
 // pass as a clean one.
 //
 // [LAW:types-are-the-program] The pool returns one OUTCOME per scope, in scope order — a discriminated
-// value: { status: 'reviewed', result } | { status: 'unreviewed', usage }. 'unreviewed' is the time
-// budget's planned degradation, reached two ways that differ only in what was burned: shouldStart()
-// said no before the spawn (the budget was already spent — usage null, nothing ran), or the spawn was
-// killed at the deadline mid-flight (DeadlineExceededError — usage is the span-only record of the
-// wall clock it burned, which the caller folds into the pass total; zai-timing-31d.4). Both are
-// absorbed HERE, scope by scope, so sibling workers' already-earned
-// results survive — the deadline must never take the fail-loud path that discards the whole batch.
+// value: { status: 'reviewed', result } | { status: 'unreviewed' }. 'unreviewed' is the time budget's
+// planned degradation, reached two ways: shouldStart() said no before the spawn (nothing ran), or the
+// spawn was killed at the deadline mid-flight (DeadlineExceededError). Both are absorbed HERE, scope
+// by scope, so sibling workers' already-earned results survive — the deadline must never take the
+// fail-loud path that discards the whole batch. The killed spawn's burned time is NOT this pool's
+// concern: it is metered at the one spawn seam in runMultiScopePass (zai-timing-31d.5), which records
+// every attempt — including this killed one, via err.span — before the error reaches this absorber.
+// [LAW:single-enforcer] the pool schedules; the spawn seam meters.
 // Every other error still aborts the batch exactly as before; the caller decides what 'unreviewed'
 // means for its layer (a pass-0 coverage gap vs a merely-curtailed sweep).
 async function runScopeWorkers({ scopes, runOne, maxConcurrent, shouldStart = () => true }) {
@@ -34240,19 +34242,16 @@ async function runScopeWorkers({ scopes, runOne, maxConcurrent, shouldStart = ()
     while (next < scopes.length && !firstError) {
       const i = next++;
       if (!shouldStart()) {
-        // Refused before anything spawned: no time was burned, so there is no usage to carry.
-        outcomes[i] = { status: 'unreviewed', usage: null };
+        outcomes[i] = { status: 'unreviewed' }; // refused before anything spawned
         continue;
       }
       try {
         outcomes[i] = { status: 'reviewed', result: await runOne(scopes[i]) };
       } catch (e) {
         if (e instanceof DeadlineExceededError) {
-          // A killed spawn's burned time still counts (zai-timing-31d.4): runEngine stamps the span
-          // on the error, and it rides out of here as a span-only usage record — the same shape a
-          // token-less success produces, folded by the same sumUsage. [LAW:one-type-per-behavior]
-          // e.span is absent when the deadline gate refused the spawn outright: nothing ran, no usage.
-          outcomes[i] = { status: 'unreviewed', usage: e.span ? { span: e.span } : null };
+          // The kill's burned time was already recorded upstream at the spawn seam (see the pool
+          // header); here the outcome only says WHAT happened to the scope, never what it cost.
+          outcomes[i] = { status: 'unreviewed' };
           continue;
         }
         firstError = firstError || e;
@@ -34269,23 +34268,33 @@ async function runScopeWorkers({ scopes, runOne, maxConcurrent, shouldStart = ()
 // It does one thing — review one scope — and returns its raw findings + summary + usage as a value.
 // `spawn` is the transient-retry-wrapped engine spawn (see runMultiScopePass), so a blip retries THIS
 // worker in place rather than failing the whole pass. [LAW:decomposition]
-// priorFindings and labelPrefix are the convergence-sweep values (zai-recall-upr.2): the initial pass
-// runs with [] and '' (byte-identical prompt and logs), a sweep with the cumulative found list and a
-// 'sweep N ' prefix — one worker, varied by values, never a sweep mode. [LAW:one-type-per-behavior]
-async function runScopeWorker({ scope, context, material, spawn, log, priorFindings = [], labelPrefix = '' }) {
+// priorFindings and pass are the convergence-sweep values (zai-recall-upr.2): the initial pass runs
+// with [] and 0 (byte-identical prompt and logs), a sweep with the cumulative found list and its
+// pass index — one worker, varied by values, never a sweep mode. [LAW:one-type-per-behavior]
+// [LAW:one-source-of-truth] `pass` is the index as DATA (0 = the review of record, 1..N = sweeps);
+// the human-facing 'sweep N ' label derives from it via sweepLabelPrefix, and the schedule record
+// carries the number — one value, both representations derived.
+async function runScopeWorker({ scope, context, material, spawn, log, priorFindings = [], pass = 0 }) {
   const focusText = workerFocusText(scope, context);
   // [LAW:decomposition] The worker reads its scope's assigned files in full, not the whole changed set;
   // the material threads scope.files into the read instruction. Repo material ignores it (no diff).
   const buildPromptFor = (toolNames) => material.buildWorkerPrompt(focusText, toolNames, scope.files, priorFindings);
-  const label = `${labelPrefix}scope '${scope.name}'`;
+  const label = `${sweepLabelPrefix(pass)}scope '${scope.name}'`;
   log(`${label} starting…`);
   // [LAW:dataflow-not-control-flow] Every record kind the spawn produced flows through this seam
   // unbroken — findings AND dependency assessments (the go.mod-owning worker's per-module judgments).
   // Dropping assessments here would silently strip the whole feature: the aggregation's `|| []` fallback
   // would fire on every worker and every bump would render "unassessed". [LAW:no-silent-failure]
-  const { summary, findings, assessments, usage } = await spawn(buildPromptFor, label);
+  const { summary, findings, assessments, usage } = await spawn(buildPromptFor, label, { phase: 'worker', scope: scope.name, pass });
   log(`${label} done — ${findings.length} finding(s)`);
   return { name: scope.name, summary, findings, assessments, usage };
+}
+
+// [LAW:one-source-of-truth] The one derivation of a pass index's log-label prefix, shared by the
+// worker's spawn label and the pool caller's skip lines: pass 0 (the review of record) is unprefixed,
+// so its logs stay byte-identical to the pre-sweep engine.
+function sweepLabelPrefix(pass) {
+  return pass === 0 ? '' : `sweep ${pass} `;
 }
 
 // [LAW:effects-at-boundaries] Pure: given the scout's planned scopes and the changed paths the plan was
@@ -34424,8 +34433,9 @@ function uniquelyNamed(scopes) {
 
 // One full multi-scope pass for ONE config: scout → workers → aggregate. This is the produceOnce that
 // failover.produceReview drives, so the whole pass is one attempt and retry/failover wraps it as a
-// unit. Returns the same {summary, findings, usage} shape a single engine spawn used to return, so
-// every downstream sink stays unchanged. [LAW:decomposition]
+// unit. Returns the same {summary, findings, usage} shape a single engine spawn used to return —
+// plus `schedule`, the pass's recorded shape (zai-timing-31d.5) — so every downstream sink stays
+// unchanged. [LAW:decomposition]
 // `deadline` (epoch ms, null = no budget) and `now` (the injected clock, matching the sleepFn
 // convention) are the wall-clock budget: the pass stops STARTING work — scope workers and sweeps —
 // once the budget is spent, delivers everything already collected, and reports the coverage gap as
@@ -34439,33 +34449,68 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   if (!Number.isInteger(sweepCap) || sweepCap < 0) {
     throw new Error(`runMultiScopePass requires a non-negative integer sweepCap (got ${JSON.stringify(sweepCap)}); it comes from the effort profile.`);
   }
+  // [LAW:single-enforcer] Same checkpoint for the concurrency: the pool would silently clamp a
+  // nonsensical value to 1, but the schedule records scopeConcurrency AS USED and describeSchedule
+  // divides by it — a 0 or negative here would make the recorded schedule disagree with what the
+  // pool actually did (and derive Infinity waves). One loud gate keeps record and behavior one fact.
+  if (!Number.isInteger(maxConcurrent) || maxConcurrent < 1) {
+    throw new Error(`runMultiScopePass requires a positive integer maxConcurrent (got ${JSON.stringify(maxConcurrent)}); it comes from the effort profile.`);
+  }
   const adapter = registry.get(config.engine);
 
   // [LAW:decomposition] Every engine spawn in this pass goes through one transient-retry seam, so a
   // single flaky request (a dropped socket, a 5xx) is absorbed in place — the scout and each worker
   // recover independently and a blip never re-runs the whole pass. An exhausted or non-transient error
   // still propagates, so config-level failover (produceReview) is unchanged. [LAW:one-source-of-truth]
-  const spawn = (buildPromptFor, label) =>
-    retryTransientSpawn(
-      () => adapter.produceReview({ config, buildPromptFor, instructionsPath, deadline }),
-      {
-        sleepFn,
-        // The same deadline bounds the spawn AND its retry sleeps: an uncapped Retry-After near
-        // the budget's edge must not sleep the run past its own deadline. [LAW:single-enforcer]
-        // the clamp lives in retryTransientSpawn; this seam only threads the value.
-        deadline,
-        now,
-        onRetry: ({ attempt, limit, delay, err }) =>
-          log(`${label}: transient error (attempt ${attempt}/${limit}), retrying in ${Math.round(delay / 1000)}s: ${err.message}`),
-      },
-    );
+  //
+  // [LAW:single-enforcer] The same seam is the pass's ONE metering point (zai-timing-31d.5): every
+  // spawn ATTEMPT settles here, so every attempt leaves a tagged record — the successful spawn with
+  // its full usage, a transiently-failed-then-retried attempt with the span it burned (err.span,
+  // stamped by runEngine; the gap PR #134 deferred), and the settling failure (a deadline kill, an
+  // exhausted retry) with its span before the error escapes to whoever absorbs it. The pass total
+  // AND the schedule both derive from this one list, so no phase can appear in one and be forgotten
+  // by the other. [LAW:one-source-of-truth] `tag` is the record's identity — { phase: 'scout' } or
+  // { phase: 'worker', scope, pass } — a value, never re-parsed from the human-facing label. Every
+  // record is minted through spawnRecord (src/schedule.js), the one owner of the record shape, so a
+  // drifted tag or outcome fails loudly here rather than silently corrupting the derived breakdown.
+  const spawnRecords = [];
+  const spanOnlyUsage = (err) => (err.span ? { span: err.span } : null);
+  const spawn = async (buildPromptFor, label, tag) => {
+    try {
+      const result = await retryTransientSpawn(
+        () => adapter.produceReview({ config, buildPromptFor, instructionsPath, deadline }),
+        {
+          sleepFn,
+          // The same deadline bounds the spawn AND its retry sleeps: an uncapped Retry-After near
+          // the budget's edge must not sleep the run past its own deadline. [LAW:single-enforcer]
+          // the clamp lives in retryTransientSpawn; this seam only threads the value.
+          deadline,
+          now,
+          onRetry: ({ attempt, limit, delay, err }) => {
+            // [LAW:no-silent-failure] A retried attempt burned real time; it appears as its own
+            // record (span-only — a failed spawn reports no tokens) rather than vanishing into
+            // the retry loop. err.span is absent when the failure predated the spawn: nothing ran.
+            spawnRecords.push(spawnRecord(tag, 'retried', spanOnlyUsage(err)));
+            log(`${label}: transient error (attempt ${attempt}/${limit}), retrying in ${Math.round(delay / 1000)}s: ${err.message}`);
+          },
+        },
+      );
+      spawnRecords.push(spawnRecord(tag, 'completed', result.usage));
+      return result;
+    } catch (err) {
+      // The settling failure's burned time is recorded BEFORE the error escapes — a deadline-killed
+      // worker is absorbed as 'unreviewed' by the pool downstream, but its record is already here.
+      spawnRecords.push(spawnRecord(tag, 'failed', spanOnlyUsage(err)));
+      throw err;
+    }
+  };
 
   // Layer 1 — the scout: a survey-only spawn. Its product is the typed scope records it logged through
   // the add_scope collector tool (validated at the collector boundary), plus a structural summary that
   // becomes shared worker context. Its findings, if any, are ignored by design. [LAW:no-silent-failure]
   // a scout that planned zero scopes fails loud here rather than running zero workers and "succeeding"
   // having reviewed nothing.
-  const scoutResult = await spawn(material.buildScoutPrompt, 'scout');
+  const scoutResult = await spawn(material.buildScoutPrompt, 'scout', { phase: 'scout' });
   if (scoutResult.scopes.length === 0) {
     throw new Error(`Scout planned no scopes (no add_scope calls). Scout summary:\n${scoutResult.summary}`);
   }
@@ -34508,9 +34553,6 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   const allResults = [];
   const sweeps = [];
   const unreviewedScopes = [];
-  // Span-only usage records from deadline-killed spawns (null when nothing spawned) — folded into
-  // the pass total below so the envelope covers time a killed scope burned. [LAW:one-source-of-truth]
-  const unreviewedUsages = [];
   let budgetExhausted = false;
   let findings = [];
   for (let pass = 0; pass <= sweepCap; pass++) {
@@ -34523,18 +34565,16 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
       log(`convergence sweeps stopped before sweep ${pass} — time budget exhausted`);
       break;
     }
-    const labelPrefix = pass === 0 ? '' : `sweep ${pass} `;
     const priorFindings = findings;
     const outcomes = await runScopeWorkers({
       scopes,
       maxConcurrent,
       shouldStart: () => remainingMs(deadline, now()) > 0,
-      runOne: (scope) => runScopeWorker({ scope, context, material, spawn, log, priorFindings, labelPrefix }),
+      runOne: (scope) => runScopeWorker({ scope, context, material, spawn, log, priorFindings, pass }),
     });
     const results = outcomes.filter(o => o.status === 'reviewed').map(o => o.result);
     const skipped = scopes.filter((s, i) => outcomes[i].status === 'unreviewed');
-    unreviewedUsages.push(...outcomes.filter(o => o.status === 'unreviewed').map(o => o.usage));
-    for (const s of skipped) log(`${labelPrefix}scope '${s.name}' not reviewed — time budget exhausted`);
+    for (const s of skipped) log(`${sweepLabelPrefix(pass)}scope '${s.name}' not reviewed — time budget exhausted`);
     if (skipped.length > 0) budgetExhausted = true;
     if (pass === 0) {
       // An unreviewed scope at pass 0 is a COVERAGE gap, carried as data to the summary and the
@@ -34574,9 +34614,21 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     // any; dedupeAssessments (keyed by module) collapses the multi-go.mod case — and the sweep-pass
     // re-assessments, which collapse by the same module key. Non-dependency PR → [].
     assessments: dedupeAssessments(allResults.flatMap(r => r.assessments)),
-    // The unreviewed usages make the recorded envelope honest: a scope the deadline killed mid-spawn
-    // burned real wall clock, and its span widens the pass window exactly as a reviewed spawn's does.
-    usage: sumUsage([scoutResult.usage, ...allResults.map(r => r.usage), ...unreviewedUsages]),
+    // [LAW:one-source-of-truth] The pass total folds from the SAME record list the schedule reports,
+    // so "what this pass consumed" has one owner: a spawn in the schedule is in the total, and a
+    // spawn in the total is in the schedule — including retried attempts and deadline-killed scopes,
+    // whose span-only records widen the envelope exactly as a reviewed spawn's does.
+    usage: sumUsage(spawnRecords.map(r => r.usage)),
+    // The pass's recorded shape (zai-timing-31d.5): the scheduling facts as actually used, plus one
+    // record per spawn attempt. Wave count is deliberately NOT stored — it derives from scopeCount
+    // and scopeConcurrency (describeSchedule, src/schedule.js), so the record cannot contradict
+    // itself. [LAW:one-source-of-truth]
+    schedule: scheduleRecord({
+      scopeConcurrency: maxConcurrent,
+      sweepCap,
+      scopeCount: scopes.length,
+      spawns: spawnRecords,
+    }),
     // [LAW:one-source-of-truth] The coverage gap as DATA, for the sinks: the PR sink withholds
     // approval when unreviewedScopes is non-empty (transport.submitReview), and run.js warns when
     // the budget bit at all. The summary text above derives from these same values, never the
@@ -36937,6 +36989,146 @@ async function run() {
 }
 
 module.exports = { run, runPrReview, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, MAX_DEPENDENCY_BUMPS_FETCHED };
+
+
+/***/ }),
+
+/***/ 7932:
+/***/ ((module) => {
+
+"use strict";
+
+
+// The pass's SCHEDULE, derived — the facts that turn per-spawn time into wall-clock time.
+//
+// [FRAMING:representation] Summed spawn time and elapsed wall time are different numbers, and their
+// ratio is the diagnosis: an operator who sees only a total cannot tell a slow model (fix: faster
+// engine) from too many waves (fix: raise concurrency) from too many sweeps (fix: lower sweepCap) —
+// three causes with opposite remedies. The schedule value recorded by runMultiScopePass carries the
+// facts; this module derives everything derivable from them, so the record can never contradict
+// itself — wave count is never STORED anywhere, it always falls out of scope count and concurrency.
+// [LAW:one-source-of-truth]
+//
+// The recorded schedule value:
+//   { scopeConcurrency, sweepCap, scopeCount, spawns: SpawnRecord[] }
+// where each SpawnRecord is a discriminated value, one per engine spawn ATTEMPT:
+//   { phase: 'scout',                     outcome, usage }
+//   { phase: 'worker', scope, pass,      outcome, usage }
+// pass 0 is the review of record; pass 1..N are convergence sweeps. outcome is
+// 'completed' (the spawn settled with a result), 'retried' (a transient attempt retried in place —
+// its burned time is real and appears as its own record), or 'failed' (the settling attempt failed:
+// deadline-killed, retry-exhausted, or non-retryable). usage is the spawn's Usage record — its
+// host-stamped span carries the duration — or null when nothing ran (a pre-spawn refusal).
+// [LAW:types-are-the-program]
+
+// [LAW:one-source-of-truth] THIS module owns the SpawnRecord shape: the producer (the spawn seam in
+// src/multiscope.js) mints every record through spawnRecord below, so a drifted tag or outcome
+// fails loudly at the mint, never as a silently-wrong breakdown. [LAW:parse-dont-validate] the
+// constructor is the checkpoint: a SpawnRecord exists only by passing it, so everything downstream
+// reads the stamp instead of re-checking the shape. [LAW:single-enforcer] the mint is the ONE
+// checkpoint for the vocabulary — describeSchedule does not re-validate `outcome` (it carries it
+// through without branching); its phase throw is exhaustive DISPATCH, not a second check, because
+// phase is the one field the fold branches on.
+const SPAWN_OUTCOMES = new Set(['completed', 'retried', 'failed']);
+function spawnRecord(tag, outcome, usage) {
+  if (tag.phase !== 'scout' && tag.phase !== 'worker') {
+    throw new Error(`spawnRecord: unknown phase ${JSON.stringify(tag.phase)}`);
+  }
+  if (tag.phase === 'worker' && (typeof tag.scope !== 'string' || !Number.isInteger(tag.pass) || tag.pass < 0)) {
+    throw new Error(`spawnRecord: a worker tag needs a scope name and a non-negative pass index (got ${JSON.stringify(tag)})`);
+  }
+  if (!SPAWN_OUTCOMES.has(outcome)) {
+    throw new Error(`spawnRecord: unknown outcome ${JSON.stringify(outcome)}`);
+  }
+  return { ...tag, outcome, usage };
+}
+
+// [LAW:one-source-of-truth] The OUTER shape gets the same owner the inner one has: the pass builds
+// its schedule envelope through this mint, so a renamed or dropped field fails loudly here instead
+// of surfacing as describeSchedule deriving NaN waves from an undefined count. The domains mirror
+// the pass's own entry gates (positive concurrency, non-negative sweep cap); the gates exist to
+// fail BEFORE spawns are spent, this mint to stamp the record — same predicate, different instant.
+function scheduleRecord({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
+  if (!Number.isInteger(scopeConcurrency) || scopeConcurrency < 1) {
+    throw new Error(`scheduleRecord: scopeConcurrency must be a positive integer (got ${JSON.stringify(scopeConcurrency)})`);
+  }
+  if (!Number.isInteger(sweepCap) || sweepCap < 0) {
+    throw new Error(`scheduleRecord: sweepCap must be a non-negative integer (got ${JSON.stringify(sweepCap)})`);
+  }
+  if (!Number.isInteger(scopeCount) || scopeCount < 1) {
+    throw new Error(`scheduleRecord: scopeCount must be a positive integer (got ${JSON.stringify(scopeCount)})`);
+  }
+  if (!Array.isArray(spawns)) {
+    throw new Error('scheduleRecord: spawns must be an array of spawn records');
+  }
+  return { scopeConcurrency, sweepCap, scopeCount, spawns };
+}
+
+// [LAW:effects-at-boundaries] Pure: a span's duration in milliseconds. Absent span → null — a
+// recorded absence (nothing ran, or the failure predated the spawn), never a fabricated zero.
+// [LAW:parse-dont-validate] spans arrive host-stamped by runEngine (ISO-8601 UTC, both ends), so
+// there is nothing to defend against here: absent is the only legal alternative to well-formed.
+function spanMs(span) {
+  if (!span) return null;
+  return Date.parse(span.to) - Date.parse(span.from);
+}
+
+// [LAW:effects-at-boundaries] Pure: sum the present durations; all-absent sums to null, matching
+// sumUsage's convention (a fold over nothing reports nothing, never a fabricated zero).
+function sumMs(values) {
+  const present = values.filter(v => v != null);
+  if (present.length === 0) return null;
+  return present.reduce((a, b) => a + b, 0);
+}
+
+// [LAW:effects-at-boundaries] Pure: derive the reportable breakdown from a recorded schedule.
+// Returns {
+//   scoutMs,            // the scout phase's spawn time (all scout attempts summed), null if unclocked
+//   passes: [           // worker spawns grouped by pass index, ascending; order within a pass is
+//     { pass, spawns: [{ scope, outcome, ms }], waves }   // settle order, as recorded
+//   ],
+//   scopeCount, scopeConcurrency, sweepCap,        // the scheduling facts, echoed as recorded
+//   waveCount,          // sum of each pass's waves — DERIVED, so it cannot contradict the records
+// }
+// [LAW:one-source-of-truth] A pass's `waves` derives from the DISTINCT scopes that actually spawned
+// in it — ceil(distinctScopes / scopeConcurrency) — never from the planned scopeCount: a pass the
+// time budget cut short mid-wave ran fewer waves than the plan implies, and a retried attempt is a
+// second record for the SAME scope, not a second slot in a wave. So waveCount reflects work that
+// actually ran — a fully-refused pass contributes no group, a partially-refused one only the waves
+// its spawned scopes filled — never work that was merely planned.
+function describeSchedule({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
+  const scoutDurations = [];
+  const byPass = new Map();
+  // [LAW:no-silent-failure] The dispatch is EXHAUSTIVE over the phase vocabulary this module owns:
+  // a record with a phase this fold doesn't recognize would otherwise vanish from the breakdown —
+  // the exact drift the shared constructor exists to make impossible — so it throws instead.
+  for (const s of spawns) {
+    if (s.phase === 'scout') {
+      scoutDurations.push(spanMs(s.usage && s.usage.span));
+    } else if (s.phase === 'worker') {
+      if (!byPass.has(s.pass)) byPass.set(s.pass, []);
+      byPass.get(s.pass).push({ scope: s.scope, outcome: s.outcome, ms: spanMs(s.usage && s.usage.span) });
+    } else {
+      throw new Error(`describeSchedule: unknown phase ${JSON.stringify(s.phase)} in spawn record`);
+    }
+  }
+  const scoutMs = sumMs(scoutDurations);
+  const passes = [...byPass.keys()].sort((a, b) => a - b).map(pass => {
+    const spawns = byPass.get(pass);
+    const distinctScopes = new Set(spawns.map(s => s.scope)).size;
+    return { pass, spawns, waves: Math.ceil(distinctScopes / scopeConcurrency) };
+  });
+  return {
+    scoutMs,
+    passes,
+    scopeCount,
+    scopeConcurrency,
+    sweepCap,
+    waveCount: passes.reduce((sum, p) => sum + p.waves, 0),
+  };
+}
+
+module.exports = { spawnRecord, scheduleRecord, spanMs, sumMs, describeSchedule };
 
 
 /***/ }),
