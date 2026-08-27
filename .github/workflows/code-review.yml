@@ -31,7 +31,14 @@ name: AI Code Review
 # prIsFromFork check.
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `ready_for_review` is deliberately ABSENT. GitHub does NOT suppress `opened`
+    # for a PR created as a draft, so a draft is already reviewed at creation; and
+    # nothing in this template guards on `draft == false`. Marking that PR ready
+    # carries no new commit, so `head.sha` is byte-identical to the SHA just
+    # reviewed — the event could only ever buy a second, fully-billed review of a
+    # diff already reviewed. Adding it back requires first adding the draft guard
+    # that would make the first review not happen. [LAW:no-mode-explosion]
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
@@ -56,19 +63,20 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout pull request
-        # SHA-pinned, unlike the review action below — a deliberately DIFFERENT posture for a
-        # DIFFERENT risk. checkout is third-party code fetched over the network on every run,
-        # including untrusted fork PRs, before this job's own prIsFromFork gating (which lives
-        # inside the review action's process, not this workflow) ever runs. A moving tag here
-        # means a future compromised or malicious checkout release executes automatically, with
-        # no review, on every incoming PR. The review action's `uses: ./` line below
-        # is a repo we control and review, checked out from a repo already fetched by THIS step —
-        # its moving-tag argument doesn't transfer to a third party with no such relationship.
+        # SHA-pinned, unlike the review action below — a deliberately DIFFERENT posture for
+        # a DIFFERENT risk, not an inconsistency to tidy up. checkout is THIRD-PARTY code
+        # fetched over the network on every run, including on untrusted fork PRs, and it
+        # runs BEFORE the review action's own fork gating (which lives inside that action's
+        # process, not in this workflow). Under a moving tag, a future compromised release
+        # would execute automatically, unreviewed, on every incoming PR.
         #
-        # Bump by re-running the installer once the template's pin is updated (its version
-        # comment, not this line's prose, is what to keep in sync) — same re-bump cost the
-        # moving-tag argument was built to avoid for the org's own action, accepted here because
-        # the action fetched is not one we author.
+        # The moving-tag argument that governs the review action does not transfer here: it
+        # rests on the ref pointing at a repo we author, review, and release — a
+        # relationship no third party has with us. So this pin accepts exactly the re-bump
+        # cost that argument avoids, because the code being fetched is not ours.
+        # [LAW:one-type-per-behavior] Two different trust relationships, two rules.
+        #
+        # Bump by editing this template and re-running the installer everywhere.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -87,13 +95,8 @@ jobs:
       # Pinned to the action's moving major tag on purpose: this repo tracks its latest
       # release with no edit here, ever. Pinning a SHA instead would mean a PR against
       # every consuming repo for every release, which in practice means none of them get
-      # updated. The ref is chosen by the installer (`./` in the action's own source repo,
-      # dogfooding whatever is on the checked-out branch; `ACTION_REF` everywhere else) —
-      # and, like the checkout pin above, the version appears on the `uses:` line and
-      # nowhere else.
-      #
-      # id: review — read by the dogfood-only transcript-archive step below (a no-op
-      # output for consumer repos that don't reference it).
+      # updated. The ref is chosen in the template, which owns this file — and, like the
+      # checkout pin above, the version appears on the `uses:` line and nowhere else.
       #
       # BOTH credentials are passed on purpose. PROVIDER defaults to `auto`, which the
       # action retargets centrally — it moved from deepseek to claude-subscription in
@@ -110,40 +113,45 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           # DEPENDENCY_DIFF is on for EVERY repo this installs into — a deliberate
           # universal default baked into the template, NOT a per-repo divergence that
-          # leaked in. The feature (src/dependency-diff.js) only scans go.mod diffs: on a
-          # PR that bumps a Go module requirement, the reviewer fetches the bumped
+          # leaked in. On a PR that bumps a dependency the reviewer fetches the bumped
           # module's upstream commits and changed files instead of reviewing a bare
-          # version string. For a non-Go repo (no go.mod — this template applies to any
-          # language) it is presently a harmless no-op, not a feature that "helps in any
-          # repo"; it costs nothing to leave on. Because it lives in the template, this IS
-          # the baseline: a re-run of the installer preserves it. Do not "reconverge to a
-          # barer default" by removing it — there is no barer default, and stripping it
-          # silently degrades every Go dependency-bump review.
+          # version string. Scope, stated honestly: the action recognizes `go.mod`
+          # require-line bumps and nothing else, so in a repo with no `go.mod` this
+          # input is INERT — it costs nothing and can never fire. It is on everywhere
+          # because a universally-safe default beats a per-repo question, not because
+          # it helps every repo. Do not "reconverge to a barer default" by removing
+          # it — there is no barer default, and stripping it silently degrades every
+          # go.mod dependency-bump review.
           DEPENDENCY_DIFF: "true"
-          # Dogfood-only additions (this repo IS the action's source; not part of the
-          # consumer template — see install.sh's self-repo overlay). PROVIDER: auto
-          # exercises the shipped default resolution path live on every PR here.
-          PROVIDER: auto
-          # Deliberately left wired to a repo variable that is NOT set, so every PR here is
-          # live coverage of the blank-input path: this interpolates to "", which the action
-          # resolves to its own default reviewer name (parseReviewerName). Setting the
-          # variable renames the reviewer without editing this file; leaving it unset must
-          # stay indistinguishable from omitting the input.
-          ZAI_REVIEWER_NAME: ${{ vars.ZAI_REVIEWER_NAME }}
-          # dist/** is committed BUNDLED output (ncc): every feature PR changes it, and
-          # reviewing the 1.5 MB bundle in full costs ~700K input tokens for zero signal —
-          # CI already verifies dist matches a fresh build of src/. EXCLUDE_PATTERNS
-          # REPLACES action.yml's default (it does not append), so the lock-file patterns
-          # are copied from it — keep them in sync if that default changes.
-          EXCLUDE_PATTERNS: "dist/**,*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml"
+          # Generated, committed build output is reviewed by NO repo. A bundle is
+          # mechanically derived from sources the reviewer is already reading, so a
+          # finding against it is either a restatement of one already made upstream or
+          # a comment on machine output nobody edits — and the repo's own CI proves
+          # the bundle matches a fresh build far more exactly than a reader can.
+          # Measured here: a review that read a 1.5 MB ncc bundle spent an entire
+          # scope concluding it was a "faithful, byte-consistent rebuild", at ~700K
+          # input tokens for that zero-signal confirmation.
+          #
+          # EXCLUDE_PATTERNS REPLACES action.yml's default rather than appending to
+          # it, so the lock-file patterns are carried explicitly here. Dropping one
+          # from this line silently un-excludes it. [LAW:one-source-of-truth]
+          EXCLUDE_PATTERNS: "dist/**,build/**,*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml"
 
-      # Dogfood-only: archive the full session transcript (prompt + raw engine output
-      # incl. thinking/tool calls + stderr) on every run, success or failure — not part
-      # of the consumer template. if: always() captures it even when the review step
-      # fails; if-no-files-found: ignore tolerates a run that spawned no engine (e.g. a
-      # fork-PR skip), where the directory is legitimately empty.
+      # The transcript is the only artifact that can explain a review that failed,
+      # hung, or misbehaved — the exact prompt, the raw engine output including
+      # thinking and tool calls, and stderr, for every attempt. action.yml produces
+      # it on EVERY termination path and documents this exact consumption; a
+      # template that never consumed it left every consumer with a failed run and
+      # nothing to read. [LAW:no-silent-failure]
+      #
+      # `if: always()` because the run that most needs a transcript is the one that
+      # failed. The output guard covers the paths that legitimately spawn no engine
+      # (a fork-PR skip), where the directory is empty rather than missing.
       - name: Archive review transcript
         if: always() && steps.review.outputs.transcript-dir != ''
+        # SHA-pinned for the same reason as the checkout above: third-party code fetched
+        # over the network on every run, so it does not inherit the moving-tag argument
+        # that governs our own action.
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: review-session-transcript

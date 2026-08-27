@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { TransientError, classifyTransient } = require('../failover');
-const { computeCostUsd } = require('../usage');
+const { priceFromTable, spawnFromTokens } = require('../usage');
 const { makeCliAdapter } = require('./cli');
 const { resolveReasoningTier } = require('../effort');
 
@@ -176,11 +176,18 @@ function assertSucceeded(stdout) {
 
 // [LAW:effects-at-boundaries] Pure: reads usage from the engine's own JSONL output and returns
 // a Usage value, or null when no usage was reported. Codex emits NO USD — 'actual USD' is
-// tokens x the centralized price table (computeCostUsd); a model absent from the
-// table yields cost {basis:'unpriced', reason:'no-price'}, never a fabricated zero. [LAW:no-silent-failure]
+// tokens x the centralized price table (priceFromTable), which reports its own reason when it cannot
+// price a spawn and never a fabricated zero. [LAW:no-silent-failure]
 // The cumulative turn usage rides on the final turn.completed event; later events overwrite
 // earlier ones so the last wins. An absent/empty usage object (no token fields) is reported as
 // no usage (null), not as a $0.00 run. [LAW:dataflow-not-control-flow]
+//
+// input_tokens is a SUM ACROSS THE TURN'S MODEL REQUESTS, not the size of any one prompt — measured
+// 2026-08-27 against a live codex run, where one turn making three requests of ~26K context each
+// reported 78,338 with cached_input_tokens 52,352 (the two later requests re-reading the same prefix).
+// That is why a context-tiered model prices from an interval rather than from this number; see
+// THE SPAWN FACTS in src/usage.js. usage appears on turn.completed and on no other event, so a
+// per-request context length cannot be recovered from this stream at all.
 function extractUsage(stdout, config, startedAt) {
   let usage = null;
   for (const line of stdout.split('\n')) {
@@ -205,13 +212,13 @@ function extractUsage(stdout, config, startedAt) {
   };
   // `startedAt` is the spawn's start instant, supplied by makeCliAdapter — the price table is a
   // schedule, so the rate is selected by WHEN this spawn ran, not by a clock read in here.
-  const costUsd = computeCostUsd(tokens, config.model, startedAt);
-  // [LAW:types-are-the-program] cost is a discriminated value. Codex reports no USD, so a null
-  // here means exactly one thing — the model is absent from the price table — and the adapter
-  // declares that reason at the point it knows it, rather than the boundary re-deriving it.
-  // The basis is always 'dollars': codex declares credentialKinds ['api-key'], so no codex run can
+  // [LAW:types-are-the-program] cost is a discriminated value, and priceFromTable returns it whole —
+  // dollars, or unpriced carrying the reason it discovered. This adapter never manufactures that
+  // reason: codex can reach two of them (the model is absent from the table, or its schedule covers
+  // no card for this spawn) and telling them apart is the price table's job, not the adapter's.
+  // The basis is never 'subscription': codex declares credentialKinds ['api-key'], so no codex run can
   // ever be billed to a subscription and this adapter has no notional arm to reach.
-  const cost = costUsd == null ? { basis: 'unpriced', reason: 'no-price' } : { basis: 'dollars', usd: costUsd };
+  const cost = priceFromTable(spawnFromTokens(startedAt, tokens), config.model);
   return { tokens, cost };
 }
 

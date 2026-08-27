@@ -20,7 +20,7 @@ const sourceVerifiedOn = verifiedOn => ({
   vendor: 'Testco',
   url: 'https://example.invalid/pricing',
   verifiedOn,
-  models: { 'test-model': { rates: { input: 1, cachedInput: 0.1, output: 2 }, tiers: [] } },
+  models: { 'test-model': { tiers: [{ when: [], rates: { input: 1, cachedInput: 0.1, output: 2 } }] } },
 });
 
 const NOW = new Date('2026-08-26T12:00:00.000Z');
