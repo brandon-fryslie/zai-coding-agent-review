@@ -36330,12 +36330,13 @@ async function preflightChain(chain) {
 // line carries a running PR total, and a machine-readable cost marker is embedded so the NEXT round can
 // sum this one. Repo mode passes no priorCost — the single-round line stands, and the (harmless) marker
 // simply isn't read by anyone. [LAW:dataflow-not-control-flow]
-// [LAW:types-are-the-program] The timing envelope is DESTRUCTURED at the seam, into the two facts it
-// carries, because both of them are read in different places below — one inside the render's try, one
+// [LAW:types-are-the-program] The timing envelope is DESTRUCTURED at the seam, into the three facts it
+// carries, because they are read in different places below — two inside the render's try, one
 // outside it. Reaching into `timing` at each use made an absent envelope a THROWN review at whichever
 // use happened to sit outside the try, which is precisely the trade this epic forbids: time is
-// diagnostics, findings are the product. Named here, an absent envelope is an absent schedule and an
-// absent total — two values the renderer already knows how to report as gaps. [LAW:no-silent-failure]
+// diagnostics, findings are the product. Named here, an absent envelope is an absent schedule, an
+// absent total and an absent prior duration — three values the renderer already knows how to report
+// as gaps, the last of them as no cumulative clause at all. [LAW:no-silent-failure]
 function buildReviewFooter(usage, configUsed, priorCost, { schedule = null, totalMs, priorDuration = null } = {}) {
   const warning = costWarning(usage, configUsed);
   if (warning) core.warning(warning);
@@ -39780,15 +39781,26 @@ function emptyTally() {
 }
 
 // [LAW:single-enforcer] THE fold. Every quantity summed across rounds passes through here, so the
-// treatment of an unrecorded figure cannot differ between cost and time. `n` is whatever the one
-// reader (parseCostRecord) recovered — already screened to a non-negative finite number or null —
-// and anything not finite is an absence, never a zero.
+// treatment of an unrecorded figure cannot differ between cost and time.
+//
+// What counts as countable is NOT decided here: it is `recordedQuantity`, the same predicate the
+// marker boundary screens with, so the sign rule has ONE definition rather than one per site. The
+// three producers that reach this fold are genuinely different — a marker's parsed `totalMs`, a
+// live-computed cost figure, and the run's own raw duration — and only the first has already been
+// screened. Routing all three through the one predicate makes the guarantee a property of the fold
+// instead of a promise each caller has to keep. [LAW:one-source-of-truth]
+//
+// So a negative from ANY source lands in unknownCount: a total that could be driven DOWN by one bad
+// figure would report a PR as cheaper in money or in time than its rounds actually cost, and
+// under-counting is the direction that releases a budget gate rather than tripping it. An
+// unrepresentable quantity is an absence, never a zero and never a subtraction. [LAW:no-silent-failure]
 function tallyQuantity(tally, n) {
-  if (Number.isFinite(n)) {
-    tally.total += n;
-    tally.count++;
-  } else {
+  const q = recordedQuantity(n);
+  if (q === null) {
     tally.unknownCount++;
+  } else {
+    tally.total += q;
+    tally.count++;
   }
   return tally;
 }

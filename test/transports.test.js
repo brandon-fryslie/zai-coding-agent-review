@@ -292,12 +292,26 @@ describe('summarizePriorReviews', () => {
 
   // A marker is free text in a body anyone with write access can edit. Under-counting time is the
   // direction that makes a slow PR look fast, so a negative is unrecordable — not a smaller number.
+  //
+  // The marker name is spelled EXACTLY as BASIS.dollars.marker writes it. A near-miss name is not a
+  // weaker version of this test, it is a different test: ANY_MARKER_RE would not match at all, the
+  // record would read as null, and the round would land in unknownCount by the markerless path the
+  // test above already covers — passing even with the sign screening deleted. [LAW:verifiable-goals]
+  //
+  // So the assertions pin the per-FIELD screening, which is the actual claim: the forged round's
+  // cost still parses and tallies, while its duration alone is refused. A body is a bag of facts,
+  // and one unrecordable fact does not discard the others.
   test('a hand-edited negative duration cannot drive the PR total DOWN', async () => {
-    const forged = `verdict\n\n<!-- agent-review-cost:{"usd":0.01,"totalMs":-999999} -->\n\n${REVIEW_MARKER}`;
+    const forged = `verdict\n\n<!-- agent-review-cost-usd:{"usd":0.01,"totalMs":-999999} -->\n\n${REVIEW_MARKER}`;
     const octokit = fakeOctokit([[{ body: withDuration(0.05, 60_000) }, { body: forged }]]);
-    const { duration } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
-    assert.equal(duration.total, 60_000);     // unchanged by the forgery
+    const { duration, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
+    assert.equal(duration.total, 60_000);     // unchanged by the forgery — never 60_000 - 999_999
+    assert.equal(duration.count, 1);
     assert.equal(duration.unknownCount, 1);   // and the forged round is still COUNTED, as unknown
+    // The same body's cost DID parse: the marker matched and only the negative field was refused.
+    // Without this, a name typo would make the test pass for the wrong reason.
+    assert.equal(Number(cost.billed.total.toFixed(2)), 0.06);
+    assert.equal(cost.billed.count, 2);
   });
 
   test('returns zeroes when the PR has no reviews', async () => {
