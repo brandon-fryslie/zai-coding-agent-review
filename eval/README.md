@@ -450,6 +450,28 @@ move finding quality. Run `eval/compare.js` and paste the verdict table into the
 efficiency epic's quality-sensitive tickets (`copirate-efficiency-235.2`–`.5`) name this as their
 acceptance instrument.
 
+### Running it in CI
+
+`.github/workflows/eval.yml` runs the same command in GitHub Actions and puts the verdict where
+reviewers look: the verdict table lands in the run's **Step Summary**, `DEGRADED` reds the check
+(exit `1`), and the candidate root (per-run findings, scorecards, transcripts, `verdict.{md,json}`)
+is uploaded as the `eval-candidate` artifact even on a red or aborted run.
+
+Two triggers, both deliberate spends (~$3.50 and ~1 hour per run at the current baseline):
+
+- **On demand**: `gh workflow run eval.yml` (optionally `--ref <branch>`) — pressing the button is
+  the spend approval. The candidate is that ref's checkout.
+- **Per PR, label-gated**: attach the **`eval`** label to a PR. There is *no* unconditional per-PR
+  trigger, and unrelated label changes on an already-labeled PR do not re-run the suite; a push to
+  a labeled PR does. The candidate is the PR merge ref — the code as it would land.
+
+The workflow checks out with `fetch-depth: 0` because the no-`--baseline` newest-pick ranks
+committed baselines by commit-graph order, which a shallow clone collapses to a refused tie. It
+forwards every provider credential the action accepts (`DEEPSEEK_API_KEY`, `ZAI_API_KEY`,
+`OPENAI_API_KEY`); the cases' pinned engine selects which one is read, so re-freezing the baseline
+onto another provider changes no workflow line. Runs share one concurrency group — a second trigger
+queues rather than interleaving spend.
+
 ### The gate's own validation (the sabotage test)
 
 The gate is only trustworthy if it *fires* on a genuinely worse engine, so it is validated by
