@@ -68,6 +68,13 @@ const prior = ({ usd = 0, count = 0, unknownCount = 0, notionalUsd = 0, notional
   notional: { usd: notionalUsd, count: notionalCount, unknownCount: notionalUnknownCount },
 });
 
+// The two instants the fixtures below are priced at. DeepSeek's schedule is 01:00-04:00 and
+// 06:00-10:00 UTC, Monday through Friday, so these sit on opposite tiers of the same week — and
+// OFF_PEAK is a Saturday, which is off-peak by DAY at an hour that would be peak on a weekday.
+// Every flat-rate model prices identically at either, which is the point: only the schedule varies.
+const OFF_PEAK = new Date('2026-08-22T02:30:00.000Z'); // Saturday 02:30 UTC
+const PEAK = new Date('2026-08-20T02:30:00.000Z');     // Thursday 02:30 UTC
+
 // --- computeCostUsd ---
 
 describe('computeCostUsd', () => {
@@ -77,37 +84,114 @@ describe('computeCostUsd', () => {
     const cost = computeCostUsd(
       { inputCacheMiss: 6_000, inputCacheHit: 4_000, output: 2_000 },
       'gpt-5.4-mini',
+      OFF_PEAK,
     );
     assert.ok(Math.abs(cost - 0.0138) < 1e-9, `expected ~0.0138, got ${cost}`);
   });
 
   test('a non-finite result (NaN token count) is null (unknown), never a NaN cost', () => {
-    assert.equal(computeCostUsd({ inputCacheMiss: NaN, inputCacheHit: 0, output: 2_000 }, 'gpt-5.4-mini'), null);
+    assert.equal(computeCostUsd({ inputCacheMiss: NaN, inputCacheHit: 0, output: 2_000 }, 'gpt-5.4-mini', OFF_PEAK), null);
   });
 
   test('treats absent cached tokens as zero (all input billed at full rate)', () => {
-    const cost = computeCostUsd({ inputCacheMiss: 1_000_000, inputCacheHit: 0, output: 0 }, 'gpt-5.5');
+    const cost = computeCostUsd({ inputCacheMiss: 1_000_000, inputCacheHit: 0, output: 0 }, 'gpt-5.5', OFF_PEAK);
     assert.equal(cost, 5.00);
   });
 
   test('prices deepseek and glm models from the same table (one mechanism, every provider)', () => {
-    // deepseek-v4-pro: input 0.435, output 0.87. 1M in + 1M out = 0.435 + 0.87 = 1.305.
-    const ds = computeCostUsd({ inputCacheMiss: 1_000_000, inputCacheHit: 0, output: 1_000_000 }, 'deepseek-v4-pro');
-    assert.ok(Math.abs(ds - 1.305) < 1e-9, `deepseek: got ${ds}`);
+    // deepseek-v4-pro off-peak: input 0.66, output 1.98. 1M in + 1M out = 0.66 + 1.98 = 2.64.
+    const ds = computeCostUsd({ inputCacheMiss: 1_000_000, inputCacheHit: 0, output: 1_000_000 }, 'deepseek-v4-pro', OFF_PEAK);
+    assert.ok(Math.abs(ds - 2.64) < 1e-9, `deepseek: got ${ds}`);
     // glm-5.1: input 1.40, cachedInput 0.26, output 4.40. 800k non-cached @1.40 + 200k @0.26 + 100k out @4.40.
-    const glm = computeCostUsd({ inputCacheMiss: 800_000, inputCacheHit: 200_000, output: 100_000 }, 'glm-5.1');
+    const glm = computeCostUsd({ inputCacheMiss: 800_000, inputCacheHit: 200_000, output: 100_000 }, 'glm-5.1', OFF_PEAK);
     const expected = (800_000 * 1.40 + 200_000 * 0.26 + 100_000 * 4.40) / 1e6;
     assert.ok(Math.abs(glm - expected) < 1e-9, `glm: got ${glm}`);
   });
 
   test('returns null for a model with no price-table entry — never a fabricated zero', () => {
-    assert.equal(computeCostUsd({ inputCacheMiss: 100, inputCacheHit: 0, output: 100 }, 'gpt-unknown'), null);
+    assert.equal(computeCostUsd({ inputCacheMiss: 100, inputCacheHit: 0, output: 100 }, 'gpt-unknown', OFF_PEAK), null);
+  });
+
+  test('a model named after an inherited property is absent from the table, not a schedule', () => {
+    // A model id is a config value, so it can be any string. A bare index answers Object.prototype's
+    // own members for these, which is truthy and is not a schedule — the lookup must ask about own
+    // keys or a review dies reading `.tiers` off a function.
+    const tokens = { inputCacheMiss: 100, inputCacheHit: 0, output: 100 };
+    for (const model of ['__proto__', 'constructor', 'toString', 'hasOwnProperty', 'valueOf']) {
+      assert.equal(computeCostUsd(tokens, model, OFF_PEAK), null, `${model} must price as unknown`);
+    }
   });
 
   test('every default model the providers ship has a price-table entry', () => {
     for (const model of ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'deepseek-v4-pro', 'glm-5.1']) {
       assert.ok(PRICES_PER_MILLION[model], `missing price for ${model}`);
     }
+  });
+});
+
+// --- the price table is a SCHEDULE (zai-cost-truth-p5o.1) ---
+
+describe('time-varying rates', () => {
+  const TOKENS = { inputCacheMiss: 2_000_000, inputCacheHit: 24_000_000, output: 600_000 };
+
+  // [LAW:verifiable-goals] THE ACCEPTANCE CRITERION. One identical usage record, two instants, and
+  // the only thing that differs is which side of the schedule they fall on. The 2x is ASSERTED here
+  // rather than encoded in the table as a multiplier, so this test can still fail the day a vendor
+  // prices its tiers independently — which is exactly what a table-drift test is for.
+  test('the same tokens cost exactly 2x at a peak instant as at an off-peak one', () => {
+    const offPeak = computeCostUsd(TOKENS, 'deepseek-v4-pro', OFF_PEAK);
+    const peak = computeCostUsd(TOKENS, 'deepseek-v4-pro', PEAK);
+    assert.ok(Math.abs(peak - offPeak * 2) < 1e-9, `off-peak ${offPeak}, peak ${peak}`);
+  });
+
+  test('the weekend is off-peak at an hour that is peak on a weekday', () => {
+    // Same hour-of-day, one Saturday and one Thursday. Peak is Monday-Friday, so the day is as
+    // load-bearing as the hour — a schedule holding only hours would double-charge every weekend run.
+    assert.equal(OFF_PEAK.getUTCHours(), PEAK.getUTCHours());
+    assert.ok(computeCostUsd(TOKENS, 'deepseek-v4-pro', OFF_PEAK) < computeCostUsd(TOKENS, 'deepseek-v4-pro', PEAK));
+  });
+
+  test('a boundary instant belongs to the window that starts there, not the one that ends there', () => {
+    const inPeak = computeCostUsd(TOKENS, 'deepseek-v4-pro', new Date('2026-08-20T03:59:59.000Z'));
+    const atFour = computeCostUsd(TOKENS, 'deepseek-v4-pro', new Date('2026-08-20T04:00:00.000Z'));
+    const atOne = computeCostUsd(TOKENS, 'deepseek-v4-pro', new Date('2026-08-20T01:00:00.000Z'));
+    assert.equal(atFour, computeCostUsd(TOKENS, 'deepseek-v4-pro', OFF_PEAK));
+    assert.equal(atOne, inPeak);
+  });
+
+  test('a flat-rate model prices identically at every instant — an empty schedule, not a special case', () => {
+    const at = t => computeCostUsd(TOKENS, 'gpt-5.4-mini', t);
+    assert.equal(at(PEAK), at(OFF_PEAK));
+    assert.equal(at(PEAK), at(new Date('2026-08-20T07:15:00.000Z')));
+  });
+
+  // [LAW:verifiable-goals] THE SECOND ACCEPTANCE CRITERION — a pass whose spawns straddle 04:00 UTC
+  // bills each spawn at its own tier. Driven through the adapter's extractUsage, the layer that turns
+  // an instant into a priced spawn, and then through the real sumCost the pass total uses. The other
+  // half of the seam — that makeCliAdapter gives each spawn its OWN instant, and the same one it
+  // records as span.from — is not asserted here: it is driven against a live spawn in
+  // test/engine-cli.test.js, because nothing at this layer could tell one clock read from two.
+  test('a pass straddling 04:00 UTC bills each spawn at its own tier, and the sum is not repriced', () => {
+    const stdout = JSON.stringify({ type: 'result', usage: { input_tokens: 1_000_000, output_tokens: 1_000_000 } });
+    const before = claudeExtractUsage(stdout, DEEPSEEK_CONFIG, new Date('2026-08-20T03:50:00.000Z')); // peak
+    const after = claudeExtractUsage(stdout, DEEPSEEK_CONFIG, new Date('2026-08-20T04:10:00.000Z'));  // off-peak
+
+    assert.ok(Math.abs(before.cost.usd - 5.28) < 1e-9, `peak spawn: ${before.cost.usd}`);
+    assert.ok(Math.abs(after.cost.usd - 2.64) < 1e-9, `off-peak spawn: ${after.cost.usd}`);
+
+    const total = sumCost([before.cost, after.cost]);
+    assert.equal(total.basis, 'dollars');
+    // 7.92 — the sum of two individually-priced spawns. Neither 5.28x2 (the whole pass at the tier it
+    // started in, the shape this ticket forbids) nor 2.64x2 (priced at the tier it ended in).
+    assert.ok(Math.abs(total.usd - 7.92) < 1e-9, `pass total: ${total.usd}`);
+  });
+
+  test('pricing needs the instant as a value: a missing or invalid one throws, never prices at standard', () => {
+    // The failure this replaces is silent: NaN coordinates match no window, so a caller that forgot
+    // to thread the instant would have billed every peak review at half rate with nothing to notice.
+    assert.throws(() => computeCostUsd(TOKENS, 'deepseek-v4-pro'), /start instant/);
+    assert.throws(() => computeCostUsd(TOKENS, 'deepseek-v4-pro', new Date('nonsense')), /start instant/);
+    assert.throws(() => computeCostUsd(TOKENS, 'deepseek-v4-pro', '2026-08-20T02:30:00Z'), /start instant/);
   });
 });
 
@@ -119,7 +203,7 @@ describe('codexExtractUsage', () => {
       '{"type":"thread.started","thread_id":"abc"}',
       '{"type":"turn.completed","usage":{"input_tokens":5000,"cached_input_tokens":1000,"output_tokens":500,"reasoning_output_tokens":200}}',
     ].join('\n');
-    const usage = codexExtractUsage(stdout, CODEX_CONFIG);
+    const usage = codexExtractUsage(stdout, CODEX_CONFIG, OFF_PEAK);
     assert.equal(totalInputTokens(usage.tokens), 5000);
     assert.equal(usage.tokens.output, 500);
     assert.equal(usage.cost.basis, 'dollars');
@@ -132,26 +216,26 @@ describe('codexExtractUsage', () => {
       '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}',
       '{"type":"turn.completed","usage":{"input_tokens":9000,"output_tokens":300}}',
     ].join('\n');
-    const usage = codexExtractUsage(stdout, CODEX_CONFIG);
+    const usage = codexExtractUsage(stdout, CODEX_CONFIG, OFF_PEAK);
     assert.equal(totalInputTokens(usage.tokens), 9000);
     assert.equal(usage.tokens.output, 300);
   });
 
   test('cost is unavailable with reason no-price (tokens still reported) when the model has no price', () => {
     const stdout = '{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":10}}';
-    const usage = codexExtractUsage(stdout, { ...CODEX_CONFIG, model: 'gpt-future' });
+    const usage = codexExtractUsage(stdout, { ...CODEX_CONFIG, model: 'gpt-future' }, OFF_PEAK);
     assert.equal(totalInputTokens(usage.tokens), 100);
     assert.deepEqual(usage.cost, { basis: 'unpriced', reason: 'no-price' });
   });
 
   test('returns null when no turn.completed carries usage', () => {
     const stdout = '{"type":"thread.started","thread_id":"abc"}';
-    assert.equal(codexExtractUsage(stdout, CODEX_CONFIG), null);
+    assert.equal(codexExtractUsage(stdout, CODEX_CONFIG, OFF_PEAK), null);
   });
 
   test('an empty usage object is reported as no usage, not a $0.00 run', () => {
     const stdout = '{"type":"turn.completed","usage":{}}';
-    assert.equal(codexExtractUsage(stdout, CODEX_CONFIG), null);
+    assert.equal(codexExtractUsage(stdout, CODEX_CONFIG, OFF_PEAK), null);
   });
 });
 
@@ -172,7 +256,7 @@ describe('claudeExtractUsage', () => {
         cache_creation_input_tokens: 250,
       },
     });
-    const usage = claudeExtractUsage(stdout, ANTHROPIC_CONFIG);
+    const usage = claudeExtractUsage(stdout, ANTHROPIC_CONFIG, OFF_PEAK);
     assert.equal(totalInputTokens(usage.tokens), 1000 + 4000 + 250);
     assert.equal(usage.tokens.output, 500);
     assert.deepEqual(usage.cost, { basis: 'dollars', usd: 0.0123 });
@@ -180,7 +264,7 @@ describe('claudeExtractUsage', () => {
 
   test('cost is unavailable with reason not-reported when a genuine Anthropic envelope omits total_cost_usd', () => {
     const stdout = JSON.stringify({ type: 'result', usage: { input_tokens: 10, output_tokens: 5 } });
-    const usage = claudeExtractUsage(stdout, ANTHROPIC_CONFIG);
+    const usage = claudeExtractUsage(stdout, ANTHROPIC_CONFIG, OFF_PEAK);
     assert.equal(totalInputTokens(usage.tokens), 10);
     assert.deepEqual(usage.cost, { basis: 'unpriced', reason: 'not-reported' });
   });
@@ -194,11 +278,11 @@ describe('claudeExtractUsage', () => {
       total_cost_usd: 0.5, // wrong-vendor figure — must NOT appear in the result
       usage: { input_tokens: 1_000_000, output_tokens: 1_000_000 },
     });
-    const usage = claudeExtractUsage(stdout, DEEPSEEK_CONFIG);
+    const usage = claudeExtractUsage(stdout, DEEPSEEK_CONFIG, OFF_PEAK);
     assert.equal(totalInputTokens(usage.tokens), 1_000_000);
     assert.equal(usage.cost.basis, 'dollars');
-    // deepseek-v4-pro: 1M in @0.435 + 1M out @0.87 = 1.305 — not the 0.5 Anthropic figure.
-    assert.ok(Math.abs(usage.cost.usd - 1.305) < 1e-9, `got ${usage.cost.usd}`);
+    // deepseek-v4-pro off-peak: 1M in @0.66 + 1M out @1.98 = 2.64 — not the 0.5 Anthropic figure.
+    assert.ok(Math.abs(usage.cost.usd - 2.64) < 1e-9, `got ${usage.cost.usd}`);
   });
 
   test('cache reads bill at the discounted cached rate, fresh + cache writes at the full rate', () => {
@@ -206,16 +290,16 @@ describe('claudeExtractUsage', () => {
       type: 'result',
       usage: { input_tokens: 1_000_000, cache_read_input_tokens: 500_000, cache_creation_input_tokens: 250_000, output_tokens: 100_000 },
     });
-    const usage = claudeExtractUsage(stdout, DEEPSEEK_CONFIG);
-    // full-rate = fresh(1M) + cache_creation(250k) = 1.25M @0.435; cached = cache_read(500k) @0.003625; out 100k @0.87.
-    const expected = (1_250_000 * 0.435 + 500_000 * 0.003625 + 100_000 * 0.87) / 1e6;
+    const usage = claudeExtractUsage(stdout, DEEPSEEK_CONFIG, OFF_PEAK);
+    // full-rate = fresh(1M) + cache_creation(250k) = 1.25M @0.66; cached = cache_read(500k) @0.022; out 100k @1.98.
+    const expected = (1_250_000 * 0.66 + 500_000 * 0.022 + 100_000 * 1.98) / 1e6;
     assert.ok(Math.abs(usage.cost.usd - expected) < 1e-9, `got ${usage.cost.usd}, expected ${expected}`);
   });
 
   test('a foreign endpoint whose model is not in the table reports no-price (tokens still shown)', () => {
     const stdout = JSON.stringify({ type: 'result', total_cost_usd: 0.5, usage: { input_tokens: 10, output_tokens: 5 } });
     const unlisted = { engine: 'claude-code', model: 'glm-unreleased', endpoint: { baseUrl: 'https://api.z.ai/api/anthropic', credential: { kind: 'api-key', value: 'k' } } };
-    assert.deepEqual(claudeExtractUsage(stdout, unlisted).cost, { basis: 'unpriced', reason: 'no-price' });
+    assert.deepEqual(claudeExtractUsage(stdout, unlisted, OFF_PEAK).cost, { basis: 'unpriced', reason: 'no-price' });
   });
 
   test('a lookalike host (notanthropic.com) is classified foreign, not trusted as Anthropic', () => {
@@ -223,9 +307,9 @@ describe('claudeExtractUsage', () => {
     // model not in the table → no-price (proves total_cost_usd was NOT used); genuine host → total_cost_usd.
     const stdout = JSON.stringify({ type: 'result', total_cost_usd: 0.5, usage: { input_tokens: 10, output_tokens: 5 } });
     const lookalike = { engine: 'claude-code', model: 'x', endpoint: { baseUrl: 'https://api.notanthropic.com', credential: { kind: 'api-key', value: 'k' } } };
-    assert.deepEqual(claudeExtractUsage(stdout, lookalike).cost, { basis: 'unpriced', reason: 'no-price' });
+    assert.deepEqual(claudeExtractUsage(stdout, lookalike, OFF_PEAK).cost, { basis: 'unpriced', reason: 'no-price' });
     const sub = { engine: 'claude-code', model: 'x', endpoint: { baseUrl: 'https://api.anthropic.com', credential: { kind: 'api-key', value: 'k' } } };
-    assert.deepEqual(claudeExtractUsage(stdout, sub).cost, { basis: 'dollars', usd: 0.5 });
+    assert.deepEqual(claudeExtractUsage(stdout, sub, OFF_PEAK).cost, { basis: 'dollars', usd: 0.5 });
   });
 
   // [LAW:verifiable-goals] AC for zai-billing-xl0.2: a subscription run's figure is Anthropic LIST
@@ -234,9 +318,9 @@ describe('claudeExtractUsage', () => {
   // variant, so no spend fold has a `usd` here to pick up.
   test('a subscription run reports its list price as NOTIONAL, never as spend', () => {
     const stdout = JSON.stringify({ type: 'result', total_cost_usd: 0.42, usage: { input_tokens: 10, output_tokens: 5 } });
-    assert.deepEqual(claudeExtractUsage(stdout, SUBSCRIPTION_CONFIG).cost, { basis: 'subscription', notionalUsd: 0.42 });
+    assert.deepEqual(claudeExtractUsage(stdout, SUBSCRIPTION_CONFIG, OFF_PEAK).cost, { basis: 'subscription', notionalUsd: 0.42 });
     // the structural exclusion: there is no `usd` field for a spend fold to read, at all.
-    assert.equal('usd' in claudeExtractUsage(stdout, SUBSCRIPTION_CONFIG).cost, false);
+    assert.equal('usd' in claudeExtractUsage(stdout, SUBSCRIPTION_CONFIG, OFF_PEAK).cost, false);
   });
 
   // [LAW:no-silent-failure] AC for zai-billing-xl0.2: an omitted total_cost_usd under a subscription
@@ -245,21 +329,21 @@ describe('claudeExtractUsage', () => {
   // the run cost in DOLLARS is known exactly (nothing); only its list price is missing.
   test('a subscription run with no total_cost_usd reports the notional as unavailable, not as zero', () => {
     const stdout = JSON.stringify({ type: 'result', usage: { input_tokens: 10, output_tokens: 5 } });
-    assert.deepEqual(claudeExtractUsage(stdout, SUBSCRIPTION_CONFIG).cost, { basis: 'subscription', notionalUsd: null });
+    assert.deepEqual(claudeExtractUsage(stdout, SUBSCRIPTION_CONFIG, OFF_PEAK).cost, { basis: 'subscription', notionalUsd: null });
   });
 
   // A garbage total_cost_usd must not become a NaN notional that later renders "$NaN".
   test('a non-finite total_cost_usd under a subscription is an unavailable notional', () => {
     const stdout = '{"type":"result","total_cost_usd":"lots","usage":{"input_tokens":10,"output_tokens":5}}';
-    assert.deepEqual(claudeExtractUsage(stdout, SUBSCRIPTION_CONFIG).cost, { basis: 'subscription', notionalUsd: null });
+    assert.deepEqual(claudeExtractUsage(stdout, SUBSCRIPTION_CONFIG, OFF_PEAK).cost, { basis: 'subscription', notionalUsd: null });
   });
 
   test('returns null when the envelope has no usage', () => {
-    assert.equal(claudeExtractUsage('{"type":"result","result":"x"}', ANTHROPIC_CONFIG), null);
+    assert.equal(claudeExtractUsage('{"type":"result","result":"x"}', ANTHROPIC_CONFIG, OFF_PEAK), null);
   });
 
   test('returns null when stdout is not a parseable envelope', () => {
-    assert.equal(claudeExtractUsage('not json at all', ANTHROPIC_CONFIG), null);
+    assert.equal(claudeExtractUsage('not json at all', ANTHROPIC_CONFIG, OFF_PEAK), null);
   });
 });
 
@@ -287,11 +371,11 @@ describe('renderCostLine', () => {
 
   test('a z.ai/deepseek (foreign) claude-code run renders its own table-priced cost, never the Anthropic figure', () => {
     const stdout = JSON.stringify({ type: 'result', total_cost_usd: 0.5, usage: { input_tokens: 1_000_000, output_tokens: 1_000_000 } });
-    const dsLine = renderCostLine(claudeExtractUsage(stdout, DEEPSEEK_CONFIG), DEEPSEEK_CONFIG);
-    assert.match(dsLine, /\$1\.3050/);          // deepseek-priced, not $0.5000
+    const dsLine = renderCostLine(claudeExtractUsage(stdout, DEEPSEEK_CONFIG, OFF_PEAK), DEEPSEEK_CONFIG);
+    assert.match(dsLine, /\$2\.6400/);          // deepseek-priced, not $0.5000
     assert.doesNotMatch(dsLine, /\$0\.5000/);
     assert.match(dsLine, /· est\._$/);
-    const glmLine = renderCostLine(claudeExtractUsage(stdout, ZAI_CONFIG), ZAI_CONFIG);
+    const glmLine = renderCostLine(claudeExtractUsage(stdout, ZAI_CONFIG, OFF_PEAK), ZAI_CONFIG);
     assert.match(glmLine, /Cost: \$/);          // glm-5.1 priced
     assert.doesNotMatch(glmLine, /unknown/);
   });
@@ -347,7 +431,8 @@ describe('renderCostLine', () => {
   });
 });
 
-// The measured token split of a real review (PR #108, deepseek-v4-pro, 2026-08-22 peak window) —
+// The measured token split of a real review (PR #108, deepseek-v4-pro, 2026-08-22, a Saturday and so
+// off-peak under the Monday-Friday schedule whatever the hour) —
 // the run whose collapsed footer forced an audit to BORROW a cache-hit ratio from an unrelated local
 // run. Using the real numbers keeps the round-trip test honest about magnitude: 91.8% of this input
 // is cache-hit, priced ~30x below the miss class, so a marker that fused them could not reprice.
@@ -439,13 +524,16 @@ describe('cost marker — the recorded facts re-derive the cost (zai-cost-truth-
   // corrected price table needs in order to restate a review that has already been posted, and it is
   // exactly what the collapsed "16,389,982 in" figure could not supply.
   test('a recorded marker reprices to the exact same USD through computeCostUsd', () => {
-    const usd = computeCostUsd(SAMPLE_TOKENS, DEEPSEEK_CONFIG.model);
+    const usd = computeCostUsd(SAMPLE_TOKENS, DEEPSEEK_CONFIG.model, new Date(SAMPLE_SPAN.from));
     const marker = costMarker({ tokens: SAMPLE_TOKENS, span: SAMPLE_SPAN, cost: { basis: 'dollars', usd } }, DEEPSEEK_CONFIG);
 
     const record = parseCostRecord(marker);
     assert.deepEqual(record.tokens, SAMPLE_TOKENS);
     assert.equal(record.model, 'deepseek-v4-pro');
-    assert.equal(computeCostUsd(record.tokens, record.model), usd);
+    // Repriced from the record ALONE — its own tokens, its own model, and its own recorded start
+    // instant. Now that the table is a schedule, the span is not decoration on the record: it is the
+    // third input the price needs, and a restatement that guessed at it would be guessing at the rate.
+    assert.equal(computeCostUsd(record.tokens, record.model, new Date(record.from)), usd);
   });
 
   test('the record carries the provider identity, the model, and the pass time span', () => {

@@ -492,7 +492,11 @@ describe('parseResultEnvelope — robust to json and stream-json', () => {
       JSON.stringify(RESULT),
     ].join('\n');
     assert.doesNotThrow(() => assertSucceeded(stream));
-    const usage = extractUsage(stream, { ...BASE_CONFIG, endpoint: { ...BASE_CONFIG.endpoint, baseUrl: 'https://api.deepseek.com/anthropic' }, model: 'deepseek-v4-pro' });
+    const usage = extractUsage(
+      stream,
+      { ...BASE_CONFIG, endpoint: { ...BASE_CONFIG.endpoint, baseUrl: 'https://api.deepseek.com/anthropic' }, model: 'deepseek-v4-pro' },
+      new Date('2026-08-22T12:00:00.000Z'), // the spawn's start instant — deepseek's rate varies by it
+    );
     assert.equal(totalInputTokens(usage.tokens), 100);
     assert.equal(usage.tokens.output, 10);
   });

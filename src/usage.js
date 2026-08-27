@@ -9,25 +9,60 @@
 // tokens × price and formats the footer.
 // [LAW:single-enforcer] Token cost is computed in exactly one place: computeCostUsd.
 
-// [LAW:one-source-of-truth] The price table — EVERY priced provider, one table, keyed by the exact
-// model id each engine reports (namespaces don't collide: gpt-*, deepseek-*, glm-*). Dollars per ONE
-// MILLION tokens, matching each vendor's published per-1M figures so they can be eyeballed against
-// the pricing page. PRICE-SENSITIVE: these drift whenever a vendor changes prices and have no machine
-// source — they MUST be updated by hand. `cachedInput` is the discounted prompt-cache rate.
+// [LAW:types-are-the-program] A PRICE ENTRY IS A RATE SCHEDULE, not a rate:
+//
+//   { rates: {input, cachedInput, output}, tiers: [ { when: {daysUtc, hoursUtc}, rates } ] }
+//
+// `rates` is the STANDARD rate and is always present, so a schedule with an unpriced moment is
+// unrepresentable — there is no instant the table cannot answer for. `tiers` names the windows where
+// a DIFFERENT rate applies; the first tier covering the instant wins, and an empty list means the
+// vendor charges one rate around the clock. A flat-rate vendor is therefore the SAME shape with
+// `tiers: []`, never a second union arm, so ratesAt runs the same operations for every model and the
+// variability lives entirely in the data. [LAW:dataflow-not-control-flow] [LAW:no-mode-explosion]
+// This is why there is no isDeepSeek flag and no isPeak boolean anywhere below: the rate is selected
+// by the instant against the schedule, so the next vendor to introduce time-of-day pricing is a table
+// row, not a branch.
+//
+// [LAW:one-source-of-truth] EVERY priced provider, one table, keyed by the exact model id each engine
+// reports (namespaces don't collide: gpt-*, deepseek-*, glm-*). Dollars per ONE MILLION tokens,
+// matching each vendor's published per-1M figures so they can be eyeballed against the pricing page.
+// PRICE-SENSITIVE: these drift whenever a vendor changes prices and have no machine source — they
+// MUST be updated by hand. `cachedInput` is the discounted prompt-cache rate.
 // Sources / last verified:
 //   OpenAI   2026-06-14 — https://openai.com/api/pricing/
-//   DeepSeek 2026-07-10 — https://api-docs.deepseek.com/quick_start/pricing  (aggressive disk-cache rate)
+//   DeepSeek 2026-08-26 — https://api-docs.deepseek.com/quick_start/pricing (peak/off-peak, effective
+//            16:00 UTC 2026-08-16 per https://api-docs.deepseek.com/news/news260813; cross-checked
+//            against https://www.aipricing.guru/deepseek-pricing/ and https://tokencost.app/models/deepseek-v4-pro)
 //   z.ai GLM 2026-06-17 — https://docs.z.ai/guides/overview/pricing
+
+// DeepSeek's peak window, verified 2026-08-26 against the official pricing page: "Peak hours are
+// 01:00 - 04:00 and 06:00 - 10:00 UTC, Monday through Friday". The DAYS are as load-bearing as the
+// hours and are why `when` is not an hours list: peak covers 7 hours on 5 days, so a schedule holding
+// only the hours would bill every weekend review at double its real rate — the same silently-wrong
+// figure this epic exists to end, in the opposite direction. [FRAMING:representation]
+const DEEPSEEK_PEAK = { daysUtc: [1, 2, 3, 4, 5], hoursUtc: [[1, 4], [6, 10]] };
+
 const PRICES_PER_MILLION = {
-  'gpt-5.5': { input: 5.00, cachedInput: 0.50, output: 30.00 },
-  'gpt-5.4': { input: 2.50, cachedInput: 0.25, output: 15.00 },
-  'gpt-5.4-mini': { input: 0.75, cachedInput: 0.075, output: 4.50 },
-  // The tiny cachedInput rates below are DeepSeek's real published disk-cache pricing — a cache hit is
-  // priced far below a cache miss — verified 2026-07-10 against the page, an intentional outlier not typos.
-  'deepseek-v4-pro': { input: 0.435, cachedInput: 0.003625, output: 0.87 },
-  'deepseek-v4-flash': { input: 0.14, cachedInput: 0.0028, output: 0.28 },
-  'glm-5.1': { input: 1.40, cachedInput: 0.26, output: 4.40 },
-  'glm-4.6': { input: 0.60, cachedInput: 0.11, output: 2.20 },
+  'gpt-5.5': { rates: { input: 5.00, cachedInput: 0.50, output: 30.00 }, tiers: [] },
+  'gpt-5.4': { rates: { input: 2.50, cachedInput: 0.25, output: 15.00 }, tiers: [] },
+  'gpt-5.4-mini': { rates: { input: 0.75, cachedInput: 0.075, output: 4.50 }, tiers: [] },
+  // DeepSeek's standard rate is its OFF-PEAK rate; peak is exactly double across all three classes
+  // today. The peak numbers are written out rather than expressed as a 2x multiplier because what the
+  // vendor publishes is two rate cards, and a multiplier would make the table a claim about the
+  // RELATIONSHIP between them — one that stops being true the first time a vendor prices its classes
+  // independently, and one no reader could check against the pricing page. [FRAMING:representation]
+  // The tiny cachedInput rates are DeepSeek's real published disk-cache pricing — a cache hit is
+  // priced ~30x below a cache miss — an intentional outlier, not typos.
+  'deepseek-v4-pro': {
+    rates: { input: 0.66, cachedInput: 0.022, output: 1.98 },
+    tiers: [{ when: DEEPSEEK_PEAK, rates: { input: 1.32, cachedInput: 0.044, output: 3.96 } }],
+  },
+  'deepseek-v4-flash': {
+    rates: { input: 0.22, cachedInput: 0.007, output: 0.66 },
+    tiers: [{ when: DEEPSEEK_PEAK, rates: { input: 0.44, cachedInput: 0.014, output: 1.32 } }],
+  },
+  'glm-5.1': { rates: { input: 1.40, cachedInput: 0.26, output: 4.40 }, tiers: [] },
+  'glm-4.6': { rates: { input: 0.60, cachedInput: 0.11, output: 2.20 }, tiers: [] },
 };
 
 // [LAW:types-are-the-program] THE TOKEN RECORD — the PRIMARY FACT behind every cost figure, and the
@@ -43,14 +78,17 @@ const PRICES_PER_MILLION = {
 // guarding it, and the price is then a plain dot product of three counts against three rates.
 //
 // Why it matters beyond tidiness: the two input rates differ by up to ~30x, and reviews run ~92%
-// cache-hit. DeepSeek's real rates as of 2026-08-16 are miss $0.66/M and hit $0.022/M off-peak —
-// figures quoted here as the MOTIVE for the split, NOT as what PRICES_PER_MILLION holds. That table
-// is still the stale 2026-07-10 row and correcting it is zai-cost-truth-p5o.1's job, deliberately
-// separate: recording a repriceable fact and repricing from a correct table are two changes, and
-// landing them together would leave no way to tell a bad record from a bad rate. What this record
-// buys is precisely that the correction can be applied RETROACTIVELY when it lands. A fused total
-// cannot be — auditing PR #108 had to BORROW a cache-hit ratio measured from an unrelated local run
-// to restate CI costs at all. [FRAMING:representation]
+// cache-hit, so the class this workload leans on hardest is the one DeepSeek's 2026-08-16 repricing
+// moved hardest — +507% at the off-peak rate and +1114% at the peak one (0.003625 -> 0.022 / 0.044),
+// against ~52% for the miss class. This record is what let that correction land RETROACTIVELY: every
+// review posted from 1.53.0 on records its own disjoint counts, its model and its span. A pass whose
+// recorded span falls wholly inside one rate window reprices EXACTLY from those facts; one that
+// straddles a window boundary reprices to a range, because the marker holds the pass ENVELOPE and
+// not each spawn's own instant (see computeCostUsd). A fused total cannot be repriced — auditing PR #108
+// had to BORROW a cache-hit ratio measured from an unrelated local run to restate CI costs at all.
+// Reviews posted BEFORE 1.53.0 carry a bare figure and are a permanent, honest gap: they must be
+// restated as unknown, never quietly repriced as if their tokens had been recorded.
+// [FRAMING:representation]
 // the stored figure must be able to answer the question later, not merely print a number today; a
 // cost is DERIVED, the tokens are primary, and the primary fact is what must be durable.
 function totalInputTokens(tokens) {
@@ -69,15 +107,69 @@ function addTokens(a, b) {
   };
 }
 
-// [LAW:effects-at-boundaries] Pure: tokens + model -> USD, no IO. Returns null (cost unknown)
-// when the model has no price-table entry — never a fabricated zero, so a missing price surfaces
-// as "unknown" rather than a confident-but-wrong $0.00. [LAW:no-silent-failure]
+// [LAW:parse-dont-validate] The one crossing from "some value a caller handed us" into the two
+// coordinates a rate schedule is indexed by. It returns a shape that could not exist before the check
+// — a UTC weekday plus a fractional hour-of-day — and fails LOUDLY when handed anything else.
+// The loud arm is the whole point: an Invalid Date (or an omitted argument that JS quietly turns into
+// one) yields NaN coordinates, NaN matches no window, and the run would then price at the standard
+// rate — a peak review billed at half, silently, from a caller's programming error. That is the exact
+// failure mode this ticket exists to delete, so it throws rather than guessing. [LAW:no-silent-failure]
+// Fractional hours (not whole ones) because a vendor is free to move a boundary to :30 — the
+// coordinate should not decide what the schedule is allowed to express.
+function utcInstant(at) {
+  const ms = at instanceof Date ? at.getTime() : NaN;
+  if (!Number.isFinite(ms)) {
+    throw new TypeError(`price lookup needs the spawn's start instant as a Date; got ${String(at)}`);
+  }
+  return { day: at.getUTCDay(), hour: at.getUTCHours() + at.getUTCMinutes() / 60 };
+}
+
+// Half-open [start, end): a boundary instant belongs to the window that STARTS there, never the one
+// that ends there, so two adjacent windows can neither both claim it nor leave it unclaimed.
+function covers(when, { day, hour }) {
+  return when.daysUtc.includes(day)
+    && when.hoursUtc.some(([start, end]) => hour >= start && hour < end);
+}
+
+// [LAW:dataflow-not-control-flow] Rate selection with no branch on WHETHER a model has time-varying
+// pricing: find the first tier covering the instant, and fall back to the entry itself. That works
+// because the entry and a tier both carry `.rates` — the entry IS the standard tier — so a flat-rate
+// model takes the identical path with an empty list to search.
+function ratesAt(entry, instant) {
+  return (entry.tiers.find((tier) => covers(tier.when, instant)) ?? entry).rates;
+}
+
+// [LAW:effects-at-boundaries] Pure: tokens + model + the instant the tokens started being spent ->
+// USD, no IO and no clock read. `at` is a REQUIRED value supplied by the boundary that owns the
+// engine child's lifetime (src/engine/cli.js), because a rate that varies by time of day cannot be
+// selected without it and reading the clock here would price a spawn at the moment its output was
+// parsed rather than the moment it ran.
+//
+// Each SPAWN is priced at its own start, never the run at the run's start: a multi-scope pass runs
+// for many minutes across many spawns and routinely straddles 04:00 UTC, so one rate for the whole
+// pass would misprice every spawn on the far side of the boundary. The pass total is then the sum of
+// individually-priced spawns (sumCost), never the sum repriced at one tier.
+//
+// The residual, stated rather than hidden: a single spawn that itself crosses a boundary is billed by
+// the vendor per request across both tiers, and is priced here wholly at its start tier. Nothing in
+// the engine's output reports when within the spawn each request fired, so any finer split would be a
+// fabricated ratio — a guess wearing a number. Spawns run minutes and boundaries fall four times a
+// day, so this is a bounded ~1% of spawns rather than the systematic ~3.6x understatement it replaces.
+//
+// Returns null (cost unknown) when the model has no price-table entry — never a fabricated zero, so a
+// missing price surfaces as "unknown" rather than a confident-but-wrong $0.00. [LAW:no-silent-failure]
 // One rate per class, no subtraction: each adapter has already parsed its vendor's overlapping
 // counts into the disjoint record above (see THE TOKEN RECORD), so by the time tokens arrive here
 // the classes are exactly the billing buckets.
-function computeCostUsd(tokens, model) {
-  const price = PRICES_PER_MILLION[model];
-  if (!price) return null;
+function computeCostUsd(tokens, model, at) {
+  const instant = utcInstant(at);
+  // [LAW:parse-dont-validate] `Object.hasOwn`, never a bare index: a model id is a config value, and
+  // a bare lookup answers Object.prototype's members for the likes of `constructor` or `toString` —
+  // handing back something truthy that is not a schedule, which then reads `.tiers` off a function
+  // and throws mid-review. The question is "is this model IN the table", and only own-keys answer it.
+  const entry = Object.hasOwn(PRICES_PER_MILLION, model) ? PRICES_PER_MILLION[model] : null;
+  if (!entry) return null;
+  const price = ratesAt(entry, instant);
   const total =
     tokens.inputCacheMiss * price.input +
     tokens.inputCacheHit * price.cachedInput +
@@ -313,8 +405,11 @@ const ANY_MARKER_RE = new RegExp(
 //
 // The figure is quantized to 6 decimal places, exactly as the legacy marker was, so the recorded
 // dollars stay byte-stable across a re-render. It is NOT what a later audit reprices from — that is
-// what `tokens` + `model` are for, at full precision — it is the figure this run believed at the
-// time, kept so a restatement can be compared against it.
+// what `tokens` and `model` are for, at full precision, together with an INSTANT the auditor draws
+// from the span, since `computeCostUsd` selects a rate from one instant and never from two ends —
+// which is also why a pass straddling a boundary reprices to a range rather than a figure. The
+// recorded dollars are what this run believed at the time, kept so a restatement can be compared
+// against it.
 // [LAW:single-enforcer] EVERY field is screened through the SAME predicate its reader uses — the
 // figure and each token class through `recordedQuantity`, each string fact through `recordedString`
 // — so the set of records this function can emit IS the set `parseCostRecord` accepts. A predicate
@@ -335,10 +430,10 @@ function costRecord(usage, config) {
     tokens: recorded(usage ? recordedTokens(usage.tokens) : null),
     model: recorded(recordedString(config.model)),
     provider: recorded(recordedString(providerIdentity(config))),
-    // The pass's time SPAN, not one instant. A review's spawns run over many minutes and time is
-    // about to become a pricing input (DeepSeek's peak windows begin at 01:00/06:00 UTC), so a
-    // single timestamp would silently misprice every review that straddles a boundary. Two ends let
-    // a restatement price exactly when they fall in one window, and say so when they do not.
+    // The pass's time SPAN, not one instant. A review's spawns run over many minutes and time IS a
+    // pricing input (DeepSeek's peak windows begin at 01:00/06:00 UTC), so a single timestamp would
+    // silently misprice every review that straddles a boundary. Two ends let a restatement price
+    // exactly when they fall in one window, and say so when they do not.
     from: recorded(recordedString(span.from)),
     to: recorded(recordedString(span.to)),
   };
