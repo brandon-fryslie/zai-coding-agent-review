@@ -197,3 +197,107 @@ describe('describeSchedule', () => {
     assert.equal(d.scoutMs, 3 * MIN);
   });
 });
+
+// --- rendering (zai-timing-31d.6) ---
+
+describe('formatMs', () => {
+  const { formatMs } = require('../src/schedule');
+  test('renders seconds, minutes and hours at footer-line density', () => {
+    assert.equal(formatMs(45_000), '45s');
+    assert.equal(formatMs(128_000), '2m08s');
+    assert.equal(formatMs(1021_000), '17m01s');
+    assert.equal(formatMs(3728_000), '1h02m08s');
+    assert.equal(formatMs(0), '0s');
+  });
+  test('a recorded absence renders as the word for it, never a fabricated zero', () => {
+    // [LAW:no-silent-failure] an unclocked spawn took time we cannot state; '0s' would state one.
+    assert.equal(formatMs(null), 'unclocked');
+  });
+});
+
+describe('renderTimingBreakdown', () => {
+  const { renderTimingBreakdown } = require('../src/schedule');
+  const worker = (scope, pass, fromMin, toMin, outcome = 'completed') =>
+    ({ phase: 'worker', scope, pass, outcome, usage: { span: span(fromMin, toMin) } });
+  // The hand-measured shape from the epic: a scout, then two passes of workers.
+  const schedule = {
+    scopeConcurrency: 2,
+    sweepCap: 1,
+    scopeCount: 2,
+    spawns: [
+      { phase: 'scout', outcome: 'completed', usage: { span: span(0, 2) } },
+      worker('engine', 0, 2, 5),
+      worker('transport', 0, 2, 4),
+      worker('engine', 1, 5, 6),
+      worker('transport', 1, 5, 7),
+    ],
+  };
+
+  test('the summary line answers "why was this slow?": total, spawn time, phase split, slowest scope, schedule sentence', () => {
+    const block = renderTimingBreakdown(schedule, 10 * MIN);
+    const line = block.split('\n')[0];
+    assert.match(line, /^_Timing: 10m00s total/);
+    // spawn time inside the total: 2 + 3 + 2 + 1 + 2 = 10 minutes across 5 attempts
+    assert.match(line, /10m00s \(5 attempt\(s\)\)/);
+    assert.match(line, /scout 2m00s/);
+    assert.match(line, /review 5m00s/);
+    assert.match(line, /sweep 1 3m00s/);
+    // the slowest CLOCKED worker attempt, named — pass 0's engine at 3 minutes
+    assert.match(line, /slowest scope: engine \(3m00s\)/);
+    // the schedule sentence that turns spawn time into wall time
+    assert.match(line, /2 scope\(s\) at concurrency 2 over 2 pass\(es\) = 2 wave\(s\)/);
+  });
+
+  test('the per-attempt table sits behind <details>, one row per spawn attempt', () => {
+    const block = renderTimingBreakdown(schedule, 10 * MIN);
+    assert.match(block, /<details>\n<summary>Timing by scope<\/summary>/);
+    assert.match(block, /\| scout \| — \| completed \| 2m00s \|/);
+    assert.match(block, /\| review \| engine \| completed \| 3m00s \|/);
+    assert.match(block, /\| sweep 1 \| transport \| completed \| 2m00s \|/);
+  });
+
+  test('a missing phase renders as an explicit gap, never a silently omitted clause', () => {
+    // [LAW:no-silent-failure] a schedule with no scout record (the phase never ran or its record
+    // was lost) names the gap rather than pretending the phase was free.
+    const block = renderTimingBreakdown({
+      scopeConcurrency: 1, sweepCap: 0, scopeCount: 1,
+      spawns: [worker('only', 0, 0, 1)],
+    }, 2 * MIN);
+    assert.match(block, /scout missing/);
+  });
+
+  test('an unclocked spawn marks its phase sum as a lower bound and never wins slowest-scope', () => {
+    const block = renderTimingBreakdown({
+      scopeConcurrency: 2, sweepCap: 0, scopeCount: 2,
+      spawns: [
+        { phase: 'scout', outcome: 'completed', usage: { span: span(0, 1) } },
+        worker('clocked', 0, 1, 3),
+        { phase: 'worker', scope: 'unclocked-scope', pass: 0, outcome: 'failed', usage: null },
+      ],
+    }, 5 * MIN);
+    // the pass sum carries the '+' the cost tally already taught the reader
+    assert.match(block, /review 2m00s\+/);
+    assert.match(block, /slowest scope: clocked \(2m00s\)/);
+    // the table still rows the unclocked attempt, explicitly
+    assert.match(block, /\| review \| unclocked-scope \| failed \| unclocked \|/);
+  });
+
+  test('a wholly unclocked worker phase reports slowest scope as unclocked, never a fabricated winner', () => {
+    const block = renderTimingBreakdown({
+      scopeConcurrency: 1, sweepCap: 0, scopeCount: 1,
+      spawns: [{ phase: 'worker', scope: 's', pass: 0, outcome: 'failed', usage: null }],
+    }, MIN);
+    assert.match(block, /slowest scope: unclocked/);
+  });
+
+  test('a null schedule renders the total with an explicit gap, never a silently omitted line', () => {
+    // [LAW:no-silent-failure] the recorded absence (a review produced without a pass envelope).
+    const block = renderTimingBreakdown(null, 1021_000);
+    assert.equal(block, '_Timing: 17m01s total · spawn breakdown unavailable — this run recorded no schedule_');
+  });
+
+  test('a nonsense total is a wiring bug thrown loudly, never rendered', () => {
+    assert.throws(() => renderTimingBreakdown(null, undefined), /totalMs must be a non-negative finite number/);
+    assert.throws(() => renderTimingBreakdown(null, -5), /totalMs must be a non-negative finite number/);
+  });
+});

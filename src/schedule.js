@@ -98,14 +98,14 @@ function sumMs(values) {
 // actually ran — a fully-refused pass contributes no group, a partially-refused one only the waves
 // its spawned scopes filled — never work that was merely planned.
 function describeSchedule({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
-  const scoutDurations = [];
+  const scouts = [];
   const byPass = new Map();
   // [LAW:no-silent-failure] The dispatch is EXHAUSTIVE over the phase vocabulary this module owns:
   // a record with a phase this fold doesn't recognize would otherwise vanish from the breakdown —
   // the exact drift the shared constructor exists to make impossible — so it throws instead.
   for (const s of spawns) {
     if (s.phase === 'scout') {
-      scoutDurations.push(spanMs(s.usage && s.usage.span));
+      scouts.push({ outcome: s.outcome, ms: spanMs(s.usage && s.usage.span) });
     } else if (s.phase === 'worker') {
       if (!byPass.has(s.pass)) byPass.set(s.pass, []);
       byPass.get(s.pass).push({ scope: s.scope, outcome: s.outcome, ms: spanMs(s.usage && s.usage.span) });
@@ -113,14 +113,16 @@ function describeSchedule({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
       throw new Error(`describeSchedule: unknown phase ${JSON.stringify(s.phase)} in spawn record`);
     }
   }
-  const scoutMs = sumMs(scoutDurations);
   const passes = [...byPass.keys()].sort((a, b) => a - b).map(pass => {
     const spawns = byPass.get(pass);
     const distinctScopes = new Set(spawns.map(s => s.scope)).size;
     return { pass, spawns, waves: Math.ceil(distinctScopes / scopeConcurrency) };
   });
   return {
-    scoutMs,
+    // scoutMs stays derived from the scout rows it sits beside, so the summary figure and the
+    // per-attempt table can never disagree about the scout. [LAW:one-source-of-truth]
+    scoutMs: sumMs(scouts.map(s => s.ms)),
+    scouts,
     passes,
     scopeCount,
     scopeConcurrency,
@@ -129,4 +131,100 @@ function describeSchedule({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
   };
 }
 
-module.exports = { spawnRecord, scheduleRecord, spanMs, sumMs, describeSchedule };
+// ---------------------------------------------------------------------------------------------
+// RENDERING — the schedule as the footer line an operator reads. It lives here, beside the value
+// it formats, exactly as renderCostLine lives beside the cost value in usage.js: one module owns
+// "what the pass's time was" from record shape through derivation to the string a sink prints.
+// [LAW:one-type-per-behavior] Every sink (PR footer, repo report, the local dev script) renders
+// through this one formatter, so the breakdown cannot drift between them.
+
+// [LAW:effects-at-boundaries] Pure: a millisecond count as the compact figure a footer line can
+// afford — '2m08s', '45s', '1h02m08s'. null is a RECORDED absence and renders as the word for it,
+// never as a fabricated '0s': an unclocked spawn did take time, we just cannot say how much.
+// [LAW:no-silent-failure]
+function formatMs(ms) {
+  if (ms == null) return 'unclocked';
+  const totalSec = Math.round(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  if (h > 0) return `${h}h${String(m).padStart(2, '0')}m${String(s).padStart(2, '0')}s`;
+  if (m > 0) return `${m}m${String(s).padStart(2, '0')}s`;
+  return `${s}s`;
+}
+
+// [LAW:dataflow-not-control-flow] One clause shape for every phase, selected by the VALUES of its
+// durations, not by branches that skip the phase: no records at all is 'missing' (the explicit gap
+// the ticket demands for an absent phase), all-unclocked is 'unclocked', a partial clock renders
+// as the sum marked '+' — the same lower-bound convention the cost tally already uses — and a full
+// clock is the plain figure.
+function phaseClause(label, durations) {
+  if (durations.length === 0) return `${label} missing`;
+  const sum = sumMs(durations);
+  if (sum == null) return `${label} unclocked`;
+  const partial = durations.some(d => d == null) ? '+' : '';
+  return `${label} ${formatMs(sum)}${partial}`;
+}
+
+// pass 0 is the review of record; pass 1..N are convergence sweeps — the same vocabulary the run
+// log's 'sweep N ' labels already use. [LAW:one-source-of-truth]
+function passLabel(pass) {
+  return pass === 0 ? 'review' : `sweep ${pass}`;
+}
+
+// [LAW:effects-at-boundaries] Pure: the timing breakdown as the markdown block the sinks print —
+// one scannable summary line, then the per-attempt table folded behind <details> so it sits under
+// a review a human reads for its FINDINGS without shouting over them.
+//
+// The line answers "why was this slow?" without the run log: total wall clock (the whole run —
+// preflight, diff fetch and host I/O included, which is why it comes from the run's own clock and
+// not from summing spawns); the spawn time inside it (their ratio separates working from waiting);
+// the split by phase; the slowest scope (one pathological scope sets its wave's duration, and
+// every wave waits for it); and the schedule sentence that turns spawn time into wall time.
+//
+// [LAW:parse-dont-validate] totalMs is minted by the run boundary from its one clock; a non-finite
+// or negative figure here is a wiring bug, thrown loudly for the boundary's catch — never rendered
+// as a nonsense total. schedule may be null — the recorded absence (e.g. a review produced without
+// a pass envelope) — and renders as the explicit gap, never as a silently omitted line.
+// [LAW:no-silent-failure]
+function renderTimingBreakdown(schedule, totalMs) {
+  if (!Number.isFinite(totalMs) || totalMs < 0) {
+    throw new Error(`renderTimingBreakdown: totalMs must be a non-negative finite number (got ${JSON.stringify(totalMs)})`);
+  }
+  if (schedule == null) {
+    return `_Timing: ${formatMs(totalMs)} total · spawn breakdown unavailable — this run recorded no schedule_`;
+  }
+  const d = describeSchedule(schedule);
+  const workerRows = d.passes.flatMap(p => p.spawns.map(s => ({ pass: p.pass, ...s })));
+  const allDurations = [...d.scouts.map(s => s.ms), ...workerRows.map(s => s.ms)];
+  const spawnCount = allDurations.length;
+  const phases = [
+    phaseClause('scout', d.scouts.map(s => s.ms)),
+    ...d.passes.map(p => phaseClause(passLabel(p.pass), p.spawns.map(s => s.ms))),
+  ].join(' · ');
+  // The slowest CLOCKED worker attempt; ties keep the first recorded. All-unclocked stays an
+  // explicit 'unclocked', never a fabricated winner.
+  const slowest = workerRows.reduce((best, s) => (s.ms != null && (best == null || s.ms > best.ms) ? s : best), null);
+  const slowestClause = slowest ? `slowest scope: ${slowest.scope} (${formatMs(slowest.ms)})` : 'slowest scope: unclocked';
+  const scheduleSentence =
+    `${d.scopeCount} scope(s) at concurrency ${d.scopeConcurrency} over ${d.passes.length} pass(es) = ${d.waveCount} wave(s)`;
+  const line = `_Timing: ${formatMs(totalMs)} total · ${phaseClause('spawns', allDurations)} (${spawnCount} attempt(s))`
+    + ` — ${phases} · ${slowestClause} · ${scheduleSentence}_`;
+  const rows = [
+    ...d.scouts.map(s => `| scout | — | ${s.outcome} | ${formatMs(s.ms)} |`),
+    ...workerRows.map(s => `| ${passLabel(s.pass)} | ${s.scope} | ${s.outcome} | ${formatMs(s.ms)} |`),
+  ];
+  const details = [
+    '<details>',
+    '<summary>Timing by scope</summary>',
+    '',
+    '| phase | scope | outcome | duration |',
+    '| --- | --- | --- | --- |',
+    ...rows,
+    '',
+    '</details>',
+  ].join('\n');
+  return `${line}\n\n${details}`;
+}
+
+module.exports = { spawnRecord, scheduleRecord, spanMs, sumMs, describeSchedule, formatMs, renderTimingBreakdown };

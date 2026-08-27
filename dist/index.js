@@ -36185,6 +36185,7 @@ const { difficultyCandidates, parseDifficultyScaling } = __nccwpck_require__(993
 const { readSpentToday, appendCost } = __nccwpck_require__(8192);
 const { parseDependencyDiffFlag, parseGoModBumps, fetchUpstreamChangeSummary, unresolvedSummary, renderDependencyReviewSection } = __nccwpck_require__(9838);
 const { renderCostLine, costWarning, costMarker } = __nccwpck_require__(9614);
+const { renderTimingBreakdown } = __nccwpck_require__(7932);
 const { renderRepoReport } = __nccwpck_require__(8959);
 const registry = __nccwpck_require__(25);
 const { loadConfig, peekConfigNames } = __nccwpck_require__(1283);
@@ -36296,13 +36297,26 @@ async function preflightChain(chain) {
 // line carries a running PR total, and a machine-readable cost marker is embedded so the NEXT round can
 // sum this one. Repo mode passes no priorCost — the single-round line stands, and the (harmless) marker
 // simply isn't read by anyone. [LAW:dataflow-not-control-flow]
-function buildReviewFooter(usage, configUsed, priorCost = null) {
+function buildReviewFooter(usage, configUsed, priorCost, timing) {
   const warning = costWarning(usage, configUsed);
   if (warning) core.warning(warning);
   const costLine = renderCostLine(usage, configUsed, priorCost);
   if (costLine) core.info(costLine.replace(/^_|_$/g, ''));
+  // The timing breakdown renders beside the cost, from the schedule the pass recorded and the total
+  // the run's clock minted (zai-timing-31d.6) — this boundary only formats; every figure derives in
+  // src/schedule.js. [LAW:one-source-of-truth] Time is diagnostics and findings are the product, so
+  // a render failure omits the block LOUDLY — a warning naming the cause — and never fails the
+  // review. [LAW:no-silent-failure] An absent schedule is not a failure: it renders as an explicit
+  // gap inside renderTimingBreakdown.
+  let timingBlock = null;
+  try {
+    timingBlock = renderTimingBreakdown(timing.schedule ?? null, timing.totalMs);
+    core.info(timingBlock.split('\n')[0].replace(/^_|_$/g, ''));
+  } catch (e) {
+    core.warning(`Timing breakdown unavailable (${e.message}) — the review is posted without it.`);
+  }
   const marker = costMarker(usage, configUsed);
-  return [buildAttributionFooter(configUsed), costLine, marker].filter(Boolean).join('\n\n');
+  return [buildAttributionFooter(configUsed), costLine, timingBlock, marker].filter(Boolean).join('\n\n');
 }
 
 // [LAW:one-source-of-truth] The budget-exhaustion warning, composed ONCE for both review modes from
@@ -36503,7 +36517,12 @@ async function resolveDependencySummaries(octokit, filteredFiles, dependencyDiff
 // chain, and submit an inline GitHub review. `deadline` (epoch ms, null = no budget) is the run's
 // wall-clock budget, minted once in run(); the pre-review phases here (PR fetch, preflight,
 // dependency fetch) spend from it implicitly because it is absolute.
-async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadline) {
+// `startedAt` (epoch ms) is the run's start instant from that SAME mint — the timing footer's
+// total is (now - startedAt), so it counts preflight, the diff fetch and host I/O, time no spawn
+// owns. The entry default covers direct callers (tests, embedding): for them THIS boundary is the
+// run boundary, so the mint moves here rather than a second clock appearing anywhere inland.
+// [LAW:no-ambient-temporal-coupling]
+async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadline, startedAt = Date.now()) {
   const maxDiffChars = parseInt(core.getInput('MAX_DIFF_CHARS'), 10) || 0;
   const token = core.getInput('GITHUB_TOKEN');
   core.setSecret(token);
@@ -36861,7 +36880,9 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   // structured summaries the prompt note derived from — now enriched by the workers' per-module
   // assessments. '' for a non-dependency PR, so the posted body is byte-identical to before. [LAW:dataflow-not-control-flow]
   const dependencySection = renderDependencyReviewSection(dependencySummaries, review.assessments);
-  const footer = buildReviewFooter(review.usage, configUsed, prior.cost);
+  // totalMs is read HERE, at the last instant before the sink, so the total covers everything the
+  // run did up to submission — the same clock startedAt came from, read once. [LAW:one-source-of-truth]
+  const footer = buildReviewFooter(review.usage, configUsed, prior.cost, { schedule: review.schedule, totalMs: Date.now() - startedAt });
   await submitReview(
     reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
     // [LAW:dataflow-not-control-flow] Coverage is stated, never inferred: the engine's own gap
@@ -36889,7 +36910,9 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
 
 // Whole-repo review: no PR, no fork gate, no host transport. Build a repo-exploration prompt
 // (optionally scoped), run the same engine chain, and print the report to the Step Summary + logs.
-async function runRepoReview(reviewerName, excludePatterns, effort, deadline) {
+// `startedAt` carries the same contract as runPrReview's: the run's one start instant, defaulted
+// at this entry only for direct callers whose run boundary this is. [LAW:no-ambient-temporal-coupling]
+async function runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt = Date.now()) {
   const scope = core.getInput('SCOPE').trim();
 
   let chain;
@@ -36917,7 +36940,7 @@ async function runRepoReview(reviewerName, excludePatterns, effort, deadline) {
   });
   warnBudgetExhausted(review);
 
-  const footer = buildReviewFooter(review.usage, configUsed);
+  const footer = buildReviewFooter(review.usage, configUsed, null, { schedule: review.schedule, totalMs: Date.now() - startedAt });
   const report = renderRepoReport({ reviewerName, scope, review, footer });
 
   // [LAW:effects-at-boundaries] The printed sink: the report goes to the run log and the Step
@@ -36968,11 +36991,15 @@ async function run() {
   // pre-budget behavior. [LAW:one-source-of-truth] The mint shares the parses' failure path: it is
   // the boundary that proves the deadline SUM sound (deadline.js), and its refusal is the same
   // misconfiguration class as a malformed input.
+  // The run's start instant is the SAME mint the deadline spends from — one clock read, two
+  // consumers (the budget's horizon, the timing footer's total) — never a second Date.now()
+  // that could disagree with it. [LAW:one-source-of-truth] (zai-timing-31d.6)
+  const startedAt = Date.now();
   let roundCap;
   let deadline;
   try {
     roundCap = parseMaxRounds(core.getInput('MAX_REVIEW_ROUNDS'));
-    deadline = mintDeadline(Date.now(), parseTimeBudgetMinutes(core.getInput('TIME_BUDGET_MINUTES')));
+    deadline = mintDeadline(startedAt, parseTimeBudgetMinutes(core.getInput('TIME_BUDGET_MINUTES')));
   } catch (e) {
     core.setFailed(e.message);
     return;
@@ -36980,15 +37007,15 @@ async function run() {
   const effort = defaultEffortProfile({ roundCap });
 
   if (mode === 'pr') {
-    await runPrReview(reviewerName, excludePatterns, effort, deadline);
+    await runPrReview(reviewerName, excludePatterns, effort, deadline, startedAt);
   } else if (mode === 'repo') {
-    await runRepoReview(reviewerName, excludePatterns, effort, deadline);
+    await runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt);
   } else {
     core.setFailed(`Invalid MODE '${mode}'. Valid values: 'pr' (review a pull request) or 'repo' (whole-repo review).`);
   }
 }
 
-module.exports = { run, runPrReview, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, MAX_DEPENDENCY_BUMPS_FETCHED };
+module.exports = { run, runPrReview, buildReviewFooter, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, MAX_DEPENDENCY_BUMPS_FETCHED };
 
 
 /***/ }),
@@ -37097,14 +37124,14 @@ function sumMs(values) {
 // actually ran — a fully-refused pass contributes no group, a partially-refused one only the waves
 // its spawned scopes filled — never work that was merely planned.
 function describeSchedule({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
-  const scoutDurations = [];
+  const scouts = [];
   const byPass = new Map();
   // [LAW:no-silent-failure] The dispatch is EXHAUSTIVE over the phase vocabulary this module owns:
   // a record with a phase this fold doesn't recognize would otherwise vanish from the breakdown —
   // the exact drift the shared constructor exists to make impossible — so it throws instead.
   for (const s of spawns) {
     if (s.phase === 'scout') {
-      scoutDurations.push(spanMs(s.usage && s.usage.span));
+      scouts.push({ outcome: s.outcome, ms: spanMs(s.usage && s.usage.span) });
     } else if (s.phase === 'worker') {
       if (!byPass.has(s.pass)) byPass.set(s.pass, []);
       byPass.get(s.pass).push({ scope: s.scope, outcome: s.outcome, ms: spanMs(s.usage && s.usage.span) });
@@ -37112,14 +37139,16 @@ function describeSchedule({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
       throw new Error(`describeSchedule: unknown phase ${JSON.stringify(s.phase)} in spawn record`);
     }
   }
-  const scoutMs = sumMs(scoutDurations);
   const passes = [...byPass.keys()].sort((a, b) => a - b).map(pass => {
     const spawns = byPass.get(pass);
     const distinctScopes = new Set(spawns.map(s => s.scope)).size;
     return { pass, spawns, waves: Math.ceil(distinctScopes / scopeConcurrency) };
   });
   return {
-    scoutMs,
+    // scoutMs stays derived from the scout rows it sits beside, so the summary figure and the
+    // per-attempt table can never disagree about the scout. [LAW:one-source-of-truth]
+    scoutMs: sumMs(scouts.map(s => s.ms)),
+    scouts,
     passes,
     scopeCount,
     scopeConcurrency,
@@ -37128,7 +37157,103 @@ function describeSchedule({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
   };
 }
 
-module.exports = { spawnRecord, scheduleRecord, spanMs, sumMs, describeSchedule };
+// ---------------------------------------------------------------------------------------------
+// RENDERING — the schedule as the footer line an operator reads. It lives here, beside the value
+// it formats, exactly as renderCostLine lives beside the cost value in usage.js: one module owns
+// "what the pass's time was" from record shape through derivation to the string a sink prints.
+// [LAW:one-type-per-behavior] Every sink (PR footer, repo report, the local dev script) renders
+// through this one formatter, so the breakdown cannot drift between them.
+
+// [LAW:effects-at-boundaries] Pure: a millisecond count as the compact figure a footer line can
+// afford — '2m08s', '45s', '1h02m08s'. null is a RECORDED absence and renders as the word for it,
+// never as a fabricated '0s': an unclocked spawn did take time, we just cannot say how much.
+// [LAW:no-silent-failure]
+function formatMs(ms) {
+  if (ms == null) return 'unclocked';
+  const totalSec = Math.round(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  if (h > 0) return `${h}h${String(m).padStart(2, '0')}m${String(s).padStart(2, '0')}s`;
+  if (m > 0) return `${m}m${String(s).padStart(2, '0')}s`;
+  return `${s}s`;
+}
+
+// [LAW:dataflow-not-control-flow] One clause shape for every phase, selected by the VALUES of its
+// durations, not by branches that skip the phase: no records at all is 'missing' (the explicit gap
+// the ticket demands for an absent phase), all-unclocked is 'unclocked', a partial clock renders
+// as the sum marked '+' — the same lower-bound convention the cost tally already uses — and a full
+// clock is the plain figure.
+function phaseClause(label, durations) {
+  if (durations.length === 0) return `${label} missing`;
+  const sum = sumMs(durations);
+  if (sum == null) return `${label} unclocked`;
+  const partial = durations.some(d => d == null) ? '+' : '';
+  return `${label} ${formatMs(sum)}${partial}`;
+}
+
+// pass 0 is the review of record; pass 1..N are convergence sweeps — the same vocabulary the run
+// log's 'sweep N ' labels already use. [LAW:one-source-of-truth]
+function passLabel(pass) {
+  return pass === 0 ? 'review' : `sweep ${pass}`;
+}
+
+// [LAW:effects-at-boundaries] Pure: the timing breakdown as the markdown block the sinks print —
+// one scannable summary line, then the per-attempt table folded behind <details> so it sits under
+// a review a human reads for its FINDINGS without shouting over them.
+//
+// The line answers "why was this slow?" without the run log: total wall clock (the whole run —
+// preflight, diff fetch and host I/O included, which is why it comes from the run's own clock and
+// not from summing spawns); the spawn time inside it (their ratio separates working from waiting);
+// the split by phase; the slowest scope (one pathological scope sets its wave's duration, and
+// every wave waits for it); and the schedule sentence that turns spawn time into wall time.
+//
+// [LAW:parse-dont-validate] totalMs is minted by the run boundary from its one clock; a non-finite
+// or negative figure here is a wiring bug, thrown loudly for the boundary's catch — never rendered
+// as a nonsense total. schedule may be null — the recorded absence (e.g. a review produced without
+// a pass envelope) — and renders as the explicit gap, never as a silently omitted line.
+// [LAW:no-silent-failure]
+function renderTimingBreakdown(schedule, totalMs) {
+  if (!Number.isFinite(totalMs) || totalMs < 0) {
+    throw new Error(`renderTimingBreakdown: totalMs must be a non-negative finite number (got ${JSON.stringify(totalMs)})`);
+  }
+  if (schedule == null) {
+    return `_Timing: ${formatMs(totalMs)} total · spawn breakdown unavailable — this run recorded no schedule_`;
+  }
+  const d = describeSchedule(schedule);
+  const workerRows = d.passes.flatMap(p => p.spawns.map(s => ({ pass: p.pass, ...s })));
+  const allDurations = [...d.scouts.map(s => s.ms), ...workerRows.map(s => s.ms)];
+  const spawnCount = allDurations.length;
+  const phases = [
+    phaseClause('scout', d.scouts.map(s => s.ms)),
+    ...d.passes.map(p => phaseClause(passLabel(p.pass), p.spawns.map(s => s.ms))),
+  ].join(' · ');
+  // The slowest CLOCKED worker attempt; ties keep the first recorded. All-unclocked stays an
+  // explicit 'unclocked', never a fabricated winner.
+  const slowest = workerRows.reduce((best, s) => (s.ms != null && (best == null || s.ms > best.ms) ? s : best), null);
+  const slowestClause = slowest ? `slowest scope: ${slowest.scope} (${formatMs(slowest.ms)})` : 'slowest scope: unclocked';
+  const scheduleSentence =
+    `${d.scopeCount} scope(s) at concurrency ${d.scopeConcurrency} over ${d.passes.length} pass(es) = ${d.waveCount} wave(s)`;
+  const line = `_Timing: ${formatMs(totalMs)} total · ${phaseClause('spawns', allDurations)} (${spawnCount} attempt(s))`
+    + ` — ${phases} · ${slowestClause} · ${scheduleSentence}_`;
+  const rows = [
+    ...d.scouts.map(s => `| scout | — | ${s.outcome} | ${formatMs(s.ms)} |`),
+    ...workerRows.map(s => `| ${passLabel(s.pass)} | ${s.scope} | ${s.outcome} | ${formatMs(s.ms)} |`),
+  ];
+  const details = [
+    '<details>',
+    '<summary>Timing by scope</summary>',
+    '',
+    '| phase | scope | outcome | duration |',
+    '| --- | --- | --- | --- |',
+    ...rows,
+    '',
+    '</details>',
+  ].join('\n');
+  return `${line}\n\n${details}`;
+}
+
+module.exports = { spawnRecord, scheduleRecord, spanMs, sumMs, describeSchedule, formatMs, renderTimingBreakdown };
 
 
 /***/ }),

@@ -131,8 +131,9 @@ const AUTH_LABEL = {
 
 // [LAW:effects-at-boundaries] Pure: render the report string from values. Highlights the one signal
 // this tool exists for — explore-or-not, and whether exploration reached beyond the changed files.
-function formatReport({ config, mode, files, result, sessions, repo }) {
+function formatReport({ config, mode, files, result, sessions, repo, totalMs }) {
   const { renderCostLine } = require('../src/usage');
+  const { renderTimingBreakdown } = require('../src/schedule');
   const lines = [];
   lines.push('================ local-review report ================');
   lines.push(`config:   ${config.name}  (engine=${config.engine}, model=${config.model})`);
@@ -174,6 +175,11 @@ function formatReport({ config, mode, files, result, sessions, repo }) {
   // diagnostic cannot drift into disagreeing with production about what a run cost.
   const costLine = renderCostLine(result.usage, config);
   lines.push(costLine ? `usage: ${costLine.replace(/^_|_$/g, '')}` : 'usage: not reported');
+  // [LAW:one-source-of-truth] The action's OWN timing renderer, same rationale as the cost line
+  // above: the local breakdown cannot drift from what a production footer would say. The summary
+  // line is what a terminal reader wants; the <details> table is footer furniture, dropped here.
+  const timing = renderTimingBreakdown(result.schedule ?? null, totalMs);
+  lines.push(`timing: ${timing.split('\n')[0].replace(/^_|_$/g, '')}`);
   lines.push('=====================================================');
   return lines.join('\n');
 }
@@ -233,6 +239,10 @@ async function main() {
     process.stdout.write(USAGE);
     return;
   }
+  // The local run's one clock, minted at the run boundary exactly as run.js mints its own — so the
+  // reported total covers config resolution and diff parsing, time no spawn owns, the same way
+  // production's total covers preflight and host I/O. [LAW:no-ambient-temporal-coupling]
+  const startedAt = Date.now();
 
   // [LAW:no-ambient-temporal-coupling] main owns the ordering: create an isolated run dir and point
   // RUNNER_TEMP at it BEFORE the engine stack is required, so debug.js computes TRANSCRIPT_DIR against
@@ -270,7 +280,7 @@ async function main() {
     log: msg => process.stderr.write(`[local-review] ${msg}\n`),
   });
 
-  const report = formatReport({ config: configUsed, mode: opts.mode, files, result: review, sessions: readSessions(TRANSCRIPT_DIR), repo });
+  const report = formatReport({ config: configUsed, mode: opts.mode, files, result: review, sessions: readSessions(TRANSCRIPT_DIR), repo, totalMs: Date.now() - startedAt });
   process.stdout.write(`\n${report}\n`);
 }
 

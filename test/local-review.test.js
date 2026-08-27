@@ -113,10 +113,18 @@ test('formatReport surfaces the explore verdict, beyond-diff reads, findings, an
       findings: [{ path: 'src/run.js', line: 52, body: 'comment is a WHAT-comment' }],
       summary: 'looks fine',
       usage: { tokens: { inputCacheMiss: 1000, inputCacheHit: 0, output: 200 }, cost: { basis: 'dollars', usd: 0.0123 } },
+      schedule: {
+        scopeConcurrency: 2, sweepCap: 0, scopeCount: 1,
+        spawns: [
+          { phase: 'scout', outcome: 'completed', usage: { span: { from: '2026-08-23T12:00:00.000Z', to: '2026-08-23T12:01:00.000Z' } } },
+          { phase: 'worker', scope: 'the change', pass: 0, outcome: 'completed', usage: { span: { from: '2026-08-23T12:01:00.000Z', to: '2026-08-23T12:02:00.000Z' } } },
+        ],
+      },
     },
     // Read the changed file (src/run.js) AND a sibling (src/engine/run.js): same basename, different
     // file — only the latter is beyond the diff, and repo-relative paths must keep them distinct.
     sessions: [{ file: '/tmp/t.txt', toolCounts: { Read: 2 }, exploreCalls: 2, explored: true, reads: ['/repo/src/run.js', '/repo/src/engine/run.js'], greps: [], globs: [] }],
+    totalMs: 128000,
   });
   assert.match(report, /EXPLORED REPO: YES/);
   assert.match(report, /files read:\s+src\/run\.js, src\/engine\/run\.js/);
@@ -127,6 +135,9 @@ test('formatReport surfaces the explore verdict, beyond-diff reads, findings, an
   // asserts the production format — the two cannot drift into disagreeing about what a run cost.
   assert.match(report, /Cost: \$0\.0123 · 1,000 in \(0 cached\) \/ 200 out tokens · claude-code\/deepseek-v4-pro · est\./);
   assert.match(report, /endpoint: api-key → https:\/\/x\/anthropic/);
+  // [LAW:one-source-of-truth] The timing renders through the action's OWN renderTimingBreakdown, so
+  // the local diagnostic and the posted footer cannot drift about where the run's time went.
+  assert.match(report, /timing: Timing: 2m08s total · spawns 2m00s \(2 attempt\(s\)\) — scout 1m00s · review 1m00s/);
 });
 
 // Each credential kind gets its own label, so the report cannot reach for a field the other kind
@@ -152,6 +163,7 @@ test('formatReport labels an oauth endpoint as subscription-billed', () => {
       usage: { tokens: { inputCacheMiss: 1000, inputCacheHit: 0, output: 200 }, cost: { basis: 'subscription', notionalUsd: 63.59 } },
     },
     sessions: [],
+    totalMs: 128000,
   });
   assert.match(report, /endpoint: oauth \(subscription\) → https:\/\/api\.anthropic\.com/);
   assert.match(report, /billed to plan quota, not per token/);
@@ -173,6 +185,7 @@ test('formatReport renders every credential kind PRESETS can produce', () => {
       },
       mode: 'pr', repo: '/repo', files: [], sessions: [],
       result: { findings: [], summary: '', usage: null },
+      totalMs: 128000,
     });
     assert.match(report, new RegExp(`endpoint: ${kind}[^\\n]*https://h\\.example`), `credential kind '${kind}' has no AUTH_LABEL entry`);
   }
