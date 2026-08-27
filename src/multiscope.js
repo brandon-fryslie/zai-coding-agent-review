@@ -4,7 +4,7 @@ const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = require('./deadlin
 const { defaultEffortProfile, maxTier } = require('./effort');
 const { dedupeFindings, dedupeAssessments, parseScopeValue } = require('./review');
 const { sumCost, emptyTokens, addTokens } = require('./usage');
-const { spawnRecord } = require('./schedule');
+const { spawnRecord, scheduleRecord } = require('./schedule');
 const { renderDependencyDiffNote } = require('./dependency-diff');
 const { NO_EXCLUSIONS, excludedPathList } = require('./diff');
 const {
@@ -552,12 +552,12 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     // record per spawn attempt. Wave count is deliberately NOT stored — it derives from scopeCount
     // and scopeConcurrency (describeSchedule, src/schedule.js), so the record cannot contradict
     // itself. [LAW:one-source-of-truth]
-    schedule: {
+    schedule: scheduleRecord({
       scopeConcurrency: maxConcurrent,
       sweepCap,
       scopeCount: scopes.length,
       spawns: spawnRecords,
-    },
+    }),
     // [LAW:one-source-of-truth] The coverage gap as DATA, for the sinks: the PR sink withholds
     // approval when unreviewedScopes is non-empty (transport.submitReview), and run.js warns when
     // the budget bit at all. The summary text above derives from these same values, never the

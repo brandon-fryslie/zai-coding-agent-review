@@ -42,6 +42,27 @@ function spawnRecord(tag, outcome, usage) {
   return { ...tag, outcome, usage };
 }
 
+// [LAW:one-source-of-truth] The OUTER shape gets the same owner the inner one has: the pass builds
+// its schedule envelope through this mint, so a renamed or dropped field fails loudly here instead
+// of surfacing as describeSchedule deriving NaN waves from an undefined count. The domains mirror
+// the pass's own entry gates (positive concurrency, non-negative sweep cap); the gates exist to
+// fail BEFORE spawns are spent, this mint to stamp the record — same predicate, different instant.
+function scheduleRecord({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
+  if (!Number.isInteger(scopeConcurrency) || scopeConcurrency < 1) {
+    throw new Error(`scheduleRecord: scopeConcurrency must be a positive integer (got ${JSON.stringify(scopeConcurrency)})`);
+  }
+  if (!Number.isInteger(sweepCap) || sweepCap < 0) {
+    throw new Error(`scheduleRecord: sweepCap must be a non-negative integer (got ${JSON.stringify(sweepCap)})`);
+  }
+  if (!Number.isInteger(scopeCount) || scopeCount < 1) {
+    throw new Error(`scheduleRecord: scopeCount must be a positive integer (got ${JSON.stringify(scopeCount)})`);
+  }
+  if (!Array.isArray(spawns)) {
+    throw new Error('scheduleRecord: spawns must be an array of spawn records');
+  }
+  return { scopeConcurrency, sweepCap, scopeCount, spawns };
+}
+
 // [LAW:effects-at-boundaries] Pure: a span's duration in milliseconds. Absent span → null — a
 // recorded absence (nothing ran, or the failure predated the spawn), never a fabricated zero.
 // [LAW:parse-dont-validate] spans arrive host-stamped by runEngine (ISO-8601 UTC, both ends), so
@@ -63,15 +84,17 @@ function sumMs(values) {
 // Returns {
 //   scoutMs,            // the scout phase's spawn time (all scout attempts summed), null if unclocked
 //   passes: [           // worker spawns grouped by pass index, ascending; order within a pass is
-//     { pass, spawns: [{ scope, outcome, ms }] }   // settle order, as recorded
+//     { pass, spawns: [{ scope, outcome, ms }], waves }   // settle order, as recorded
 //   ],
 //   scopeCount, scopeConcurrency, sweepCap,        // the scheduling facts, echoed as recorded
-//   wavesPerPass,       // ceil(scopeCount / scopeConcurrency) — the pool's sequential depth per pass
-//   waveCount,          // wavesPerPass × passes actually run — DERIVED, so it cannot contradict
+//   waveCount,          // sum of each pass's waves — DERIVED, so it cannot contradict the records
 // }
-// [LAW:dataflow-not-control-flow] Grouping is a fold over the records; a pass that spawned nothing
-// (every scope refused pre-spawn) simply contributes no group, so waveCount reflects work that
-// actually ran, never work that was merely planned.
+// [LAW:one-source-of-truth] A pass's `waves` derives from the DISTINCT scopes that actually spawned
+// in it — ceil(distinctScopes / scopeConcurrency) — never from the planned scopeCount: a pass the
+// time budget cut short mid-wave ran fewer waves than the plan implies, and a retried attempt is a
+// second record for the SAME scope, not a second slot in a wave. So waveCount reflects work that
+// actually ran — a fully-refused pass contributes no group, a partially-refused one only the waves
+// its spawned scopes filled — never work that was merely planned.
 function describeSchedule({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
   const scoutDurations = [];
   const byPass = new Map();
@@ -89,17 +112,19 @@ function describeSchedule({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
     }
   }
   const scoutMs = sumMs(scoutDurations);
-  const passes = [...byPass.keys()].sort((a, b) => a - b).map(pass => ({ pass, spawns: byPass.get(pass) }));
-  const wavesPerPass = Math.ceil(scopeCount / scopeConcurrency);
+  const passes = [...byPass.keys()].sort((a, b) => a - b).map(pass => {
+    const spawns = byPass.get(pass);
+    const distinctScopes = new Set(spawns.map(s => s.scope)).size;
+    return { pass, spawns, waves: Math.ceil(distinctScopes / scopeConcurrency) };
+  });
   return {
     scoutMs,
     passes,
     scopeCount,
     scopeConcurrency,
     sweepCap,
-    wavesPerPass,
-    waveCount: wavesPerPass * passes.length,
+    waveCount: passes.reduce((sum, p) => sum + p.waves, 0),
   };
 }
 
-module.exports = { spawnRecord, spanMs, sumMs, describeSchedule };
+module.exports = { spawnRecord, scheduleRecord, spanMs, sumMs, describeSchedule };

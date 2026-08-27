@@ -2,7 +2,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { spawnRecord, spanMs, sumMs, describeSchedule } = require('../src/schedule');
+const { spawnRecord, scheduleRecord, spanMs, sumMs, describeSchedule } = require('../src/schedule');
 
 const at = (min) => `2026-08-22T03:${String(min).padStart(2, '0')}:00.000Z`;
 const span = (fromMin, toMin) => ({ from: at(fromMin), to: at(toMin) });
@@ -27,6 +27,21 @@ describe('spawnRecord', () => {
   });
   test('rejects an outcome outside the vocabulary', () => {
     assert.throws(() => spawnRecord({ phase: 'scout' }, 'killed', null), /unknown outcome "killed"/);
+  });
+});
+
+// The outer envelope's mint, mirroring spawnRecord: a drifted field name fails here, never as
+// describeSchedule deriving NaN waves from an undefined count. [LAW:one-source-of-truth]
+describe('scheduleRecord', () => {
+  const good = { scopeConcurrency: 2, sweepCap: 1, scopeCount: 3, spawns: [] };
+  test('mints the envelope as given', () => {
+    assert.deepEqual(scheduleRecord(good), good);
+  });
+  test('rejects a missing or out-of-domain field loudly', () => {
+    assert.throws(() => scheduleRecord({ ...good, scopeConcurrency: 0 }), /scopeConcurrency must be a positive integer/);
+    assert.throws(() => scheduleRecord({ ...good, sweepCap: -1 }), /sweepCap must be a non-negative integer/);
+    assert.throws(() => scheduleRecord({ ...good, scopeCount: undefined }), /scopeCount must be a positive integer/);
+    assert.throws(() => scheduleRecord({ ...good, spawns: undefined }), /spawns must be an array/);
   });
 });
 
@@ -87,9 +102,9 @@ describe('describeSchedule', () => {
       d.passes[1].spawns.map(({ scope, ms }) => ({ scope, ms })),
       [{ scope: 's1', ms: 1 * MIN }, { scope: 's2', ms: 2 * MIN }, { scope: 's3', ms: 1 * MIN }, { scope: 's4', ms: 1 * MIN }],
     );
-    // 4 scopes at concurrency 2 = 2 waves per pass; 2 passes actually ran = 4 waves. Derived, never
-    // stored — the record cannot contradict its own arithmetic. [LAW:one-source-of-truth]
-    assert.equal(d.wavesPerPass, 2);
+    // 4 distinct scopes spawned at concurrency 2 = 2 waves in each pass; 4 waves total. Derived from
+    // the records, never stored — the count cannot contradict its own arithmetic. [LAW:one-source-of-truth]
+    assert.deepEqual(d.passes.map(p => p.waves), [2, 2]);
     assert.equal(d.waveCount, 4);
     // The scheduling facts are echoed as recorded.
     assert.equal(d.scopeCount, 4);
@@ -126,6 +141,29 @@ describe('describeSchedule', () => {
       d.passes[0].spawns,
       [{ scope: 's1', outcome: 'retried', ms: 3 * MIN }, { scope: 's1', outcome: 'completed', ms: 2 * MIN }],
     );
+    // Two records, ONE scope: a retried attempt reoccupies the same wave slot, never inflates waves.
+    assert.equal(d.passes[0].waves, 1);
+    assert.equal(d.waveCount, 1);
+  });
+
+  test('a pass the budget cut short mid-wave reports only the waves its spawned scopes filled', () => {
+    // The plan said 3 scopes at concurrency 2 (2 waves), but shouldStart refused the third scope
+    // before it spawned: only wave 1 ran, and the count must say so — an operator diagnosing a
+    // budget-exhausted run must not be told to raise concurrency for a wave that never happened.
+    const d = describeSchedule({
+      scopeConcurrency: 2,
+      sweepCap: 0,
+      scopeCount: 3,
+      spawns: [
+        { phase: 'scout', outcome: 'completed', usage: { span: span(0, 1) } },
+        worker('s1', 0, 1, 3),
+        worker('s2', 0, 1, 4),
+        // s3 never spawned — no record, exactly as the pool's pre-spawn refusal leaves it.
+      ],
+    });
+    assert.equal(d.passes[0].waves, 1);
+    assert.equal(d.waveCount, 1);
+    assert.equal(d.scopeCount, 3); // the plan is still echoed; the gap between them IS the diagnosis
   });
 
   test('a spawn that never ran (usage null) reports a null duration, never zero', () => {
