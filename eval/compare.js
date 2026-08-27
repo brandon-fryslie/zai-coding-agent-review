@@ -14,8 +14,8 @@
 //   2. scores each case (spawning eval/score.js),
 //   3. reduces the candidate's scored summaries into a suite with the SAME buildBaseline the frozen baseline
 //      was built with (so producer and comparator can NEVER drift — [LAW:one-source-of-truth]), and
-//   4. applies the frozen pooled degradation rule: candidate pooled must-find recall < the baseline's
-//      pooled gate floor  ⇒  DEGRADED (non-zero exit, so the gate is mechanical).
+//   4. applies the frozen pooled degradation rule via baseline.js's evaluateGate: candidate pooled
+//      inventory must-find recall < the baseline's pooled gate floor  ⇒  DEGRADED (non-zero exit).
 // N and the engine are DERIVED FROM the baseline and asserted, because a candidate run at a different N or
 // engine is not comparable — its pooled rate measures a different thing. [LAW:no-silent-failure]
 //
@@ -28,7 +28,7 @@ const os = require('os');
 const path = require('path');
 const { spawnSync, execFileSync } = require('child_process');
 const {
-  parseCaseSummary, parseCaseEngine, buildBaseline, parseBaseline, sameEngine,
+  parseCaseSummary, parseCaseEngine, buildBaseline, parseBaseline, sameEngine, evaluateGate,
 } = require('./baseline');
 const { JUDGE_MODEL } = require('./score');
 
@@ -147,28 +147,28 @@ function compareVerdict(baseline, candidate) {
     throw new Error(`Incomparable case sets: ${missing.length ? `candidate is missing [${missing.join(', ')}]` : ''}${missing.length && extra.length ? '; ' : ''}${extra.length ? `candidate has extra [${extra.join(', ')}]` : ''}. The gate pools over the baseline's exact suite.`);
   }
 
-  const candidateRate = candidate.suite.pooledMustFind.rate;
-  const baselineRate = baseline.pooledMustFind.rate;
-  const gateFloor = baseline.pooledMustFind.gateFloor;
-  // THE GATE — strictly-less, matching degradationRule.comparator 'lt': a candidate AT the floor is not
-  // degraded (the floor is the accept boundary). This is the ONLY line that decides the exit code.
-  const degraded = candidateRate < gateFloor;
+  // THE GATE — delegated to evaluateGate (baseline.js), the single place DEGRADATION_RULE is applied to a
+  // candidate. [LAW:single-enforcer] This file must never re-derive degraded from raw rate/floor numbers.
+  const candidatePooled = candidate.suite.pooledInventoryMustFind;
+  const baselinePooled = baseline.pooledInventoryMustFind;
+  const gate = evaluateGate(baseline, candidatePooled);
+  const { degraded, gateFloor } = gate;
   // IMPROVED / OK are informational labels only (never the gate): the pooled point estimate rising above the
   // baseline's is suggestive, not significant at this denominator. Only DEGRADED reds the run.
-  const status = degraded ? 'DEGRADED' : (baselineRate !== null && candidateRate > baselineRate ? 'IMPROVED' : 'OK');
+  const status = degraded ? 'DEGRADED' : (baselinePooled.rate !== null && candidatePooled.rate > baselinePooled.rate ? 'IMPROVED' : 'OK');
 
-  // Per-case localization — for each baseline case, its frozen diagnostic band vs the candidate's. `moved`
+  // Per-case localization — for each baseline case, its inventory diagnostic band vs the candidate's. `moved`
   // flags a case whose candidate MEAN recall dipped below the baseline's own observed worst run (its
   // diagnostic floor): the localizer for "which case moved the pooled rate". Diagnostics only — never a gate.
   const candByName = new Map(candidate.cases.map(c => [c.case, c]));
   const cases = baseline.cases.map((b) => {
     const c = candByName.get(b.case);
-    const candBand = c.mustFindRecall;
-    const delta = (candBand.mean !== null && b.mustFindRecall.mean !== null) ? candBand.mean - b.mustFindRecall.mean : null;
+    const candBand = c.inventoryMustFindRecall;
+    const delta = (candBand.mean !== null && b.inventoryMustFindRecall.mean !== null) ? candBand.mean - b.inventoryMustFindRecall.mean : null;
     const moved = (b.diagnosticFloor !== null && candBand.mean !== null && candBand.mean < b.diagnosticFloor);
     return {
       case: b.case,
-      baselineBand: b.mustFindRecall,
+      baselineBand: b.inventoryMustFindRecall,
       baselineDiagnosticFloor: b.diagnosticFloor,
       candidateBand: candBand,
       candidateDiagnosticFloor: c.diagnosticFloor,
@@ -184,8 +184,8 @@ function compareVerdict(baseline, candidate) {
     engine: baseline.engine,
     matcher: baseline.matcher,
     pooled: {
-      candidate: candidate.suite.pooledMustFind,
-      baseline: baseline.pooledMustFind,
+      candidate: candidatePooled,
+      baseline: baselinePooled,
       gateFloor,
     },
     movedCases: cases.filter(c => c.moved).map(c => c.case),
@@ -215,7 +215,7 @@ function renderVerdictMarkdown(verdict, meta = {}) {
       `${eng ? ` · engine \`${eng.provider}\`/\`${eng.model}\`${eng.reasoning ? `/reasoning=${eng.reasoning}` : ''}` : ''}` +
       ` · N=${verdict.repeats}${verdict.matcher ? ` · matcher \`${verdict.matcher}\`` : ''}.`,
     '',
-    `**PRIMARY GATE — pooled must-find recall:** candidate **${pct(p.candidate.rate)}** ` +
+    `**PRIMARY GATE — pooled inventory must-find recall:** candidate **${pct(p.candidate.rate)}** ` +
       `(${p.candidate.found}/${p.candidate.opportunities}) vs gate floor **${pct(p.gateFloor)}** ` +
       `(baseline ${pct(p.baseline.rate)}, ${p.baseline.found}/${p.baseline.opportunities}) → ` +
       `${verdict.degraded ? '**below floor**' : 'at/above floor'}.`,
@@ -244,11 +244,11 @@ function renderVerdictMarkdown(verdict, meta = {}) {
     const named = verdict.movedCases.length
       ? `Localized to: ${verdict.movedCases.map(n => `\`${n}\``).join(', ')} (candidate mean below the case's diagnostic floor).`
       : `No single case crossed its diagnostic floor — the pooled recall fell broadly, not in one case.`;
-    lines.push(`**VERDICT: DEGRADED** — candidate pooled must-find recall ${pct(p.candidate.rate)} is below the ${pct(p.gateFloor)} gate floor. ${named}`);
+    lines.push(`**VERDICT: DEGRADED** — candidate pooled inventory must-find recall ${pct(p.candidate.rate)} is below the ${pct(p.gateFloor)} gate floor. ${named}`);
   } else if (verdict.status === 'IMPROVED') {
-    lines.push(`**VERDICT: OK (improved)** — candidate pooled must-find recall ${pct(p.candidate.rate)} clears the ${pct(p.gateFloor)} floor and exceeds the baseline ${pct(p.baseline.rate)}. (Point estimate only — not significant at this denominator.)`);
+    lines.push(`**VERDICT: OK (improved)** — candidate pooled inventory must-find recall ${pct(p.candidate.rate)} clears the ${pct(p.gateFloor)} floor and exceeds the baseline ${pct(p.baseline.rate)}. (Point estimate only — not significant at this denominator.)`);
   } else {
-    lines.push(`**VERDICT: OK** — candidate pooled must-find recall ${pct(p.candidate.rate)} clears the ${pct(p.gateFloor)} gate floor. Finding quality is not degraded.`);
+    lines.push(`**VERDICT: OK** — candidate pooled inventory must-find recall ${pct(p.candidate.rate)} clears the ${pct(p.gateFloor)} gate floor. Finding quality is not degraded.`);
   }
   lines.push('');
   return lines.join('\n') + '\n';
@@ -333,7 +333,7 @@ function main() {
 
   process.stderr.write(`\nBaseline: ${baselineJsonPath}\n`);
   process.stderr.write(`  ${baseline.mainSha.slice(0, 7)} · engine ${baseline.engine ? `${baseline.engine.provider}/${baseline.engine.model}` : '(unpinned)'} · N=${repeats} · matcher ${baseline.matcher || '(none)'}\n`);
-  process.stderr.write(`  gate floor ${(baseline.pooledMustFind.gateFloor * 100).toFixed(0)}% (baseline pooled ${(baseline.pooledMustFind.rate * 100).toFixed(0)}%, ${baseline.pooledMustFind.found}/${baseline.pooledMustFind.opportunities})\n`);
+  process.stderr.write(`  gate floor ${(baseline.pooledInventoryMustFind.gateFloor * 100).toFixed(0)}% (baseline pooled ${(baseline.pooledInventoryMustFind.rate * 100).toFixed(0)}%, ${baseline.pooledInventoryMustFind.found}/${baseline.pooledInventoryMustFind.opportunities})\n`);
 
   if (opts.reuseCandidate) {
     process.stderr.write(`\nReusing candidate artifacts under ${candidateRoot} (no replay, no spend).\n`);

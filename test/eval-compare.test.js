@@ -15,16 +15,23 @@ const { JUDGE_MODEL } = require('../eval/score');
 // No IO, no spawn. [LAW:behavior-not-structure] They assert the gate contract, not internals.
 
 // A candidate SUITE is exactly buildBaseline's output — build fixtures through it so the test can't drift
-// from the real reducer. Each case pools its perRun must-finds. `caseEntry` mirrors eval-baseline.test.js.
+// from the real reducer. Each case pools its perRun must-finds. `caseEntry` mirrors eval-baseline.test.js:
+// the gate reads the INVENTORY band/fractions (the primary gate since the pooled-inventory refactor), so
+// each perRun entry carries both the frozen-round and inventory fractions — here identical (no extra
+// inventory rounds), matching a case with a single frozen round.
 function caseEntry(name, mustFindBand, perRun, engine) {
   return {
     summary: {
       case: name, runs: perRun.length, matcher: 'llm/deepseek-v4-flash',
       mustFindRecall: mustFindBand,
+      inventoryMustFindRecall: mustFindBand,
       niceToFindRecall: { mean: 0, min: 0, max: 0, n: perRun.length },
+      inventoryNiceToFindRecall: { mean: 0, min: 0, max: 0, n: perRun.length },
       noiseCount: { mean: 1, min: 0, max: 2, n: perRun.length },
       costUsd: { mean: 0.2, min: 0.1, max: 0.3, n: perRun.length },
-      perRun: perRun.map(([found, total], i) => ({ mustFind: { found, total }, costUsd: 0.1 + i * 0.05 })),
+      perRun: perRun.map(([found, total], i) => ({
+        mustFind: { found, total }, inventoryMustFind: { found, total }, costUsd: 0.1 + i * 0.05,
+      })),
     },
     engine: engine ?? { provider: 'deepseek', model: 'deepseek-v4-pro', reasoning: null },
   };
@@ -149,15 +156,21 @@ test('compareVerdict treats a candidate exactly AT the floor as OK (strictly-les
   // candidate whose rate equals the baseline's own gate floor value — the comparator is `lt`, so equal
   // is not degraded. We fabricate by loading a baseline and asking a candidate at its floor.
   const baseline = frozenBaseline(CASES_A());
-  const floor = baseline.pooledMustFind.gateFloor;
-  // A candidate suite whose pooled rate == floor: pick perRun summing to floor over the pooled denominator.
-  // Rather than solve integer fractions, assert the boundary property directly on the pure decision: a
-  // candidate rate == floor is NOT degraded, one epsilon below IS.
+  const floor = baseline.pooledInventoryMustFind.gateFloor;
+  // evaluateGate compares candidate.found/opportunities directly (not the pre-rounded .rate field), so drive
+  // the boundary through the fraction it actually reads. Rather than solve integer fractions, assert the
+  // boundary property directly on the pure decision: a candidate rate == floor is NOT degraded, one epsilon
+  // below IS.
+  const atOpportunities = baseline.pooledInventoryMustFind.opportunities;
   const atFloor = candidateSuite(CASES_A());
-  atFloor.suite.pooledMustFind.rate = floor;
+  atFloor.suite.pooledInventoryMustFind.found = Math.ceil(floor * atOpportunities);
+  atFloor.suite.pooledInventoryMustFind.opportunities = atOpportunities;
+  atFloor.suite.pooledInventoryMustFind.rate = atFloor.suite.pooledInventoryMustFind.found / atOpportunities;
   assert.equal(compareVerdict(baseline, atFloor).degraded, false);
   const below = candidateSuite(CASES_A());
-  below.suite.pooledMustFind.rate = floor - 0.0001;
+  below.suite.pooledInventoryMustFind.found = 0;
+  below.suite.pooledInventoryMustFind.opportunities = atOpportunities;
+  below.suite.pooledInventoryMustFind.rate = 0;
   assert.equal(compareVerdict(baseline, below).degraded, true);
 });
 
@@ -206,7 +219,7 @@ test('renderVerdictMarkdown surfaces the gate, the per-case table, cost, and a f
     cost: { baselinePerRun: 0.7, candidatePerRun: 0.5, delta: -0.2 },
   });
   assert.match(md, /## Eval verdict — 🔴 DEGRADED/);
-  assert.match(md, /PRIMARY GATE — pooled must-find recall/);
+  assert.match(md, /PRIMARY GATE — pooled inventory must-find recall/);
   assert.match(md, /working tree `cafe123`, dirty/);
   assert.match(md, /\| `case-a` \|/);
   assert.match(md, /⚠️ yes/);

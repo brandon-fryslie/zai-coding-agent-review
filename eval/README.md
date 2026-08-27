@@ -408,7 +408,8 @@ DEEPSEEK_API_KEY=… node eval/compare.js
 #          --reuse-candidate <dir> (gate an already-produced candidate root; no replay, no spend)
 ```
 
-**A candidate is just another suite.** `compare.js` reimplements no pooling and no scoring — it:
+**A candidate is just another suite.** `compare.js` reimplements no pooling, no scoring, and no
+gate predicate — it:
 
 1. replays every baseline case **N times** (N and the engine come *from the baseline*, and are
    asserted — a candidate run at a different N or engine measures something else) by spawning
@@ -416,8 +417,9 @@ DEEPSEEK_API_KEY=… node eval/compare.js
 2. reduces the candidate's scored summaries into a suite with the **same `buildBaseline`** the
    frozen baseline was built with — so the producer and the comparator can never drift
    (`[LAW:one-source-of-truth]`); and
-3. applies the frozen [degradation rule](#the-degradation-rule): **candidate pooled must-find
-   recall < the baseline's pooled gate floor ⇒ DEGRADED.**
+3. applies the frozen [degradation rule](#the-degradation-rule) via `baseline.js`'s `evaluateGate`
+   (`[LAW:single-enforcer]`): **candidate pooled inventory must-find recall < the baseline's pooled
+   gate floor ⇒ DEGRADED.**
 
 It prints the **estimated cost up front** (the baseline's recorded `$/full-run` × N), then a
 per-case verdict table and a final `DEGRADED` / `OK` / `IMPROVED` line — Markdown, so it pastes
