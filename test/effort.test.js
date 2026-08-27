@@ -6,8 +6,8 @@ const { defaultEffortProfile, resolveReasoningTier, maxTier, TIER_RANK } = requi
 const registry = require('../src/engine/registry');
 
 describe('defaultEffortProfile', () => {
-  test('reproduces the pre-profile scope concurrency (4)', () => {
-    assert.deepEqual(defaultEffortProfile(), { scopeConcurrency: 4, roundCap: 0, sweepCap: 2, reasoningTier: null });
+  test('defaults scope concurrency to one wave for the largest observed plan (8)', () => {
+    assert.deepEqual(defaultEffortProfile(), { scopeConcurrency: 8, roundCap: 0, sweepCap: 2, reasoningTier: null });
   });
 
   test('defaults sweepCap to the convergence-sweep bound (2) and folds a supplied one', () => {
@@ -28,7 +28,7 @@ describe('defaultEffortProfile', () => {
   test('returns a fresh object each call (no shared mutable default)', () => {
     const a = defaultEffortProfile();
     a.scopeConcurrency = 99;
-    assert.equal(defaultEffortProfile().scopeConcurrency, 4);
+    assert.equal(defaultEffortProfile().scopeConcurrency, 8);
   });
 
   test('folds the supplied roundCap into the profile (the cost-bearing axis)', () => {

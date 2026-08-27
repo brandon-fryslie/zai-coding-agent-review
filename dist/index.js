@@ -32027,7 +32027,14 @@ module.exports = {
 // [LAW:one-source-of-truth] The default scope-worker concurrency. Quality is identical at any
 // concurrency; this only trades runner load for wall time. It lived as DEFAULT_SCOPE_CONCURRENCY in
 // multiscope.js; it is the profile's value now, and the worker pool reads it FROM the profile.
-const DEFAULT_SCOPE_CONCURRENCY = 4;
+// 8, not 4 (zai-efficiency-wp8.1): wall clock scales with waves = ceil(scopes / concurrency), and the
+// largest scout plan yet observed is 8 scopes (run 32639972593) — at 4 that pass paid two waves where
+// one would do, and every wave is a full per-spawn latency (~140s measured). 8 makes every observed
+// plan a single wave. The runner-memory ceiling (each lane is one engine child process on a 2-core
+// ubuntu-latest runner) is a HYPOTHESIS the ticket records, not a measured limit; the live per-scope
+// done lines (zai-timing-31d.7) are the check — lane thrash would show as inflated worker spans
+// relative to the 65–176s band measured at concurrency 4. [LAW:verifiable-goals]
+const DEFAULT_SCOPE_CONCURRENCY = 8;
 
 // [LAW:one-source-of-truth] The default convergence-sweep bound: after the initial worker pass, up to
 // this many further sweep passes re-review the same material hunting only for findings NOT yet
