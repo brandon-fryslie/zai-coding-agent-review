@@ -32170,7 +32170,7 @@ const os = __nccwpck_require__(857);
 const { parseRetryAfterMs, classifyTransient } = __nccwpck_require__(2887);
 const { parseJsonEnvelope, formatOutputTail } = __nccwpck_require__(8861);
 const { makeCliAdapter } = __nccwpck_require__(2890);
-const { isAnthropicEndpoint, isSubscription, computeCostUsd } = __nccwpck_require__(9614);
+const { isAnthropicEndpoint, isSubscription, priceFromTable, spawnFromTokens } = __nccwpck_require__(9614);
 const { resolveReasoningTier } = __nccwpck_require__(4652);
 
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
@@ -32435,8 +32435,9 @@ function costFromEnvelope(env, config, buckets, startedAt) {
       ? { basis: 'dollars', usd: env.total_cost_usd }
       : { basis: 'unpriced', reason: 'not-reported' };
   }
-  const usd = computeCostUsd(buckets, config.model, startedAt);
-  return usd == null ? { basis: 'unpriced', reason: 'no-price' } : { basis: 'dollars', usd };
+  // priceFromTable returns the cost value whole, reasons and all, so this arm neither re-derives WHY a
+  // table price was unavailable nor collapses the two causes into one. [LAW:single-enforcer]
+  return priceFromTable(spawnFromTokens(startedAt, buckets), config.model);
 }
 
 // [LAW:single-enforcer] Classification of the shared transient vocabulary (429/529/network drop) lives
@@ -32625,7 +32626,7 @@ const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 const os = __nccwpck_require__(857);
 const { TransientError, classifyTransient } = __nccwpck_require__(2887);
-const { computeCostUsd } = __nccwpck_require__(9614);
+const { priceFromTable, spawnFromTokens } = __nccwpck_require__(9614);
 const { makeCliAdapter } = __nccwpck_require__(2890);
 const { resolveReasoningTier } = __nccwpck_require__(4652);
 
@@ -32798,11 +32799,18 @@ function assertSucceeded(stdout) {
 
 // [LAW:effects-at-boundaries] Pure: reads usage from the engine's own JSONL output and returns
 // a Usage value, or null when no usage was reported. Codex emits NO USD — 'actual USD' is
-// tokens x the centralized price table (computeCostUsd); a model absent from the
-// table yields cost {basis:'unpriced', reason:'no-price'}, never a fabricated zero. [LAW:no-silent-failure]
+// tokens x the centralized price table (priceFromTable), which reports its own reason when it cannot
+// price a spawn and never a fabricated zero. [LAW:no-silent-failure]
 // The cumulative turn usage rides on the final turn.completed event; later events overwrite
 // earlier ones so the last wins. An absent/empty usage object (no token fields) is reported as
 // no usage (null), not as a $0.00 run. [LAW:dataflow-not-control-flow]
+//
+// input_tokens is a SUM ACROSS THE TURN'S MODEL REQUESTS, not the size of any one prompt — measured
+// 2026-08-27 against a live codex run, where one turn making three requests of ~26K context each
+// reported 78,338 with cached_input_tokens 52,352 (the two later requests re-reading the same prefix).
+// That is why a context-tiered model prices from an interval rather than from this number; see
+// THE SPAWN FACTS in src/usage.js. usage appears on turn.completed and on no other event, so a
+// per-request context length cannot be recovered from this stream at all.
 function extractUsage(stdout, config, startedAt) {
   let usage = null;
   for (const line of stdout.split('\n')) {
@@ -32827,13 +32835,13 @@ function extractUsage(stdout, config, startedAt) {
   };
   // `startedAt` is the spawn's start instant, supplied by makeCliAdapter — the price table is a
   // schedule, so the rate is selected by WHEN this spawn ran, not by a clock read in here.
-  const costUsd = computeCostUsd(tokens, config.model, startedAt);
-  // [LAW:types-are-the-program] cost is a discriminated value. Codex reports no USD, so a null
-  // here means exactly one thing — the model is absent from the price table — and the adapter
-  // declares that reason at the point it knows it, rather than the boundary re-deriving it.
-  // The basis is always 'dollars': codex declares credentialKinds ['api-key'], so no codex run can
+  // [LAW:types-are-the-program] cost is a discriminated value, and priceFromTable returns it whole —
+  // dollars, or unpriced carrying the reason it discovered. This adapter never manufactures that
+  // reason: codex can reach two of them (the model is absent from the table, or its schedule covers
+  // no card for this spawn) and telling them apart is the price table's job, not the adapter's.
+  // The basis is never 'subscription': codex declares credentialKinds ['api-key'], so no codex run can
   // ever be billed to a subscription and this adapter has no notional arm to reach.
-  const cost = costUsd == null ? { basis: 'unpriced', reason: 'no-price' } : { basis: 'dollars', usd: costUsd };
+  const cost = priceFromTable(spawnFromTokens(startedAt, tokens), config.model);
   return { tokens, cost };
 }
 
@@ -38324,32 +38332,60 @@ module.exports = {
 // formats an already-extracted Usage value into the review footer line. Extraction is engine-specific
 // and lives in each adapter (engine/codex.js, engine/claude-code.js); this module computes cost from
 // tokens × price and formats the footer.
-// [LAW:single-enforcer] Token cost is computed in exactly one place: computeCostUsd.
+// [LAW:single-enforcer] Token cost is computed in exactly one place: priceFromTable.
 
 // [LAW:types-are-the-program] A PRICE ENTRY IS A RATE SCHEDULE, not a rate:
 //
-//   { rates: {input, cachedInput, output}, tiers: [ { when: {daysUtc, hoursUtc}, rates } ] }
+//   { tiers: [ { when: Constraint[], rates: {input, cachedInput, output} } ] }
 //
-// `rates` is the STANDARD rate and is always present, so a schedule with an unpriced moment is
-// unrepresentable — there is no instant the table cannot answer for. `tiers` names the windows where
-// a DIFFERENT rate applies; the first tier covering the instant wins, and an empty list means the
-// vendor charges one rate around the clock. A flat-rate vendor is therefore the SAME shape with
-// `tiers: []`, never a second union arm, so ratesAt runs the same operations for every model and the
-// variability lives entirely in the data. [LAW:dataflow-not-control-flow] [LAW:no-mode-explosion]
-// This is why there is no isDeepSeek flag and no isPeak boolean anywhere below: the rate is selected
-// by the instant against the schedule, so the next vendor to introduce time-of-day pricing is a table
-// row, not a branch.
+// The FIRST tier whose every constraint holds wins, and `when: []` holds always — so a flat-rate
+// vendor is one tier constraining nothing, never a second union arm, and ratesAt runs the identical
+// operations for every model with the variability living entirely in the data.
+// [LAW:dataflow-not-control-flow] [LAW:no-mode-explosion] This is why there is no isDeepSeek flag, no
+// isPeak boolean and no isLongContext boolean anywhere below.
+//
+// A CONSTRAINT NAMES ITS AXIS, and a rate is therefore selected by a VECTOR of facts about the spawn
+// — when it ran AND how long its prompts were — rather than by an instant alone. Each axis has one
+// matcher (CONSTRAINT_MATCHERS), so the next vendor to price along a new axis is a new constraint kind
+// plus its matcher, and NOT an edit to any row that does not use it. [LAW:locality-or-seam] An axis
+// with no matcher THROWS rather than silently holding: a constraint nobody can evaluate that reads as
+// "satisfied" would price the spawn off the wrong rate card. [LAW:no-silent-failure]
+//
+// THERE IS DELIBERATELY NO ALWAYS-PRESENT `rates` FIELD, and its removal is the point rather than a
+// side effect. The previous shape carried a STANDARD rate beside the tiers, on the theorem that "a
+// schedule with a moment it cannot price is unrepresentable — there is no gap to fall into". That
+// theorem is TRUE of time (a vendor charges something at every instant) and FALSE of context length,
+// which is how it was discovered: OpenAI publishes gpt-5.5 as "gpt-5.5 (<272K context length)" and
+// publishes no rate at all above that, while the model's own context window is 1,050,000 — so the
+// unpriced region is reachable, not hypothetical. A standard-rate field would have forced that gap to
+// be spelled as a rate, i.e. to assert the ≤272K price applies at 900K. A stronger-but-false theorem
+// makes the code lie; the honest one is that a schedule MAY decline, and a spawn no tier covers is
+// reported unpriced and loud. [FRAMING:representation] [LAW:no-silent-failure]
 //
 // DeepSeek's peak window, quoted from the official pricing page: "Peak hours are
 // 01:00 - 04:00 and 06:00 - 10:00 UTC, Monday through Friday". WHEN that was last confirmed is not
 // written here — it is the DeepSeek source's `verifiedOn` below, which covers this window exactly as
 // it covers the rates. A date restated in a comment beside the field that owns it is the second clock
 // this table was just rid of. [LAW:one-source-of-truth]
-// The DAYS are as load-bearing as the
-// hours and are why `when` is not an hours list: peak covers 7 hours on 5 days, so a schedule holding
-// only the hours would bill every weekend review at double its real rate — the same silently-wrong
-// figure this epic exists to end, in the opposite direction. [FRAMING:representation]
-const DEEPSEEK_PEAK = { daysUtc: [1, 2, 3, 4, 5], hoursUtc: [[1, 4], [6, 10]] };
+// The DAYS are as load-bearing as the hours and are why peak is two constraints rather than an hours
+// list: peak covers 7 hours on 5 days, so a schedule holding only the hours would bill every weekend
+// review at double its real rate — the same silently-wrong figure this epic exists to end, in the
+// opposite direction. [FRAMING:representation]
+const DEEPSEEK_PEAK = [
+  { axis: 'daysUtc', days: [1, 2, 3, 4, 5] },
+  { axis: 'hoursUtc', ranges: [[1, 4], [6, 10]] },
+];
+
+// OpenAI's context split, quoted from the tooltips on its own pricing table: short context is
+// "≤272K input tokens", long context is ">272K input tokens". ONE constant carries the boundary and
+// both constraints derive from it, so the two halves cannot drift into overlapping or leaving a gap.
+// [LAW:one-source-of-truth] Half-open [start, end) exactly as the hour windows are, which is why the
+// boundary is written as the first LONG token count rather than the last short one: token counts are
+// integers, so "≤272,000" and "[0, 272,001)" are the same set, and one convention for every axis beats
+// a second inclusive-end rule that only this axis would use. [LAW:one-type-per-behavior]
+const OPENAI_LONG_CONTEXT_FROM = 272_001;
+const SHORT_CONTEXT = { axis: 'contextTokens', range: [0, OPENAI_LONG_CONTEXT_FROM] };
+const LONG_CONTEXT = { axis: 'contextTokens', range: [OPENAI_LONG_CONTEXT_FROM, Infinity] };
 
 // [LAW:one-source-of-truth] EVERY priced provider, one table — grouped by the PAGE a human verifies it
 // against, because that page and the date someone last read it are facts ABOUT these rates and not
@@ -38374,36 +38410,68 @@ const DEEPSEEK_PEAK = { daysUtc: [1, 2, 3, 4, 5], hoursUtc: [[1, 4], [6, 10]] };
 const PRICE_SOURCES = [
   {
     vendor: 'OpenAI',
-    url: 'https://openai.com/api/pricing/',
-    verifiedOn: '2026-08-26',
+    // The DEVELOPER pricing page, not openai.com/api/pricing — that host answers 403 to a plain
+    // fetch, and this one renders the same figures in a table a human can read end to end.
+    url: 'https://developers.openai.com/api/docs/pricing',
+    verifiedOn: '2026-08-27',
     // WHAT the last reconciliation found, recorded here because the date alone cannot carry it — when
     // it happened is `verifiedOn` above and is never restated in prose, or this group would keep two
-    // clocks about its own freshness. The page's flagship table now lists only
-    // gpt-5.6-{sol,terra,luna}, so these three rows are no longer on it. Nor are they on
-    // developers.openai.com/api/docs/pricing,
-    // .../docs/models, or platform.openai.com/docs/pricing — all four were checked. They remain live
-    // and unchanged at these exact figures per several third-party trackers, which is why they stay —
-    // but "checked, still true, no longer on any page we can name" is a different fact from "read
-    // straight off the page", and a bare date would have hidden the difference.
-    // [FRAMING:representation]
+    // clocks about its own freshness. [FRAMING:representation]
     //
-    // SO THIS GROUP HAS A BLIND SPOT, and it is stated rather than left for someone to discover: the
-    // freshness check scores a source by WHEN it was last reconciled, never by WHETHER `url` can still
-    // answer for the rows underneath. These three can therefore read "fresh" for thirty days while the
-    // prices they assert drift somewhere this table cannot see. The check is not lying — the
-    // reconciliation genuinely happened, and opening `url` genuinely re-discovers this — but it is
-    // weaker here than for DeepSeek and z.ai, whose pages price every row they carry. Making "no page
-    // prices this row" a fact the TABLE carries, rather than a paragraph a human has to read, is
-    // zai-cost-truth-p5o.5 along with the question of whether these rows should exist at all.
-    // [LAW:no-silent-failure]
-    // The gpt-5.6 rows are deliberately NOT added yet: OpenAI prices them differently for short and
-    // long context, and a `tiers` window is keyed by an INSTANT, so a long-context run would price at
-    // the short-context rate — a fresh silent misprice inside the mechanism built to end them. That
-    // axis is a schema question, not a table row.
+    // Every row below was read off this page's own tables on that date, including the three that a
+    // previous pass recorded as unfindable. They ARE here — the flagship table carries
+    // gpt-5.6-{sol,terra,luna} and the "all models" table carries the rest — so the blind spot that
+    // pass recorded ("no page we can name prices these rows") is RESOLVED, not inherited. What misled
+    // it is worth naming, because the next reader will meet it too: the all-models table renders from
+    // a JSON payload in the page source rather than as static markup, so a reader who searches only
+    // the rendered text finds gpt-5.6 and concludes the older rows are gone.
+    //
+    // THE SPLIT IS THE POINT OF THIS GROUP. The page prices by CONTEXT LENGTH, its own column tooltips
+    // defining short as "≤272K input tokens" and long as ">272K input tokens":
+    //   - gpt-5.6-{sol,terra,luna} publish BOTH cards, so both are carried.
+    //   - gpt-5.5 and gpt-5.4 are listed as "gpt-5.5 (<272K context length)" and publish NO card above
+    //     that. Their schedules therefore stop at 272K and a larger spawn is reported unpriced. This
+    //     is a real gap and not a transcription slip: both models carry a 1,050,000 context window
+    //     (developers.openai.com/api/docs/models/gpt-5.5), so a >272K request is accepted by the model
+    //     while the vendor names no price for it. Carrying these as flat rates — which is what this
+    //     table did until now — asserted the ≤272K price applies at 900K. [LAW:no-silent-failure]
+    //   - gpt-5.4-mini is listed with NO context qualifier and one card, so it is genuinely flat and
+    //     its tier constrains nothing. The distinction is the vendor's, not ours.
+    //
+    // OpenAI also publishes a FOURTH class, "cache writes" ($5.00 for sol against $4.00 input). THE
+    // TOKEN RECORD folds cache creation into the cache-MISS class, which is exact for DeepSeek and
+    // Anthropic (both bill it at the full input rate) and approximate here. It costs nothing today
+    // because codex reports no cache-write count to price — its usage payload carries input_tokens,
+    // cached_input_tokens and output_tokens only — so there is no number being multiplied by the wrong
+    // rate, and inventing one to fill the class would be a guess wearing a number.
     models: {
-      'gpt-5.5': { rates: { input: 5.00, cachedInput: 0.50, output: 30.00 }, tiers: [] },
-      'gpt-5.4': { rates: { input: 2.50, cachedInput: 0.25, output: 15.00 }, tiers: [] },
-      'gpt-5.4-mini': { rates: { input: 0.75, cachedInput: 0.075, output: 4.50 }, tiers: [] },
+      'gpt-5.6-sol': {
+        tiers: [
+          { when: [SHORT_CONTEXT], rates: { input: 4.00, cachedInput: 0.40, output: 20.00 } },
+          { when: [LONG_CONTEXT], rates: { input: 8.00, cachedInput: 0.80, output: 30.00 } },
+        ],
+      },
+      'gpt-5.6-terra': {
+        tiers: [
+          { when: [SHORT_CONTEXT], rates: { input: 2.00, cachedInput: 0.20, output: 12.00 } },
+          { when: [LONG_CONTEXT], rates: { input: 4.00, cachedInput: 0.40, output: 18.00 } },
+        ],
+      },
+      'gpt-5.6-luna': {
+        tiers: [
+          { when: [SHORT_CONTEXT], rates: { input: 0.20, cachedInput: 0.02, output: 1.20 } },
+          { when: [LONG_CONTEXT], rates: { input: 0.40, cachedInput: 0.04, output: 1.80 } },
+        ],
+      },
+      'gpt-5.5': {
+        tiers: [{ when: [SHORT_CONTEXT], rates: { input: 5.00, cachedInput: 0.50, output: 30.00 } }],
+      },
+      'gpt-5.4': {
+        tiers: [{ when: [SHORT_CONTEXT], rates: { input: 2.50, cachedInput: 0.25, output: 15.00 } }],
+      },
+      'gpt-5.4-mini': {
+        tiers: [{ when: [], rates: { input: 0.75, cachedInput: 0.075, output: 4.50 } }],
+      },
     },
   },
   {
@@ -38422,12 +38490,16 @@ const PRICE_SOURCES = [
     // priced ~30x below a cache miss — an intentional outlier, not typos.
     models: {
       'deepseek-v4-pro': {
-        rates: { input: 0.66, cachedInput: 0.022, output: 1.98 },
-        tiers: [{ when: DEEPSEEK_PEAK, rates: { input: 1.32, cachedInput: 0.044, output: 3.96 } }],
+        tiers: [
+          { when: DEEPSEEK_PEAK, rates: { input: 1.32, cachedInput: 0.044, output: 3.96 } },
+          { when: [], rates: { input: 0.66, cachedInput: 0.022, output: 1.98 } },
+        ],
       },
       'deepseek-v4-flash': {
-        rates: { input: 0.22, cachedInput: 0.007, output: 0.66 },
-        tiers: [{ when: DEEPSEEK_PEAK, rates: { input: 0.44, cachedInput: 0.014, output: 1.32 } }],
+        tiers: [
+          { when: DEEPSEEK_PEAK, rates: { input: 0.44, cachedInput: 0.014, output: 1.32 } },
+          { when: [], rates: { input: 0.22, cachedInput: 0.007, output: 0.66 } },
+        ],
       },
     },
   },
@@ -38438,8 +38510,8 @@ const PRICE_SOURCES = [
     // time-of-day tier. (When that happened is `verifiedOn`, never restated here.)
     verifiedOn: '2026-08-26',
     models: {
-      'glm-5.1': { rates: { input: 1.40, cachedInput: 0.26, output: 4.40 }, tiers: [] },
-      'glm-4.6': { rates: { input: 0.60, cachedInput: 0.11, output: 2.20 }, tiers: [] },
+      'glm-5.1': { tiers: [{ when: [], rates: { input: 1.40, cachedInput: 0.26, output: 4.40 } }] },
+      'glm-4.6': { tiers: [{ when: [], rates: { input: 0.60, cachedInput: 0.11, output: 2.20 } }] },
     },
   },
 ];
@@ -38559,7 +38631,7 @@ function stalenessOf(ageDays, maxAgeDays) {
 // review posted from 1.53.0 on records its own disjoint counts, its model and its span. A pass whose
 // recorded span falls wholly inside one rate window reprices EXACTLY from those facts; one that
 // straddles a window boundary reprices to a range, because the marker holds the pass ENVELOPE and
-// not each spawn's own instant (see computeCostUsd). A fused total cannot be repriced — auditing PR #108
+// not each spawn's own instant (see priceFromTable). A fused total cannot be repriced — auditing PR #108
 // had to BORROW a cache-hit ratio measured from an unrelated local run to restate CI costs at all.
 // Reviews posted BEFORE 1.53.0 carry a bare figure and are a permanent, honest gap: they must be
 // restated as unknown, never quietly repriced as if their tokens had been recorded.
@@ -38582,20 +38654,6 @@ function addTokens(a, b) {
   };
 }
 
-// [LAW:parse-dont-validate] The one crossing from "some value a caller handed us" into the two
-// coordinates a rate schedule is indexed by. It returns a shape that could not exist before the check
-// — a UTC weekday plus a fractional hour-of-day — and fails LOUDLY when handed anything else.
-// The loud arm is the whole point: an Invalid Date (or an omitted argument that JS quietly turns into
-// one) yields NaN coordinates, NaN matches no window, and the run would then price at the standard
-// rate — a peak review billed at half, silently, from a caller's programming error. That is the exact
-// failure mode this ticket exists to delete, so it throws rather than guessing. [LAW:no-silent-failure]
-// Fractional hours (not whole ones) because a vendor is free to move a boundary to :30 — the
-// coordinate should not decide what the schedule is allowed to express.
-function utcInstant(at) {
-  instantMs(at, "price lookup needs the spawn's start instant as a Date");
-  return { day: at.getUTCDay(), hour: at.getUTCHours() + at.getUTCMinutes() / 60 };
-}
-
 // [LAW:single-enforcer] ONE spelling of "a clock value is a real Date or it is an error", shared by
 // both readers of one below — the rate lookup above and the freshness check further down. `what` is
 // the caller's own sentence rather than a generic message, because the two failures need different
@@ -38607,26 +38665,85 @@ function instantMs(at, what) {
   return ms;
 }
 
-// Half-open [start, end): a boundary instant belongs to the window that STARTS there, never the one
-// that ends there, so two adjacent windows can neither both claim it nor leave it unclaimed.
-function covers(when, { day, hour }) {
-  return when.daysUtc.includes(day)
-    && when.hoursUtc.some(([start, end]) => hour >= start && hour < end);
+// [LAW:single-enforcer] ONE matcher per pricing axis, and the only place an axis's meaning is decided.
+// Every matcher answers the same question — "do the spawn's facts PROVE this constraint holds?" — so
+// a fact that is merely consistent with a constraint does not satisfy it. That distinction is what
+// makes the context axis sound; see SPAWN FACTS below.
+//
+// Half-open [start, end) on every range axis: a boundary value belongs to the window that STARTS
+// there, never the one that ends there, so two adjacent windows can neither both claim it nor leave it
+// unclaimed. [LAW:one-type-per-behavior]
+const CONSTRAINT_MATCHERS = {
+  daysUtc: (constraint, facts) => constraint.days.includes(facts.day),
+  hoursUtc: (constraint, facts) => constraint.ranges.some(([start, end]) => facts.hour >= start && facts.hour < end),
+  // The fact is an INTERVAL the true context length lies within, so the constraint holds only when the
+  // WHOLE interval falls inside the window — "every value it could be is priced at this card". A
+  // spawn whose interval straddles the boundary proves nothing and matches neither side.
+  contextTokens: (constraint, facts) => facts.context.min >= constraint.range[0]
+    && facts.context.max < constraint.range[1],
+};
+
+// [LAW:dataflow-not-control-flow] Rate selection with no branch on WHICH axes a model prices along:
+// the first tier whose every constraint holds wins, and a tier constraining nothing holds always, so
+// a flat model, a time-tiered one and a context-tiered one take the identical path.
+//
+// Returns null when NO tier covers the spawn — the schedule declining, which is a real state now that
+// entries may carry a gap (see the OpenAI group). An unknown axis throws instead: a constraint nobody
+// can evaluate is a table someone edited without teaching the matcher, and reading it as "holds" would
+// price the spawn off whichever card happened to be listed first. [LAW:no-silent-failure]
+function ratesAt(entry, facts) {
+  const tier = entry.tiers.find((t) => t.when.every((constraint) => {
+    const matcher = CONSTRAINT_MATCHERS[constraint.axis];
+    if (!matcher) throw new Error(`price table constrains unknown axis "${constraint.axis}"; add a matcher to CONSTRAINT_MATCHERS`);
+    return matcher(constraint, facts);
+  }));
+  return tier ? tier.rates : null;
 }
 
-// [LAW:dataflow-not-control-flow] Rate selection with no branch on WHETHER a model has time-varying
-// pricing: find the first tier covering the instant, and fall back to the entry itself. That works
-// because the entry and a tier both carry `.rates` — the entry IS the standard tier — so a flat-rate
-// model takes the identical path with an empty list to search.
-function ratesAt(entry, instant) {
-  return (entry.tiers.find((tier) => covers(tier.when, instant)) ?? entry).rates;
+// [LAW:parse-dont-validate] THE SPAWN: everything a price depends on, in one value — the tokens spent,
+// when they started being spent, and what is known about the context length they were spent at. It is
+// an explicit ARGUMENT rather than something priceFromTable derives, because this vector IS the seam:
+// different callers know different amounts about a spawn, and a derivation hidden inside would fix
+// every caller at whatever the least-informed one can prove. [LAW:dataflow-not-control-flow]
+//
+// `context` is an INTERVAL, not a number, and that is the whole honesty of this axis. OpenAI bills
+// context length PER REQUEST, while THE TOKEN RECORD counts a SUM over every request in the spawn:
+// measured against a real codex run on 2026-08-27, one turn making three model requests of ~26K
+// context each reported input_tokens 78,338 — three times the context, not the context. Feeding that
+// sum to a ">272K" test would price a four-request spawn of 70K prompts at the long-context card and
+// double its bill, which is precisely the confident misprice this epic exists to end.
+//
+// spawnFromTokens is what an engine adapter can honestly claim TODAY, and it is one function rather
+// than a line in each adapter so the two cannot come to different opinions about what a token total
+// proves. [LAW:one-source-of-truth] What the sum proves is an upper bound — no single request's
+// context exceeded the total — so the interval is [0, total]: a spawn totalling under 272K is PROVABLY
+// short and prices correctly, while a larger one proves neither card and is reported unpriced rather
+// than guessed. An adapter that can one day observe a per-request context builds a narrower interval
+// and the long card becomes reachable with no change to any of this. [FRAMING:representation]
+function spawnFromTokens(at, tokens) {
+  return { at, tokens, context: { min: 0, max: totalInputTokens(tokens) } };
 }
 
-// [LAW:effects-at-boundaries] Pure: tokens + model + the instant the tokens started being spent ->
-// USD, no IO and no clock read. `at` is a REQUIRED value supplied by the boundary that owns the
-// engine child's lifetime (src/engine/cli.js), because a rate that varies by time of day cannot be
-// selected without it and reading the clock here would price a spawn at the moment its output was
-// parsed rather than the moment it ran.
+// The coordinates a constraint is matched against, parsed from the spawn once per price lookup. The
+// instant's loud arm is the point: an Invalid Date (or an omitted argument JS quietly turns into one)
+// yields NaN coordinates, NaN falls in no window, and the spawn would read as an unpriceable gap —
+// a caller's threading bug wearing the costume of a vendor's pricing gap. [LAW:no-silent-failure]
+// Fractional hours (not whole ones) because a vendor is free to move a boundary to :30 — the
+// coordinate should not decide what the schedule is allowed to express.
+function spawnFacts(spawn) {
+  instantMs(spawn.at, "price lookup needs the spawn's start instant as a Date");
+  return {
+    day: spawn.at.getUTCDay(),
+    hour: spawn.at.getUTCHours() + spawn.at.getUTCMinutes() / 60,
+    context: spawn.context,
+  };
+}
+
+// [LAW:effects-at-boundaries] Pure: a spawn + a model -> a cost, with no IO and no clock read. The
+// spawn's `at` is a REQUIRED value supplied by the boundary that owns the engine child's lifetime
+// (src/engine/cli.js), because a rate that varies by time of day cannot be selected without it and
+// reading the clock here would price a spawn at the moment its output was parsed rather than the
+// moment it ran.
 //
 // Each SPAWN is priced at its own start, never the run at the run's start: a multi-scope pass runs
 // for many minutes across many spawns and routinely straddles 04:00 UTC, so one rate for the whole
@@ -38639,28 +38756,40 @@ function ratesAt(entry, instant) {
 // fabricated ratio — a guess wearing a number. Spawns run minutes and boundaries fall four times a
 // day, so this is a bounded ~1% of spawns rather than the systematic ~3.6x understatement it replaces.
 //
-// Returns null (cost unknown) when the model has no price-table entry — never a fabricated zero, so a
-// missing price surfaces as "unknown" rather than a confident-but-wrong $0.00. [LAW:no-silent-failure]
-// One rate per class, no subtraction: each adapter has already parsed its vendor's overlapping
-// counts into the disjoint record above (see THE TOKEN RECORD), so by the time tokens arrive here
-// the classes are exactly the billing buckets.
-function computeCostUsd(tokens, model, at) {
-  const instant = utcInstant(at);
+// [LAW:single-enforcer] Returns THE COST VALUE itself rather than a bare number, so the two ways a
+// table price can be unavailable are NAMED once, here, where each is discovered — instead of every
+// adapter collapsing them to null and re-deriving a single reason for all of them. Both adapters used
+// to end with the identical `usd == null ? {reason:'no-price'} : {usd}`, which was already a second
+// copy of that judgement and would have reported "add the model to PRICE_SOURCES" for a model that IS
+// in PRICE_SOURCES. A remedy that sends the maintainer to do a thing that cannot help is the same
+// misattribution as blaming a time budget for a quota wall. [LAW:no-silent-failure]
+//
+//   no-price     — no entry: the model is absent from the table entirely.
+//   schedule-gap — an entry, but no tier covers this spawn: either the vendor prices no card for it
+//                  (gpt-5.5 above 272K) or the spawn's facts cannot prove which card applies.
+//
+// One rate per class, no subtraction: each adapter has already parsed its vendor's overlapping counts
+// into the disjoint record above (see THE TOKEN RECORD), so by the time tokens arrive here the classes
+// are exactly the billing buckets.
+function priceFromTable(spawn, model) {
+  const { tokens } = spawn;
+  const facts = spawnFacts(spawn);
   // A plain index is safe here only because the table is built with a null prototype (flattenPrices),
   // so a model id like `constructor` or `toString` reads as the absence it is instead of answering
   // with an inherited member that is not a rate schedule.
   const entry = PRICES_PER_MILLION[model];
-  if (!entry) return null;
-  const price = ratesAt(entry, instant);
-  const total =
+  if (!entry) return { basis: 'unpriced', reason: 'no-price' };
+  const price = ratesAt(entry, facts);
+  if (!price) return { basis: 'unpriced', reason: 'schedule-gap' };
+  const usd = (
     tokens.inputCacheMiss * price.input +
     tokens.inputCacheHit * price.cachedInput +
-    tokens.output * price.output;
-  const usd = total / 1_000_000;
+    tokens.output * price.output
+  ) / 1_000_000;
   // [LAW:types-are-the-program] Non-finite input (a NaN token count) yields no usable price, not a NaN
-  // "cost": return null so the caller renders it unavailable, keeping a finite figure on every
-  // dollars-basis cost.
-  return Number.isFinite(usd) ? usd : null;
+  // "cost": report it unpriced so every dollars-basis figure stays finite. It reads as a schedule gap
+  // because that is what it is — a spawn this schedule cannot answer for.
+  return Number.isFinite(usd) ? { basis: 'dollars', usd } : { basis: 'unpriced', reason: 'schedule-gap' };
 }
 
 // [LAW:types-are-the-program] THE COST VALUE. A review's cost is discriminated by its BASIS — the
@@ -38888,7 +39017,7 @@ const ANY_MARKER_RE = new RegExp(
 // The figure is quantized to 6 decimal places, exactly as the legacy marker was, so the recorded
 // dollars stay byte-stable across a re-render. It is NOT what a later audit reprices from — that is
 // what `tokens` and `model` are for, at full precision, together with an INSTANT the auditor draws
-// from the span, since `computeCostUsd` selects a rate from one instant and never from two ends —
+// from the span, since `priceFromTable` selects a rate from one instant and never from two ends —
 // which is also why a pass straddling a boundary reprices to a range rather than a figure. The
 // recorded dollars are what this run believed at the time, kept so a restatement can be compared
 // against it.
@@ -39169,11 +39298,29 @@ const COST_WARNING = {
   subscription: (cost, tag, config) => Number.isFinite(cost.notionalUsd) ? null
     : `${config.engine} reported no cost for ${tag}; this review was billed to Claude subscription `
       + 'quota (so it cost $0 either way), but its Anthropic list-price figure is unavailable.',
-  unpriced: (cost, tag, config) => cost.reason === 'no-price'
-    ? `No price-table entry for ${tag}; the review footer shows cost as "unknown". `
-      + 'Add the model to PRICE_SOURCES in src/usage.js, under the vendor page that prices it.'
-    : `${config.engine} reported no cost (no USD in its output) for ${tag}; `
-      + 'the review footer shows cost as "unknown".',
+  unpriced: (cost, tag, config) => {
+    const remedy = UNPRICED_REMEDY[cost.reason];
+    // [LAW:no-silent-failure] An unlisted reason THROWS rather than falling through to whichever
+    // message sits last: the reasons are a closed set, and a new one silently borrowing another's
+    // remedy is how a maintainer gets sent to fix the wrong thing.
+    if (!remedy) throw new Error(`unknown unpriced reason "${cost.reason}"; add it to UNPRICED_REMEDY`);
+    return remedy(tag, config);
+  },
+};
+
+// [LAW:dataflow-not-control-flow] One line per reason, selected by the reason VALUE — the same shape
+// scripts/check-price-freshness.js uses for its staleness reasons. Each names the remedy that actually
+// helps, which is the entire reason the reasons are distinct values instead of one null.
+const UNPRICED_REMEDY = {
+  'no-price': (tag) => `No price-table entry for ${tag}; the review footer shows cost as "unknown". `
+    + 'Add the model to PRICE_SOURCES in src/usage.js, under the vendor page that prices it.',
+  'schedule-gap': (tag) => `${tag} is in the price table, but no rate card in its schedule covers this `
+    + 'spawn, so the review footer shows cost as "unknown". Either the vendor publishes no rate for '
+    + 'this spawn (OpenAI prices gpt-5.5 and gpt-5.4 only up to 272K context), or the spawn is too '
+    + "large for its per-request context length to be proven from the run's token totals. Nothing is "
+    + 'wrong with the table: a rate that cannot be shown to apply is reported unknown rather than guessed.',
+  'not-reported': (tag, config) => `${config.engine} reported no cost (no USD in its output) for ${tag}; `
+    + 'the review footer shows cost as "unknown".',
 };
 
 function costWarning(usage, config) {
@@ -39186,7 +39333,11 @@ module.exports = {
   PRICE_SOURCES,
   PRICE_VERIFICATION_MAX_AGE_DAYS,
   stalePriceSources,
-  computeCostUsd,
+  priceFromTable,
+  // Exported for its own unit tests only — the axis-matching rule is the fragile part of the schedule
+  // and deserves to be driven directly, including its loud arm. [LAW:behavior-not-structure]
+  ratesAt,
+  spawnFromTokens,
   totalInputTokens,
   emptyTokens,
   addTokens,

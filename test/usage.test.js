@@ -5,7 +5,9 @@ const assert = require('node:assert/strict');
 const { extractUsage: codexExtractUsage } = require('../src/engine/codex');
 const { extractUsage: claudeExtractUsage } = require('../src/engine/claude-code');
 const {
-  computeCostUsd,
+  priceFromTable,
+  ratesAt,
+  spawnFromTokens,
   totalInputTokens,
   renderCostLine,
   renderPrTotal,
@@ -75,41 +77,61 @@ const prior = ({ usd = 0, count = 0, unknownCount = 0, notionalUsd = 0, notional
 const OFF_PEAK = new Date('2026-08-22T02:30:00.000Z'); // Saturday 02:30 UTC
 const PEAK = new Date('2026-08-20T02:30:00.000Z');     // Thursday 02:30 UTC
 
-// --- computeCostUsd ---
+// priceFromTable returns THE COST VALUE, so these two read the arm a test is actually about and fail
+// loudly on the other. Asserting the basis here is what keeps `usd` from silently reading `undefined`
+// off an unpriced result and comparing it to a number.
+// These build the spawn the way an engine adapter does — through spawnFromTokens, so what they
+// exercise is what production can actually prove about a spawn, never a context nobody could observe.
+const usd = (tokens, model, at) => {
+  const cost = priceFromTable(spawnFromTokens(at, tokens), model);
+  assert.equal(cost.basis, 'dollars', `expected a priced result, got ${JSON.stringify(cost)}`);
+  return cost.usd;
+};
+const unpriced = (tokens, model, at) => {
+  const cost = priceFromTable(spawnFromTokens(at, tokens), model);
+  assert.equal(cost.basis, 'unpriced', `expected an unpriced result, got ${JSON.stringify(cost)}`);
+  return cost.reason;
+};
 
-describe('computeCostUsd', () => {
+// --- priceFromTable ---
+
+describe('priceFromTable', () => {
   test('prices non-cached input, cached input, and output at their distinct rates', () => {
     // gpt-5.4-mini: input 0.75, cachedInput 0.075, output 4.50 (per 1M).
     // 6,000 non-cached in @0.75 + 4,000 cached @0.075 + 2,000 out @4.50 = 13,800 / 1e6.
-    const cost = computeCostUsd(
-      { inputCacheMiss: 6_000, inputCacheHit: 4_000, output: 2_000 },
-      'gpt-5.4-mini',
-      OFF_PEAK,
-    );
+    const cost = usd({ inputCacheMiss: 6_000, inputCacheHit: 4_000, output: 2_000 }, 'gpt-5.4-mini', OFF_PEAK);
     assert.ok(Math.abs(cost - 0.0138) < 1e-9, `expected ~0.0138, got ${cost}`);
   });
 
-  test('a non-finite result (NaN token count) is null (unknown), never a NaN cost', () => {
-    assert.equal(computeCostUsd({ inputCacheMiss: NaN, inputCacheHit: 0, output: 2_000 }, 'gpt-5.4-mini', OFF_PEAK), null);
+  test('a non-finite result (NaN token count) is unpriced, never a NaN cost', () => {
+    assert.equal(unpriced({ inputCacheMiss: NaN, inputCacheHit: 0, output: 2_000 }, 'gpt-5.4-mini', OFF_PEAK), 'schedule-gap');
   });
 
   test('treats absent cached tokens as zero (all input billed at full rate)', () => {
-    const cost = computeCostUsd({ inputCacheMiss: 1_000_000, inputCacheHit: 0, output: 0 }, 'gpt-5.5', OFF_PEAK);
-    assert.equal(cost, 5.00);
+    // gpt-5.5 prices only up to 272K context, so this stays inside that card deliberately:
+    // 200k non-cached @5.00 = 1.00.
+    assert.equal(usd({ inputCacheMiss: 200_000, inputCacheHit: 0, output: 0 }, 'gpt-5.5', OFF_PEAK), 1.00);
   });
 
   test('prices deepseek and glm models from the same table (one mechanism, every provider)', () => {
     // deepseek-v4-pro off-peak: input 0.66, output 1.98. 1M in + 1M out = 0.66 + 1.98 = 2.64.
-    const ds = computeCostUsd({ inputCacheMiss: 1_000_000, inputCacheHit: 0, output: 1_000_000 }, 'deepseek-v4-pro', OFF_PEAK);
+    const ds = usd({ inputCacheMiss: 1_000_000, inputCacheHit: 0, output: 1_000_000 }, 'deepseek-v4-pro', OFF_PEAK);
     assert.ok(Math.abs(ds - 2.64) < 1e-9, `deepseek: got ${ds}`);
     // glm-5.1: input 1.40, cachedInput 0.26, output 4.40. 800k non-cached @1.40 + 200k @0.26 + 100k out @4.40.
-    const glm = computeCostUsd({ inputCacheMiss: 800_000, inputCacheHit: 200_000, output: 100_000 }, 'glm-5.1', OFF_PEAK);
+    const glm = usd({ inputCacheMiss: 800_000, inputCacheHit: 200_000, output: 100_000 }, 'glm-5.1', OFF_PEAK);
     const expected = (800_000 * 1.40 + 200_000 * 0.26 + 100_000 * 4.40) / 1e6;
     assert.ok(Math.abs(glm - expected) < 1e-9, `glm: got ${glm}`);
   });
 
-  test('returns null for a model with no price-table entry — never a fabricated zero', () => {
-    assert.equal(computeCostUsd({ inputCacheMiss: 100, inputCacheHit: 0, output: 100 }, 'gpt-unknown', OFF_PEAK), null);
+  test('a model with no price-table entry is unpriced as no-price — never a fabricated zero', () => {
+    assert.equal(unpriced({ inputCacheMiss: 100, inputCacheHit: 0, output: 100 }, 'gpt-unknown', OFF_PEAK), 'no-price');
+  });
+
+  // [LAW:no-silent-failure] The two causes are told apart, because their remedies differ: one says
+  // add the model, the other says the model is there and its schedule declines this spawn. Collapsing
+  // them would send a maintainer to edit a table that is already correct.
+  test('a listed model whose schedule covers no card reads schedule-gap, not no-price', () => {
+    assert.equal(unpriced({ inputCacheMiss: 900_000, inputCacheHit: 0, output: 0 }, 'gpt-5.5', OFF_PEAK), 'schedule-gap');
   });
 
   test('a model named after an inherited property is absent from the table, not a schedule', () => {
@@ -118,7 +140,7 @@ describe('computeCostUsd', () => {
     // keys or a review dies reading `.tiers` off a function.
     const tokens = { inputCacheMiss: 100, inputCacheHit: 0, output: 100 };
     for (const model of ['__proto__', 'constructor', 'toString', 'hasOwnProperty', 'valueOf']) {
-      assert.equal(computeCostUsd(tokens, model, OFF_PEAK), null, `${model} must price as unknown`);
+      assert.equal(unpriced(tokens, model, OFF_PEAK), 'no-price', `${model} must price as unknown`);
     }
   });
 
@@ -139,8 +161,8 @@ describe('time-varying rates', () => {
   // rather than encoded in the table as a multiplier, so this test can still fail the day a vendor
   // prices its tiers independently — which is exactly what a table-drift test is for.
   test('the same tokens cost exactly 2x at a peak instant as at an off-peak one', () => {
-    const offPeak = computeCostUsd(TOKENS, 'deepseek-v4-pro', OFF_PEAK);
-    const peak = computeCostUsd(TOKENS, 'deepseek-v4-pro', PEAK);
+    const offPeak = usd(TOKENS, 'deepseek-v4-pro', OFF_PEAK);
+    const peak = usd(TOKENS, 'deepseek-v4-pro', PEAK);
     assert.ok(Math.abs(peak - offPeak * 2) < 1e-9, `off-peak ${offPeak}, peak ${peak}`);
   });
 
@@ -148,19 +170,19 @@ describe('time-varying rates', () => {
     // Same hour-of-day, one Saturday and one Thursday. Peak is Monday-Friday, so the day is as
     // load-bearing as the hour — a schedule holding only hours would double-charge every weekend run.
     assert.equal(OFF_PEAK.getUTCHours(), PEAK.getUTCHours());
-    assert.ok(computeCostUsd(TOKENS, 'deepseek-v4-pro', OFF_PEAK) < computeCostUsd(TOKENS, 'deepseek-v4-pro', PEAK));
+    assert.ok(usd(TOKENS, 'deepseek-v4-pro', OFF_PEAK) < usd(TOKENS, 'deepseek-v4-pro', PEAK));
   });
 
   test('a boundary instant belongs to the window that starts there, not the one that ends there', () => {
-    const inPeak = computeCostUsd(TOKENS, 'deepseek-v4-pro', new Date('2026-08-20T03:59:59.000Z'));
-    const atFour = computeCostUsd(TOKENS, 'deepseek-v4-pro', new Date('2026-08-20T04:00:00.000Z'));
-    const atOne = computeCostUsd(TOKENS, 'deepseek-v4-pro', new Date('2026-08-20T01:00:00.000Z'));
-    assert.equal(atFour, computeCostUsd(TOKENS, 'deepseek-v4-pro', OFF_PEAK));
+    const inPeak = usd(TOKENS, 'deepseek-v4-pro', new Date('2026-08-20T03:59:59.000Z'));
+    const atFour = usd(TOKENS, 'deepseek-v4-pro', new Date('2026-08-20T04:00:00.000Z'));
+    const atOne = usd(TOKENS, 'deepseek-v4-pro', new Date('2026-08-20T01:00:00.000Z'));
+    assert.equal(atFour, usd(TOKENS, 'deepseek-v4-pro', OFF_PEAK));
     assert.equal(atOne, inPeak);
   });
 
   test('a flat-rate model prices identically at every instant — an empty schedule, not a special case', () => {
-    const at = t => computeCostUsd(TOKENS, 'gpt-5.4-mini', t);
+    const at = t => usd(TOKENS, 'gpt-5.4-mini', t);
     assert.equal(at(PEAK), at(OFF_PEAK));
     assert.equal(at(PEAK), at(new Date('2026-08-20T07:15:00.000Z')));
   });
@@ -189,9 +211,87 @@ describe('time-varying rates', () => {
   test('pricing needs the instant as a value: a missing or invalid one throws, never prices at standard', () => {
     // The failure this replaces is silent: NaN coordinates match no window, so a caller that forgot
     // to thread the instant would have billed every peak review at half rate with nothing to notice.
-    assert.throws(() => computeCostUsd(TOKENS, 'deepseek-v4-pro'), /start instant/);
-    assert.throws(() => computeCostUsd(TOKENS, 'deepseek-v4-pro', new Date('nonsense')), /start instant/);
-    assert.throws(() => computeCostUsd(TOKENS, 'deepseek-v4-pro', '2026-08-20T02:30:00Z'), /start instant/);
+    assert.throws(() => priceFromTable(TOKENS, 'deepseek-v4-pro'), /start instant/);
+    assert.throws(() => priceFromTable(TOKENS, 'deepseek-v4-pro', new Date('nonsense')), /start instant/);
+    assert.throws(() => priceFromTable(TOKENS, 'deepseek-v4-pro', '2026-08-20T02:30:00Z'), /start instant/);
+  });
+});
+
+// --- the price table is selected by a VECTOR of facts (zai-cost-truth-p5o.4) ---
+
+describe('context-length rates', () => {
+  // [LAW:verifiable-goals] THE ACCEPTANCE CRITERION. One identical usage record priced at a short and
+  // a long context, asserting the multiple OpenAI publishes. The context is stated as an EXACT
+  // interval, which is the only way either card can be proven to apply — see the sibling test on what
+  // a real spawn can prove. The multiple is asserted rather than encoded as a multiplier in the table,
+  // so this still fails the day OpenAI prices its two cards independently.
+  const tokensOf = n => ({ inputCacheMiss: n, inputCacheHit: 0, output: 0 });
+  // A spawn whose context is EXACTLY known — the shape an adapter that can observe a per-request
+  // context would build. codex cannot (see the sibling test), so this is the schedule's contract
+  // rather than a claim about today's engines.
+  const atContext = (n, tokens) => ({ at: OFF_PEAK, tokens, context: { min: n, max: n } });
+  const usdAtContext = (n, tokens, model) => {
+    const cost = priceFromTable(atContext(n, tokens), model);
+    assert.equal(cost.basis, 'dollars', `expected a priced result, got ${JSON.stringify(cost)}`);
+    return cost.usd;
+  };
+
+  test('the same tokens cost the published multiple at a long context as at a short one', () => {
+    // ONE identical usage record, priced twice, differing only in the context it was spent at.
+    // gpt-5.6-sol: input 4.00 short, 8.00 long — 100k tokens is 0.40 or 0.80.
+    const tokens = tokensOf(100_000);
+    const short = usdAtContext(100_000, tokens, 'gpt-5.6-sol');
+    const long = usdAtContext(300_000, tokens, 'gpt-5.6-sol');
+    assert.ok(Math.abs(short - 0.40) < 1e-9, `short: ${short}`);
+    assert.ok(Math.abs(long - 0.80) < 1e-9, `long: ${long}`);
+    // The multiple OpenAI publishes, asserted rather than encoded as a multiplier in the table — so
+    // this fails the day it prices its two cards independently.
+    assert.ok(Math.abs(long - short * 2) < 1e-12);
+  });
+
+  test('the boundary belongs to the short card: 272,000 is short, 272,001 is long', () => {
+    // "≤272K input tokens" / ">272K input tokens", the vendor's own tooltips. Half-open, exactly as
+    // the hour windows are, so neither card can claim the boundary token nor leave it unclaimed.
+    const tokens = tokensOf(1_000_000);
+    assert.ok(Math.abs(usdAtContext(272_000, tokens, 'gpt-5.6-luna') - 0.20) < 1e-12);
+    assert.ok(Math.abs(usdAtContext(272_001, tokens, 'gpt-5.6-luna') - 0.40) < 1e-12);
+  });
+
+  test('a flat-rate model prices identically at every context size, as it does at every instant', () => {
+    // The third acceptance criterion: adding an axis must not make a flat vendor a special case.
+    const tokens = tokensOf(1_000_000);
+    assert.equal(usdAtContext(1_000, tokens, 'glm-5.1'), usdAtContext(9_000_000, tokens, 'glm-5.1'));
+    // …and it still prices from what a real spawn can prove, where the context is only bounded.
+    assert.equal(usd(tokens, 'glm-5.1', OFF_PEAK), usdAtContext(1_000, tokens, 'glm-5.1'));
+  });
+
+  test('a spawn too large to prove its per-request context is unpriced, never priced at either card', () => {
+    // What a REAL codex spawn reports is a SUM over the turn's requests, so a 900k total proves only
+    // that no single request exceeded 900k — it could be one long request or twenty short ones, which
+    // bill at different cards. Pricing it at the long card would double a short-context spawn's bill;
+    // pricing it at the short card would halve a long one's. The honest answer is neither.
+    assert.equal(unpriced(tokensOf(900_000), 'gpt-5.6-sol', OFF_PEAK), 'schedule-gap');
+    // Under the threshold the bound is proof enough, so the common spawn still prices.
+    assert.ok(usd(tokensOf(100_000), 'gpt-5.6-sol', OFF_PEAK) > 0);
+  });
+
+  test('a vendor that publishes no card above its threshold declines rather than extending the last one', () => {
+    // OpenAI lists "gpt-5.5 (<272K context length)" and prices nothing above it, while the model's own
+    // context window is 1,050,000 — so the gap is reachable. The previous shape could not express this
+    // at all: a standard rate applied everywhere, asserting the ≤272K price at 900k.
+    const tokens = tokensOf(1_000);
+    for (const model of ['gpt-5.5', 'gpt-5.4']) {
+      const cost = priceFromTable(atContext(300_000, tokens), model);
+      assert.equal(cost.basis, 'unpriced', `${model} must decline above 272K`);
+      assert.equal(cost.reason, 'schedule-gap');
+    }
+  });
+
+  test('an unknown constraint axis throws rather than reading as satisfied', () => {
+    // A constraint nobody can evaluate must not silently hold: that would price the spawn off
+    // whichever card happened to be listed first.
+    const entry = { tiers: [{ when: [{ axis: 'serviceTier', is: 'flex' }], rates: { input: 1, cachedInput: 1, output: 1 } }] };
+    assert.throws(() => ratesAt(entry, { day: 6, hour: 2, context: { min: 0, max: 10 } }), /unknown axis/);
   });
 });
 
@@ -523,9 +623,9 @@ describe('cost marker — the recorded facts re-derive the cost (zai-cost-truth-
   // cost — no assumed cache-hit ratio, no borrowed measurement from some other run. This is what a
   // corrected price table needs in order to restate a review that has already been posted, and it is
   // exactly what the collapsed "16,389,982 in" figure could not supply.
-  test('a recorded marker reprices to the exact same USD through computeCostUsd', () => {
-    const usd = computeCostUsd(SAMPLE_TOKENS, DEEPSEEK_CONFIG.model, new Date(SAMPLE_SPAN.from));
-    const marker = costMarker({ tokens: SAMPLE_TOKENS, span: SAMPLE_SPAN, cost: { basis: 'dollars', usd } }, DEEPSEEK_CONFIG);
+  test('a recorded marker reprices to the exact same USD through priceFromTable', () => {
+    const priced = usd(SAMPLE_TOKENS, DEEPSEEK_CONFIG.model, new Date(SAMPLE_SPAN.from));
+    const marker = costMarker({ tokens: SAMPLE_TOKENS, span: SAMPLE_SPAN, cost: { basis: 'dollars', usd: priced } }, DEEPSEEK_CONFIG);
 
     const record = parseCostRecord(marker);
     assert.deepEqual(record.tokens, SAMPLE_TOKENS);
@@ -533,7 +633,7 @@ describe('cost marker — the recorded facts re-derive the cost (zai-cost-truth-
     // Repriced from the record ALONE — its own tokens, its own model, and its own recorded start
     // instant. Now that the table is a schedule, the span is not decoration on the record: it is the
     // third input the price needs, and a restatement that guessed at it would be guessing at the rate.
-    assert.equal(computeCostUsd(record.tokens, record.model, new Date(record.from)), usd);
+    assert.equal(usd(record.tokens, record.model, new Date(record.from)), priced);
   });
 
   test('the record carries the provider identity, the model, and the pass time span', () => {
@@ -741,6 +841,25 @@ describe('costWarning', () => {
     const w = costWarning({ tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 1 }, cost: { basis: 'unpriced', reason: 'no-price' } }, { ...CODEX_CONFIG, model: 'gpt-future' });
     assert.match(w, /price-table entry for codex\/gpt-future/);
     assert.match(w, /PRICE_SOURCES/);
+  });
+
+  // [LAW:no-silent-failure] The remedy has to match the cause. A model that IS in the table must not
+  // be reported with "add the model to PRICE_SOURCES" — that sends the maintainer to edit a table that
+  // is already correct, the same misattribution as blaming a time budget for a quota wall.
+  test('schedule-gap says the model is present and its schedule declined — never "add the model"', () => {
+    const w = costWarning(
+      { tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 1 }, cost: { basis: 'unpriced', reason: 'schedule-gap' } },
+      { ...CODEX_CONFIG, model: 'gpt-5.6-sol' },
+    );
+    assert.match(w, /is in the price table/);
+    assert.doesNotMatch(w, /PRICE_SOURCES/);
+  });
+
+  test('an unlisted unpriced reason throws rather than borrowing another reason\'s remedy', () => {
+    assert.throws(
+      () => costWarning({ tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 1 }, cost: { basis: 'unpriced', reason: 'invented' } }, CODEX_CONFIG),
+      /unknown unpriced reason/,
+    );
   });
 
   test('not-reported names the engine, never the price table — the codex/claude causes do not conflate', () => {

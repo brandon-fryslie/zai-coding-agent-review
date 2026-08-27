@@ -5,7 +5,7 @@ const os = require('os');
 const { parseRetryAfterMs, classifyTransient } = require('../failover');
 const { parseJsonEnvelope, formatOutputTail } = require('./run');
 const { makeCliAdapter } = require('./cli');
-const { isAnthropicEndpoint, isSubscription, computeCostUsd } = require('../usage');
+const { isAnthropicEndpoint, isSubscription, priceFromTable, spawnFromTokens } = require('../usage');
 const { resolveReasoningTier } = require('../effort');
 
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
@@ -270,8 +270,9 @@ function costFromEnvelope(env, config, buckets, startedAt) {
       ? { basis: 'dollars', usd: env.total_cost_usd }
       : { basis: 'unpriced', reason: 'not-reported' };
   }
-  const usd = computeCostUsd(buckets, config.model, startedAt);
-  return usd == null ? { basis: 'unpriced', reason: 'no-price' } : { basis: 'dollars', usd };
+  // priceFromTable returns the cost value whole, reasons and all, so this arm neither re-derives WHY a
+  // table price was unavailable nor collapses the two causes into one. [LAW:single-enforcer]
+  return priceFromTable(spawnFromTokens(startedAt, buckets), config.model);
 }
 
 // [LAW:single-enforcer] Classification of the shared transient vocabulary (429/529/network drop) lives
