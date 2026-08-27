@@ -1625,3 +1625,92 @@ describe('runMultiScope — failover budget bounded by the deadline', () => {
     assert.ok(spawns <= 6, `attempts bounded by the deadline, not the 60m default horizon: ${spawns}`);
   });
 });
+
+// ── phase timings stream to the run log live (zai-timing-31d.7) ──────────────────────────────────
+// The contract is the LIVE log, not the posted footer: the scout's done line (before the zero-scope
+// gate), each worker's done line carrying its own span, and one running-total line per pass — all
+// formatted from the SAME spans the schedule records, through the same spanMs/formatMs derivation
+// the footer uses, so the live lines and the breakdown cannot disagree. [LAW:one-source-of-truth]
+// Waves are deliberately absent: the pool is lane-based and waves exist only as describeSchedule's
+// post-hoc derivation, so no "wave done" line fakes an event no scheduler observed.
+describe('runMultiScopePass — phase timings stream to the run log live', () => {
+  const MIN = 60_000;
+  const SCOPES = [
+    { name: 'a', focus: 'fa', files: [] },
+    { name: 'b', focus: 'fb', files: [] },
+  ];
+  const material = {
+    changedPaths: [],
+    buildScoutPrompt: () => 'SCOUT',
+    buildWorkerPrompt: (focusText, _tools, _files, priorFindings) => `${priorFindings.length > 0 ? 'SWEEP ' : ''}${focusText}`,
+  };
+  const config = { engine: 'fake', name: 'c1' };
+  const at = (min) => `2026-08-22T03:${String(min).padStart(2, '0')}:00.000Z`;
+  const span = (fromMin, toMin) => ({ from: at(fromMin), to: at(toMin) });
+
+  // Scout runs minutes 0–2; worker for scope s runs (1 + index) minutes; a sweep worker finds
+  // nothing (so sweepCap:1 converges after one sweep). `usageFor` lets a test null a scope's usage.
+  function makeRegistry({ usageFor } = {}) {
+    const adapter = {
+      async produceReview({ buildPromptFor }) {
+        const prompt = buildPromptFor({});
+        if (prompt === 'SCOUT') {
+          return { summary: 'ctx', findings: [], scopes: SCOPES, assessments: [], usage: { span: span(0, 2) } };
+        }
+        const sweep = prompt.startsWith('SWEEP ');
+        const scope = SCOPES.find(s => prompt.includes(`${s.name} — ${s.focus}`));
+        const i = SCOPES.findIndex(s => s.name === scope.name);
+        const usage = usageFor ? usageFor(scope.name) : { span: span(10, 11 + i) };
+        return {
+          summary: `sum-${scope.name}`,
+          findings: sweep ? [] : [{ path: `${scope.name}.js`, line: 1, body: `bug in ${scope.name}`, severity: 3 }],
+          assessments: [],
+          usage,
+        };
+      },
+    };
+    return { get: () => adapter };
+  }
+
+  const run = async (extra = {}, registry = makeRegistry()) => {
+    const logs = [];
+    await runMultiScopePass({
+      config, material, registry, instructionsPath: 'x', maxConcurrent: 2, sweepCap: 0,
+      log: (m) => logs.push(m), sleepFn: async () => {}, ...extra,
+    });
+    return logs;
+  };
+
+  test("the scout's done line lands with its elapsed time, before the plan is announced", async () => {
+    const logs = await run();
+    const done = logs.indexOf('scout done — 2m00s');
+    const planned = logs.findIndex(m => /^scout planned /.test(m));
+    assert.ok(done >= 0, `scout done line present, got: ${JSON.stringify(logs)}`);
+    assert.ok(planned > done, 'timing lands before the plan announcement');
+  });
+
+  test("each worker's done line carries its own span duration", async () => {
+    const logs = await run();
+    assert.ok(logs.includes("scope 'a' done — 1 finding(s) — 1m00s"), JSON.stringify(logs));
+    assert.ok(logs.includes("scope 'b' done — 1 finding(s) — 2m00s"), JSON.stringify(logs));
+  });
+
+  test('a worker whose adapter reported no usage renders the recorded absence, never a fabricated figure', async () => {
+    const registry = makeRegistry({ usageFor: (name) => (name === 'a' ? null : { span: span(10, 12) }) });
+    const logs = await run({}, registry);
+    assert.ok(logs.includes("scope 'a' done — 1 finding(s) — unclocked"), JSON.stringify(logs));
+  });
+
+  test('every pass completion logs a running total counted from the run mint, against the budget', async () => {
+    // The injected clock reads 6m32s after the mint; the deadline is 15m from the same mint.
+    const startedAt = 1_000_000;
+    const logs = await run({ startedAt, deadline: startedAt + 15 * MIN, now: () => startedAt + 6 * MIN + 32_000, sweepCap: 1 });
+    assert.ok(logs.includes('review workers done — elapsed 6m32s of 15m00s budget'), JSON.stringify(logs));
+    assert.ok(logs.includes('sweep 1 workers done — elapsed 6m32s of 15m00s budget'), JSON.stringify(logs));
+  });
+
+  test('a caller without a start mint or budget logs the typed absences, not a second clock', async () => {
+    const logs = await run();
+    assert.ok(logs.includes('review workers done — elapsed unclocked (no budget)'), JSON.stringify(logs));
+  });
+});

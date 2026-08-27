@@ -290,6 +290,9 @@ async function main() {
     chain, material, registry, instructionsPath,
     effort: { ...defaultEffortProfile(), scopeConcurrency: opts.workers },
     log: msg => process.stderr.write(`[local-review] ${msg}\n`),
+    // [LAW:one-source-of-truth] The same start instant formatReport's total counts from, so the
+    // live running totals and the report's figure share one clock.
+    startedAt,
   });
 
   const report = formatReport({ config: configUsed, mode: opts.mode, files, result: review, sessions: readSessions(TRANSCRIPT_DIR), repo, totalMs: Date.now() - startedAt });
