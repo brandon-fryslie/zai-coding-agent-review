@@ -975,7 +975,10 @@ const COST_IS_ESTIMATE = { dollars: true, subscription: true, unpriced: false };
 // distinct renderings, not branches that skip work: no usage -> no line; every basis -> one line
 // assembled by the same expression, differing only in the phrase its basis selected.
 function renderCostLine(usage, config, priorCost = null) {
-  if (!usage) return '';
+  // "The engine reported nothing" is a usage whose tokens are absent, not a null usage: the record
+  // still exists, carrying the host-stamped span (zai-timing-31d.4). Either way there is no cost
+  // line to render — same output as before the span learned to survive a token-less spawn.
+  if (!usage || !usage.tokens) return '';
   const tag = reviewerTag(config);
   // The human line stays one clause per quantity: the input total a reader already expects, with the
   // cache-hit share named beside it in the SAME unit rather than as a derived percentage — an
@@ -1026,7 +1029,9 @@ const UNPRICED_REMEDY = {
 };
 
 function costWarning(usage, config) {
-  if (!usage) return 'Engine reported no token usage; the review footer omits the cost line.';
+  // Tokens and cost go absent together when the engine reported nothing; the usage record itself
+  // may still exist to carry the spawn's span (zai-timing-31d.4). Both shapes warn identically.
+  if (!usage || !usage.cost) return 'Engine reported no token usage; the review footer omits the cost line.';
   return COST_WARNING[usage.cost.basis](usage.cost, reviewerTag(config), config);
 }
 

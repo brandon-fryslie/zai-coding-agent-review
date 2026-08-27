@@ -32582,25 +32582,37 @@ function makeCliAdapter(spec) {
         try {
           const home = spec.materializeHome({ config, instructionsPath, collector });
           try {
-            // [LAW:effects-at-boundaries] The clock is an effect, so the spawn's start instant is
-            // read HERE — the one place that owns the child's lifetime — and handed to extractUsage
-            // as a VALUE, which keeps every adapter a pure function of the engine's output and the
-            // instant it was given. Time is a pricing input (DeepSeek's peak/off-peak windows), so
-            // this spawn is priced at the tier it actually ran in rather than at whatever tier the
-            // pass happened to start in.
-            // [LAW:one-source-of-truth] The priced instant and the recorded span.from are the SAME
-            // Date. Two `new Date()` reads would be two clocks, free to disagree about which side of
-            // a boundary a spawn fell on — a review whose recorded span says off-peak and whose
-            // figure says peak, with nothing to say which one lied.
-            const startedAt = new Date();
-            const output = await runEngine(spec, config, prompt, home, collector, cwd, deadline);
-            const raw = spec.extractUsage(output, config, startedAt);
-            const usage = raw && { ...raw, span: { from: startedAt.toISOString(), to: new Date().toISOString() } };
-            const review = readCollectedReview(collector.recordsPath);
-            // [LAW:dataflow-not-control-flow] scopes (a scout run), findings (a worker run), and
-            // dependency assessments (a worker that reviewed a go.mod bump) are all carried through as
-            // values; the caller uses whichever its pass produced, an empty list otherwise.
-            return { summary: review.summary, findings: review.findings, scopes: review.scopes, assessments: review.assessments, usage };
+            // [LAW:one-source-of-truth] The spawn's span is stamped by runEngine — the one place
+            // that owns the child's lifetime, on every termination path — and the priced instant is
+            // DERIVED from span.from rather than read from a second clock. Two `new Date()` reads
+            // would be free to disagree about which side of a rate boundary a spawn fell on — a
+            // review whose recorded span says off-peak and whose figure says peak, with nothing to
+            // say which one lied. Time is a pricing input (DeepSeek's peak/off-peak windows), so
+            // this spawn is priced at the tier it actually ran in; extractUsage stays a pure
+            // function of the engine's output and the instant it was given. [LAW:effects-at-boundaries]
+            const { stdout: output, span } = await runEngine(spec, config, prompt, home, collector, cwd, deadline);
+            // [LAW:no-silent-failure] From here the spawn HAS run and its span is known, so any
+            // failure past this point — a throwing extractUsage, a ProtocolError from an engine
+            // that never called finish_review — still burned real wall clock and provider cost.
+            // The throw carries the span out, matching the invariant runEngine's own rejections
+            // already hold: no outcome of a spawn that ran loses its duration (zai-timing-31d.4).
+            try {
+              const raw = spec.extractUsage(output, config, new Date(span.from));
+              // The spawn's usage record: tokens and cost are the ENGINE's report and go absent
+              // together when it reported nothing; span is the HOST's clock and is always present —
+              // a duration cannot go missing the way a provider's token count can (zai-timing-31d.4).
+              // [LAW:one-type-per-behavior] One record answers "what did this spawn consume", in
+              // tokens, dollars, and seconds.
+              const usage = { ...(raw ?? {}), span };
+              const review = readCollectedReview(collector.recordsPath);
+              // [LAW:dataflow-not-control-flow] scopes (a scout run), findings (a worker run), and
+              // dependency assessments (a worker that reviewed a go.mod bump) are all carried through as
+              // values; the caller uses whichever its pass produced, an empty list otherwise.
+              return { summary: review.summary, findings: review.findings, scopes: review.scopes, assessments: review.assessments, usage };
+            } catch (err) {
+              err.span = span;
+              throw err;
+            }
           } finally {
             removeQuietly(home, 'temp HOME');
           }
@@ -33327,7 +33339,9 @@ function formatOutputTail(label, value) {
 
 // [LAW:decomposition] Generic spawn runner: owns timeout, size-cap, and process lifecycle.
 // All engine-specific logic (args, env, success check, error classification) lives in the adapter.
-// Resolves with the child's captured stdout so the caller can extract usage/cost from it.
+// Resolves with { stdout, span }: the child's captured stdout so the caller can extract usage/cost
+// from it, and the spawn's wall-clock span ({ from, to }, ISO-8601 UTC) stamped by this module's
+// own clock — the one owner of the child's lifetime (zai-timing-31d.4).
 // [LAW:no-ambient-temporal-coupling] The per-invocation timeout is owned here, not in callers.
 // [LAW:effects-at-boundaries] This is the only place that spawns a child process.
 // cwd is the engine's working directory — an isolated scratch dir outside the reviewed repo tree
@@ -33370,6 +33384,16 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
     // is owned by the live-group registry + shutdown reaper above, so the engine dies with the
     // action on cancel/signal paths too.
     const posix = process.platform !== 'win32';
+    // [LAW:effects-at-boundaries] The spawn's clock is read HERE, in the one place that owns the
+    // child's whole lifetime — started at spawn, stopped in finish(), which runs on EVERY
+    // termination path. A spawn that failed after 200 seconds is the most interesting timing datum
+    // there is; a clock hung off the success path would throw it away. The stamped span rides the
+    // resolution as a value and every post-spawn rejection as err.span, so no outcome loses its
+    // duration. [LAW:one-source-of-truth] This is the single mint of the span — the caller derives
+    // the pricing instant from span.from rather than reading a second clock that could land on the
+    // other side of a rate boundary.
+    const startedAt = new Date();
+    let span = null;
     const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'], cwd, detached: posix });
     if (posix) {
       installShutdownReaper();
@@ -33401,6 +33425,9 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
     const finish = result => {
       if (settled) return;
       settled = true;
+      // The span closes at the settle — after 'close' proved the tree exited and released the
+      // pipes — so a killed spawn's duration includes the kill-to-exit tail it actually occupied.
+      span = { from: startedAt.toISOString(), to: new Date().toISOString() };
       clearTimeout(timeout);
       clearTimeout(escalation);
       liveEngineGroups.delete(child.pid);
@@ -33413,6 +33440,16 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
         label: `transcript-${config.name || adapter.name}-${process.hrtime.bigint().toString(36)}`,
       });
       result();
+    };
+    // [LAW:no-silent-failure] Every post-spawn rejection carries the span it burned: the duration
+    // of a failed spawn is diagnostics the callers upstream may surface, and the error object is
+    // the only vehicle that survives a rejection. The guarantee is per SPAWN: a retry loop that
+    // re-spawns after a transient failure receives each attempt's own span, and folding those
+    // attempts into a schedule is the aggregation layer's job (zai-timing-31d.5) — today
+    // retryTransientSpawn reads only the attempt it settles on.
+    const fail = err => {
+      err.span = span;
+      reject(err);
     };
 
     // [LAW:no-ambient-temporal-coupling] A kill SETTLES NOTHING here: the timeout only signals the
@@ -33446,7 +33483,7 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
     child.stderr.on('data', chunk => { stderr = appendBounded(stderr, chunk, maxRetained).text; });
 
     child.on('error', err => {
-      finish(() => reject(adapter.classifyError(err, '')));
+      finish(() => fail(adapter.classifyError(err, '')));
     });
 
     child.on('close', code => {
@@ -33462,7 +33499,7 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
           // early close cancels the pending escalation, and outlive the settle into the cleanup —
           // the ENOTEMPTY/credit-burn hole again. Idempotent: ESRCH is the goal state.
           killTree('SIGKILL');
-          reject(deadlineBound
+          fail(deadlineBound
             ? new DeadlineExceededError(
               `${adapter.name} spawn killed: the review's time budget ran out mid-spawn. ${BUDGET_REMEDY}`,
             )
@@ -33476,7 +33513,7 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
             formatOutputTail('stderr tail', stderr),
             formatOutputTail('stdout tail', stdout),
           ].join('\n\n');
-          reject(adapter.classifyError(new Error(msg), `${stdout}\n${stderr}`));
+          fail(adapter.classifyError(new Error(msg), `${stdout}\n${stderr}`));
           return;
         }
         try {
@@ -33495,9 +33532,9 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
           // [LAW:dataflow-not-control-flow] The captured stdout is the engine's output value;
           // the caller derives usage/cost from it via the adapter's extractUsage. Findings
           // still flow out-of-band through the MCP collector — stdout carries only usage.
-          resolve(stdout);
+          resolve({ stdout, span });
         } catch (err) {
-          reject(adapter.classifyError(err, stdout));
+          fail(adapter.classifyError(err, stdout));
         }
       });
     });
@@ -34101,13 +34138,19 @@ function workerFocusText(scope, context) {
 // costs share the same model and the same basis; sumCost still resolves the mixed case as a value.
 // [LAW:no-silent-failure] no spawn's cost is silently dropped: one unpriced spawn makes the whole
 // sum unpriced, carrying that spawn's reason.
-// usage === null (an engine reported nothing) is excluded; all-null sums to null, matching the
-// single-spawn behavior the cost renderer already handles.
+// usage === null (no spawn record at all) is excluded; all-null sums to null, matching the
+// single-spawn behavior the cost renderer already handles. A spawn whose engine reported nothing
+// still carries its host-stamped span (zai-timing-31d.4), so its record arrives with tokens and
+// cost ABSENT: it contributes its span to the envelope and nothing to the token or cost folds,
+// and a pass where NO spawn reported tokens sums them to null — the renderer's "engine reported
+// no token usage" value, never a fabricated zero. [LAW:parse-dont-validate]
 function sumUsage(usages) {
   const present = usages.filter(Boolean);
   if (present.length === 0) return null;
+  const tokens = present.map(u => u.tokens).filter(Boolean);
+  const costs = present.map(u => u.cost).filter(Boolean);
   return {
-    tokens: present.map(u => u.tokens).reduce(addTokens, emptyTokens()),
+    tokens: tokens.length > 0 ? tokens.reduce(addTokens, emptyTokens()) : null,
     // The pass's SPAN is the envelope of its spawns' spans — earliest start, latest end — which is
     // the honest answer for a scheduler that runs workers in waves: the pass occupied that window,
     // and a restatement that needs to know which price epoch applies can see whether the window sits
@@ -34115,7 +34158,9 @@ function sumUsage(usages) {
     // [LAW:no-silent-failure] A spawn that recorded no span contributes none, exactly as a spawn
     // that recorded no usage contributes no tokens.
     span: sumSpan(present.map(u => u.span)),
-    cost: sumCost(present.map(u => u.cost)),
+    // Absent costs (engine reported nothing) are excluded from the fold exactly as their tokens
+    // are; an UNPRICED cost is a present value and still poisons the sum, as before.
+    cost: costs.length > 0 ? sumCost(costs) : null,
   };
 }
 
@@ -34178,10 +34223,12 @@ function composeSummary(scopes, workerResults, sweeps = [], budget = { exhausted
 // pass as a clean one.
 //
 // [LAW:types-are-the-program] The pool returns one OUTCOME per scope, in scope order — a discriminated
-// value: { status: 'reviewed', result } | { status: 'unreviewed' }. 'unreviewed' is the time budget's
-// planned degradation, reached two ways that mean the same thing: shouldStart() said no before the
-// spawn (the budget was already spent), or the spawn was killed at the deadline mid-flight
-// (DeadlineExceededError). Both are absorbed HERE, scope by scope, so sibling workers' already-earned
+// value: { status: 'reviewed', result } | { status: 'unreviewed', usage }. 'unreviewed' is the time
+// budget's planned degradation, reached two ways that differ only in what was burned: shouldStart()
+// said no before the spawn (the budget was already spent — usage null, nothing ran), or the spawn was
+// killed at the deadline mid-flight (DeadlineExceededError — usage is the span-only record of the
+// wall clock it burned, which the caller folds into the pass total; zai-timing-31d.4). Both are
+// absorbed HERE, scope by scope, so sibling workers' already-earned
 // results survive — the deadline must never take the fail-loud path that discards the whole batch.
 // Every other error still aborts the batch exactly as before; the caller decides what 'unreviewed'
 // means for its layer (a pass-0 coverage gap vs a merely-curtailed sweep).
@@ -34193,14 +34240,19 @@ async function runScopeWorkers({ scopes, runOne, maxConcurrent, shouldStart = ()
     while (next < scopes.length && !firstError) {
       const i = next++;
       if (!shouldStart()) {
-        outcomes[i] = { status: 'unreviewed' };
+        // Refused before anything spawned: no time was burned, so there is no usage to carry.
+        outcomes[i] = { status: 'unreviewed', usage: null };
         continue;
       }
       try {
         outcomes[i] = { status: 'reviewed', result: await runOne(scopes[i]) };
       } catch (e) {
         if (e instanceof DeadlineExceededError) {
-          outcomes[i] = { status: 'unreviewed' };
+          // A killed spawn's burned time still counts (zai-timing-31d.4): runEngine stamps the span
+          // on the error, and it rides out of here as a span-only usage record — the same shape a
+          // token-less success produces, folded by the same sumUsage. [LAW:one-type-per-behavior]
+          // e.span is absent when the deadline gate refused the spawn outright: nothing ran, no usage.
+          outcomes[i] = { status: 'unreviewed', usage: e.span ? { span: e.span } : null };
           continue;
         }
         firstError = firstError || e;
@@ -34456,6 +34508,9 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   const allResults = [];
   const sweeps = [];
   const unreviewedScopes = [];
+  // Span-only usage records from deadline-killed spawns (null when nothing spawned) — folded into
+  // the pass total below so the envelope covers time a killed scope burned. [LAW:one-source-of-truth]
+  const unreviewedUsages = [];
   let budgetExhausted = false;
   let findings = [];
   for (let pass = 0; pass <= sweepCap; pass++) {
@@ -34478,6 +34533,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     });
     const results = outcomes.filter(o => o.status === 'reviewed').map(o => o.result);
     const skipped = scopes.filter((s, i) => outcomes[i].status === 'unreviewed');
+    unreviewedUsages.push(...outcomes.filter(o => o.status === 'unreviewed').map(o => o.usage));
     for (const s of skipped) log(`${labelPrefix}scope '${s.name}' not reviewed — time budget exhausted`);
     if (skipped.length > 0) budgetExhausted = true;
     if (pass === 0) {
@@ -34518,7 +34574,9 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     // any; dedupeAssessments (keyed by module) collapses the multi-go.mod case — and the sweep-pass
     // re-assessments, which collapse by the same module key. Non-dependency PR → [].
     assessments: dedupeAssessments(allResults.flatMap(r => r.assessments)),
-    usage: sumUsage([scoutResult.usage, ...allResults.map(r => r.usage)]),
+    // The unreviewed usages make the recorded envelope honest: a scope the deadline killed mid-spawn
+    // burned real wall clock, and its span widens the pass window exactly as a reviewed spawn's does.
+    usage: sumUsage([scoutResult.usage, ...allResults.map(r => r.usage), ...unreviewedUsages]),
     // [LAW:one-source-of-truth] The coverage gap as DATA, for the sinks: the PR sink withholds
     // approval when unreviewedScopes is non-empty (transport.submitReview), and run.js warns when
     // the budget bit at all. The summary text above derives from these same values, never the
@@ -39331,7 +39389,10 @@ const COST_IS_ESTIMATE = { dollars: true, subscription: true, unpriced: false };
 // distinct renderings, not branches that skip work: no usage -> no line; every basis -> one line
 // assembled by the same expression, differing only in the phrase its basis selected.
 function renderCostLine(usage, config, priorCost = null) {
-  if (!usage) return '';
+  // "The engine reported nothing" is a usage whose tokens are absent, not a null usage: the record
+  // still exists, carrying the host-stamped span (zai-timing-31d.4). Either way there is no cost
+  // line to render — same output as before the span learned to survive a token-less spawn.
+  if (!usage || !usage.tokens) return '';
   const tag = reviewerTag(config);
   // The human line stays one clause per quantity: the input total a reader already expects, with the
   // cache-hit share named beside it in the SAME unit rather than as a derived percentage — an
@@ -39382,7 +39443,9 @@ const UNPRICED_REMEDY = {
 };
 
 function costWarning(usage, config) {
-  if (!usage) return 'Engine reported no token usage; the review footer omits the cost line.';
+  // Tokens and cost go absent together when the engine reported nothing; the usage record itself
+  // may still exist to carry the spawn's span (zai-timing-31d.4). Both shapes warn identically.
+  if (!usage || !usage.cost) return 'Engine reported no token usage; the review footer omits the cost line.';
   return COST_WARNING[usage.cost.basis](usage.cost, reviewerTag(config), config);
 }
 

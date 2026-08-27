@@ -222,6 +222,29 @@ describe('sumUsage', () => {
     assert.equal(sumUsage([null, null]), null);
     assert.equal(sumUsage([]), null);
   });
+
+  // A spawn whose engine reported nothing still carries its host-stamped span (zai-timing-31d.4):
+  // its record arrives with tokens and cost absent together, contributes its span to the envelope,
+  // and contributes nothing to the token or cost folds.
+  test('a span-only spawn record widens the envelope without touching the token or cost sums', () => {
+    const total = sumUsage([
+      { tokens: { inputCacheMiss: 4, inputCacheHit: 0, output: 2 }, cost: { basis: 'dollars', usd: 0.05 }, span: { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:35:00.000Z' } },
+      { span: { from: '2026-08-22T03:20:00.000Z', to: '2026-08-22T03:35:00.000Z' } },
+    ]);
+    assert.equal(totalInputTokens(total.tokens), 4);
+    assert.equal(total.cost.usd, 0.05);
+    assert.deepEqual(total.span, { from: '2026-08-22T03:20:00.000Z', to: '2026-08-22T03:35:00.000Z' });
+  });
+
+  test('a pass where NO spawn reported tokens sums them to null, never a fabricated zero — the span survives', () => {
+    const total = sumUsage([
+      { span: { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:35:00.000Z' } },
+      { span: { from: '2026-08-22T03:31:00.000Z', to: '2026-08-22T03:40:00.000Z' } },
+    ]);
+    assert.equal(total.tokens, null);
+    assert.equal(total.cost, null);
+    assert.deepEqual(total.span, { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:40:00.000Z' });
+  });
 });
 
 // ── composeSummary ────────────────────────────────────────────────────────────────────────────
@@ -282,6 +305,30 @@ describe('runScopeWorkers', () => {
     const outcomes = await runScopeWorkers({ scopes, runOne, maxConcurrent: 3 });
     assert.deepEqual(outcomes.map(o => o.status), ['reviewed', 'unreviewed', 'reviewed']);
     assert.deepEqual(outcomes.filter(o => o.status === 'reviewed').map(o => o.result.name), ['a', 'c']);
+  });
+
+  // The time a killed spawn burned still counts (zai-timing-31d.4): runEngine stamps err.span, and
+  // the unreviewed outcome carries it out as a span-only usage record — the shape sumUsage folds.
+  test('a deadline-killed worker whose error carries a span surfaces it as a span-only usage', async () => {
+    const span = { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:35:00.000Z' };
+    const scopes = [{ name: 'a' }, { name: 'b' }];
+    const runOne = async (s) => {
+      if (s.name === 'b') {
+        const err = new DeadlineExceededError('killed at the deadline');
+        err.span = span;
+        throw err;
+      }
+      return { name: s.name };
+    };
+    const outcomes = await runScopeWorkers({ scopes, runOne, maxConcurrent: 2 });
+    assert.deepEqual(outcomes[1], { status: 'unreviewed', usage: { span } });
+  });
+
+  test('a spawn refused at the deadline gate (no err.span — nothing ran) carries a null usage', async () => {
+    const scopes = [{ name: 'a' }];
+    const runOne = async () => { throw new DeadlineExceededError('spawn refused: budget exhausted'); };
+    const outcomes = await runScopeWorkers({ scopes, runOne, maxConcurrent: 1 });
+    assert.deepEqual(outcomes[0], { status: 'unreviewed', usage: null });
   });
 
   test('once shouldStart says no, remaining scopes are unreviewed without spawning', async () => {
@@ -1287,6 +1334,27 @@ describe('runMultiScopePass — wall-clock time budget', () => {
     assert.equal(calls.workers.b, 1); // a spent budget is not retried in place
     assert.match(review.summary, /Reviewed 2 scope\(s\): a, c\./);
     assert.match(review.summary, /Time budget exhausted.*2 of 3 scope\(s\).*NOT reviewed: b/);
+  });
+
+  // The killed spawn's burned wall clock reaches the pass total (zai-timing-31d.4): the span rides
+  // the DeadlineExceededError out of the worker pool as a span-only usage and widens the envelope.
+  test("a deadline-killed worker's span still widens the pass usage envelope", async () => {
+    const span = { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:35:00.000Z' };
+    const { registry } = makeRegistry({
+      workerBehavior: ({ scope }) => {
+        if (scope.name === 'b') {
+          const err = new DeadlineExceededError('killed at the deadline');
+          err.span = span;
+          throw err;
+        }
+        return okResult(scope);
+      },
+    });
+    const review = await runMultiScopePass(passArgs(registry, { deadline: Date.now() + 3_600_000 }));
+    assert.deepEqual(review.unreviewedScopes, ['b']);
+    // Every reviewed spawn reported usage:null here, so the killed spawn's span IS the envelope.
+    assert.deepEqual(review.usage.span, span);
+    assert.equal(review.usage.tokens, null);
   });
 
   test('the budget expiring before ANY scope completes fails fast, naming the knob', async () => {

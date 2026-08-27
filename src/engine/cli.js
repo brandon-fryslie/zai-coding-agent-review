@@ -79,25 +79,37 @@ function makeCliAdapter(spec) {
         try {
           const home = spec.materializeHome({ config, instructionsPath, collector });
           try {
-            // [LAW:effects-at-boundaries] The clock is an effect, so the spawn's start instant is
-            // read HERE — the one place that owns the child's lifetime — and handed to extractUsage
-            // as a VALUE, which keeps every adapter a pure function of the engine's output and the
-            // instant it was given. Time is a pricing input (DeepSeek's peak/off-peak windows), so
-            // this spawn is priced at the tier it actually ran in rather than at whatever tier the
-            // pass happened to start in.
-            // [LAW:one-source-of-truth] The priced instant and the recorded span.from are the SAME
-            // Date. Two `new Date()` reads would be two clocks, free to disagree about which side of
-            // a boundary a spawn fell on — a review whose recorded span says off-peak and whose
-            // figure says peak, with nothing to say which one lied.
-            const startedAt = new Date();
-            const output = await runEngine(spec, config, prompt, home, collector, cwd, deadline);
-            const raw = spec.extractUsage(output, config, startedAt);
-            const usage = raw && { ...raw, span: { from: startedAt.toISOString(), to: new Date().toISOString() } };
-            const review = readCollectedReview(collector.recordsPath);
-            // [LAW:dataflow-not-control-flow] scopes (a scout run), findings (a worker run), and
-            // dependency assessments (a worker that reviewed a go.mod bump) are all carried through as
-            // values; the caller uses whichever its pass produced, an empty list otherwise.
-            return { summary: review.summary, findings: review.findings, scopes: review.scopes, assessments: review.assessments, usage };
+            // [LAW:one-source-of-truth] The spawn's span is stamped by runEngine — the one place
+            // that owns the child's lifetime, on every termination path — and the priced instant is
+            // DERIVED from span.from rather than read from a second clock. Two `new Date()` reads
+            // would be free to disagree about which side of a rate boundary a spawn fell on — a
+            // review whose recorded span says off-peak and whose figure says peak, with nothing to
+            // say which one lied. Time is a pricing input (DeepSeek's peak/off-peak windows), so
+            // this spawn is priced at the tier it actually ran in; extractUsage stays a pure
+            // function of the engine's output and the instant it was given. [LAW:effects-at-boundaries]
+            const { stdout: output, span } = await runEngine(spec, config, prompt, home, collector, cwd, deadline);
+            // [LAW:no-silent-failure] From here the spawn HAS run and its span is known, so any
+            // failure past this point — a throwing extractUsage, a ProtocolError from an engine
+            // that never called finish_review — still burned real wall clock and provider cost.
+            // The throw carries the span out, matching the invariant runEngine's own rejections
+            // already hold: no outcome of a spawn that ran loses its duration (zai-timing-31d.4).
+            try {
+              const raw = spec.extractUsage(output, config, new Date(span.from));
+              // The spawn's usage record: tokens and cost are the ENGINE's report and go absent
+              // together when it reported nothing; span is the HOST's clock and is always present —
+              // a duration cannot go missing the way a provider's token count can (zai-timing-31d.4).
+              // [LAW:one-type-per-behavior] One record answers "what did this spawn consume", in
+              // tokens, dollars, and seconds.
+              const usage = { ...(raw ?? {}), span };
+              const review = readCollectedReview(collector.recordsPath);
+              // [LAW:dataflow-not-control-flow] scopes (a scout run), findings (a worker run), and
+              // dependency assessments (a worker that reviewed a go.mod bump) are all carried through as
+              // values; the caller uses whichever its pass produced, an empty list otherwise.
+              return { summary: review.summary, findings: review.findings, scopes: review.scopes, assessments: review.assessments, usage };
+            } catch (err) {
+              err.span = span;
+              throw err;
+            }
           } finally {
             removeQuietly(home, 'temp HOME');
           }
