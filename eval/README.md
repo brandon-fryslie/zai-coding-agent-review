@@ -392,6 +392,76 @@ set's hardest findings. The instrument is faithful (the LLM judge agreed with ha
 measure. It is the floor the efficiency epic (`copirate-efficiency-235`) must not push
 lower, and the bar the quality work must raise.
 
+## Comparing a candidate — the quality gate
+
+`eval/compare.js` (`npm run review:compare`) is the command the whole epic exists for: **"did my
+change degrade finding quality?"** answered as a measured verdict, not a guess. It gates the
+**current working tree** (the candidate — the replay runner drives `src/` directly, so the candidate
+is simply the code as checked out; no build or publish) against a frozen baseline.
+
+```bash
+DEEPSEEK_API_KEY=… node eval/compare.js
+# options: --baseline <dir|baseline.json> (default: newest under eval/baseline/ by COMMIT-GRAPH order,
+#            not directory-name order — an uncommitted baseline.json always outranks a committed one;
+#            refused if the newest can't be determined unambiguously, e.g. a shallow git clone with
+#            more than one candidate),
+#          --matcher llm|lexical (default llm; MUST match the baseline's matcher; IGNORED under
+#            --reuse-candidate, where the reused summaries' own recorded matcher is checked instead),
+#          --out <dir> (default eval/out/candidate-<ts>, git-ignored; mutually exclusive with
+#            --reuse-candidate; refused if it already holds run artifacts for a case),
+#          --workers <N> (default 4), --cases-dir <dir>, --cache <file>,
+#          --reuse-candidate <dir> (gate an already-produced candidate root; no replay, no spend;
+#            mutually exclusive with --out)
+```
+
+DEEPSEEK_API_KEY is required **unconditionally** for the default `--matcher llm` (the judge's own
+credential), regardless of which provider the baseline's pinned engine itself uses — pass
+`--matcher lexical` to avoid it.
+
+**A candidate is just another suite.** `compare.js` reimplements no pooling, no scoring, and no
+gate predicate — it:
+
+1. replays every baseline case **N times** (N and the engine come *from the baseline*, and are
+   asserted — a candidate run at a different N or engine measures something else) by spawning
+   `run-case.js`, then scores each with `score.js`, into an isolated candidate root;
+2. reduces the candidate's scored summaries into a suite with the **same `buildBaseline`** the
+   frozen baseline was built with — so the producer and the comparator can never drift
+   (`[LAW:one-source-of-truth]`); and
+3. applies the frozen [degradation rule](#the-degradation-rule) via `baseline.js`'s `evaluateGate`
+   (`[LAW:single-enforcer]`): **candidate pooled inventory must-find recall < the baseline's pooled
+   gate floor ⇒ DEGRADED.**
+
+It prints the **estimated cost up front** (the baseline's recorded `$/full-run` × N), then a
+per-case verdict table and a final `DEGRADED` / `OK` / `IMPROVED` line — Markdown, so it pastes
+straight into a PR body. The per-case bands are diagnostics that localize *which* case moved a
+pooled regression (a `moved?` ⚠️ marks a case whose candidate mean fell below its baseline
+diagnostic floor); they never gate on their own. Artifacts land at `<out>/verdict.{md,json}`.
+
+**Exit codes are a trichotomy** so a CI gate (`copirate-eval-harness-2fk.6`) can tell the three
+outcomes apart: `0` = ran and OK/IMPROVED, `1` = ran and **DEGRADED** (the gate tripped), `2` =
+could not run (bad args, missing baseline, a matcher/N/engine that isn't comparable — refused
+*before* any spend where possible).
+
+### When to run it
+
+Any PR that changes **prompts** (`src/prompt.js`, `review-agent/instructions.md`), **spawn
+structure** (`src/multiscope.js`), or **effort/reasoning behavior** (`src/effort.js`) can silently
+move finding quality. Run `eval/compare.js` and paste the verdict table into the PR body. The
+efficiency epic's quality-sensitive tickets (`copirate-efficiency-235.2`–`.5`) name this as their
+acceptance instrument.
+
+### The gate's own validation (the sabotage test)
+
+The gate is only trustworthy if it *fires* on a genuinely worse engine, so it is validated by
+**deliberately degrading the worker prompt** and confirming `DEGRADED`: strip the "read the files
+in full / follow the change to its call sites before judging" directive from `buildReviewInput`
+(`src/prompt.js`) — the guidance most responsible for the subtle must-finds — and the pooled recall
+collapses below the floor. That run is recorded on `copirate-eval-harness-2fk.5`. Self-consistency
+(the baseline's own runs replayed through `compare.js --reuse-candidate` reproduce the baseline rate
+⇒ `OK`) is the other half.
+
+Like the rest of `eval/`, `compare.js` is dev-only tooling and does **not** bump the version.
+
 ## Adding a new case
 
 1. **Freeze the mechanical inputs** with the freezer, which resolves the reviewed head
