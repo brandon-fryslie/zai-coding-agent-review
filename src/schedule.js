@@ -23,11 +23,13 @@
 // [LAW:types-are-the-program]
 
 // [LAW:one-source-of-truth] THIS module owns the SpawnRecord shape: the producer (the spawn seam in
-// src/multiscope.js) mints every record through spawnRecord below, and the consumer
-// (describeSchedule) dispatches exhaustively on the same vocabulary — so a renamed field or a new
-// outcome value fails loudly at the mint or the derive, never as a silently-wrong breakdown.
-// [LAW:parse-dont-validate] the constructor is the checkpoint: a SpawnRecord exists only by passing
-// it, so everything downstream reads the stamp instead of re-checking the shape.
+// src/multiscope.js) mints every record through spawnRecord below, so a drifted tag or outcome
+// fails loudly at the mint, never as a silently-wrong breakdown. [LAW:parse-dont-validate] the
+// constructor is the checkpoint: a SpawnRecord exists only by passing it, so everything downstream
+// reads the stamp instead of re-checking the shape. [LAW:single-enforcer] the mint is the ONE
+// checkpoint for the vocabulary — describeSchedule does not re-validate `outcome` (it carries it
+// through without branching); its phase throw is exhaustive DISPATCH, not a second check, because
+// phase is the one field the fold branches on.
 const SPAWN_OUTCOMES = new Set(['completed', 'retried', 'failed']);
 function spawnRecord(tag, outcome, usage) {
   if (tag.phase !== 'scout' && tag.phase !== 'worker') {
