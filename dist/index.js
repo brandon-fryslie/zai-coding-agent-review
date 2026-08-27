@@ -32552,7 +32552,9 @@ function removeQuietly(dir, label) {
 // is why the cwd must NOT be the repo's parent (that would put the repo under cwd and re-open the
 // nested-memory vector for claude-code). The reviewer's own instructions load from the isolated home
 // (HOME/CODEX_HOME/XDG), keyed to env not cwd, so they are untouched. The repo stays readable by
-// absolute path (no per-engine read grant needed). [LAW:effects-at-boundaries]
+// absolute path — though a CLI's OWN directory-scoping rules may still demand a per-engine read
+// grant for paths outside cwd (opencode gates them as `external_directory`; its adapter allows it),
+// so verify the read path when writing a new adapter. [LAW:effects-at-boundaries]
 function makeCliAdapter(spec) {
   return {
     // [LAW:single-enforcer] The shared adapter interface: exactly what registry/run.js depend on.
@@ -32904,7 +32906,7 @@ const path = __nccwpck_require__(6928);
 const os = __nccwpck_require__(857);
 const { classifyTransient } = __nccwpck_require__(2887);
 const { emptyTokens, addTokens } = __nccwpck_require__(9614);
-const { makeCliAdapter } = __nccwpck_require__(2890);
+const { makeCliAdapter, removeQuietly } = __nccwpck_require__(2890);
 
 // [LAW:no-ambient-temporal-coupling] Pin off '@latest' — the same trap claude-code hit: an unowned,
 // time-varying input that lets an upstream npm release break a run with nothing here changing. Pinned
@@ -32945,6 +32947,16 @@ const TOOL_NAMES = {
 // `reasoning:` is rejected at config load, so nothing reasoning-related reaches this builder.
 function buildOpencodeConfig(config, collectorSpawn, agentsPath) {
   const providerId = config.model.split('/')[0];
+  // Everything after the provider prefix, slashes included — HF-style ids like
+  // `mlx-community/Qwen3-…` are one model name, not nesting.
+  const modelId = config.model.split('/').slice(1).join('/');
+  // [LAW:no-silent-failure] The `<provider>/<model>` shape is OpenCode's own resolution rule, so this
+  // adapter is its one enforcer — src/config.js validates engine-independent facts only. Without this,
+  // a bare model name would emit a nonsensical `models: { '': {} }` catalog entry and fail deep inside
+  // the run instead of at config time.
+  if (!providerId || !modelId) {
+    throw new Error(`opencode requires a '<provider>/<model>' model id (got '${config.model}').`);
+  }
   return {
     $schema: 'https://opencode.ai/config.json',
     model: config.model,
@@ -32960,6 +32972,11 @@ function buildOpencodeConfig(config, collectorSpawn, agentsPath) {
       grep: 'allow',
       glob: 'allow',
       list: 'allow',
+      // The engine runs from a scratch cwd OUTSIDE the reviewed repo (see cli.js) and reads the repo
+      // by absolute path — which OpenCode gates as `external_directory` and, non-interactively,
+      // auto-REJECTS when unstated, killing the session (verified live, 2026-08-27). Allowing it is
+      // the read-only design intent above, not a widening: every mutating capability stays denied.
+      external_directory: 'allow',
     },
     provider: {
       [providerId]: {
@@ -32967,6 +32984,12 @@ function buildOpencodeConfig(config, collectorSpawn, agentsPath) {
           baseURL: config.endpoint.baseUrl,
           apiKey: config.endpoint.credential.value,
         },
+        // [LAW:no-silent-failure] OpenCode resolves models against its models.dev catalog and fails a
+        // run whose model is not listed (ProviderModelNotFoundError, exit 0 — verified live,
+        // 2026-08-27). Production requests exactly this one model, so declare it: a catalog model
+        // merges harmlessly, and a non-catalog model (a self-hosted openai-chat endpoint) becomes
+        // reachable instead of unreachable-by-construction.
+        models: { [modelId]: {} },
       },
     },
     mcp: {
@@ -32988,24 +33011,32 @@ function buildOpencodeConfig(config, collectorSpawn, agentsPath) {
 // from $XDG_CONFIG_HOME/opencode/opencode.json (verified live, 2026-06-14).
 function materializeHome({ config, instructionsPath, collector }) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zai-reviewer-opencode-home-'));
-  const cfgDir = path.join(home, 'opencode');
-  fs.mkdirSync(cfgDir, { recursive: true });
+  // [LAW:no-silent-failure] A throw below (bad model shape, unreadable collector config, failed
+  // copy) escapes before cli.js ever receives `home`, so its finally-cleanup can't run — without
+  // this, every such failure silently abandons the just-created temp dir.
+  try {
+    const cfgDir = path.join(home, 'opencode');
+    fs.mkdirSync(cfgDir, { recursive: true });
 
-  // [LAW:single-enforcer] Instructions are copied from the one shared source, as AGENTS.md.
-  const agentsPath = path.join(cfgDir, 'AGENTS.md');
-  fs.copyFileSync(instructionsPath, agentsPath);
+    // [LAW:single-enforcer] Instructions are copied from the one shared source, as AGENTS.md.
+    const agentsPath = path.join(cfgDir, 'AGENTS.md');
+    fs.copyFileSync(instructionsPath, agentsPath);
 
-  // [LAW:one-source-of-truth] createReviewCollector owns the spawn argv and records path; read its
-  // computed spec rather than recomputing the node binary / dist entry reference.
-  const mcpCfg = JSON.parse(fs.readFileSync(collector.mcpConfigPath, 'utf8'));
-  const collectorSpawn = mcpCfg.mcpServers.review_collector;
+    // [LAW:one-source-of-truth] createReviewCollector owns the spawn argv and records path; read its
+    // computed spec rather than recomputing the node binary / dist entry reference.
+    const mcpCfg = JSON.parse(fs.readFileSync(collector.mcpConfigPath, 'utf8'));
+    const collectorSpawn = mcpCfg.mcpServers.review_collector;
 
-  fs.writeFileSync(
-    path.join(cfgDir, 'opencode.json'),
-    JSON.stringify(buildOpencodeConfig(config, collectorSpawn, agentsPath), null, 2),
-    'utf8',
-  );
-  return home;
+    fs.writeFileSync(
+      path.join(cfgDir, 'opencode.json'),
+      JSON.stringify(buildOpencodeConfig(config, collectorSpawn, agentsPath), null, 2),
+      'utf8',
+    );
+    return home;
+  } catch (err) {
+    removeQuietly(home, 'temp HOME');
+    throw err;
+  }
 }
 
 // [LAW:effects-at-boundaries] Pure: returns a full spawn spec from the validated ReviewConfig.
