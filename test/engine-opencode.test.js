@@ -50,6 +50,17 @@ describe('buildOpencodeConfig — generated opencode.json content', () => {
     assert.equal(provider.openai.options.apiKey, 'sk-test-key-xyz');
   });
 
+  test('the configured model is declared under the provider, so non-catalog models resolve', () => {
+    assert.deepEqual(cfg().provider.openai.models, { 'gpt-5.4-mini': {} });
+  });
+
+  test('a multi-segment model id (HF-style) keeps its inner slashes in the declaration', () => {
+    const config = { ...BASE_CONFIG, model: 'lmstudio/mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit' };
+    const provider = buildOpencodeConfig(config, MOCK_COLLECTOR_SPAWN, MOCK_AGENTS_PATH).provider;
+    assert.deepEqual(Object.keys(provider), ['lmstudio']);
+    assert.deepEqual(provider.lmstudio.models, { 'mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit': {} });
+  });
+
   test('permission block denies every mutating capability', () => {
     const perm = cfg().permission;
     assert.equal(perm.edit, 'deny');
@@ -64,6 +75,9 @@ describe('buildOpencodeConfig — generated opencode.json content', () => {
     assert.equal(perm.grep, 'allow');
     assert.equal(perm.glob, 'allow');
     assert.equal(perm.list, 'allow');
+    // The scratch-cwd design reads the repo by absolute path; without this OpenCode auto-rejects
+    // every repo read as external_directory and the session never reaches a stop.
+    assert.equal(perm.external_directory, 'allow');
   });
 
   test('instructions reference the AGENTS.md by absolute path', () => {

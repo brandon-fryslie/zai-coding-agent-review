@@ -45,6 +45,9 @@ const TOOL_NAMES = {
 // `reasoning:` is rejected at config load, so nothing reasoning-related reaches this builder.
 function buildOpencodeConfig(config, collectorSpawn, agentsPath) {
   const providerId = config.model.split('/')[0];
+  // Everything after the provider prefix, slashes included — HF-style ids like
+  // `mlx-community/Qwen3-…` are one model name, not nesting.
+  const modelId = config.model.split('/').slice(1).join('/');
   return {
     $schema: 'https://opencode.ai/config.json',
     model: config.model,
@@ -60,6 +63,11 @@ function buildOpencodeConfig(config, collectorSpawn, agentsPath) {
       grep: 'allow',
       glob: 'allow',
       list: 'allow',
+      // The engine runs from a scratch cwd OUTSIDE the reviewed repo (see cli.js) and reads the repo
+      // by absolute path — which OpenCode gates as `external_directory` and, non-interactively,
+      // auto-REJECTS when unstated, killing the session (verified live, 2026-08-27). Allowing it is
+      // the read-only design intent above, not a widening: every mutating capability stays denied.
+      external_directory: 'allow',
     },
     provider: {
       [providerId]: {
@@ -67,6 +75,12 @@ function buildOpencodeConfig(config, collectorSpawn, agentsPath) {
           baseURL: config.endpoint.baseUrl,
           apiKey: config.endpoint.credential.value,
         },
+        // [LAW:no-silent-failure] OpenCode resolves models against its models.dev catalog and fails a
+        // run whose model is not listed (ProviderModelNotFoundError, exit 0 — verified live,
+        // 2026-08-27). Production requests exactly this one model, so declare it: a catalog model
+        // merges harmlessly, and a non-catalog model (a self-hosted openai-chat endpoint) becomes
+        // reachable instead of unreachable-by-construction.
+        models: { [modelId]: {} },
       },
     },
     mcp: {
