@@ -29,7 +29,11 @@
 // provenance, not about any one review's arithmetic, and it is reported as its own fact rather than
 // smuggled into a cost as an absence. [LAW:one-type-per-behavior]
 //
-// Usage: node scripts/check-price-freshness.js   (exit 0 fresh, exit 1 with the list when overdue)
+// Usage: node scripts/check-price-freshness.js
+//   exit 0  every source verified within the threshold
+//   exit 1  any source overdue, OR carrying a verifiedOn dated in the future — both red, because both
+//           mean a rate is being asserted that nobody has confirmed lately, and the second additionally
+//           means the check would never have said so again.
 'use strict';
 
 const {

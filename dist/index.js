@@ -38376,9 +38376,11 @@ const PRICE_SOURCES = [
     vendor: 'OpenAI',
     url: 'https://openai.com/api/pricing/',
     verifiedOn: '2026-08-26',
-    // Reconciled 2026-08-26, and what the reconciliation FOUND is recorded here rather than collapsed
-    // into the date: the page's flagship table now lists only gpt-5.6-{sol,terra,luna}, so these three
-    // rows are no longer on it. Nor are they on developers.openai.com/api/docs/pricing,
+    // WHAT the last reconciliation found, recorded here because the date alone cannot carry it — when
+    // it happened is `verifiedOn` above and is never restated in prose, or this group would keep two
+    // clocks about its own freshness. The page's flagship table now lists only
+    // gpt-5.6-{sol,terra,luna}, so these three rows are no longer on it. Nor are they on
+    // developers.openai.com/api/docs/pricing,
     // .../docs/models, or platform.openai.com/docs/pricing — all four were checked. They remain live
     // and unchanged at these exact figures per several third-party trackers, which is why they stay —
     // but "checked, still true, no longer on any page we can name" is a different fact from "read
@@ -38432,7 +38434,8 @@ const PRICE_SOURCES = [
   {
     vendor: 'z.ai GLM',
     url: 'https://docs.z.ai/guides/overview/pricing',
-    // Read off the page 2026-08-26: both rows unchanged, and the page advertises no time-of-day tier.
+    // Read straight off the page, every row: both were unchanged, and the page advertises no
+    // time-of-day tier. (When that happened is `verifiedOn`, never restated here.)
     verifiedOn: '2026-08-26',
     models: {
       'glm-5.1': { rates: { input: 1.40, cachedInput: 0.26, output: 4.40 }, tiers: [] },
