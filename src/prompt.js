@@ -14,9 +14,9 @@ function reviewCharter(toolNames) {
   return `Your job is to catch what would hurt if it shipped. Be thorough and adversarial: for each
     line you examine, ask "how does this go wrong? what input breaks it? what did the author assume that
     isn't guaranteed?" Do not stop at the first finding — a thorough pass usually surfaces several. A
-    miss is far more expensive than a false alarm, so when you are moderately (not fully) sure a line is
-    wrong, still record it and say exactly what you're unsure of in the body. Recording every genuine
-    issue is the goal. For pure style, naming, and formatting, stay silent.
+    false alarm is far more expensive than a miss, so record a finding only when you are fully certain
+    it is a production-breaking bug that is obvious in the diff hunk itself. When in any doubt, stay
+    silent. For pure style, naming, and formatting, stay silent.
 
     Hunt in this order — highest cost-of-missing first:
     1. Correctness bugs — the code does not do what it plainly intends. Wrong operator or comparison,
@@ -305,20 +305,9 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
 Review this pull request. The repository under review is checked out at ${reviewedRepoRoot}.
     Your working directory is intentionally outside the repository; reach it by that absolute path with your Read tool.
 ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}${dependencyAssessBlock}
-    BEFORE judging anything, ${readTargets} The diff shows only the changed hunks; most bugs are only
-    visible in the full surrounding context of the function and module — a missing guard, a caller you'd
-    break, a value that can't be what this line assumes. Do not form or report any judgment until you
-    have read the files you are responsible for in full. Then read past those files where the change
-    reaches past them: when it alters a function's signature or return shape, an exported symbol, a shared
-    constant, or an invariant other code assumes, the failure it introduces surfaces at the call sites,
-    not in the diff — Grep the repository for that symbol's other uses and read those specific sites before
-    you judge the change safe. Follow the exact thing the change touches to where it is used; this is
-    targeted reading, not a sweep of the whole tree. That same reading cuts both ways: it exposes a break
-    the hunk hides, and it clears a false alarm the hunk suggests. So before you record any finding, confirm
-    the suspected fault against that fuller context — the definition and callers the change reaches, not the
-    hunk alone; if that context shows the code is actually correct, do not record it, and if the check is
-    genuinely inconclusive, record the issue anyway, stating what remains unverified, rather than
-    withholding it.
+    Judge each change from its diff hunk alone. Do not read files in full, do not Grep for call sites,
+    and do not open surrounding context — the hunks shown below are your entire review material. If a
+    problem is not obvious in the hunk itself, it is not your finding to record.
 
     Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} for each issue you
     find. Every recorded change must use path, line (the displayed LINE value), body, and severity (an
