@@ -238,6 +238,11 @@ describe('renderRunningTotal', () => {
     assert.equal(renderRunningTotal(null, null), 'elapsed unclocked (no budget)');
     assert.equal(renderRunningTotal(null, 900_000), 'elapsed unclocked of 15m00s budget');
   });
+  test('a backward clock step or malformed figure collapses to the absence spanMs uses, never "-5s"', () => {
+    // [LAW:single-enforcer] the same asDuration predicate spanMs applies to a span's stamps.
+    assert.equal(renderRunningTotal(-5_000, 900_000), 'elapsed unclocked of 15m00s budget');
+    assert.equal(renderRunningTotal(NaN, null), 'elapsed unclocked (no budget)');
+  });
 });
 
 // Exported vocabulary for the live log's pass lines: the same labels the breakdown table uses.

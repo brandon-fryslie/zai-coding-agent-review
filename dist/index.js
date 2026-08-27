@@ -37129,7 +37129,16 @@ function scheduleRecord({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
 // [LAW:no-silent-failure] 'unclocked' IS the loud form here: the absence is printed, not skipped.
 function spanMs(span) {
   if (!span) return null;
-  const ms = Date.parse(span.to) - Date.parse(span.from);
+  return asDuration(Date.parse(span.to) - Date.parse(span.from));
+}
+
+// [LAW:single-enforcer] The ONE predicate deciding whether a millisecond figure is a duration:
+// NaN (a malformed stamp) and a negative (a backward clock step between the two reads — NTP
+// resync, VM migration) are not durations, and both collapse to the same typed absence the
+// renderers spell 'unclocked'. Shared by spanMs (a span's two stamps) and renderRunningTotal
+// (the run mint vs the live clock), so the two elapsed figures cannot drift apart in what they
+// refuse. [LAW:no-silent-failure] the absence is printed, never a '-5s' or 'NaNs'.
+function asDuration(ms) {
   return Number.isFinite(ms) && ms >= 0 ? ms : null;
 }
 
@@ -37221,8 +37230,10 @@ function formatMs(ms) {
 // as 'unclocked' (formatMs's word for time we cannot count), and a null budget renders '(no
 // budget)' rather than inventing a bound. [LAW:dataflow-not-control-flow] one clause shape,
 // selected by the values — the no-budget run logs through the same line, not around it.
+// The elapsed passes through asDuration, the same collapse spanMs applies: a backward clock
+// step between the run mint and this read renders the absence, never a negative figure.
 function renderRunningTotal(elapsedMs, budgetMs) {
-  const elapsed = `elapsed ${formatMs(elapsedMs)}`;
+  const elapsed = `elapsed ${formatMs(asDuration(elapsedMs))}`;
   return budgetMs == null ? `${elapsed} (no budget)` : `${elapsed} of ${formatMs(budgetMs)} budget`;
 }
 
