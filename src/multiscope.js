@@ -152,10 +152,12 @@ function composeSummary(scopes, workerResults, sweeps = [], budget = { exhausted
 // pass as a clean one.
 //
 // [LAW:types-are-the-program] The pool returns one OUTCOME per scope, in scope order — a discriminated
-// value: { status: 'reviewed', result } | { status: 'unreviewed' }. 'unreviewed' is the time budget's
-// planned degradation, reached two ways that mean the same thing: shouldStart() said no before the
-// spawn (the budget was already spent), or the spawn was killed at the deadline mid-flight
-// (DeadlineExceededError). Both are absorbed HERE, scope by scope, so sibling workers' already-earned
+// value: { status: 'reviewed', result } | { status: 'unreviewed', usage }. 'unreviewed' is the time
+// budget's planned degradation, reached two ways that differ only in what was burned: shouldStart()
+// said no before the spawn (the budget was already spent — usage null, nothing ran), or the spawn was
+// killed at the deadline mid-flight (DeadlineExceededError — usage is the span-only record of the
+// wall clock it burned, which the caller folds into the pass total; zai-timing-31d.4). Both are
+// absorbed HERE, scope by scope, so sibling workers' already-earned
 // results survive — the deadline must never take the fail-loud path that discards the whole batch.
 // Every other error still aborts the batch exactly as before; the caller decides what 'unreviewed'
 // means for its layer (a pass-0 coverage gap vs a merely-curtailed sweep).

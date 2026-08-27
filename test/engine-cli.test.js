@@ -76,4 +76,20 @@ describe('makeCliAdapter — the spawn start instant (zai-cost-truth-p5o.1)', ()
     assert.equal(result.usage.cost, undefined);
     assert.equal(result.summary, 'done');
   });
+
+  // A spawn that RAN and then failed the post-spawn steps (a throwing extractUsage, a ProtocolError
+  // from an engine that never called finish_review) burned real wall clock; the throw carries the
+  // span out, matching the invariant runEngine's own rejections hold. [LAW:no-silent-failure]
+  test('a failure after the spawn ran still reports the duration it burned, on the error', async () => {
+    const adapter = makeCliAdapter(specThatRecords(() => { throw new Error('usage payload was garbage'); }));
+    await assert.rejects(
+      adapter.produceReview({ config: CONFIG, buildPromptFor: () => 'prompt', instructionsPath: null }),
+      err => {
+        assert.match(err.message, /usage payload was garbage/);
+        assert.ok(err.span, 'the post-spawn failure carries the spawn span');
+        assert.ok(Date.parse(err.span.to) >= Date.parse(err.span.from));
+        return true;
+      },
+    );
+  });
 });

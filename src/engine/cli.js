@@ -88,18 +88,28 @@ function makeCliAdapter(spec) {
             // this spawn is priced at the tier it actually ran in; extractUsage stays a pure
             // function of the engine's output and the instant it was given. [LAW:effects-at-boundaries]
             const { stdout: output, span } = await runEngine(spec, config, prompt, home, collector, cwd, deadline);
-            const raw = spec.extractUsage(output, config, new Date(span.from));
-            // The spawn's usage record: tokens and cost are the ENGINE's report and go absent
-            // together when it reported nothing; span is the HOST's clock and is always present —
-            // a duration cannot go missing the way a provider's token count can (zai-timing-31d.4).
-            // [LAW:one-type-per-behavior] One record answers "what did this spawn consume", in
-            // tokens, dollars, and seconds.
-            const usage = { ...(raw ?? {}), span };
-            const review = readCollectedReview(collector.recordsPath);
-            // [LAW:dataflow-not-control-flow] scopes (a scout run), findings (a worker run), and
-            // dependency assessments (a worker that reviewed a go.mod bump) are all carried through as
-            // values; the caller uses whichever its pass produced, an empty list otherwise.
-            return { summary: review.summary, findings: review.findings, scopes: review.scopes, assessments: review.assessments, usage };
+            // [LAW:no-silent-failure] From here the spawn HAS run and its span is known, so any
+            // failure past this point — a throwing extractUsage, a ProtocolError from an engine
+            // that never called finish_review — still burned real wall clock and provider cost.
+            // The throw carries the span out, matching the invariant runEngine's own rejections
+            // already hold: no outcome of a spawn that ran loses its duration (zai-timing-31d.4).
+            try {
+              const raw = spec.extractUsage(output, config, new Date(span.from));
+              // The spawn's usage record: tokens and cost are the ENGINE's report and go absent
+              // together when it reported nothing; span is the HOST's clock and is always present —
+              // a duration cannot go missing the way a provider's token count can (zai-timing-31d.4).
+              // [LAW:one-type-per-behavior] One record answers "what did this spawn consume", in
+              // tokens, dollars, and seconds.
+              const usage = { ...(raw ?? {}), span };
+              const review = readCollectedReview(collector.recordsPath);
+              // [LAW:dataflow-not-control-flow] scopes (a scout run), findings (a worker run), and
+              // dependency assessments (a worker that reviewed a go.mod bump) are all carried through as
+              // values; the caller uses whichever its pass produced, an empty list otherwise.
+              return { summary: review.summary, findings: review.findings, scopes: review.scopes, assessments: review.assessments, usage };
+            } catch (err) {
+              err.span = span;
+              throw err;
+            }
           } finally {
             removeQuietly(home, 'temp HOME');
           }

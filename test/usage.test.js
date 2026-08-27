@@ -787,6 +787,19 @@ describe('cost marker — the recorded facts re-derive the cost (zai-cost-truth-
     assert.equal(record.tokens, null);
     assert.deepEqual(record.cost, { basis: 'dollars', usd: 0.5 });
   });
+
+  // The one marker shape zai-timing-31d.4 introduced: a spawn whose engine reported nothing still
+  // records its host-stamped span. The persistence path must keep the window while honestly
+  // recording the absent figure — an unknown-cost round that still says WHEN it ran.
+  test('a span-only usage round-trips: from/to recorded, tokens null, cost unpriced', () => {
+    const span = { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:35:00.000Z' };
+    const marker = costMarker({ span }, DEEPSEEK_CONFIG);
+    const record = parseCostRecord(marker);
+    assert.equal(record.from, span.from);
+    assert.equal(record.to, span.to);
+    assert.equal(record.tokens, null);
+    assert.deepEqual(record.cost, { basis: 'unpriced', reason: 'not-reported' });
+  });
 });
 
 describe('sumCost', () => {

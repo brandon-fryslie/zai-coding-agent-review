@@ -192,7 +192,10 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
     };
     // [LAW:no-silent-failure] Every post-spawn rejection carries the span it burned: the duration
     // of a failed spawn is diagnostics the callers upstream may surface, and the error object is
-    // the only vehicle that survives a rejection.
+    // the only vehicle that survives a rejection. The guarantee is per SPAWN: a retry loop that
+    // re-spawns after a transient failure receives each attempt's own span, and folding those
+    // attempts into a schedule is the aggregation layer's job (zai-timing-31d.5) — today
+    // retryTransientSpawn reads only the attempt it settles on.
     const fail = err => {
       err.span = span;
       reject(err);

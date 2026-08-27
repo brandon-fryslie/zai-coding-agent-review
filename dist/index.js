@@ -32591,18 +32591,28 @@ function makeCliAdapter(spec) {
             // this spawn is priced at the tier it actually ran in; extractUsage stays a pure
             // function of the engine's output and the instant it was given. [LAW:effects-at-boundaries]
             const { stdout: output, span } = await runEngine(spec, config, prompt, home, collector, cwd, deadline);
-            const raw = spec.extractUsage(output, config, new Date(span.from));
-            // The spawn's usage record: tokens and cost are the ENGINE's report and go absent
-            // together when it reported nothing; span is the HOST's clock and is always present —
-            // a duration cannot go missing the way a provider's token count can (zai-timing-31d.4).
-            // [LAW:one-type-per-behavior] One record answers "what did this spawn consume", in
-            // tokens, dollars, and seconds.
-            const usage = { ...(raw ?? {}), span };
-            const review = readCollectedReview(collector.recordsPath);
-            // [LAW:dataflow-not-control-flow] scopes (a scout run), findings (a worker run), and
-            // dependency assessments (a worker that reviewed a go.mod bump) are all carried through as
-            // values; the caller uses whichever its pass produced, an empty list otherwise.
-            return { summary: review.summary, findings: review.findings, scopes: review.scopes, assessments: review.assessments, usage };
+            // [LAW:no-silent-failure] From here the spawn HAS run and its span is known, so any
+            // failure past this point — a throwing extractUsage, a ProtocolError from an engine
+            // that never called finish_review — still burned real wall clock and provider cost.
+            // The throw carries the span out, matching the invariant runEngine's own rejections
+            // already hold: no outcome of a spawn that ran loses its duration (zai-timing-31d.4).
+            try {
+              const raw = spec.extractUsage(output, config, new Date(span.from));
+              // The spawn's usage record: tokens and cost are the ENGINE's report and go absent
+              // together when it reported nothing; span is the HOST's clock and is always present —
+              // a duration cannot go missing the way a provider's token count can (zai-timing-31d.4).
+              // [LAW:one-type-per-behavior] One record answers "what did this spawn consume", in
+              // tokens, dollars, and seconds.
+              const usage = { ...(raw ?? {}), span };
+              const review = readCollectedReview(collector.recordsPath);
+              // [LAW:dataflow-not-control-flow] scopes (a scout run), findings (a worker run), and
+              // dependency assessments (a worker that reviewed a go.mod bump) are all carried through as
+              // values; the caller uses whichever its pass produced, an empty list otherwise.
+              return { summary: review.summary, findings: review.findings, scopes: review.scopes, assessments: review.assessments, usage };
+            } catch (err) {
+              err.span = span;
+              throw err;
+            }
           } finally {
             removeQuietly(home, 'temp HOME');
           }
@@ -33433,7 +33443,10 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
     };
     // [LAW:no-silent-failure] Every post-spawn rejection carries the span it burned: the duration
     // of a failed spawn is diagnostics the callers upstream may surface, and the error object is
-    // the only vehicle that survives a rejection.
+    // the only vehicle that survives a rejection. The guarantee is per SPAWN: a retry loop that
+    // re-spawns after a transient failure receives each attempt's own span, and folding those
+    // attempts into a schedule is the aggregation layer's job (zai-timing-31d.5) — today
+    // retryTransientSpawn reads only the attempt it settles on.
     const fail = err => {
       err.span = span;
       reject(err);
@@ -34210,10 +34223,12 @@ function composeSummary(scopes, workerResults, sweeps = [], budget = { exhausted
 // pass as a clean one.
 //
 // [LAW:types-are-the-program] The pool returns one OUTCOME per scope, in scope order — a discriminated
-// value: { status: 'reviewed', result } | { status: 'unreviewed' }. 'unreviewed' is the time budget's
-// planned degradation, reached two ways that mean the same thing: shouldStart() said no before the
-// spawn (the budget was already spent), or the spawn was killed at the deadline mid-flight
-// (DeadlineExceededError). Both are absorbed HERE, scope by scope, so sibling workers' already-earned
+// value: { status: 'reviewed', result } | { status: 'unreviewed', usage }. 'unreviewed' is the time
+// budget's planned degradation, reached two ways that differ only in what was burned: shouldStart()
+// said no before the spawn (the budget was already spent — usage null, nothing ran), or the spawn was
+// killed at the deadline mid-flight (DeadlineExceededError — usage is the span-only record of the
+// wall clock it burned, which the caller folds into the pass total; zai-timing-31d.4). Both are
+// absorbed HERE, scope by scope, so sibling workers' already-earned
 // results survive — the deadline must never take the fail-loud path that discards the whole batch.
 // Every other error still aborts the batch exactly as before; the caller decides what 'unreviewed'
 // means for its layer (a pass-0 coverage gap vs a merely-curtailed sweep).
