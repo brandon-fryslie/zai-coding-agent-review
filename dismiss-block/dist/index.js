@@ -32274,47 +32274,175 @@ module.exports = {
 // by the instant against the schedule, so the next vendor to introduce time-of-day pricing is a table
 // row, not a branch.
 //
-// [LAW:one-source-of-truth] EVERY priced provider, one table, keyed by the exact model id each engine
-// reports (namespaces don't collide: gpt-*, deepseek-*, glm-*). Dollars per ONE MILLION tokens,
-// matching each vendor's published per-1M figures so they can be eyeballed against the pricing page.
-// PRICE-SENSITIVE: these drift whenever a vendor changes prices and have no machine source — they
-// MUST be updated by hand. `cachedInput` is the discounted prompt-cache rate.
-// Sources / last verified:
-//   OpenAI   2026-06-14 — https://openai.com/api/pricing/
-//   DeepSeek 2026-08-26 — https://api-docs.deepseek.com/quick_start/pricing (peak/off-peak, effective
-//            16:00 UTC 2026-08-16 per https://api-docs.deepseek.com/news/news260813; cross-checked
-//            against https://www.aipricing.guru/deepseek-pricing/ and https://tokencost.app/models/deepseek-v4-pro)
-//   z.ai GLM 2026-06-17 — https://docs.z.ai/guides/overview/pricing
-
-// DeepSeek's peak window, verified 2026-08-26 against the official pricing page: "Peak hours are
-// 01:00 - 04:00 and 06:00 - 10:00 UTC, Monday through Friday". The DAYS are as load-bearing as the
+// DeepSeek's peak window, quoted from the official pricing page: "Peak hours are
+// 01:00 - 04:00 and 06:00 - 10:00 UTC, Monday through Friday". WHEN that was last confirmed is not
+// written here — it is the DeepSeek source's `verifiedOn` below, which covers this window exactly as
+// it covers the rates. A date restated in a comment beside the field that owns it is the second clock
+// this table was just rid of. [LAW:one-source-of-truth]
+// The DAYS are as load-bearing as the
 // hours and are why `when` is not an hours list: peak covers 7 hours on 5 days, so a schedule holding
 // only the hours would bill every weekend review at double its real rate — the same silently-wrong
 // figure this epic exists to end, in the opposite direction. [FRAMING:representation]
 const DEEPSEEK_PEAK = { daysUtc: [1, 2, 3, 4, 5], hoursUtc: [[1, 4], [6, 10]] };
 
-const PRICES_PER_MILLION = {
-  'gpt-5.5': { rates: { input: 5.00, cachedInput: 0.50, output: 30.00 }, tiers: [] },
-  'gpt-5.4': { rates: { input: 2.50, cachedInput: 0.25, output: 15.00 }, tiers: [] },
-  'gpt-5.4-mini': { rates: { input: 0.75, cachedInput: 0.075, output: 4.50 }, tiers: [] },
-  // DeepSeek's standard rate is its OFF-PEAK rate; peak is exactly double across all three classes
-  // today. The peak numbers are written out rather than expressed as a 2x multiplier because what the
-  // vendor publishes is two rate cards, and a multiplier would make the table a claim about the
-  // RELATIONSHIP between them — one that stops being true the first time a vendor prices its classes
-  // independently, and one no reader could check against the pricing page. [FRAMING:representation]
-  // The tiny cachedInput rates are DeepSeek's real published disk-cache pricing — a cache hit is
-  // priced ~30x below a cache miss — an intentional outlier, not typos.
-  'deepseek-v4-pro': {
-    rates: { input: 0.66, cachedInput: 0.022, output: 1.98 },
-    tiers: [{ when: DEEPSEEK_PEAK, rates: { input: 1.32, cachedInput: 0.044, output: 3.96 } }],
+// [LAW:one-source-of-truth] EVERY priced provider, one table — grouped by the PAGE a human verifies it
+// against, because that page and the date someone last read it are facts ABOUT these rates and not
+// commentary beside them. They used to be exactly that: a "Sources / last verified" block comment
+// above the table, which is a map only a human redraws. It went stale on 2026-08-16 and stayed stale
+// for six weeks while every review printed a confident figure understating the real bill ~3.6x, and
+// nothing in the system could even ask how old the numbers were. A date the machine can read is a date
+// a check can refuse (see stalePriceSources below and scripts/check-price-freshness.js).
+// [FRAMING:representation]
+//
+// The grouping is what makes "priced but unverified" unrepresentable: a model lives INSIDE the source
+// that dates it, so a rate cannot be added without a page and a date, and re-verifying a vendor is one
+// edit rather than one-per-row that must agree. `verifiedOn` covers the WHOLE schedule the group
+// holds — every rate, every tier, and every tier's window and days — so a vendor that moves a peak
+// boundary or drops a weekday drifts exactly as detectably as one that changes a number.
+//
+// PRICE-SENSITIVE and hand-maintained: there is no machine source, and building a scraper against a
+// marketing page would be a second map with no contract. Re-verifying means opening `url`, comparing
+// every figure AND every window below, and moving `verifiedOn` to the day you did it.
+// Dollars per ONE MILLION tokens, matching each vendor's published per-1M figures so a reader can
+// eyeball them against the page. `cachedInput` is the discounted prompt-cache rate.
+const PRICE_SOURCES = [
+  {
+    vendor: 'OpenAI',
+    url: 'https://openai.com/api/pricing/',
+    verifiedOn: '2026-08-26',
+    // Reconciled 2026-08-26, and what the reconciliation FOUND is recorded here rather than collapsed
+    // into the date: the page's flagship table now lists only gpt-5.6-{sol,terra,luna}, so these three
+    // rows are no longer on it. They remain live and unchanged at these exact figures per OpenAI's own
+    // model docs and several third-party trackers, which is why they stay — but "checked, still true,
+    // no longer on the headline table" is a different fact from "read straight off the page", and a
+    // bare date would have hidden the difference. [FRAMING:representation]
+    // The gpt-5.6 rows are deliberately NOT added yet: OpenAI prices them differently for short and
+    // long context, and a `tiers` window is keyed by an INSTANT, so a long-context run would price at
+    // the short-context rate — a fresh silent misprice inside the mechanism built to end them. That
+    // axis is a schema question, not a table row.
+    models: {
+      'gpt-5.5': { rates: { input: 5.00, cachedInput: 0.50, output: 30.00 }, tiers: [] },
+      'gpt-5.4': { rates: { input: 2.50, cachedInput: 0.25, output: 15.00 }, tiers: [] },
+      'gpt-5.4-mini': { rates: { input: 0.75, cachedInput: 0.075, output: 4.50 }, tiers: [] },
+    },
   },
-  'deepseek-v4-flash': {
-    rates: { input: 0.22, cachedInput: 0.007, output: 0.66 },
-    tiers: [{ when: DEEPSEEK_PEAK, rates: { input: 0.44, cachedInput: 0.014, output: 1.32 } }],
+  {
+    vendor: 'DeepSeek',
+    url: 'https://api-docs.deepseek.com/quick_start/pricing',
+    verifiedOn: '2026-08-26',
+    // Peak/off-peak took effect 16:00 UTC 2026-08-16 per https://api-docs.deepseek.com/news/news260813;
+    // cross-checked against https://www.aipricing.guru/deepseek-pricing/ and
+    // https://tokencost.app/models/deepseek-v4-pro. DeepSeek's standard rate is its OFF-PEAK rate;
+    // peak is exactly double across all three classes today. The peak numbers are written out rather
+    // than expressed as a 2x multiplier because what the vendor publishes is two rate cards, and a
+    // multiplier would make the table a claim about the RELATIONSHIP between them — one that stops
+    // being true the first time a vendor prices its classes independently, and one no reader could
+    // check against the pricing page. [FRAMING:representation]
+    // The tiny cachedInput rates are DeepSeek's real published disk-cache pricing — a cache hit is
+    // priced ~30x below a cache miss — an intentional outlier, not typos.
+    models: {
+      'deepseek-v4-pro': {
+        rates: { input: 0.66, cachedInput: 0.022, output: 1.98 },
+        tiers: [{ when: DEEPSEEK_PEAK, rates: { input: 1.32, cachedInput: 0.044, output: 3.96 } }],
+      },
+      'deepseek-v4-flash': {
+        rates: { input: 0.22, cachedInput: 0.007, output: 0.66 },
+        tiers: [{ when: DEEPSEEK_PEAK, rates: { input: 0.44, cachedInput: 0.014, output: 1.32 } }],
+      },
+    },
   },
-  'glm-5.1': { rates: { input: 1.40, cachedInput: 0.26, output: 4.40 }, tiers: [] },
-  'glm-4.6': { rates: { input: 0.60, cachedInput: 0.11, output: 2.20 }, tiers: [] },
-};
+  {
+    vendor: 'z.ai GLM',
+    url: 'https://docs.z.ai/guides/overview/pricing',
+    // Read off the page 2026-08-26: both rows unchanged, and the page advertises no time-of-day tier.
+    verifiedOn: '2026-08-26',
+    models: {
+      'glm-5.1': { rates: { input: 1.40, cachedInput: 0.26, output: 4.40 }, tiers: [] },
+      'glm-4.6': { rates: { input: 0.60, cachedInput: 0.11, output: 2.20 }, tiers: [] },
+    },
+  },
+];
+
+// [LAW:one-source-of-truth] The flat lookup every price call indexes, DERIVED from the grouped table
+// rather than maintained beside it, keyed by the exact model id each engine reports (namespaces don't
+// collide: gpt-*, deepseek-*, glm-*).
+//
+// The table has a NULL PROTOTYPE, and that is load-bearing rather than tidy. A model id is a config
+// value, so it can be any string; an ordinary object answers `constructor` or `toString` with
+// Object.prototype's members, handing the lookup something truthy that is not a rate schedule, which
+// then reads `.tiers` off a function and throws mid-review. Refusing the members at construction is
+// one enforcer at the one place the table is built, so every reader gets `undefined` for a model that
+// is not listed and no reader has to remember an own-key guard. [LAW:types-are-the-program]
+//
+// A model listed under two vendors throws HERE rather than letting the later silently win: two groups
+// claiming one model id are two rate schedules for one fact, and which one priced your review would
+// then depend on array order. [LAW:no-silent-failure]
+function flattenPrices(sources) {
+  const table = Object.create(null);
+  for (const source of sources) {
+    for (const [model, entry] of Object.entries(source.models)) {
+      if (model in table) {
+        throw new Error(`price table lists ${model} under two sources (${source.vendor} repeats it); one model, one rate schedule`);
+      }
+      table[model] = entry;
+    }
+  }
+  return table;
+}
+
+const PRICES_PER_MILLION = flattenPrices(PRICE_SOURCES);
+
+const MS_PER_DAY = 86_400_000;
+
+// How long a hand-copied rate may go unconfirmed before the build refuses it. Thirty days is a legible
+// human cadence (open three pricing pages once a month) and it is the number the incident argues for:
+// DeepSeek repriced 37 days after this table's last verification and the wrong figures ran for six
+// more weeks. A threshold cannot make drift impossible — nothing can, for a map with no machine source
+// — it can only BOUND how long the drift stays silent, and the bound has to be shorter than the
+// interval that already burned us. One threshold for every vendor, not one per row: a rate nobody is
+// paying today is a wrong figure the moment someone flips PROVIDER, and a per-source knob would be a
+// mode with no owner. [LAW:no-mode-explosion]
+const PRICE_VERIFICATION_MAX_AGE_DAYS = 30;
+
+// [LAW:parse-dont-validate] A verification date is written 'YYYY-MM-DD' and read as UTC midnight. It
+// throws on anything else, because the alternative is the quietest possible failure: an unreadable
+// date yields a NaN age, NaN compares false against every threshold, and that source would be scored
+// FRESH forever. A typo that silently disables the staleness check is this ticket's own bug wearing
+// its fix as a costume. [LAW:no-silent-failure]
+function verifiedOnMs(source) {
+  const ms = /^\d{4}-\d{2}-\d{2}$/.test(source.verifiedOn)
+    ? Date.parse(`${source.verifiedOn}T00:00:00Z`)
+    : NaN;
+  if (!Number.isFinite(ms)) {
+    throw new TypeError(`price source ${source.vendor} has an unreadable verifiedOn: ${String(source.verifiedOn)}`);
+  }
+  return ms;
+}
+
+// [LAW:effects-at-boundaries] Pure: which of these price sources are overdue for re-verification, as
+// of an instant the caller supplies. No clock read, so a test names the instant and the answer is
+// deterministic; the one clock read lives in scripts/check-price-freshness.js, the boundary that acts
+// on the answer.
+//
+// [LAW:single-enforcer] THE one predicate for "has this table gone stale", so the CI check cannot hold
+// a different opinion than a test does. Sources arrive as an argument rather than being reached for,
+// so the shipped table is one INPUT to this rule and never a hidden dependency a caller must
+// neutralize to test it.
+//
+// Freshness is a bounded interval [0, maxAgeDays] rather than a one-sided "not too old": a
+// `verifiedOn` dated in the FUTURE — a typo, or a date bumped without opening the page — would
+// otherwise read as permanently fresh and silence the check for good. Ages are whole elapsed days,
+// floored, so the boundary is exact: at maxAgeDays a source is still fresh, at maxAgeDays + 1 it is
+// not. Each stale source is returned WITH its age, since the report has to name how far gone it is.
+function stalePriceSources(sources, at, maxAgeDays = PRICE_VERIFICATION_MAX_AGE_DAYS) {
+  const now = instantMs(at, 'price-table freshness needs the current instant as a Date');
+  const aged = sources.map(source => ({
+    source,
+    ageDays: Math.floor((now - verifiedOnMs(source)) / MS_PER_DAY),
+  }));
+  const isFresh = ({ ageDays }) => ageDays >= 0 && ageDays <= maxAgeDays;
+  return aged.filter(entry => !isFresh(entry));
+}
 
 // [LAW:types-are-the-program] THE TOKEN RECORD — the PRIMARY FACT behind every cost figure, and the
 // one shape every adapter parses its vendor's raw counts into:
@@ -32368,11 +32496,19 @@ function addTokens(a, b) {
 // Fractional hours (not whole ones) because a vendor is free to move a boundary to :30 — the
 // coordinate should not decide what the schedule is allowed to express.
 function utcInstant(at) {
-  const ms = at instanceof Date ? at.getTime() : NaN;
-  if (!Number.isFinite(ms)) {
-    throw new TypeError(`price lookup needs the spawn's start instant as a Date; got ${String(at)}`);
-  }
+  instantMs(at, "price lookup needs the spawn's start instant as a Date");
   return { day: at.getUTCDay(), hour: at.getUTCHours() + at.getUTCMinutes() / 60 };
+}
+
+// [LAW:single-enforcer] ONE spelling of "a clock value is a real Date or it is an error", shared by
+// both readers of one below — the rate lookup above and the freshness check further down. `what` is
+// the caller's own sentence rather than a generic message, because the two failures need different
+// remedies: a missing spawn instant is a threading bug in the adapter seam, an unreadable `now` is a
+// bug in the check's own boundary.
+function instantMs(at, what) {
+  const ms = at instanceof Date ? at.getTime() : NaN;
+  if (!Number.isFinite(ms)) throw new TypeError(`${what}; got ${String(at)}`);
+  return ms;
 }
 
 // Half-open [start, end): a boundary instant belongs to the window that STARTS there, never the one
@@ -32414,11 +32550,10 @@ function ratesAt(entry, instant) {
 // the classes are exactly the billing buckets.
 function computeCostUsd(tokens, model, at) {
   const instant = utcInstant(at);
-  // [LAW:parse-dont-validate] `Object.hasOwn`, never a bare index: a model id is a config value, and
-  // a bare lookup answers Object.prototype's members for the likes of `constructor` or `toString` —
-  // handing back something truthy that is not a schedule, which then reads `.tiers` off a function
-  // and throws mid-review. The question is "is this model IN the table", and only own-keys answer it.
-  const entry = Object.hasOwn(PRICES_PER_MILLION, model) ? PRICES_PER_MILLION[model] : null;
+  // A plain index is safe here only because the table is built with a null prototype (flattenPrices),
+  // so a model id like `constructor` or `toString` reads as the absence it is instead of answering
+  // with an inherited member that is not a rate schedule.
+  const entry = PRICES_PER_MILLION[model];
   if (!entry) return null;
   const price = ratesAt(entry, instant);
   const total =
@@ -32940,7 +33075,7 @@ const COST_WARNING = {
       + 'quota (so it cost $0 either way), but its Anthropic list-price figure is unavailable.',
   unpriced: (cost, tag, config) => cost.reason === 'no-price'
     ? `No price-table entry for ${tag}; the review footer shows cost as "unknown". `
-      + 'Add the model to PRICES_PER_MILLION in src/usage.js.'
+      + 'Add the model to PRICE_SOURCES in src/usage.js, under the vendor page that prices it.'
     : `${config.engine} reported no cost (no USD in its output) for ${tag}; `
       + 'the review footer shows cost as "unknown".',
 };
@@ -32952,6 +33087,9 @@ function costWarning(usage, config) {
 
 module.exports = {
   PRICES_PER_MILLION,
+  PRICE_SOURCES,
+  PRICE_VERIFICATION_MAX_AGE_DAYS,
+  stalePriceSources,
   computeCostUsd,
   totalInputTokens,
   emptyTokens,

@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The price table goes stale by the calendar, not by anyone touching the repo — that is the whole
+  # shape of the failure it guards. A quiet week must still be able to red, so the checks run weekly
+  # as well as on every change; a failed scheduled run mails the repo owner, which is a human seeing
+  # it without going looking. Without this trigger a repo nobody touched for a month would be silent
+  # about a table that had been wrong for a month. [LAW:no-silent-failure]
+  schedule:
+    - cron: '17 6 * * 1'
 
 jobs:
   test:
@@ -45,6 +52,22 @@ jobs:
 
       - name: Test
         run: npm test
+
+  price-freshness:
+    # Its OWN job, not a step in `test`: this fails for a reason that has nothing to do with whether
+    # the code works — the rates were copied by hand off a vendor page and nobody has re-read that page
+    # lately — and a distinctly-named red check says so before anyone opens a log. It needs no deps
+    # and no build, so it costs seconds. [LAW:no-silent-failure]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+
+      - name: Require the price table to have been verified recently
+        run: node scripts/check-price-freshness.js
 
   version-bump:
     # Enforce the version-bump rule only where there is a base to diff against:
