@@ -40,6 +40,16 @@ const crypto = require('crypto');
 // the reviewed engine's. [LAW:decomposition]
 const JUDGE_BASE_URL = 'https://api.deepseek.com/anthropic';
 const JUDGE_MODEL = 'deepseek-v4-flash';
+// The exact matcher label a scorecard-summary.json's `matcher` field carries for a given --matcher kind —
+// the SINGLE producer of this format. main() below and compare.js's pre-spend comparability check
+// (expectedMatcherLabel, an alias of this) both call it, so the label FORMAT ('llm/<model>' vs a second,
+// independently-typed template) can never drift out of sync with what main() actually writes.
+// [LAW:one-source-of-truth]
+function matcherLabel(kind) {
+  if (kind === 'lexical') return 'lexical';
+  if (kind === 'llm') return `llm/${JUDGE_MODEL}`;
+  throw new Error(`Unknown matcher kind ${JSON.stringify(kind)} (expected 'llm' or 'lexical').`);
+}
 // [LAW:one-source-of-truth] The cache is keyed by this token, so a change to the judge PROMPT or the model
 // can never silently reuse a decision made under the old regime — bump it whenever either changes.
 const JUDGE_VERSION = 'judge-v1';
@@ -654,13 +664,16 @@ async function main() {
   const caseOutDir = path.resolve(opts.caseOutDir);
   const runDirs = findRunDirs(caseOutDir);
 
+  // The label THIS run will record — computed once, from the single shared producer, so it can never drift
+  // from the format the pre-spend check in compare.js expects. [LAW:one-source-of-truth]
+  const label = matcherLabel(opts.matcher);
+
   // Build the semantic judge once, shared across every run so its cache accumulates. The lexical judge is
   // pure; the llm judge demands the credential up front and aborts loudly if it's absent (rather than
   // failing mid-scoring on the first request). [LAW:parse-dont-validate]
-  let judge, matcherLabel;
+  let judge;
   if (opts.matcher === 'lexical') {
     judge = makeLexicalJudge();
-    matcherLabel = 'lexical';
   } else {
     const apiKey = process.env.DEEPSEEK_API_KEY;
     if (!apiKey) throw new Error('The llm matcher needs DEEPSEEK_API_KEY (or pass --matcher lexical for the offline fallback).');
@@ -668,7 +681,6 @@ async function main() {
       apiKey, model: JUDGE_MODEL, cacheFile: path.resolve(opts.cache),
       log: msg => process.stderr.write(`${msg}\n`),
     });
-    matcherLabel = `llm/${JUDGE_MODEL}`;
   }
 
   const scorecards = [];
@@ -689,7 +701,7 @@ async function main() {
       : { tokens: null, span: null, cost: null };
 
     process.stderr.write(`Scoring ${path.basename(runDir)} (${produced.length} finding(s))…\n`);
-    const scorecard = await scoreRun({ expected, produced, usage, meta, judge, matcherLabel });
+    const scorecard = await scoreRun({ expected, produced, usage, meta, judge, matcherLabel: label });
     fs.writeFileSync(path.join(runDir, 'scorecard.json'), JSON.stringify(scorecard, null, 2) + '\n');
     scorecards.push(scorecard);
   }
@@ -710,10 +722,13 @@ if (require.main === module) {
 module.exports = {
   parseArgs, parseJson, parseJsonObject, parseExpected, parseProduced, parseUsage, parseMeta,
   normalizeBody, pairCandidates, computeMetrics, scoreRun, aggregateRuns, renderTable,
-  makeLexicalJudge, jaccard, wordSet,
+  makeLexicalJudge, jaccard, wordSet, findRunDirs,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, callJudge, loadCache,
   // The pinned judge model, so the compare gate (2fk.5) can build the exact matcher label the scorer
   // records ('llm/<JUDGE_MODEL>') and reject a matcher mismatch against the baseline BEFORE spending a
   // full suite run — not only in the post-run buildBaseline consistency check. [LAW:one-source-of-truth]
   JUDGE_MODEL,
+  // The single producer of the label FORMAT itself (not just the model name) — compare.js's
+  // expectedMatcherLabel is an alias of this, not a second copy of the template. [LAW:one-source-of-truth]
+  matcherLabel,
 };

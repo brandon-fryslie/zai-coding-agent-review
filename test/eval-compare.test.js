@@ -198,6 +198,17 @@ test('compareVerdict refuses incomparable N / engine / matcher / case set', () =
   ])), /Incomparable case sets.*missing \[case-b\].*extra \[case-c\]/s);
 });
 
+test('compareVerdict refuses a candidate whose pooled inventory opportunities differ from the baseline', () => {
+  // expected.json is a living document (curated independent of re-freezing); if a case's inventory changed
+  // opportunity count since the baseline was frozen, the candidate's pooled denominator no longer matches
+  // what the gate floor was computed from — an apples-to-oranges verdict this check refuses.
+  const baseline = frozenBaseline(CASES_A());
+  const candidate = candidateSuite(CASES_A());
+  candidate.suite.pooledInventoryMustFind.opportunities += 1; // simulate expected.json gaining a must-find
+  assert.throws(() => compareVerdict(baseline, candidate),
+    /Incomparable: candidate's pooled inventory opportunities \(13\) differ from the baseline's \(12\)/);
+});
+
 test('compareVerdict matcher mismatch is refused', () => {
   const baseline = frozenBaseline(CASES_A());
   const lexicalCase = (name) => {

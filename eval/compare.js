@@ -29,7 +29,7 @@ const { spawnSync, execFileSync } = require('child_process');
 const {
   parseCaseSummary, parseCaseEngine, buildBaseline, parseBaseline, sameEngine, evaluateGate,
 } = require('./baseline');
-const { JUDGE_MODEL } = require('./score');
+const { matcherLabel, findRunDirs, parseMeta } = require('./score');
 
 const USAGE = `Gate a candidate (the current working tree) against a frozen eval baseline: replay the golden
 suite N times, score it, and print a DEGRADED / OK / IMPROVED verdict. Non-zero exit on DEGRADED.
@@ -101,14 +101,11 @@ function parsePositiveInt(raw, flag) {
 // Pure comparison core — the testable gate. No IO, no clock, no spawn.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
 
-// The exact matcher label score.js records for a given --matcher kind: 'lexical' or 'llm/<JUDGE_MODEL>'.
-// Built from score.js's own JUDGE_MODEL so a matcher mismatch against the baseline can be refused BEFORE a
-// full suite run, not only in the post-run buildBaseline consistency check. [LAW:one-source-of-truth]
-function expectedMatcherLabel(kind) {
-  if (kind === 'lexical') return 'lexical';
-  if (kind === 'llm') return `llm/${JUDGE_MODEL}`;
-  throw new Error(`Unknown matcher kind ${JSON.stringify(kind)} (expected 'llm' or 'lexical').`);
-}
+// The exact matcher label score.js records for a given --matcher kind — an alias of score.js's OWN
+// matcherLabel (the single producer of the format, which its main() also calls), kept under this file's
+// established name so a matcher mismatch against the baseline can be refused BEFORE a full suite run.
+// [LAW:one-source-of-truth]
+const expectedMatcherLabel = matcherLabel;
 
 // The candidate's estimated cost for one gate invocation: one full suite run per repeat. Uses the
 // baseline's own recorded per-full-run cost × N (2fk.4's numbers), so the guardrail is printed BEFORE
@@ -277,12 +274,28 @@ function renderVerdictMarkdown(verdict, meta = {}) {
 // Effects (main) — resolve the baseline, spawn the replay+score CLIs, reduce, compare, exit.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
 
+// The ISO commit date of the last commit that touched `filePath`, or null if git can't answer (not a repo,
+// the file was never committed, git unavailable). A tie-break signal only — falls back to name order when
+// unavailable, same as when it's absent.
+function lastCommitIso(filePath) {
+  try {
+    const out = execFileSync('git', ['log', '-1', '--format=%cI', '--', filePath], { cwd: __dirname }).toString().trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}
+
 // Resolve a --baseline argument (a dir or a baseline.json path) to the baseline.json file. With no
 // argument, pick the newest committed baseline under eval/baseline/. Dirs are `<date>-<shortsha>`; two
-// baselines frozen on the same UTC date (plausible mid-tuning: freeze, tweak a case, re-freeze) would tie
-// on a bare name sort, breaking on the arbitrary short-SHA string — no relation to actual recency. Tie-break
-// by each candidate's own `generatedAt` instead (buildBaseline always sets it), falling back to name order
-// only if a same-date pair somehow also ties on generatedAt. [LAW:no-silent-failure]
+// baselines frozen on the same UTC date (plausible mid-tuning: freeze, tweak a case, re-freeze) tie on a
+// bare name sort, breaking on the arbitrary short-SHA string — no relation to actual recency. A prior fix
+// tie-broke by each baseline's own `generatedAt`, but that carries the SAME `YYYY-MM-DD` string the dir
+// name is built from (buildBaseline: `generatedAt: provenance.date`; the dir name: `${date}-${sha}`) — no
+// finer granularity, so a same-date pair always ties on it too and falls through to the same arbitrary
+// sort it was meant to fix. Tie-break by the git commit history of each baseline.json instead — the actual
+// chronological order they were committed in, independent of the date string encoded in either the file or
+// the dir name. [LAW:no-silent-failure]
 function resolveBaselineJsonPath(arg) {
   if (arg) {
     const resolved = path.resolve(arg);
@@ -297,12 +310,10 @@ function resolveBaselineJsonPath(arg) {
     .filter(e => e.isDirectory() && fs.existsSync(path.join(root, e.name, 'baseline.json')))
     .map((e) => {
       const jsonPath = path.join(root, e.name, 'baseline.json');
-      let generatedAt = null;
-      try { generatedAt = JSON.parse(fs.readFileSync(jsonPath, 'utf8')).generatedAt ?? null; } catch { /* malformed — sorts as oldest, name order breaks the tie */ }
-      return { name: e.name, jsonPath, generatedAt };
+      return { name: e.name, jsonPath, committedAt: lastCommitIso(jsonPath) };
     })
     .sort((a, b) => {
-      if (a.generatedAt !== b.generatedAt) return (a.generatedAt || '').localeCompare(b.generatedAt || '');
+      if (a.committedAt !== b.committedAt) return (a.committedAt || '').localeCompare(b.committedAt || '');
       return a.name.localeCompare(b.name);
     });
   if (candidates.length === 0) throw new Error(`No committed baseline (a dir with baseline.json) under ${root}.`);
