@@ -37093,11 +37093,16 @@ function scheduleRecord({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
 
 // [LAW:effects-at-boundaries] Pure: a span's duration in milliseconds. Absent span → null — a
 // recorded absence (nothing ran, or the failure predated the spawn), never a fabricated zero.
-// [LAW:parse-dont-validate] spans arrive host-stamped by runEngine (ISO-8601 UTC, both ends), so
-// there is nothing to defend against here: absent is the only legal alternative to well-formed.
+// [LAW:parse-dont-validate] This is the ONE boundary where two timestamps become a duration, so
+// it is also where a pair that cannot make one resolves: a NaN difference (a malformed stamp) or
+// a negative one (a backward clock step between the host's two reads) is not a duration, and
+// both collapse to the same typed absence — rendered 'unclocked', never '-5s' or 'NaNs' in a
+// posted footer, and never a throw that would cost the whole breakdown for one bad span.
+// [LAW:no-silent-failure] 'unclocked' IS the loud form here: the absence is printed, not skipped.
 function spanMs(span) {
   if (!span) return null;
-  return Date.parse(span.to) - Date.parse(span.from);
+  const ms = Date.parse(span.to) - Date.parse(span.from);
+  return Number.isFinite(ms) && ms >= 0 ? ms : null;
 }
 
 // [LAW:effects-at-boundaries] Pure: sum the present durations; all-absent sums to null, matching
@@ -37111,7 +37116,10 @@ function sumMs(values) {
 // [LAW:effects-at-boundaries] Pure: derive the reportable breakdown from a recorded schedule.
 // Returns {
 //   scoutMs,            // the scout phase's spawn time (all scout attempts summed), null if unclocked
-//   passes: [           // worker spawns grouped by pass index, ascending; order within a pass is
+//   scouts: [           // one row per scout ATTEMPT, as recorded — scoutMs derives from these,
+//     { outcome, ms }   // so the summed figure and the per-attempt rows cannot disagree
+//   ],
+//   passes: [          // worker spawns grouped by pass index, ascending; order within a pass is
 //     { pass, spawns: [{ scope, outcome, ms }], waves }   // settle order, as recorded
 //   ],
 //   scopeCount, scopeConcurrency, sweepCap,        // the scheduling facts, echoed as recorded
@@ -37198,6 +37206,21 @@ function passLabel(pass) {
   return pass === 0 ? 'review' : `sweep ${pass}`;
 }
 
+// [LAW:single-enforcer] The ONE escape for untrusted text this renderer interpolates — scope names,
+// which are LLM-minted free strings (the scout's add_scope checks only the type). The rendering
+// context is a markdown table cell inside a <details> block plus an inline clause, so three things
+// must die: `|` and newlines (they ARE the table/line structure), markdown inline metacharacters
+// (emphasis, links, code spans — backslash-escaped so the name displays literally), and `<>&`
+// (entity-encoded — the block is HTML context). Deliberately local rather than imported from
+// dependency-diff.js: its mdText serves a different rendering context, and this module stays
+// dependency-free so every sink can import it. [LAW:one-way-deps]
+function scopeText(str) {
+  return String(str)
+    .replace(/\s+/g, ' ')
+    .replace(/[\\`*_[\]()~|]/g, m => `\\${m}`)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 // [LAW:effects-at-boundaries] Pure: the timing breakdown as the markdown block the sinks print —
 // one scannable summary line, then the per-attempt table folded behind <details> so it sits under
 // a review a human reads for its FINDINGS without shouting over them.
@@ -37231,14 +37254,14 @@ function renderTimingBreakdown(schedule, totalMs) {
   // The slowest CLOCKED worker attempt; ties keep the first recorded. All-unclocked stays an
   // explicit 'unclocked', never a fabricated winner.
   const slowest = workerRows.reduce((best, s) => (s.ms != null && (best == null || s.ms > best.ms) ? s : best), null);
-  const slowestClause = slowest ? `slowest scope: ${slowest.scope} (${formatMs(slowest.ms)})` : 'slowest scope: unclocked';
+  const slowestClause = slowest ? `slowest scope: ${scopeText(slowest.scope)} (${formatMs(slowest.ms)})` : 'slowest scope: unclocked';
   const scheduleSentence =
     `${d.scopeCount} scope(s) at concurrency ${d.scopeConcurrency} over ${d.passes.length} pass(es) = ${d.waveCount} wave(s)`;
   const line = `_Timing: ${formatMs(totalMs)} total · ${phaseClause('spawns', allDurations)} (${spawnCount} attempt(s))`
     + ` — ${phases} · ${slowestClause} · ${scheduleSentence}_`;
   const rows = [
     ...d.scouts.map(s => `| scout | — | ${s.outcome} | ${formatMs(s.ms)} |`),
-    ...workerRows.map(s => `| ${passLabel(s.pass)} | ${s.scope} | ${s.outcome} | ${formatMs(s.ms)} |`),
+    ...workerRows.map(s => `| ${passLabel(s.pass)} | ${scopeText(s.scope)} | ${s.outcome} | ${formatMs(s.ms)} |`),
   ];
   const details = [
     '<details>',

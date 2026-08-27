@@ -191,6 +191,17 @@ test('formatReport renders every credential kind PRESETS can produce', () => {
   }
 });
 
+test('formatReport renders a timing render failure as the line\'s explicit gap, never an aborted report', () => {
+  // [LAW:no-silent-failure] same discipline as buildReviewFooter: the cause is printed in place.
+  const report = formatReport({
+    config: { name: 'x', engine: 'claude-code', model: 'm', endpoint: { baseUrl: 'https://h', credential: { kind: 'api-key', value: 'k' } } },
+    mode: 'pr', repo: '/repo', files: [], sessions: [],
+    result: { findings: [], summary: '', usage: null },
+    // totalMs missing: the renderer throws, the report survives with the gap named
+  });
+  assert.match(report, /timing: unavailable \(renderTimingBreakdown: totalMs must be a non-negative finite number/);
+});
+
 test('parseArgs rejects an empty value for the two-source options only', () => {
   // [LAW:parse-dont-validate] For these options an empty value (typically an unset shell var:
   // --config "$CFG") would slip past the downstream truthiness discriminator and silently select

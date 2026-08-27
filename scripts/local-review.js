@@ -129,11 +129,21 @@ const AUTH_LABEL = {
   oauth: e => `oauth (subscription) → ${e.baseUrl} — billed to plan quota, not per token`,
 };
 
+// The timing summary line, or its explicit failure — one value either way, so the report always
+// carries a `timing:` line and a render bug reads as its own cause instead of a missing row.
+function renderTimingLine(schedule, totalMs) {
+  const { renderTimingBreakdown } = require('../src/schedule');
+  try {
+    return renderTimingBreakdown(schedule, totalMs).split('\n')[0].replace(/^_|_$/g, '');
+  } catch (e) {
+    return `unavailable (${e.message})`;
+  }
+}
+
 // [LAW:effects-at-boundaries] Pure: render the report string from values. Highlights the one signal
 // this tool exists for — explore-or-not, and whether exploration reached beyond the changed files.
 function formatReport({ config, mode, files, result, sessions, repo, totalMs }) {
   const { renderCostLine } = require('../src/usage');
-  const { renderTimingBreakdown } = require('../src/schedule');
   const lines = [];
   lines.push('================ local-review report ================');
   lines.push(`config:   ${config.name}  (engine=${config.engine}, model=${config.model})`);
@@ -178,8 +188,10 @@ function formatReport({ config, mode, files, result, sessions, repo, totalMs }) 
   // [LAW:one-source-of-truth] The action's OWN timing renderer, same rationale as the cost line
   // above: the local breakdown cannot drift from what a production footer would say. The summary
   // line is what a terminal reader wants; the <details> table is footer furniture, dropped here.
-  const timing = renderTimingBreakdown(result.schedule ?? null, totalMs);
-  lines.push(`timing: ${timing.split('\n')[0].replace(/^_|_$/g, '')}`);
+  // [LAW:no-silent-failure] Same discipline as buildReviewFooter's boundary: a render failure is
+  // printed as the line's explicit gap, naming the cause — never a vanished line, and never an
+  // abort that costs the findings and session diagnostics this tool exists for.
+  lines.push(`timing: ${renderTimingLine(result.schedule ?? null, totalMs)}`);
   lines.push('=====================================================');
   return lines.join('\n');
 }

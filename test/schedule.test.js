@@ -55,6 +55,15 @@ describe('spanMs', () => {
   });
 });
 
+describe('spanMs — malformed pairs', () => {
+  test('a negative or NaN difference is not a duration and resolves to the typed absence', () => {
+    // [LAW:parse-dont-validate] the one boundary where timestamps become a duration: a backward
+    // clock step or malformed stamp renders 'unclocked' downstream, never '-5s' or 'NaNs'.
+    assert.equal(spanMs({ from: at(5), to: at(3) }), null);
+    assert.equal(spanMs({ from: 'not-a-timestamp', to: at(3) }), null);
+  });
+});
+
 describe('sumMs', () => {
   test('sums the present durations, ignoring recorded absences', () => {
     assert.equal(sumMs([MIN, null, 2 * MIN]), 3 * MIN);
@@ -280,6 +289,19 @@ describe('renderTimingBreakdown', () => {
     assert.match(block, /slowest scope: clocked \(2m00s\)/);
     // the table still rows the unclocked attempt, explicitly
     assert.match(block, /\| review \| unclocked-scope \| failed \| unclocked \|/);
+  });
+
+  test('a scope name cannot inject table or markdown structure into the rendered block', () => {
+    // Scope names are LLM-minted free text; the renderer's one escape kills the characters that
+    // ARE the structure (pipes, newlines) and neuters markdown/HTML metacharacters.
+    const block = renderTimingBreakdown({
+      scopeConcurrency: 1, sweepCap: 0, scopeCount: 1,
+      spawns: [worker('a | b\n<x>_y_', 0, 0, 1)],
+    }, MIN);
+    assert.doesNotMatch(block, /\| a \| b/);
+    assert.match(block, /a \\\| b &lt;x&gt;\\_y\\_/);
+    // the newline collapsed: every table row is still one line
+    for (const line of block.split('\n')) assert.doesNotMatch(line, /^\| review \|$/);
   });
 
   test('a wholly unclocked worker phase reports slowest scope as unclocked, never a fabricated winner', () => {
