@@ -29,7 +29,7 @@ const { spawnSync, execFileSync } = require('child_process');
 const {
   parseCaseSummary, parseCaseEngine, buildBaseline, parseBaseline, sameEngine, evaluateGate,
 } = require('./baseline');
-const { matcherLabel, parseExpected } = require('./score');
+const { matcherLabel, parseExpected, requireLlmJudgeCredential } = require('./score');
 
 const USAGE = `Gate a candidate (the current working tree) against a frozen eval baseline: replay the golden
 suite N times, score it, and print a DEGRADED / OK / IMPROVED verdict. Non-zero exit on DEGRADED.
@@ -114,6 +114,16 @@ function estimateCandidateCostUsd(rawBaselineSuite, repeats) {
   const perRun = rawBaselineSuite && rawBaselineSuite.costPerFullRunUsd;
   if (typeof perRun !== 'number' || !Number.isFinite(perRun)) return null;
   return perRun * repeats;
+}
+
+// The total pooled inventory must-find opportunities a candidate suite would report, given each baseline
+// case's CURRENT must-find count (any round) from its expected.json and the repeat count — the same
+// quantity buildBaseline sums from real scored runs, computed here without spending on any of them.
+// Extracted as a pure function (fed a plain case→count map, not the fs reads that produce it) so the
+// arithmetic — the actual risk in this check (an off-by-one, a wrong multiply) — is unit-testable without
+// fixtures on disk. [LAW:effects-at-boundaries]
+function computeExpectedOpportunities(mustFindCountsByCase, repeats) {
+  return repeats * Object.values(mustFindCountsByCase).reduce((sum, n) => sum + n, 0);
 }
 
 // Compare a candidate SUITE (buildBaseline output over the candidate's scored summaries) against a frozen
@@ -301,6 +311,18 @@ function lastCommitRank(filePath, gitCwd, order) {
   }
 }
 
+// True when `gitCwd` is a shallow clone (e.g. actions/checkout's default fetch-depth: 1) — commitOrder then
+// sees only the truncated history it was given, not the repo's real graph. False on any git failure (not a
+// repo, git unavailable): that absence is already reported by commitOrder/lastCommitRank returning null,
+// not this function's job to re-diagnose.
+function isShallowRepo(gitCwd) {
+  try {
+    return execFileSync('git', ['rev-parse', '--is-shallow-repository'], { cwd: gitCwd }).toString().trim() === 'true';
+  } catch {
+    return false;
+  }
+}
+
 // Resolve a --baseline argument (a dir or a baseline.json path) to the baseline.json file. With no
 // argument, pick the newest committed baseline under eval/baseline/. Dirs are `<date>-<shortsha>`; two
 // baselines frozen on the same UTC date (plausible mid-tuning: freeze, tweak a case, re-freeze) tie on a
@@ -313,7 +335,11 @@ function lastCommitRank(filePath, gitCwd, order) {
 // baseline.json (rank null — no commit touches it yet, the exact "just froze it, about to gate" moment)
 // ranks as MORE recent than even the latest real commit, not less: a bare `|| ''`-style fallback would sort
 // it as older than everything, silently gating a freshly-frozen baseline against a stale committed one with
-// no error. [LAW:no-silent-failure]
+// no error. In a SHALLOW clone (actions/checkout's default fetch-depth: 1), commitOrder only sees the one
+// checked-out commit, so every real baseline's rank resolves to null — indistinguishable from uncommitted —
+// and picking among two or more would silently degrade back to the same arbitrary name-sort this function's
+// history was built to eliminate. Refused explicitly instead: a wrong SILENT pick is worse than a loud stop
+// naming the fix. [LAW:no-silent-failure]
 function resolveBaselineJsonPath(arg, gitCwd = __dirname) {
   if (arg) {
     const resolved = path.resolve(arg);
@@ -324,19 +350,24 @@ function resolveBaselineJsonPath(arg, gitCwd = __dirname) {
   }
   const root = path.resolve('eval/baseline');
   if (!fs.existsSync(root)) throw new Error(`No baseline dir at ${root} and no --baseline given. Freeze one with eval/baseline.js first.`);
-  const order = commitOrder(gitCwd);
-  const candidates = fs.readdirSync(root, { withFileTypes: true })
+  const dirNames = fs.readdirSync(root, { withFileTypes: true })
     .filter(e => e.isDirectory() && fs.existsSync(path.join(root, e.name, 'baseline.json')))
-    .map((e) => {
-      const jsonPath = path.join(root, e.name, 'baseline.json');
-      return { name: e.name, jsonPath, rank: lastCommitRank(jsonPath, gitCwd, order) };
+    .map(e => e.name);
+  if (dirNames.length === 0) throw new Error(`No committed baseline (a dir with baseline.json) under ${root}.`);
+  if (dirNames.length > 1 && isShallowRepo(gitCwd)) {
+    throw new Error(`Cannot pick the newest of ${dirNames.length} committed baselines under ${root}: this is a shallow git clone, so the commit-history tie-break has no real history to rank them by. Run 'git fetch --unshallow' first, or name the one to use explicitly with --baseline.`);
+  }
+  const order = commitOrder(gitCwd);
+  const candidates = dirNames
+    .map((name) => {
+      const jsonPath = path.join(root, name, 'baseline.json');
+      return { name, jsonPath, rank: lastCommitRank(jsonPath, gitCwd, order) };
     })
     .sort((a, b) => {
       const key = (c) => (c.rank === null ? -1 : c.rank); // uncommitted (-1) ranks before even the newest real commit (0)
       if (key(a) !== key(b)) return key(a) - key(b); // ascending: index 0 (most recent) sorts first
       return b.name.localeCompare(a.name); // last-resort tie among mutually-unresolvable dirs
     });
-  if (candidates.length === 0) throw new Error(`No committed baseline (a dir with baseline.json) under ${root}.`);
   return candidates[0].jsonPath;
 }
 
@@ -367,7 +398,15 @@ function main() {
     return 0;
   }
 
-  // 1. Load the frozen baseline. Parse the raw object once for the cost preview (parseBaseline is a lossy
+  // 1. --out names where FRESH artifacts land; --reuse-candidate names an EXISTING root to read from.
+  //    Passing both silently discarded --out in favor of the reused root — a candidateRoot a user asked
+  //    for by name that verdict.{md,json} then never appear under. Refuse the combination outright rather
+  //    than pick a silent winner. [LAW:no-silent-failure]
+  if (opts.out && opts.reuseCandidate) {
+    throw new Error(`--out and --reuse-candidate are mutually exclusive: --reuse-candidate names an existing root to read from and gate; there is nothing fresh for --out to name. Pass one or the other.`);
+  }
+
+  // 2. Load the frozen baseline. Parse the raw object once for the cost preview (parseBaseline is a lossy
   //    GATE SUBSET that deliberately drops cost — do not widen it), and parseBaseline for the gate contract.
   const baselineJsonPath = resolveBaselineJsonPath(opts.baseline);
   const rawBaselineText = fs.readFileSync(baselineJsonPath, 'utf8');
@@ -375,42 +414,66 @@ function main() {
   const rawBaselineSuite = JSON.parse(rawBaselineText).suite;
   const repeats = baseline.repeats;
 
-  // 2. Fail BEFORE spending an hour on a matcher that can't be compared: the candidate is scored with
-  //    opts.matcher, which must yield the baseline's exact matcher label. [LAW:no-silent-failure]
-  //    Skipped entirely under --reuse-candidate: no scoring happens in THIS run, so opts.matcher (which
-  //    defaults to 'llm' whether or not the caller passed one) carries no meaning about what the reused
-  //    summaries were actually scored with — asserting it here can throw a spurious mismatch against a
-  //    validly-reused candidate. compareVerdict's own check (the candidate's ACTUAL recorded matcher,
-  //    read from the reused summaries) is the authoritative one for this path.
-  if (baseline.matcher && !opts.reuseCandidate) {
-    const wouldBe = expectedMatcherLabel(opts.matcher);
-    if (wouldBe !== baseline.matcher) {
-      throw new Error(`Matcher mismatch: --matcher ${opts.matcher} scores as '${wouldBe}' but the baseline used '${baseline.matcher}'. Pass the matcher the baseline was built with.`);
-    }
-  }
-
   const casesDir = path.resolve(opts.casesDir);
   const runCaseScript = path.join(__dirname, 'run-case.js');
   const scoreScript = path.join(__dirname, 'score.js');
 
-  // 2b. Fail BEFORE spending on a denominator that's already known to mismatch: each case's pooled
-  //     inventory opportunity count is a PURE function of its current expected.json (findings annotated
-  //     must-find, any round) — it does not depend on what the candidate engine produces, so it costs
-  //     nothing to check here, before the first replay. compareVerdict's own check (below, via
-  //     compareVerdict) remains the universal backstop — it is the ONLY check reachable under
-  //     --reuse-candidate, where there is no pre-loop to guard. [LAW:no-silent-failure]
+  // The pre-spend guards below (3-3c) all share one shape: refuse BEFORE any replay when the thing they
+  // check is knowable without running the candidate engine at all. None of them apply under
+  // --reuse-candidate, which replays nothing — compareVerdict's own checks (matcher, engine, pooled
+  // opportunities), reading the reused summaries' ACTUAL recorded values, are the universal backstop for
+  // that path. [LAW:no-silent-failure]
   if (!opts.reuseCandidate) {
-    const currentOpportunities = repeats * baseline.cases.reduce((sum, { case: name }) => {
+    // 3. Fail BEFORE spending an hour on a matcher that can't be compared: the candidate is scored with
+    //    opts.matcher, which must yield the baseline's exact matcher label.
+    if (baseline.matcher) {
+      const wouldBe = expectedMatcherLabel(opts.matcher);
+      if (wouldBe !== baseline.matcher) {
+        throw new Error(`Matcher mismatch: --matcher ${opts.matcher} scores as '${wouldBe}' but the baseline used '${baseline.matcher}'. Pass the matcher the baseline was built with.`);
+      }
+    }
+
+    // 3a. Fail BEFORE spending if the 'llm' matcher's credential is missing — score.js's makeLlmJudge
+    //     would otherwise throw only once a case's replay is already complete and its OWN score.js
+    //     invocation runs, wasting that case's real spend on a run this file was never going to be able
+    //     to score.
+    if (opts.matcher === 'llm') requireLlmJudgeCredential();
+
+    // 3b. Fail BEFORE spending on a denominator that's already known to mismatch: each case's pooled
+    //     inventory opportunity count is a PURE function of its current expected.json (findings annotated
+    //     must-find, any round) — it does not depend on what the candidate engine produces, so it costs
+    //     nothing to check here.
+    const mustFindCountsByCase = {};
+    for (const { case: name } of baseline.cases) {
       const expectedPath = path.join(casesDir, name, 'expected.json');
       const expected = parseExpected(fs.readFileSync(expectedPath, 'utf8'), expectedPath);
-      return sum + expected.findings.filter(f => f.annotation === 'must-find').length;
-    }, 0);
+      mustFindCountsByCase[name] = expected.findings.filter(f => f.annotation === 'must-find').length;
+    }
+    const currentOpportunities = computeExpectedOpportunities(mustFindCountsByCase, repeats);
     if (currentOpportunities !== baseline.pooledInventoryMustFind.opportunities) {
       throw new Error(`Incomparable: the golden suite's current pooled inventory opportunities (${currentOpportunities}) differ from the baseline's (${baseline.pooledInventoryMustFind.opportunities}) — expected.json changed since the baseline was frozen. Re-freeze the baseline before gating against this expected.json.`);
     }
+
+    // 3c. Fail BEFORE spending on engine drift — a FULL pass over every case, not a check folded into the
+    //     replay loop below: if only a LATER case's engine pin had drifted, folding it into that loop would
+    //     let every EARLIER case fully replay and score (real spend) before the mismatch is even reached.
+    //     run-case.js's own assertConfigMatchesPin only verifies the resolved config against THIS
+    //     case.json's own pin — never against baseline.engine, the pin frozen at baseline-freeze time — so
+    //     a drifted pin would otherwise only be caught by compareVerdict's sameEngine check, after the
+    //     ENTIRE suite has replayed and scored.
+    if (baseline.engine) {
+      for (const { case: name } of baseline.cases) {
+        const caseJsonPath = path.join(casesDir, name, 'case.json');
+        if (!fs.existsSync(caseJsonPath)) throw new Error(`Baseline case '${name}' has no frozen case at ${path.join(casesDir, name)} — cannot replay it.`);
+        const casePinEngine = parseCaseEngine(fs.readFileSync(caseJsonPath, 'utf8'), caseJsonPath);
+        if (!sameEngine(casePinEngine, baseline.engine)) {
+          throw new Error(`Incomparable: case '${name}' pins engine ${JSON.stringify(casePinEngine)} but the baseline pins ${JSON.stringify(baseline.engine)} — the case's pin drifted since the baseline was frozen. Re-freeze the baseline, or fix the case's pin, before gating.`);
+        }
+      }
+    }
   }
 
-  // 3. Candidate artifact root — isolated from the baseline's own eval/out/<case> runs so score.js never
+  // 4. Candidate artifact root — isolated from the baseline's own eval/out/<case> runs so score.js never
   //    pools baseline + candidate run dirs together. Under eval/out/ (git-ignored) by default.
   const candidateRoot = opts.reuseCandidate
     ? path.resolve(opts.reuseCandidate)
@@ -423,30 +486,17 @@ function main() {
   if (opts.reuseCandidate) {
     process.stderr.write(`\nReusing candidate artifacts under ${candidateRoot} (no replay, no spend).\n`);
   } else {
-    // 4. COST GUARDRAIL — print the estimate up front, before spending. [LAW:verifiable-goals]
+    // 5. COST GUARDRAIL — print the estimate up front, before spending. [LAW:verifiable-goals]
     const estUsd = estimateCandidateCostUsd(rawBaselineSuite, repeats);
     process.stderr.write(`\nAbout to replay ${baseline.cases.length} case(s) × N=${repeats} against the WORKING TREE, then score.\n`);
     process.stderr.write(`Estimated cost ≈ ${estUsd === null ? 'unknown (baseline recorded no per-run cost)' : `$${estUsd.toFixed(2)}`} (from the baseline's recorded $/full-run × N). Actual varies with model stochasticity.\n\n`);
 
-    // 5. Replay + score each baseline case into the candidate root. Iterate the BASELINE's case set so the
-    //    candidate covers exactly it (an added-since golden case can't be gated — the baseline doesn't cover it).
+    // 6. Replay + score each baseline case into the candidate root. Iterate the BASELINE's case set so the
+    //    candidate covers exactly it (an added-since golden case can't be gated — the baseline doesn't cover
+    //    it). Every pre-spend guard above already ran as a full pass over this same set, so nothing here
+    //    re-checks case.json existence or the engine pin.
     for (const { case: name } of baseline.cases) {
       const caseDir = path.join(casesDir, name);
-      const caseJsonPath = path.join(caseDir, 'case.json');
-      if (!fs.existsSync(caseJsonPath)) throw new Error(`Baseline case '${name}' has no frozen case at ${caseDir} — cannot replay it.`);
-      // Engine drift, refused BEFORE the spend: run-case.js's own assertConfigMatchesPin only verifies the
-      // resolved config against THIS case.json's own pin — never against baseline.engine, the pin frozen at
-      // baseline-freeze time. If a case.json's engine pin drifted since freezing (without re-freezing the
-      // baseline), every case would pass its own per-case check and the FULL suite would replay and score
-      // at full cost, only for compareVerdict's sameEngine check to then discard the entire run. Checking
-      // here, before the first replay, matches this file's header claim ("refused before any spend where
-      // possible"). [LAW:no-silent-failure]
-      if (baseline.engine) {
-        const casePinEngine = parseCaseEngine(fs.readFileSync(caseJsonPath, 'utf8'), caseJsonPath);
-        if (!sameEngine(casePinEngine, baseline.engine)) {
-          throw new Error(`Incomparable: case '${name}' pins engine ${JSON.stringify(casePinEngine)} but the baseline pins ${JSON.stringify(baseline.engine)} — the case's pin drifted since the baseline was frozen. Re-freeze the baseline, or fix the case's pin, before gating.`);
-        }
-      }
       process.stderr.write(`\n─── ${name}: replaying ${repeats}× ───\n`);
       runCli(runCaseScript, [caseDir, '-n', String(repeats), '--out', candidateRoot, '--workers', String(opts.workers)], `run-case (${name})`);
       process.stderr.write(`\n─── ${name}: scoring ───\n`);
@@ -505,5 +555,5 @@ if (require.main === module) {
 
 module.exports = {
   parseArgs, parsePositiveInt, expectedMatcherLabel, estimateCandidateCostUsd,
-  compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath,
+  compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath, computeExpectedOpportunities,
 };

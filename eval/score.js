@@ -40,6 +40,15 @@ const crypto = require('crypto');
 // the reviewed engine's. [LAW:decomposition]
 const JUDGE_BASE_URL = 'https://api.deepseek.com/anthropic';
 const JUDGE_MODEL = 'deepseek-v4-flash';
+// The single place DEEPSEEK_API_KEY is read for the 'llm' matcher's credential — main() below and
+// compare.js's pre-loop guard (checking "would scoring succeed" before any replay spend) both call this,
+// so the requirement can't drift into two independently-typed checks of the same env var.
+// [LAW:one-source-of-truth]
+function requireLlmJudgeCredential() {
+  const apiKey = process.env.DEEPSEEK_API_KEY;
+  if (!apiKey) throw new Error('The llm matcher needs DEEPSEEK_API_KEY (or pass --matcher lexical for the offline fallback).');
+  return apiKey;
+}
 // The exact matcher label a scorecard-summary.json's `matcher` field carries for a given --matcher kind —
 // the SINGLE producer of this format. main() below and compare.js's pre-spend comparability check
 // (expectedMatcherLabel, an alias of this) both call it, so the label FORMAT ('llm/<model>' vs a second,
@@ -675,8 +684,7 @@ async function main() {
   if (opts.matcher === 'lexical') {
     judge = makeLexicalJudge();
   } else {
-    const apiKey = process.env.DEEPSEEK_API_KEY;
-    if (!apiKey) throw new Error('The llm matcher needs DEEPSEEK_API_KEY (or pass --matcher lexical for the offline fallback).');
+    const apiKey = requireLlmJudgeCredential();
     judge = makeLlmJudge({
       apiKey, model: JUDGE_MODEL, cacheFile: path.resolve(opts.cache),
       log: msg => process.stderr.write(`${msg}\n`),
@@ -722,8 +730,12 @@ if (require.main === module) {
 module.exports = {
   parseArgs, parseJson, parseJsonObject, parseExpected, parseProduced, parseUsage, parseMeta,
   normalizeBody, pairCandidates, computeMetrics, scoreRun, aggregateRuns, renderTable,
-  makeLexicalJudge, jaccard, wordSet, findRunDirs,
+  makeLexicalJudge, jaccard, wordSet,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, callJudge, loadCache,
+  // The single place DEEPSEEK_API_KEY is read for the 'llm' matcher — compare.js's pre-loop guard calls
+  // this to check "would scoring succeed" before any replay spend, without a second copy of the env var
+  // name. [LAW:one-source-of-truth]
+  requireLlmJudgeCredential,
   // The pinned judge model. Since `matcherLabel` below became the single producer of the 'llm/<model>'
   // label format, compare.js no longer needs this directly (it gets the label through matcherLabel); this
   // stays exported for the test suite, which asserts against the exact model name in expected strings.

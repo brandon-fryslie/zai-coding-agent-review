@@ -8,7 +8,7 @@ const { execFileSync } = require('child_process');
 
 const {
   parseArgs, parsePositiveInt, expectedMatcherLabel, estimateCandidateCostUsd,
-  compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath,
+  compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath, computeExpectedOpportunities,
 } = require('../eval/compare');
 const { buildBaseline, parseBaseline } = require('../eval/baseline');
 const { JUDGE_MODEL } = require('../eval/score');
@@ -111,6 +111,15 @@ test('estimateCandidateCostUsd multiplies the baseline per-run cost by N, or nul
   assert.equal(estimateCandidateCostUsd({ costPerFullRunUsd: null }, 5), null);
   assert.equal(estimateCandidateCostUsd({}, 5), null);
   assert.equal(estimateCandidateCostUsd(null, 5), null);
+});
+
+// ── computeExpectedOpportunities (the pre-loop opportunities-guard arithmetic) ────────────────────────
+
+test('computeExpectedOpportunities sums per-case must-find counts and multiplies by the repeat count', () => {
+  assert.equal(computeExpectedOpportunities({ 'case-a': 3, 'case-b': 3 }, 2), 12);
+  assert.equal(computeExpectedOpportunities({ 'case-a': 5 }, 1), 5);
+  assert.equal(computeExpectedOpportunities({}, 5), 0); // no cases ⇒ no opportunities, regardless of N
+  assert.equal(computeExpectedOpportunities({ 'case-a': 0, 'case-b': 4 }, 3), 12); // a case with zero must-finds contributes zero, not skipped
 });
 
 // ── compareVerdict (THE GATE) ─────────────────────────────────────────────────────────────────────────
@@ -318,5 +327,46 @@ test('resolveBaselineJsonPath picks an uncommitted baseline over any committed o
 
     const picked = resolveBaselineJsonPath(null, tmp);
     assert.match(picked, /2020-01-01-uncommitted/);
+  });
+});
+
+test('resolveBaselineJsonPath refuses to pick among multiple baselines in a shallow clone — no real history to rank them by', () => {
+  withTempGitRepo((source) => {
+    writeBaselineDir(source, '2026-08-01-first');
+    commitAll(source, 'freeze first');
+    writeBaselineDir(source, '2026-08-02-second');
+    commitAll(source, 'freeze second');
+
+    // A shallow clone (actions/checkout's default fetch-depth: 1) sees only the single checked-out commit —
+    // commitOrder has nothing to rank either baseline.json against.
+    const shallow = fs.mkdtempSync(path.join(os.tmpdir(), 'compare-baseline-shallow-'));
+    const prevCwd = process.cwd();
+    try {
+      execFileSync('git', ['clone', '--depth', '1', `file://${source}`, shallow], { stdio: 'ignore' });
+      process.chdir(shallow);
+      assert.throws(() => resolveBaselineJsonPath(null, shallow), /shallow git clone/);
+    } finally {
+      process.chdir(prevCwd);
+      fs.rmSync(shallow, { recursive: true, force: true });
+    }
+  });
+});
+
+test('resolveBaselineJsonPath does NOT refuse a shallow clone with only one baseline — nothing to tie-break', () => {
+  withTempGitRepo((source) => {
+    writeBaselineDir(source, '2026-08-01-only');
+    commitAll(source, 'freeze only');
+
+    const shallow = fs.mkdtempSync(path.join(os.tmpdir(), 'compare-baseline-shallow-'));
+    const prevCwd = process.cwd();
+    try {
+      execFileSync('git', ['clone', '--depth', '1', `file://${source}`, shallow], { stdio: 'ignore' });
+      process.chdir(shallow);
+      const picked = resolveBaselineJsonPath(null, shallow);
+      assert.match(picked, /2026-08-01-only/);
+    } finally {
+      process.chdir(prevCwd);
+      fs.rmSync(shallow, { recursive: true, force: true });
+    }
   });
 });
