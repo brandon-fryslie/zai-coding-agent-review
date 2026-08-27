@@ -22,7 +22,7 @@ const unknownEntry = (created_at) => ({ body: ledgerEntryBody(usageOf({ basis: '
 // A review billed to Claude subscription quota: $0 spent, a known Anthropic list price.
 const subscriptionEntry = (notionalUsd, created_at) => ({ body: ledgerEntryBody(usageOf({ basis: 'subscription', notionalUsd }), CONFIG), created_at });
 
-const ZERO_TALLIES = { billed: { usd: 0, count: 0, unknownCount: 0 }, notional: { usd: 0, count: 0, unknownCount: 0 } };
+const ZERO_TALLIES = { billed: { total: 0, count: 0, unknownCount: 0 }, notional: { total: 0, count: 0, unknownCount: 0 } };
 
 const NOON = new Date('2026-07-11T12:00:00Z'); // today (UTC) = 2026-07-11
 
@@ -59,7 +59,7 @@ describe('sumCostToday', () => {
       entry(9.99, '2026-07-10T23:59:59Z'), // yesterday — excluded
       entry(9.99, '2026-07-12T00:00:00Z'), // tomorrow — excluded
     ], NOON);
-    assert.equal(Number(billed.usd.toFixed(2)), 0.30);
+    assert.equal(Number(billed.total.toFixed(2)), 0.30);
     assert.equal(billed.count, 2);
   });
 
@@ -77,7 +77,7 @@ describe('sumCostToday', () => {
   test('[LAW:single-enforcer] a comment NOT leading with the sentinel is excluded even if it carries a cost marker (human quote)', () => {
     const humanQuote = { body: `I see the bot posts ${LEDGER_MARKER} ${costMarker(usageOf({ basis: 'dollars', usd: 999 }), CONFIG)} — my own note`, created_at: '2026-07-11T10:00:00Z' };
     const { billed } = sumCostToday([humanQuote], NOON);
-    assert.equal(billed.usd, 0); // the human's $999 is NOT summed
+    assert.equal(billed.total, 0); // the human's $999 is NOT summed
     assert.equal(billed.count, 0);
     assert.equal(billed.unknownCount, 0); // not even counted as an entry — it is not one
   });
@@ -94,7 +94,7 @@ describe('sumCostToday', () => {
       entry(0.05, '2026-07-11T09:00:00Z'),
       unknownEntry('2026-07-11T10:00:00Z'),
     ], NOON);
-    assert.equal(Number(billed.usd.toFixed(2)), 0.05);
+    assert.equal(Number(billed.total.toFixed(2)), 0.05);
     assert.equal(billed.count, 1);
     assert.equal(billed.unknownCount, 1); // the day's spend is an honest lower bound
   });
@@ -108,10 +108,10 @@ describe('sumCostToday', () => {
       entry(0.05, '2026-07-11T09:00:00Z'),
       subscriptionEntry(63.59, '2026-07-11T10:00:00Z'),
     ], NOON);
-    assert.equal(Number(billed.usd.toFixed(2)), 0.05);   // the subscription's $63.59 is NOT in here
+    assert.equal(Number(billed.total.toFixed(2)), 0.05);   // the subscription's $63.59 is NOT in here
     assert.equal(billed.count, 1);
     assert.equal(billed.unknownCount, 0);                // it is not an "unknown" spend either — it is zero
-    assert.equal(notional.usd, 63.59);                   // and it is not suppressed: still reported
+    assert.equal(notional.total, 63.59);                   // and it is not suppressed: still reported
     assert.equal(notional.count, 1);
   });
 
@@ -120,8 +120,8 @@ describe('sumCostToday', () => {
   // the day's spend read as a lower bound when it is exactly known.
   test('a subscription entry with an unknown list price is notional-unknown, never billed-unknown', () => {
     const { billed, notional } = sumCostToday([subscriptionEntry(null, '2026-07-11T10:00:00Z')], NOON);
-    assert.deepEqual(billed, { usd: 0, count: 0, unknownCount: 0 });
-    assert.deepEqual(notional, { usd: 0, count: 0, unknownCount: 1 });
+    assert.deepEqual(billed, { total: 0, count: 0, unknownCount: 0 });
+    assert.deepEqual(notional, { total: 0, count: 0, unknownCount: 1 });
   });
 
   test('a non-string body is tolerated (skipped, not a crash)', () => {
@@ -156,7 +156,7 @@ describe('readSpentToday', () => {
       entry(9.99, '2026-07-10T09:00:00Z'), // yesterday — excluded
     ]]);
     const { billed } = await readSpentToday(octokit, 'o', 'r', 42, NOON);
-    assert.equal(Number(billed.usd.toFixed(2)), 0.08);
+    assert.equal(Number(billed.total.toFixed(2)), 0.08);
     assert.equal(billed.count, 2);
   });
 
@@ -165,7 +165,7 @@ describe('readSpentToday', () => {
     const octokit = fakeOctokit([full, [entry(0.01, '2026-07-11T08:00:00Z'), { body: 'human note', created_at: '2026-07-11T08:00:00Z' }]]);
     const { billed } = await readSpentToday(octokit, 'o', 'r', 42, NOON);
     assert.equal(billed.count, 101);
-    assert.equal(Number(billed.usd.toFixed(2)), 1.01);
+    assert.equal(Number(billed.total.toFixed(2)), 1.01);
   });
 
   test('an empty ledger issue yields zeroes', async () => {
@@ -234,7 +234,7 @@ describe('appendCost', () => {
     await appendCost(octokit, 'o', 'r', 42, usageOf({ basis: 'dollars', usd: 0.05 }), CONFIG);
     await appendCost(octokit, 'o', 'r', 42, usageOf({ basis: 'dollars', usd: 0.03 }), CONFIG);
     const { billed } = await readSpentToday(octokit, 'o', 'r', 42, NOON);
-    assert.equal(Number(billed.usd.toFixed(2)), 0.08);
+    assert.equal(Number(billed.total.toFixed(2)), 0.08);
     assert.equal(billed.count, 2);
   });
 });

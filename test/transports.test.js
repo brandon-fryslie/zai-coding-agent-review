@@ -169,7 +169,10 @@ describe('summarizePriorReviews', () => {
   const withCost = (usd) => `verdict\n\n${costMarker(usageOf({ basis: 'dollars', usd }), CONFIG)}\n\n${REVIEW_MARKER}`;
   const unknownCost = () => `verdict\n\n${costMarker(null, CONFIG)}\n\n${REVIEW_MARKER}`;
   const withNotionalCost = (notionalUsd) => `verdict\n\n${costMarker(usageOf({ basis: 'subscription', notionalUsd }), CONFIG)}\n\n${REVIEW_MARKER}`;
-  const ZERO_TALLIES = { billed: { usd: 0, count: 0, unknownCount: 0 }, notional: { usd: 0, count: 0, unknownCount: 0 } };
+  // zai-timing-31d.3 — a round that recorded its wall clock. Every other helper above passes no
+  // duration, which is exactly what every round posted before zai-timing-31d.2 looks like.
+  const withDuration = (usd, ms) => `verdict\n\n${costMarker(usageOf({ basis: 'dollars', usd }), CONFIG, ms)}\n\n${REVIEW_MARKER}`;
+  const ZERO_TALLIES = { billed: { total: 0, count: 0, unknownCount: 0 }, notional: { total: 0, count: 0, unknownCount: 0 } };
 
   test('counts only reviews whose body ENDS with the marker (the trailing sentinel)', async () => {
     const octokit = fakeOctokit([[
@@ -198,7 +201,7 @@ describe('summarizePriorReviews', () => {
     ]]);
     const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
     assert.equal(count, 3); // three marker-bearing reviews
-    assert.equal(Number(cost.billed.usd.toFixed(2)), 0.08);
+    assert.equal(Number(cost.billed.total.toFixed(2)), 0.08);
     assert.equal(cost.billed.count, 2);
     assert.equal(cost.billed.unknownCount, 1);
   });
@@ -210,7 +213,7 @@ describe('summarizePriorReviews', () => {
     ]]);
     const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
     assert.equal(count, 1);                 // only the real agent round
-    assert.equal(Number(cost.billed.usd.toFixed(2)), 0.04); // the human's $999 marker is NOT summed
+    assert.equal(Number(cost.billed.total.toFixed(2)), 0.04); // the human's $999 marker is NOT summed
     assert.equal(cost.billed.count, 1);
   });
 
@@ -237,11 +240,64 @@ describe('summarizePriorReviews', () => {
     ]]);
     const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
     assert.equal(count, 3);                                  // every round counted, whatever paid for it
-    assert.equal(Number(cost.billed.usd.toFixed(2)), 1.20);  // the $63.59 of list price is NOT in here
+    assert.equal(Number(cost.billed.total.toFixed(2)), 1.20);  // the $63.59 of list price is NOT in here
     assert.equal(cost.billed.count, 1);
     assert.equal(cost.billed.unknownCount, 0);               // notional rounds are not "unknown" spend
-    assert.equal(Number(cost.notional.usd.toFixed(2)), 63.59);
+    assert.equal(Number(cost.notional.total.toFixed(2)), 63.59);
     assert.equal(cost.notional.count, 2);
+  });
+
+  // zai-timing-31d.3 — cumulative agent time is tallied on the SAME pass, inside the SAME marker
+  // gate, as the round count and the cost. These assert the fold; renderPrTime's tests assert what
+  // an operator reads. [LAW:verifiable-goals]
+  test('sums the per-round duration records into the PR duration tally', async () => {
+    const octokit = fakeOctokit([[
+      { body: withDuration(0.05, 225_201) },
+      { body: withDuration(0.03, 100_000) },
+      { body: 'a human review, no marker' }, // not a round, no time
+    ]]);
+    const { count, duration } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
+    assert.equal(count, 2);
+    assert.equal(duration.total, 325_201);
+    assert.equal(duration.count, 2);
+    assert.equal(duration.unknownCount, 0);
+  });
+
+  // The whole reason the tally carries two counts. Every round this action posted before
+  // zai-timing-31d.2 recorded no duration; counting it as zero would assert those rounds were
+  // instant and quietly shrink the PR's reported time. [LAW:no-silent-failure]
+  test('a round that recorded no duration is UNRECORDED, never a zero', async () => {
+    const octokit = fakeOctokit([[
+      { body: withDuration(0.05, 60_000) },
+      { body: withCost(0.03) },                     // has a cost marker, no duration (pre-31d.2)
+      { body: `old verdict\n\n${REVIEW_MARKER}` },  // no marker at all (pre-cost-reporting)
+    ]]);
+    const { duration } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
+    assert.equal(duration.total, 60_000);
+    assert.equal(duration.count, 1);
+    assert.equal(duration.unknownCount, 2);
+  });
+
+  // [LAW:one-source-of-truth] One gate defines "which rounds are ours" for the count, the cost AND
+  // the time — so a body the count refuses cannot reach the duration total by another route.
+  test('a human review that quotes a duration-bearing marker is excluded from the duration total', async () => {
+    const octokit = fakeOctokit([[
+      { body: `here is what the bot posts: ${costMarker(usageOf({ basis: 'dollars', usd: 1 }), CONFIG, 999_999_999)} — my note` },
+      { body: withDuration(0.04, 60_000) },
+    ]]);
+    const { duration } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
+    assert.equal(duration.total, 60_000);
+    assert.equal(duration.count, 1);
+  });
+
+  // A marker is free text in a body anyone with write access can edit. Under-counting time is the
+  // direction that makes a slow PR look fast, so a negative is unrecordable — not a smaller number.
+  test('a hand-edited negative duration cannot drive the PR total DOWN', async () => {
+    const forged = `verdict\n\n<!-- agent-review-cost:{"usd":0.01,"totalMs":-999999} -->\n\n${REVIEW_MARKER}`;
+    const octokit = fakeOctokit([[{ body: withDuration(0.05, 60_000) }, { body: forged }]]);
+    const { duration } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
+    assert.equal(duration.total, 60_000);     // unchanged by the forgery
+    assert.equal(duration.unknownCount, 1);   // and the forged round is still COUNTED, as unknown
   });
 
   test('returns zeroes when the PR has no reviews', async () => {
@@ -287,7 +343,7 @@ describe('summarizePriorReviews', () => {
     const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
     assert.equal(count, 101);
     assert.equal(cost.billed.count, 101);              // cost summed across BOTH pages, not just page 1
-    assert.equal(Number(cost.billed.usd.toFixed(2)), 1.01);  // 101 × $0.01
+    assert.equal(Number(cost.billed.total.toFixed(2)), 1.01);  // 101 × $0.01
   });
 });
 

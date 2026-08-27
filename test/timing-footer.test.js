@@ -16,7 +16,7 @@ core.warning = (m) => { warnings.push(String(m)); };
 core.info = () => {};
 
 const { buildReviewFooter } = require('../src/run');
-const { parseCostRecord } = require('../src/usage');
+const { parseCostRecord, emptyTally, tallyQuantity } = require('../src/usage');
 const { renderRepoReport } = require('../src/report');
 
 beforeEach(() => { warnings = []; });
@@ -100,6 +100,86 @@ describe('the pr-mode footer', () => {
     const footer = buildReviewFooter(null, CONFIG);
     assert.match(footer, /_Reviewed by config `zai`/);
     assert.equal(parseCostRecord(footer).totalMs, null);
+    assert.equal(warnings.filter(w => w.includes('Timing breakdown unavailable')).length, 1);
+  });
+});
+
+// zai-timing-31d.3 — a PR reports the running total of agent time across ALL of its reviews.
+//
+// [LAW:behavior-not-structure] Every fixture here is a REAL footer this action built, read back
+// through the one reader (parseCostRecord) and folded by the one fold — the same round trip a live
+// run makes through GitHub. Nothing hand-writes a marker, so a change to how a duration is recorded
+// cannot pass these tests while breaking the next run's ability to sum it.
+describe("the PR's cumulative agent time", () => {
+  // The fold summarizePriorReviews runs, exercised here over footers instead of an API fixture:
+  // prior rounds in, one tally out. Its gate is asserted in transports.test.js.
+  const priorRounds = (...footers) => footers.reduce(
+    (tally, body) => tallyQuantity(tally, parseCostRecord(body).totalMs),
+    emptyTally(),
+  );
+  const round = (ms) => buildReviewFooter(null, CONFIG, null, { schedule: SCHEDULE, totalMs: ms });
+
+  test('given prior reviews carrying duration records, the footer shows the summed total', () => {
+    const prior = priorRounds(round(3 * MIN), round(5 * MIN), round(4 * MIN));
+    const footer = buildReviewFooter(null, CONFIG, null, { schedule: SCHEDULE, totalMs: 2 * MIN, priorDuration: prior });
+    // 3 + 5 + 4 prior, plus this run's 2 — every round recorded, so no '+' and nothing unrecorded.
+    assert.match(footer, /_Timing: 2m00s total · PR time 14m00s across 4 rounds · spawns/);
+    assert.doesNotMatch(footer, /unrecorded/);
+  });
+
+  test('with no prior records the total is this run\'s duration alone — no cumulative clause', () => {
+    const footer = buildReviewFooter(null, CONFIG, null, { schedule: SCHEDULE, totalMs: 2 * MIN, priorDuration: emptyTally() });
+    assert.match(footer, /_Timing: 2m00s total · spawns/);
+    assert.doesNotMatch(footer, /PR time/);
+  });
+
+  // [LAW:no-silent-failure] Every round posted before zai-timing-31d.2 recorded no duration. The
+  // total is then a LOWER BOUND and says so — '+' plus the count of rounds it could not include —
+  // rather than a partial sum passed off as complete, or a zero asserting those rounds were instant.
+  test('rounds that recorded no duration render the total as a named lower bound', () => {
+    const legacy = buildReviewFooter(null, CONFIG, null, { schedule: SCHEDULE }); // pre-31d.2: no totalMs
+    assert.equal(parseCostRecord(legacy).totalMs, null);
+    const prior = priorRounds(round(6 * MIN), legacy, legacy);
+    const footer = buildReviewFooter(null, CONFIG, null, { schedule: SCHEDULE, totalMs: 4 * MIN, priorDuration: prior });
+    assert.match(footer, /PR time 10m00s\+ across 4 rounds, 2 unrecorded/);
+  });
+
+  // THE TRAP. The record carries BOTH a spawn span (from/to) and the run's wall clock, and they look
+  // redundant. They are not: the span is the spawn window, while the run also fetches a diff, waits
+  // on a scout and posts a review. Measured on the live run that reviewed PR #138, totalMs was
+  // 225201 ms against a 223475 ms span. Backfilling an unrecorded round from its span would report
+  // the model's time as the run's — a silent under-report wearing the real measurement's name.
+  test('an unrecorded round is NEVER backfilled from its spawn span', () => {
+    const legacy = buildReviewFooter(null, CONFIG, null, { schedule: SCHEDULE });
+    const record = parseCostRecord(legacy);
+    assert.equal(record.totalMs, null);
+    const prior = priorRounds(legacy);
+    assert.equal(prior.total, 0);           // nothing derived from the span
+    assert.equal(prior.unknownCount, 1);    // and the round is still visible as a round
+  });
+
+  // Repo mode has no cross-run store to read, so it reports per-run time only — by construction
+  // (priorDuration is never passed) rather than by a flag anyone has to remember. [LAW:no-mode-explosion]
+  test('repo mode reports per-run time only', () => {
+    const footer = buildReviewFooter(null, CONFIG, null, { schedule: SCHEDULE, totalMs: 10 * MIN });
+    assert.match(footer, /_Timing: 10m00s total · spawns/);
+    assert.doesNotMatch(footer, /PR time/);
+  });
+
+  // The cumulative clause is a value on the head every timing line shares, not a second line shape:
+  // a run that recorded no schedule still reports the PR's total beside its own. [LAW:dataflow-not-control-flow]
+  test('the cumulative total survives a run that recorded no schedule', () => {
+    const prior = priorRounds(round(9 * MIN));
+    const footer = buildReviewFooter(null, CONFIG, null, { schedule: null, totalMs: 1 * MIN, priorDuration: prior });
+    assert.match(footer, /_Timing: 1m00s total · PR time 10m00s across 2 rounds · spawn breakdown unavailable/);
+  });
+
+  // Time is diagnostics; findings are the product. A cumulative figure never becomes a reason a
+  // review fails to post. [LAW:no-silent-failure]
+  test('a broken totalMs omits the block loudly, cumulative clause and all, and still posts', () => {
+    const footer = buildReviewFooter(null, CONFIG, null, { schedule: SCHEDULE, totalMs: undefined, priorDuration: priorRounds(round(9 * MIN)) });
+    assert.match(footer, /_Reviewed by config `zai`/);
+    assert.doesNotMatch(footer, /Timing:/);
     assert.equal(warnings.filter(w => w.includes('Timing breakdown unavailable')).length, 1);
   });
 });

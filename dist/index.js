@@ -36217,7 +36217,7 @@ const { assessDifficulty } = __nccwpck_require__(4260);
 const { difficultyCandidates, parseDifficultyScaling } = __nccwpck_require__(9935);
 const { readSpentToday, appendCost } = __nccwpck_require__(8192);
 const { parseDependencyDiffFlag, parseGoModBumps, fetchUpstreamChangeSummary, unresolvedSummary, renderDependencyReviewSection } = __nccwpck_require__(9838);
-const { renderCostLine, costWarning, costMarker } = __nccwpck_require__(9614);
+const { renderCostLine, costWarning, costMarker, renderPrTime } = __nccwpck_require__(9614);
 const { renderTimingBreakdown } = __nccwpck_require__(7932);
 const { renderRepoReport } = __nccwpck_require__(8959);
 const registry = __nccwpck_require__(25);
@@ -36336,7 +36336,7 @@ async function preflightChain(chain) {
 // use happened to sit outside the try, which is precisely the trade this epic forbids: time is
 // diagnostics, findings are the product. Named here, an absent envelope is an absent schedule and an
 // absent total — two values the renderer already knows how to report as gaps. [LAW:no-silent-failure]
-function buildReviewFooter(usage, configUsed, priorCost, { schedule = null, totalMs } = {}) {
+function buildReviewFooter(usage, configUsed, priorCost, { schedule = null, totalMs, priorDuration = null } = {}) {
   const warning = costWarning(usage, configUsed);
   if (warning) core.warning(warning);
   const costLine = renderCostLine(usage, configUsed, priorCost);
@@ -36347,9 +36347,14 @@ function buildReviewFooter(usage, configUsed, priorCost, { schedule = null, tota
   // a render failure omits the block LOUDLY — a warning naming the cause — and never fails the
   // review. [LAW:no-silent-failure] An absent schedule is not a failure: it renders as an explicit
   // gap inside renderTimingBreakdown.
+  // The PR's cumulative agent time (zai-timing-31d.3) is rendered INSIDE the try with the block it
+  // joins: it reads the same prior-review markers the cost total does, and if that rendering fails
+  // the whole timing block is omitted loudly rather than a review being lost to a diagnostic.
+  // priorDuration is null in repo mode — no cross-run store to read — and the clause is then empty,
+  // so the line reports this run alone. [LAW:no-silent-failure]
   let timingBlock = null;
   try {
-    timingBlock = renderTimingBreakdown(schedule, totalMs);
+    timingBlock = renderTimingBreakdown(schedule, totalMs, renderPrTime(totalMs, priorDuration));
     core.info(timingBlock.split('\n')[0].replace(/^_|_$/g, ''));
   } catch (e) {
     core.warning(`Timing breakdown unavailable (${e.message}) — the review is posted without it.`);
@@ -36428,9 +36433,11 @@ async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, c
   try {
     const ledger = await readSpentToday(octokit, owner, repo, issueNumber, now);
     // [LAW:types-are-the-program] The gradient rations DOLLARS, so it reads the `billed` tally and
-    // nothing else. Subscription rounds are tallied separately under `notional` and have no `usd`
-    // field here to pick up — they cannot throttle a budget against money that was never spent.
-    spentToday = ledger.billed.usd;
+    // nothing else. A subscription round's marker lands it in `notional`, a tally this line never
+    // reads — it cannot throttle a budget against money that was never spent. The tally shape is
+    // unit-blind (see emptyTally in src/usage.js); the unit is whatever the BUCKET means, which is
+    // why the bucket and not a field name is what keeps list price out of the day's spend.
+    spentToday = ledger.billed.total;
     if (ledger.billed.unknownCount > 0) {
       core.warning(
         `Budget: ledger issue #${issueNumber} has ${ledger.billed.unknownCount} entr(ies) with unknown cost — `
@@ -36453,7 +36460,7 @@ async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, c
         : '';
       core.info(
         `Budget: ${notionalRounds} of today's review(s) were billed to Claude subscription quota, not `
-        + `dollars — $${ledger.notional.usd.toFixed(4)} at Anthropic list price${unreported}. It is `
+        + `dollars — $${ledger.notional.total.toFixed(4)} at Anthropic list price${unreported}. It is `
         + "excluded from the day's dollar spend and summed into nothing.",
       );
     }
@@ -36929,7 +36936,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   const dependencySection = renderDependencyReviewSection(dependencySummaries, review.assessments);
   // totalMs is read HERE, at the last instant before the sink, so the total covers everything the
   // run did up to submission — the same clock startedAt came from, read once. [LAW:one-source-of-truth]
-  const footer = buildReviewFooter(review.usage, configUsed, prior.cost, { schedule: review.schedule, totalMs: Date.now() - startedAt });
+  const footer = buildReviewFooter(review.usage, configUsed, prior.cost, { schedule: review.schedule, totalMs: Date.now() - startedAt, priorDuration: prior.duration });
   await submitReview(
     reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
     // [LAW:dataflow-not-control-flow] Coverage is stated, never inferred: the engine's own gap
@@ -37305,12 +37312,22 @@ function scopeText(str) {
 // as a nonsense total. schedule may be null — the recorded absence (e.g. a review produced without
 // a pass envelope) — and renders as the explicit gap, never as a silently omitted line.
 // [LAW:no-silent-failure]
-function renderTimingBreakdown(schedule, totalMs) {
+//
+// `prTime` is the PR's cumulative-agent-time clause (zai-timing-31d.3), arriving ALREADY RENDERED as
+// a plain string: the fold that produces it reads review markers, which is src/usage.js's concern,
+// and this module stays dependency-free so every sink can import it. [LAW:one-way-deps] Its empty
+// string is not a mode — repo mode and a PR's first review both pass it, and it simply contributes
+// no clause to the same head every line is built from. [LAW:dataflow-not-control-flow]
+function renderTimingBreakdown(schedule, totalMs, prTime = '') {
   if (!Number.isFinite(totalMs) || totalMs < 0) {
     throw new Error(`renderTimingBreakdown: totalMs must be a non-negative finite number (got ${JSON.stringify(totalMs)})`);
   }
+  // The head EVERY timing line shares — this run's own wall clock, then the PR's cumulative total
+  // where there is one. Built once, so the schedule-less line cannot drift from the full one.
+  // [LAW:one-source-of-truth]
+  const head = [`_Timing: ${formatMs(totalMs)} total`, prTime].filter(Boolean).join(' · ');
   if (schedule == null) {
-    return `_Timing: ${formatMs(totalMs)} total · spawn breakdown unavailable — this run recorded no schedule_`;
+    return `${head} · spawn breakdown unavailable — this run recorded no schedule_`;
   }
   const d = describeSchedule(schedule);
   const workerRows = d.passes.flatMap(p => p.spawns.map(s => ({ pass: p.pass, ...s })));
@@ -37326,7 +37343,7 @@ function renderTimingBreakdown(schedule, totalMs) {
   const slowestClause = slowest ? `slowest scope: ${scopeText(slowest.scope)} (${formatMs(slowest.ms)})` : 'slowest scope: unclocked';
   const scheduleSentence =
     `${d.scopeCount} scope(s) at concurrency ${d.scopeConcurrency} over ${d.passes.length} pass(es) = ${d.waveCount} wave(s)`;
-  const line = `_Timing: ${formatMs(totalMs)} total · ${phaseClause('spawns', allDurations)} (${spawnCount} attempt(s))`
+  const line = `${head} · ${phaseClause('spawns', allDurations)} (${spawnCount} attempt(s))`
     + ` — ${phases} · ${slowestClause} · ${scheduleSentence}_`;
   const rows = [
     ...d.scouts.map(s => `| scout | — | ${s.outcome} | ${formatMs(s.ms)} |`),
@@ -37427,7 +37444,7 @@ const { parseUnifiedDiff, parseReviewableFiles } = __nccwpck_require__(9898);
 // flattenBody is imported for the pairPushbacks BOUNDARY (stamping author-written comment text), not
 // for any sink in this file — the sinks below receive values already stamped. [LAW:parse-dont-validate]
 const { severityTag, findingLineText, flattenBody, codeSpan } = __nccwpck_require__(1565);
-const { parseCost, emptyTallies, tallyCost } = __nccwpck_require__(9614);
+const { parseCostRecord, emptyTallies, tallyCost, emptyTally, tallyQuantity } = __nccwpck_require__(9614);
 
 const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
 
@@ -38068,6 +38085,13 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber, identitie
   // NEVER added: a PR whose early rounds ran on a paid API and whose later rounds ran on the
   // subscription must not report one blended number that is true of neither.
   const tallies = emptyTallies();
+  // [LAW:one-source-of-truth] The PR's CUMULATIVE AGENT TIME (zai-timing-31d.3), tallied on this same
+  // pass and inside this same marker gate — so "which rounds count toward the total" has exactly one
+  // definition, the one that already decides the round count and the cost. A second walk of the
+  // reviews to sum durations would be a second answer to that question, free to drift from this one.
+  // Repo mode never reaches here (no PR, no prior reviews), which is why it correctly reports per-run
+  // time only, by construction rather than by a flag. [LAW:no-mode-explosion]
+  const duration = emptyTally();
   // [LAW:one-source-of-truth] The marker-bearing (RA) reviews, collected inside the SAME marker gate that
   // drives count/cost — so "which reviews are RA's" is defined exactly once here, never re-derived
   // downstream. Two consumers read it, and BOTH depend on that gate for their correctness:
@@ -38156,12 +38180,20 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber, identitie
       // any other case — an explicit 'unknown' marker, a pre-feature review with no marker, or a
       // malformed value that won't parse — is a round whose cost we don't have, counted as unknown so
       // that basis's total is an honest lower bound (+), never silently omitted.
-      tallyCost(tallies, parseCost(body));
+      // ONE parse of the body feeding BOTH folds — the record carries the cost and the round's wall
+      // clock together (they ride one marker), so reading it twice would be two chances to disagree
+      // about what this body says. [LAW:one-source-of-truth]
+      const record = parseCostRecord(body);
+      tallyCost(tallies, record === null ? null : record.cost);
+      // [LAW:no-silent-failure] A round whose marker predates duration recording reports null and is
+      // counted as UNRECORDED, never as zero: it happened, and its time is unknown. The renderer
+      // (renderPrTime) states the count so the total reads as the lower bound it is.
+      tallyQuantity(duration, record === null ? null : record.totalMs);
     }
     if (data.length < 100) break;
     page++;
   }
-  return { count, cost: tallies, reviews, latestArtifact, releaseFailureBodies };
+  return { count, cost: tallies, duration, reviews, latestArtifact, releaseFailureBodies };
 }
 
 // [LAW:effects-at-boundaries] Pure, split from the fetch below so it is testable without a fake API:
@@ -38818,10 +38850,15 @@ module.exports = {
 /***/ }),
 
 /***/ 9614:
-/***/ ((module) => {
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 "use strict";
 
+
+// [LAW:one-way-deps] The one import here, and it points downhill: src/schedule.js owns duration
+// formatting (formatMs) and depends on nothing, so every sink can import it. The PR-time clause
+// below is rendered where the marker fold that feeds it lives, rather than splitting the two.
+const { formatMs } = __nccwpck_require__(7932);
 
 // Per-run token/cost reporting.
 //
@@ -39728,33 +39765,51 @@ function sumCost(costs) {
   return { basis: 'dollars', usd: costs.reduce((sum, c) => sum + c.usd, 0) };
 }
 
-// [LAW:one-type-per-behavior] A per-basis TALLY — {usd, count, unknownCount} — is one accounting
-// shape instantiated twice, over different units, and the two instances are never added together.
-// Both marker folds (the PR total in transport.js, the daily ledger in ledger.js) tally into this,
-// so "how do you count a round whose figure is missing" is answered once for both.
-// [LAW:no-silent-failure] A cost whose figure is absent raises unknownCount rather than vanishing,
-// so each total is honestly reported as a lower bound (rendered with a '+') instead of a partial
-// sum passed off as complete. A body with no marker at all (a pre-feature round) is a dollars-basis
-// round of unknown cost — never a free one.
-function emptyTallies() {
-  return {
-    billed: { usd: 0, count: 0, unknownCount: 0 },
-    notional: { usd: 0, count: 0, unknownCount: 0 },
-  };
+// [LAW:one-type-per-behavior] A TALLY — {total, count, unknownCount} — is ONE accounting shape,
+// instantiated over every unit this action sums across a PR's rounds: dollars actually spent,
+// Anthropic list price, and (zai-timing-31d.3) milliseconds of agent time. The field is named for
+// its ROLE and not for a unit, because there is one rule here and it is unit-blind; each render
+// site supplies the unit it means ('$' below, formatMs for time). A second copy of this rule per
+// unit is how "how do you count a round whose figure is missing" would come to have two answers.
+// [LAW:no-silent-failure] A figure that is absent raises unknownCount rather than vanishing, so
+// every total is honestly reported as a lower bound (rendered with a '+') instead of a partial sum
+// passed off as complete. That is the whole reason the shape carries two counts: a round that
+// happened but reported nothing must stay visible as a round.
+function emptyTally() {
+  return { total: 0, count: 0, unknownCount: 0 };
 }
 
-function tallyCost(tallies, cost) {
-  const basis = basisOf(cost);
-  const tally = tallies[basis.bucket];
-  const figure = basis.figure(cost);
-  if (Number.isFinite(figure)) {
-    tally.usd += figure;
+// [LAW:single-enforcer] THE fold. Every quantity summed across rounds passes through here, so the
+// treatment of an unrecorded figure cannot differ between cost and time. `n` is whatever the one
+// reader (parseCostRecord) recovered — already screened to a non-negative finite number or null —
+// and anything not finite is an absence, never a zero.
+function tallyQuantity(tally, n) {
+  if (Number.isFinite(n)) {
+    tally.total += n;
     tally.count++;
   } else {
     tally.unknownCount++;
   }
+  return tally;
+}
+
+// The per-basis pair the two COST folds share (the PR total in transport.js, the daily ledger in
+// ledger.js). The two bases are never added together: a dollar of spend and a notional list-price
+// dollar are different units. A body with no marker at all (a pre-feature round) is a dollars-basis
+// round of unknown cost — never a free one.
+function emptyTallies() {
+  return { billed: emptyTally(), notional: emptyTally() };
+}
+
+function tallyCost(tallies, cost) {
+  const basis = basisOf(cost);
+  tallyQuantity(tallies[basis.bucket], basis.figure(cost));
   return tallies;
 }
+
+// A DURATION is a single tally where a cost is a pair: time has one unit, so there is no basis to
+// select and the primitive above is folded directly. The rounds it counts are defined by whoever
+// folds it (transport.js), not here. [LAW:one-source-of-truth]
 
 function tallyRounds(tally) {
   return tally.count + tally.unknownCount;
@@ -39768,7 +39823,7 @@ function renderTally(label, tally) {
   if (rounds === 0) return null;
   const approx = tally.unknownCount > 0 ? '+' : '';
   const note = tally.unknownCount > 0 ? `, ${tally.unknownCount} with unknown cost` : '';
-  return `PR ${label} $${tally.usd.toFixed(4)}${approx} across ${rounds} rounds${note}`;
+  return `PR ${label} $${tally.total.toFixed(4)}${approx} across ${rounds} rounds${note}`;
 }
 
 // [LAW:effects-at-boundaries] Pure: the " · PR total ..." clause appended to the cost line, or '' when
@@ -39793,6 +39848,33 @@ function renderPrTotal(thisCost, priorCost) {
     renderTally('list-price total', totals.notional),
   ].filter(Boolean);
   return clauses.length === 0 ? '' : ` · ${clauses.join(' · ')}`;
+}
+
+// [LAW:effects-at-boundaries] Pure: the "PR time ..." clause the timing line carries, or '' when
+// there is nothing cumulative to say — repo mode (no cross-run store, so priorDuration is null) and
+// the first review of a PR (no prior rounds) both render the run's own total alone, unchanged.
+// [LAW:one-type-per-behavior] renderPrTotal's mold over the second unit: this run folded into the
+// prior rounds' tally, rendered as a lower bound. The unit is supplied HERE — formatMs — because the
+// tally itself is unit-blind.
+//
+// WHAT A ROUND WITHOUT A RECORD COSTS THE FIGURE, stated rather than hidden. Every round posted
+// before durations were recorded (zai-timing-31d.2, merged b3b919c) reports no totalMs, so it lands
+// in unknownCount and the total renders '16m15s+ across 5 rounds, 2 unrecorded' — a lower bound with
+// the missing rounds NAMED. It is never a sum passed off as complete, and never a zero, which would
+// assert those rounds were instant. [LAW:no-silent-failure]
+//
+// Such a round is also NEVER backfilled from its record's from/to span. That span is the SPAWN
+// window; the run also fetches a diff, waits on a scout and posts a review, none of it inside a
+// spawn. Measured on the live run that reviewed PR #138: totalMs 225201 ms against a span of
+// 223475 ms, and the gap grows with diff size. Deriving one from the other is a silent fallback to a
+// different measurement wearing the real one's name. An unrecorded round is unrecorded.
+function renderPrTime(thisMs, priorDuration) {
+  if (!priorDuration) return '';
+  if (tallyRounds(priorDuration) === 0) return '';
+  const total = tallyQuantity({ ...priorDuration }, thisMs);
+  const approx = total.unknownCount > 0 ? '+' : '';
+  const note = total.unknownCount > 0 ? `, ${total.unknownCount} unrecorded` : '';
+  return `PR time ${formatMs(total.total)}${approx} across ${tallyRounds(total)} rounds${note}`;
 }
 
 // [LAW:dataflow-not-control-flow] The basis selects a PHRASE; every cost line is then assembled by
@@ -39898,6 +39980,7 @@ module.exports = {
   addTokens,
   renderCostLine,
   renderPrTotal,
+  renderPrTime,
   costMarker,
   costRecord,
   parseCostMarker,
@@ -39907,6 +39990,8 @@ module.exports = {
   sumCost,
   emptyTallies,
   tallyCost,
+  emptyTally,
+  tallyQuantity,
   costWarning,
   formatTokenCount,
   isAnthropicEndpoint,

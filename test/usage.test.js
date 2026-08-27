@@ -66,8 +66,8 @@ const SUBSCRIPTION_CONFIG = {
 // The prior-round tallies summarizePriorReviews returns: one tally per basis, reported side by side
 // and never added. Defaults are all-zero so each test names only the numbers it is actually about.
 const prior = ({ usd = 0, count = 0, unknownCount = 0, notionalUsd = 0, notionalCount = 0, notionalUnknownCount = 0 } = {}) => ({
-  billed: { usd, count, unknownCount },
-  notional: { usd: notionalUsd, count: notionalCount, unknownCount: notionalUnknownCount },
+  billed: { total: usd, count, unknownCount },
+  notional: { total: notionalUsd, count: notionalCount, unknownCount: notionalUnknownCount },
 });
 
 // The two instants the fixtures below are priced at. DeepSeek's schedule is 01:00-04:00 and

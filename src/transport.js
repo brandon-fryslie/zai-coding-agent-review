@@ -4,7 +4,7 @@ const { parseUnifiedDiff, parseReviewableFiles } = require('./diff');
 // flattenBody is imported for the pairPushbacks BOUNDARY (stamping author-written comment text), not
 // for any sink in this file — the sinks below receive values already stamped. [LAW:parse-dont-validate]
 const { severityTag, findingLineText, flattenBody, codeSpan } = require('./review');
-const { parseCost, emptyTallies, tallyCost } = require('./usage');
+const { parseCostRecord, emptyTallies, tallyCost, emptyTally, tallyQuantity } = require('./usage');
 
 const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
 
@@ -645,6 +645,13 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber, identitie
   // NEVER added: a PR whose early rounds ran on a paid API and whose later rounds ran on the
   // subscription must not report one blended number that is true of neither.
   const tallies = emptyTallies();
+  // [LAW:one-source-of-truth] The PR's CUMULATIVE AGENT TIME (zai-timing-31d.3), tallied on this same
+  // pass and inside this same marker gate — so "which rounds count toward the total" has exactly one
+  // definition, the one that already decides the round count and the cost. A second walk of the
+  // reviews to sum durations would be a second answer to that question, free to drift from this one.
+  // Repo mode never reaches here (no PR, no prior reviews), which is why it correctly reports per-run
+  // time only, by construction rather than by a flag. [LAW:no-mode-explosion]
+  const duration = emptyTally();
   // [LAW:one-source-of-truth] The marker-bearing (RA) reviews, collected inside the SAME marker gate that
   // drives count/cost — so "which reviews are RA's" is defined exactly once here, never re-derived
   // downstream. Two consumers read it, and BOTH depend on that gate for their correctness:
@@ -733,12 +740,20 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber, identitie
       // any other case — an explicit 'unknown' marker, a pre-feature review with no marker, or a
       // malformed value that won't parse — is a round whose cost we don't have, counted as unknown so
       // that basis's total is an honest lower bound (+), never silently omitted.
-      tallyCost(tallies, parseCost(body));
+      // ONE parse of the body feeding BOTH folds — the record carries the cost and the round's wall
+      // clock together (they ride one marker), so reading it twice would be two chances to disagree
+      // about what this body says. [LAW:one-source-of-truth]
+      const record = parseCostRecord(body);
+      tallyCost(tallies, record === null ? null : record.cost);
+      // [LAW:no-silent-failure] A round whose marker predates duration recording reports null and is
+      // counted as UNRECORDED, never as zero: it happened, and its time is unknown. The renderer
+      // (renderPrTime) states the count so the total reads as the lower bound it is.
+      tallyQuantity(duration, record === null ? null : record.totalMs);
     }
     if (data.length < 100) break;
     page++;
   }
-  return { count, cost: tallies, reviews, latestArtifact, releaseFailureBodies };
+  return { count, cost: tallies, duration, reviews, latestArtifact, releaseFailureBodies };
 }
 
 // [LAW:effects-at-boundaries] Pure, split from the fetch below so it is testable without a fake API:
