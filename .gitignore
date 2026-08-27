@@ -139,3 +139,6 @@ vite.config.ts.timestamp-*
 
 # Eval harness run artifacts (eval/run-case.js writes replays here; never committed)
 eval/out/
+
+# Local-only review configs (endpoints on this machine; see review-agent/local-mlx.yml)
+review-agent/local-*.yml
