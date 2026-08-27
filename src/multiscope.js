@@ -67,13 +67,19 @@ function workerFocusText(scope, context) {
 // costs share the same model and the same basis; sumCost still resolves the mixed case as a value.
 // [LAW:no-silent-failure] no spawn's cost is silently dropped: one unpriced spawn makes the whole
 // sum unpriced, carrying that spawn's reason.
-// usage === null (an engine reported nothing) is excluded; all-null sums to null, matching the
-// single-spawn behavior the cost renderer already handles.
+// usage === null (no spawn record at all) is excluded; all-null sums to null, matching the
+// single-spawn behavior the cost renderer already handles. A spawn whose engine reported nothing
+// still carries its host-stamped span (zai-timing-31d.4), so its record arrives with tokens and
+// cost ABSENT: it contributes its span to the envelope and nothing to the token or cost folds,
+// and a pass where NO spawn reported tokens sums them to null — the renderer's "engine reported
+// no token usage" value, never a fabricated zero. [LAW:parse-dont-validate]
 function sumUsage(usages) {
   const present = usages.filter(Boolean);
   if (present.length === 0) return null;
+  const tokens = present.map(u => u.tokens).filter(Boolean);
+  const costs = present.map(u => u.cost).filter(Boolean);
   return {
-    tokens: present.map(u => u.tokens).reduce(addTokens, emptyTokens()),
+    tokens: tokens.length > 0 ? tokens.reduce(addTokens, emptyTokens()) : null,
     // The pass's SPAN is the envelope of its spawns' spans — earliest start, latest end — which is
     // the honest answer for a scheduler that runs workers in waves: the pass occupied that window,
     // and a restatement that needs to know which price epoch applies can see whether the window sits
@@ -81,7 +87,9 @@ function sumUsage(usages) {
     // [LAW:no-silent-failure] A spawn that recorded no span contributes none, exactly as a spawn
     // that recorded no usage contributes no tokens.
     span: sumSpan(present.map(u => u.span)),
-    cost: sumCost(present.map(u => u.cost)),
+    // Absent costs (engine reported nothing) are excluded from the fold exactly as their tokens
+    // are; an UNPRICED cost is a present value and still poisons the sum, as before.
+    cost: costs.length > 0 ? sumCost(costs) : null,
   };
 }
 

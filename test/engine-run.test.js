@@ -81,7 +81,7 @@ describe('runEngine with an oversized engine stream', () => {
   test('a stream larger than the retained cap that ends in a terminal success COMPLETES (not killed on size), and the truncation is announced loudly', async () => {
     let stdout;
     const warnings = await captureWarnings(async () => {
-      stdout = await runEngine(makeAdapter({ emitTerminal: true }), {}, 'prompt', '/tmp', {}, process.cwd());
+      ({ stdout } = await runEngine(makeAdapter({ emitTerminal: true }), {}, 'prompt', '/tmp', {}, process.cwd()));
     });
     assert.ok(stdout.length <= RETAIN_CAP, `retained ${stdout.length} exceeds cap ${RETAIN_CAP}`);
     assert.ok(stdout.includes('turn.completed'), 'the terminal event the caller needs survives in the tail');
@@ -380,5 +380,70 @@ describe('runEngine orphan reaping', () => {
     await new Promise(r => setTimeout(r, 200)); // let the spawn register its group
     reapLiveEngineGroups();
     await assert.rejects(inFlight); // SIGKILLed → nonzero close → the loud engine-failure path
+  });
+});
+
+// ── every spawn reports its own duration (zai-timing-31d.4) ───────────────────────────────────────
+// The span is stamped in finish(), the one helper that runs on EVERY termination path — so a spawn
+// that FAILED after burning real time still reports what it burned. Success carries it on the
+// resolved value; every post-spawn rejection carries it as err.span. [LAW:no-silent-failure]
+describe('runEngine spawn duration', () => {
+  const { DeadlineExceededError } = require('../src/deadline.js');
+
+  const durationOf = span => Date.parse(span.to) - Date.parse(span.from);
+
+  function sleeperAdapter(script, extra = {}) {
+    return {
+      name: 'fake',
+      timeoutMs: 30_000,
+      buildCommand: () => ({ command: process.execPath, args: ['-e', script], env: { PATH: process.env.PATH } }),
+      assertSucceeded: () => {},
+      classifyError: err => err,
+      ...extra,
+    };
+  }
+
+  test('a successful spawn resolves with a span whose duration brackets the time it actually slept', async () => {
+    const before = Date.now();
+    const { span } = await runEngine(
+      sleeperAdapter(`setTimeout(() => process.stdout.write('{"type":"turn.completed"}\\n'), 300);`),
+      {}, 'p', '/tmp', {}, process.cwd(),
+    );
+    const after = Date.now();
+    assert.ok(durationOf(span) >= 300, `duration ${durationOf(span)}ms covers the 300ms the child slept`);
+    // The span cannot claim more time than the whole call took (same clock brackets both ends).
+    assert.ok(Date.parse(span.from) >= before && Date.parse(span.to) <= after, 'span sits inside the call window');
+  });
+
+  test('a spawn that exits non-zero still reports the duration it burned, on the error', async () => {
+    await assert.rejects(
+      runEngine(sleeperAdapter(`setTimeout(() => process.exit(3), 300);`), {}, 'p', '/tmp', {}, process.cwd()),
+      err => {
+        assert.match(err.message, /exited with status 3/);
+        assert.ok(err.span, 'the failed spawn carries its span');
+        assert.ok(durationOf(err.span) >= 300, `duration ${durationOf(err.span)}ms covers the time before the failure`);
+        return true;
+      },
+    );
+  });
+
+  test('a spawn killed at the deadline still reports the duration it burned, on the error', async () => {
+    await assert.rejects(
+      runEngine(sleeperAdapter('setTimeout(() => {}, 30000);'), {}, 'p', '/tmp', {}, process.cwd(), Date.now() + 400),
+      err => {
+        assert.ok(err instanceof DeadlineExceededError);
+        assert.ok(err.span, 'the killed spawn carries its span');
+        // The kill fires at ~400ms; the settle waits for the tree to exit, so the duration can only exceed it.
+        assert.ok(durationOf(err.span) >= 350, `duration ${durationOf(err.span)}ms covers the budget it consumed`);
+        return true;
+      },
+    );
+  });
+
+  test('a spawn refused before it starts carries no span — nothing ran, so there is nothing to time', async () => {
+    await assert.rejects(
+      runEngine(sleeperAdapter(''), {}, 'p', '/tmp', {}, process.cwd(), Date.now() - 1),
+      err => err instanceof DeadlineExceededError && err.span === undefined,
+    );
   });
 });

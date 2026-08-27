@@ -513,6 +513,12 @@ describe('renderCostLine', () => {
     assert.equal(renderCostLine(null, CODEX_CONFIG), '');
   });
 
+  // A spawn whose engine reported nothing still carries its host-stamped span (zai-timing-31d.4);
+  // the rendered output is the same empty line the null-usage shape always produced.
+  test('returns empty string for a span-only usage — the engine reported no tokens to render', () => {
+    assert.equal(renderCostLine({ span: { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:35:00.000Z' } }, CODEX_CONFIG), '');
+  });
+
   test('no prior rounds → single-round line, no PR total (first review unchanged)', () => {
     const usage = { tokens: { inputCacheMiss: 100, inputCacheHit: 0, output: 50 }, cost: { basis: 'dollars', usd: 0.02 } };
     const line = renderCostLine(usage, CODEX_CONFIG, prior());
@@ -858,6 +864,14 @@ describe('renderPrTotal', () => {
 describe('costWarning', () => {
   test('null when cost is reported — no warning for a fully-priced run', () => {
     assert.equal(costWarning({ tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 1 }, cost: { basis: 'dollars', usd: 0.1 } }, CODEX_CONFIG), null);
+  });
+
+  // "Engine reported nothing" now arrives in two shapes — no usage record at all, and a record
+  // carrying only the host-stamped span (zai-timing-31d.4). Both warn with the same words.
+  test('a span-only usage warns exactly as a null usage does', () => {
+    const expected = costWarning(null, CODEX_CONFIG);
+    assert.match(expected, /reported no token usage/);
+    assert.equal(costWarning({ span: { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:35:00.000Z' } }, CODEX_CONFIG), expected);
   });
 
   test('no-price names the price table and the model to add', () => {

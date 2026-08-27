@@ -60,16 +60,20 @@ describe('makeCliAdapter — the spawn start instant (zai-cost-truth-p5o.1)', ()
     assert.ok(Date.parse(result.usage.span.to) >= seen.getTime());
   });
 
-  // The clock is an effect and lives at this boundary; a spec that reported no usage must not acquire
-  // a span from somewhere else. [LAW:effects-at-boundaries]
-  test('a spec reporting no usage yields no usage — the span is stamped on a value, never invented', async () => {
+  // The span is the HOST's clock, stamped by runEngine on every spawn — it cannot go missing the
+  // way a provider's token count can. A spec that reported no usage still yields a record carrying
+  // the spawn's span, with tokens and cost absent together (zai-timing-31d.4).
+  test('a spec reporting no usage still reports its duration — span present, tokens and cost absent', async () => {
     const adapter = makeCliAdapter(specThatRecords(() => null));
     const result = await adapter.produceReview({
       config: CONFIG,
       buildPromptFor: () => 'prompt',
       instructionsPath: null,
     });
-    assert.equal(result.usage, null);
+    assert.ok(result.usage.span, 'the host-stamped span survives a token-less spawn');
+    assert.ok(Date.parse(result.usage.span.to) >= Date.parse(result.usage.span.from));
+    assert.equal(result.usage.tokens, undefined);
+    assert.equal(result.usage.cost, undefined);
     assert.equal(result.summary, 'done');
   });
 });

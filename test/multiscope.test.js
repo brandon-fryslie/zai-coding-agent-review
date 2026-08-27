@@ -222,6 +222,29 @@ describe('sumUsage', () => {
     assert.equal(sumUsage([null, null]), null);
     assert.equal(sumUsage([]), null);
   });
+
+  // A spawn whose engine reported nothing still carries its host-stamped span (zai-timing-31d.4):
+  // its record arrives with tokens and cost absent together, contributes its span to the envelope,
+  // and contributes nothing to the token or cost folds.
+  test('a span-only spawn record widens the envelope without touching the token or cost sums', () => {
+    const total = sumUsage([
+      { tokens: { inputCacheMiss: 4, inputCacheHit: 0, output: 2 }, cost: { basis: 'dollars', usd: 0.05 }, span: { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:35:00.000Z' } },
+      { span: { from: '2026-08-22T03:20:00.000Z', to: '2026-08-22T03:35:00.000Z' } },
+    ]);
+    assert.equal(totalInputTokens(total.tokens), 4);
+    assert.equal(total.cost.usd, 0.05);
+    assert.deepEqual(total.span, { from: '2026-08-22T03:20:00.000Z', to: '2026-08-22T03:35:00.000Z' });
+  });
+
+  test('a pass where NO spawn reported tokens sums them to null, never a fabricated zero — the span survives', () => {
+    const total = sumUsage([
+      { span: { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:35:00.000Z' } },
+      { span: { from: '2026-08-22T03:31:00.000Z', to: '2026-08-22T03:40:00.000Z' } },
+    ]);
+    assert.equal(total.tokens, null);
+    assert.equal(total.cost, null);
+    assert.deepEqual(total.span, { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:40:00.000Z' });
+  });
 });
 
 // ── composeSummary ────────────────────────────────────────────────────────────────────────────

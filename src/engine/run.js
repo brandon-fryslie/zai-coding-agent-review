@@ -88,7 +88,9 @@ function formatOutputTail(label, value) {
 
 // [LAW:decomposition] Generic spawn runner: owns timeout, size-cap, and process lifecycle.
 // All engine-specific logic (args, env, success check, error classification) lives in the adapter.
-// Resolves with the child's captured stdout so the caller can extract usage/cost from it.
+// Resolves with { stdout, span }: the child's captured stdout so the caller can extract usage/cost
+// from it, and the spawn's wall-clock span ({ from, to }, ISO-8601 UTC) stamped by this module's
+// own clock — the one owner of the child's lifetime (zai-timing-31d.4).
 // [LAW:no-ambient-temporal-coupling] The per-invocation timeout is owned here, not in callers.
 // [LAW:effects-at-boundaries] This is the only place that spawns a child process.
 // cwd is the engine's working directory — an isolated scratch dir outside the reviewed repo tree
@@ -131,6 +133,16 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
     // is owned by the live-group registry + shutdown reaper above, so the engine dies with the
     // action on cancel/signal paths too.
     const posix = process.platform !== 'win32';
+    // [LAW:effects-at-boundaries] The spawn's clock is read HERE, in the one place that owns the
+    // child's whole lifetime — started at spawn, stopped in finish(), which runs on EVERY
+    // termination path. A spawn that failed after 200 seconds is the most interesting timing datum
+    // there is; a clock hung off the success path would throw it away. The stamped span rides the
+    // resolution as a value and every post-spawn rejection as err.span, so no outcome loses its
+    // duration. [LAW:one-source-of-truth] This is the single mint of the span — the caller derives
+    // the pricing instant from span.from rather than reading a second clock that could land on the
+    // other side of a rate boundary.
+    const startedAt = new Date();
+    let span = null;
     const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'], cwd, detached: posix });
     if (posix) {
       installShutdownReaper();
@@ -162,6 +174,9 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
     const finish = result => {
       if (settled) return;
       settled = true;
+      // The span closes at the settle — after 'close' proved the tree exited and released the
+      // pipes — so a killed spawn's duration includes the kill-to-exit tail it actually occupied.
+      span = { from: startedAt.toISOString(), to: new Date().toISOString() };
       clearTimeout(timeout);
       clearTimeout(escalation);
       liveEngineGroups.delete(child.pid);
@@ -174,6 +189,13 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
         label: `transcript-${config.name || adapter.name}-${process.hrtime.bigint().toString(36)}`,
       });
       result();
+    };
+    // [LAW:no-silent-failure] Every post-spawn rejection carries the span it burned: the duration
+    // of a failed spawn is diagnostics the callers upstream may surface, and the error object is
+    // the only vehicle that survives a rejection.
+    const fail = err => {
+      err.span = span;
+      reject(err);
     };
 
     // [LAW:no-ambient-temporal-coupling] A kill SETTLES NOTHING here: the timeout only signals the
@@ -207,7 +229,7 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
     child.stderr.on('data', chunk => { stderr = appendBounded(stderr, chunk, maxRetained).text; });
 
     child.on('error', err => {
-      finish(() => reject(adapter.classifyError(err, '')));
+      finish(() => fail(adapter.classifyError(err, '')));
     });
 
     child.on('close', code => {
@@ -223,7 +245,7 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
           // early close cancels the pending escalation, and outlive the settle into the cleanup —
           // the ENOTEMPTY/credit-burn hole again. Idempotent: ESRCH is the goal state.
           killTree('SIGKILL');
-          reject(deadlineBound
+          fail(deadlineBound
             ? new DeadlineExceededError(
               `${adapter.name} spawn killed: the review's time budget ran out mid-spawn. ${BUDGET_REMEDY}`,
             )
@@ -237,7 +259,7 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
             formatOutputTail('stderr tail', stderr),
             formatOutputTail('stdout tail', stdout),
           ].join('\n\n');
-          reject(adapter.classifyError(new Error(msg), `${stdout}\n${stderr}`));
+          fail(adapter.classifyError(new Error(msg), `${stdout}\n${stderr}`));
           return;
         }
         try {
@@ -256,9 +278,9 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
           // [LAW:dataflow-not-control-flow] The captured stdout is the engine's output value;
           // the caller derives usage/cost from it via the adapter's extractUsage. Findings
           // still flow out-of-band through the MCP collector — stdout carries only usage.
-          resolve(stdout);
+          resolve({ stdout, span });
         } catch (err) {
-          reject(adapter.classifyError(err, stdout));
+          fail(adapter.classifyError(err, stdout));
         }
       });
     });
