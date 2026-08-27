@@ -65,6 +65,17 @@ test('parseArgs rejects bad input loudly', () => {
   );
 });
 
+test('parseArgs keeps --config exclusive with the preset flags, and --use tied to --config', () => {
+  assert.equal(parseArgs(['--config', 'a.yml', '--use', 'mine']).use, 'mine');
+  assert.equal(parseArgs(['--config', 'a.yml']).use, undefined);
+  // [LAW:no-silent-failure] --config and the preset flags are two sources for the same facts;
+  // letting one silently win would leave the operator believing the loser took effect.
+  assert.throws(() => parseArgs(['--config', 'a.yml', '--model', 'm']), /--config is mutually exclusive with --model/);
+  assert.throws(() => parseArgs(['--config', 'a.yml', '--provider', 'zai']), /--config is mutually exclusive with --provider/);
+  assert.throws(() => parseArgs(['--config', 'a.yml', '--base-url', 'http://x']), /--config is mutually exclusive with --base-url/);
+  assert.throws(() => parseArgs(['--use', 'mine']), /--use selects a config from --config/);
+});
+
 // The default provider is 'auto', which ALIASES to a pinned provider — so the no-`--provider`
 // invocation is the COMMON way to reach the pinned case, not an exotic one. A guard that matched the
 // concrete name only would wave this through and silently drop the flag: the same silent failure,
