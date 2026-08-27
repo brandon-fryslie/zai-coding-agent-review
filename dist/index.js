@@ -38722,9 +38722,11 @@ const ANY_MARKER_RE = new RegExp(
 //
 // The figure is quantized to 6 decimal places, exactly as the legacy marker was, so the recorded
 // dollars stay byte-stable across a re-render. It is NOT what a later audit reprices from — that is
-// what `tokens` + `model` + the span are for, at full precision, all three being inputs to
-// `computeCostUsd` now that a rate varies by time of day — it is the figure this run believed at the
-// time, kept so a restatement can be compared against it.
+// what `tokens` and `model` are for, at full precision, together with an INSTANT the auditor draws
+// from the span, since `computeCostUsd` selects a rate from one instant and never from two ends —
+// which is also why a pass straddling a boundary reprices to a range rather than a figure. The
+// recorded dollars are what this run believed at the time, kept so a restatement can be compared
+// against it.
 // [LAW:single-enforcer] EVERY field is screened through the SAME predicate its reader uses — the
 // figure and each token class through `recordedQuantity`, each string fact through `recordedString`
 // — so the set of records this function can emit IS the set `parseCostRecord` accepts. A predicate
