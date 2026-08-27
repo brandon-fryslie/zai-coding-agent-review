@@ -370,3 +370,29 @@ test('resolveBaselineJsonPath does NOT refuse a shallow clone with only one base
     }
   });
 });
+
+test('resolveBaselineJsonPath does NOT refuse a shallow clone with an uncommitted baseline alongside committed ones — the uncommitted one already wins outright, nothing ambiguous', () => {
+  withTempGitRepo((source) => {
+    writeBaselineDir(source, '2026-08-01-committed-a');
+    commitAll(source, 'freeze a');
+    writeBaselineDir(source, '2026-08-02-committed-b');
+    commitAll(source, 'freeze b');
+
+    const shallow = fs.mkdtempSync(path.join(os.tmpdir(), 'compare-baseline-shallow-'));
+    const prevCwd = process.cwd();
+    try {
+      execFileSync('git', ['clone', '--depth', '1', `file://${source}`, shallow], { stdio: 'ignore' });
+      process.chdir(shallow);
+      // The two committed baselines are indistinguishable in this shallow clone (git reports the same
+      // boundary commit as the last to touch both) — but this uncommitted one is unconditionally newer
+      // than either, so the pick is NOT ambiguous despite there being three candidate dirs in a shallow
+      // clone. A blunt "more than one dir in a shallow clone ⇒ refuse" rule would wrongly refuse this.
+      writeBaselineDir(shallow, '2020-01-01-uncommitted');
+      const picked = resolveBaselineJsonPath(null, shallow);
+      assert.match(picked, /2020-01-01-uncommitted/);
+    } finally {
+      process.chdir(prevCwd);
+      fs.rmSync(shallow, { recursive: true, force: true });
+    }
+  });
+});

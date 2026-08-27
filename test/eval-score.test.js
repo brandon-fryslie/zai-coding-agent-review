@@ -7,6 +7,7 @@ const {
   normalizeBody, pairCandidates, computeMetrics, scoreRun, aggregateRuns, renderTable,
   makeLexicalJudge, jaccard, wordSet,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, loadCache,
+  requireLlmJudgeCredential,
 } = require('../eval/score');
 
 // [LAW:verifiable-goals] AC: the scorer reduces a run's findings.json + a case's expected.json to
@@ -409,6 +410,22 @@ test('loadCache returns {} when absent and aborts loudly on a corrupt or wrong-t
   fs.writeFileSync(f, '{"ck":{"match":true,"reason":"r"}}');
   assert.deepEqual(loadCache(f), { ck: { match: true, reason: 'r' } });
   fs.rmSync(f, { force: true });
+});
+
+// ── requireLlmJudgeCredential (the shared llm-matcher credential check) ──────────────────────────────
+
+test('requireLlmJudgeCredential returns the key when set, throws naming DEEPSEEK_API_KEY when absent', () => {
+  const prev = process.env.DEEPSEEK_API_KEY;
+  try {
+    process.env.DEEPSEEK_API_KEY = 'test-key-123';
+    assert.equal(requireLlmJudgeCredential(), 'test-key-123');
+
+    delete process.env.DEEPSEEK_API_KEY;
+    assert.throws(() => requireLlmJudgeCredential(), /DEEPSEEK_API_KEY/);
+  } finally {
+    if (prev === undefined) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = prev;
+  }
 });
 
 test('makeLlmJudge surfaces a non-200 loudly', async () => {

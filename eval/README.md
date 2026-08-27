@@ -401,12 +401,22 @@ is simply the code as checked out; no build or publish) against a frozen baselin
 
 ```bash
 DEEPSEEK_API_KEY=… node eval/compare.js
-# options: --baseline <dir|baseline.json> (default: newest under eval/baseline/),
-#          --matcher llm|lexical (default llm; MUST match the baseline's matcher),
-#          --out <dir> (default eval/out/candidate-<ts>, git-ignored),
+# options: --baseline <dir|baseline.json> (default: newest under eval/baseline/ by COMMIT-GRAPH order,
+#            not directory-name order — an uncommitted baseline.json always outranks a committed one;
+#            refused if the newest can't be determined unambiguously, e.g. a shallow git clone with
+#            more than one candidate),
+#          --matcher llm|lexical (default llm; MUST match the baseline's matcher; IGNORED under
+#            --reuse-candidate, where the reused summaries' own recorded matcher is checked instead),
+#          --out <dir> (default eval/out/candidate-<ts>, git-ignored; mutually exclusive with
+#            --reuse-candidate; refused if it already holds run artifacts for a case),
 #          --workers <N> (default 4), --cases-dir <dir>, --cache <file>,
-#          --reuse-candidate <dir> (gate an already-produced candidate root; no replay, no spend)
+#          --reuse-candidate <dir> (gate an already-produced candidate root; no replay, no spend;
+#            mutually exclusive with --out)
 ```
+
+DEEPSEEK_API_KEY is required **unconditionally** for the default `--matcher llm` (the judge's own
+credential), regardless of which provider the baseline's pinned engine itself uses — pass
+`--matcher lexical` to avoid it.
 
 **A candidate is just another suite.** `compare.js` reimplements no pooling, no scoring, and no
 gate predicate — it:

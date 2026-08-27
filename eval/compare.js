@@ -37,23 +37,33 @@ suite N times, score it, and print a DEGRADED / OK / IMPROVED verdict. Non-zero 
 Usage: DEEPSEEK_API_KEY=… node eval/compare.js [options]
 
   --baseline <path>      Frozen baseline dir (or its baseline.json) to gate against. Default: the newest
-                         committed baseline under eval/baseline/. N, engine, and matcher come FROM it.
+                         committed baseline under eval/baseline/, by commit-graph order — NOT directory-name
+                         order, and an uncommitted baseline.json always outranks a committed one. Refused
+                         (exit 2) if the newest can't be determined unambiguously (e.g. a shallow git clone
+                         with more than one candidate); pass --baseline explicitly in that case. N, engine,
+                         and matcher come FROM whichever baseline is resolved.
   --matcher <kind>       Semantic matcher for scoring the candidate: 'llm' (default) or 'lexical'. MUST
                          match the baseline's matcher, or the recall numbers aren't comparable — refused
-                         up front, before any spend.
+                         up front, before any spend. IGNORED under --reuse-candidate (no scoring runs in
+                         that mode; the reused summaries' own recorded matcher is what's checked instead).
   --out <dir>            Candidate artifact root (default: eval/out/candidate-<ts>, git-ignored). Kept
-                         isolated from the baseline's own run artifacts under eval/out/<case>/.
+                         isolated from the baseline's own run artifacts under eval/out/<case>/. Mutually
+                         exclusive with --reuse-candidate (refused if both are passed). If it names an
+                         existing root with prior run artifacts for a baseline case, refused rather than
+                         silently blending old and new runs into one summary.
   --workers <N>          Max concurrent scope workers per replay (default: 4), forwarded to run-case.js.
   --cases-dir <dir>      Where the frozen golden cases live (default: eval/cases).
   --cache <file>         Judge-decision cache, forwarded to score.js (default: eval/out/.judge-cache.json).
   --reuse-candidate <d>  Skip the replay+score entirely and gate an ALREADY-produced candidate root <d>
                          (one <case>/scorecard-summary.json per baseline case). For re-rendering a verdict
-                         or validating the gate without re-spending.
+                         or validating the gate without re-spending. Mutually exclusive with --out.
   --help                 Show this help.
 
 The candidate always runs at the baseline's N and pinned engine (a replay at a different N/engine would
 measure something else). Estimated cost is printed up front. Reads the provider credential from the same
-env var the action uses (DEEPSEEK_API_KEY / ZAI_API_KEY / OPENAI_API_KEY), per the case's pinned provider.
+env var the action uses (DEEPSEEK_API_KEY / ZAI_API_KEY / OPENAI_API_KEY), per the case's pinned provider —
+PLUS, unconditionally, DEEPSEEK_API_KEY for the default '--matcher llm' judge, regardless of which provider
+the pinned engine itself uses (pass --matcher lexical to avoid this second credential).
 `;
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -333,13 +343,16 @@ function isShallowRepo(gitCwd) {
 // position in the commit GRAPH instead (commitOrder/lastCommitRank): unambiguous even for same-second
 // commits, since a child's parent pointer fixes order regardless of clock resolution. An UNCOMMITTED
 // baseline.json (rank null — no commit touches it yet, the exact "just froze it, about to gate" moment)
-// ranks as MORE recent than even the latest real commit, not less: a bare `|| ''`-style fallback would sort
-// it as older than everything, silently gating a freshly-frozen baseline against a stale committed one with
-// no error. In a SHALLOW clone (actions/checkout's default fetch-depth: 1), commitOrder only sees the one
-// checked-out commit, so every real baseline's rank resolves to null — indistinguishable from uncommitted —
-// and picking among two or more would silently degrade back to the same arbitrary name-sort this function's
-// history was built to eliminate. Refused explicitly instead: a wrong SILENT pick is worse than a loud stop
-// naming the fix. [LAW:no-silent-failure]
+// ranks as MORE recent than even the latest real commit, not less.
+//
+// A GENUINE TIE between the top two ranked candidates — including the shallow-clone case (actions/
+// checkout's default fetch-depth: 1 truncates history to the boundary commit; git then reports THAT one
+// commit as the last to touch every path present in its tree, verified empirically, so every real baseline
+// ties at the same rank) — is refused outright rather than resolved by name order: a wrong SILENT pick is
+// worse than a loud stop naming the fix. This is deliberately NOT a raw "more than one committed baseline"
+// gate: that over-refuses a fully decidable case (one candidate genuinely uncommitted among several
+// committed ones already wins outright, tying with nothing) purely because more than one dir happens to
+// exist. Rank first, refuse only an actual tie. [LAW:no-silent-failure]
 function resolveBaselineJsonPath(arg, gitCwd = __dirname) {
   if (arg) {
     const resolved = path.resolve(arg);
@@ -354,20 +367,20 @@ function resolveBaselineJsonPath(arg, gitCwd = __dirname) {
     .filter(e => e.isDirectory() && fs.existsSync(path.join(root, e.name, 'baseline.json')))
     .map(e => e.name);
   if (dirNames.length === 0) throw new Error(`No committed baseline (a dir with baseline.json) under ${root}.`);
-  if (dirNames.length > 1 && isShallowRepo(gitCwd)) {
-    throw new Error(`Cannot pick the newest of ${dirNames.length} committed baselines under ${root}: this is a shallow git clone, so the commit-history tie-break has no real history to rank them by. Run 'git fetch --unshallow' first, or name the one to use explicitly with --baseline.`);
-  }
   const order = commitOrder(gitCwd);
+  const rankKey = (rank) => (rank === null ? -1 : rank); // uncommitted (-1) ranks before even the newest real commit (0)
   const candidates = dirNames
     .map((name) => {
       const jsonPath = path.join(root, name, 'baseline.json');
       return { name, jsonPath, rank: lastCommitRank(jsonPath, gitCwd, order) };
     })
-    .sort((a, b) => {
-      const key = (c) => (c.rank === null ? -1 : c.rank); // uncommitted (-1) ranks before even the newest real commit (0)
-      if (key(a) !== key(b)) return key(a) - key(b); // ascending: index 0 (most recent) sorts first
-      return b.name.localeCompare(a.name); // last-resort tie among mutually-unresolvable dirs
-    });
+    .sort((a, b) => rankKey(a.rank) - rankKey(b.rank)); // ascending: index 0 (most recent) sorts first
+  if (candidates.length > 1 && rankKey(candidates[0].rank) === rankKey(candidates[1].rank)) {
+    const shallowHint = isShallowRepo(gitCwd)
+      ? `this is a shallow git clone, so the commit-history tie-break has no real history to rank them by — run 'git fetch --unshallow' first, or `
+      : '';
+    throw new Error(`Cannot pick the newest committed baseline under ${root}: '${candidates[0].name}' and '${candidates[1].name}' tie (${shallowHint}name --baseline explicitly to disambiguate).`);
+  }
   return candidates[0].jsonPath;
 }
 
@@ -446,6 +459,7 @@ function main() {
     const mustFindCountsByCase = {};
     for (const { case: name } of baseline.cases) {
       const expectedPath = path.join(casesDir, name, 'expected.json');
+      if (!fs.existsSync(expectedPath)) throw new Error(`Baseline case '${name}' has no frozen case at ${path.join(casesDir, name)} — cannot replay it.`);
       const expected = parseExpected(fs.readFileSync(expectedPath, 'utf8'), expectedPath);
       mustFindCountsByCase[name] = expected.findings.filter(f => f.annotation === 'must-find').length;
     }
@@ -484,14 +498,33 @@ function main() {
   process.stderr.write(`  gate floor ${pct(baseline.pooledInventoryMustFind.gateFloor)} (baseline pooled ${pct(baseline.pooledInventoryMustFind.rate)}, ${baseline.pooledInventoryMustFind.found}/${baseline.pooledInventoryMustFind.opportunities})\n`);
 
   if (opts.reuseCandidate) {
-    process.stderr.write(`\nReusing candidate artifacts under ${candidateRoot} (no replay, no spend).\n`);
+    // --matcher (default 'llm' even when never passed) has no effect in this branch: no scoring runs here,
+    // and compareVerdict checks the reused summaries' ACTUAL recorded matcher, not opts.matcher. Loud about
+    // it rather than a silent no-op, the same reasoning that made --out + --reuse-candidate an outright
+    // refusal above — except here there's a principled winner (the reused data), just not the flag's value.
+    process.stderr.write(`\nReusing candidate artifacts under ${candidateRoot} (no replay, no spend). --matcher is ignored in this mode — the reused summaries' own recorded matcher is what's checked.\n`);
   } else {
-    // 5. COST GUARDRAIL — print the estimate up front, before spending. [LAW:verifiable-goals]
+    // 5. Refuse a non-fresh --out: run-case.js is append-only (never cleans <out>/<case>/) and score.js's
+    //    findRunDirs pools EVERY run dir under a case's output root — stale, fresh, whichever — into one
+    //    scorecard-summary.json. Reusing an --out that already has a case's run artifacts would silently
+    //    blend runs from two different working-tree states into a single candidate summary, with no error
+    //    (and possibly no N mismatch either, if the counts happen to add up). The default --out is always a
+    //    fresh timestamped path, so this only fires when --out is passed explicitly at an existing location.
+    for (const { case: name } of baseline.cases) {
+      const caseOutDir = path.join(candidateRoot, name);
+      const hasRunDirs = fs.existsSync(caseOutDir) && fs.readdirSync(caseOutDir, { withFileTypes: true })
+        .some(e => e.isDirectory() && fs.existsSync(path.join(caseOutDir, e.name, 'findings.json')));
+      if (hasRunDirs) {
+        throw new Error(`--out ${candidateRoot} already has run artifacts for case '${name}' at ${caseOutDir} — run-case.js is append-only and would blend them with fresh runs into one summary. Pick a fresh --out, or remove ${caseOutDir} first.`);
+      }
+    }
+
+    // 6. COST GUARDRAIL — print the estimate up front, before spending. [LAW:verifiable-goals]
     const estUsd = estimateCandidateCostUsd(rawBaselineSuite, repeats);
     process.stderr.write(`\nAbout to replay ${baseline.cases.length} case(s) × N=${repeats} against the WORKING TREE, then score.\n`);
     process.stderr.write(`Estimated cost ≈ ${estUsd === null ? 'unknown (baseline recorded no per-run cost)' : `$${estUsd.toFixed(2)}`} (from the baseline's recorded $/full-run × N). Actual varies with model stochasticity.\n\n`);
 
-    // 6. Replay + score each baseline case into the candidate root. Iterate the BASELINE's case set so the
+    // 7. Replay + score each baseline case into the candidate root. Iterate the BASELINE's case set so the
     //    candidate covers exactly it (an added-since golden case can't be gated — the baseline doesn't cover
     //    it). Every pre-spend guard above already ran as a full pass over this same set, so nothing here
     //    re-checks case.json existence or the engine pin.
@@ -504,7 +537,7 @@ function main() {
     }
   }
 
-  // 6. Reduce the candidate's scored summaries into a suite with the SAME buildBaseline the frozen baseline
+  // 8. Reduce the candidate's scored summaries into a suite with the SAME buildBaseline the frozen baseline
   //    used — producer and comparator can't drift. Read each case's summary + its pinned engine, exactly as
   //    baseline.js's main() does.
   const { sha: candidateSha, dirty } = gitShaAndDirty();
@@ -518,7 +551,7 @@ function main() {
   });
   const candidateSuite = buildBaseline({ cases: candidateCases, provenance: { sha: candidateSha || 'working-tree', date: new Date().toISOString().slice(0, 10) } });
 
-  // 7. THE VERDICT.
+  // 9. THE VERDICT.
   const verdict = compareVerdict(baseline, candidateSuite);
   const cost = {
     baselinePerRun: rawBaselineSuite ? rawBaselineSuite.costPerFullRunUsd ?? null : null,
