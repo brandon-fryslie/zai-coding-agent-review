@@ -95,9 +95,17 @@ assertPresetsSafe(PRESETS);
 // that turns the simple-mode (no CONFIG_FILE) action inputs into a typed ReviewConfig.
 //
 // [LAW:one-source-of-truth] Each provider spec names its engine, its endpoint PRESET, credential
-// input, default model, and how to pull its fields from the flat action-input bag. Adding a provider
+// input, default model, and which action-input KEY each of its fields arrives under. Adding a provider
 // is one entry here — every consumer (validation, error messages, config synthesis) derives
 // from this table, so none of them branches on a hardcoded provider name.
+//
+// `inputKeys` is DATA, not a closure, because the mapping is read in BOTH directions:
+// synthesizeProviderConfig pulls a bag apart with it, and resolveProviderConfig assembles one with it.
+// It used to be a per-row `fields: i => ({...})` reader, which meant every caller that had to BUILD a
+// bag hand-wrote the same key names again — scripts/local-review.js and eval/run-case.js each carried
+// a copy, and the eval copy never grew the subscription's keys when 1.42.0 retargeted `auto`, so the
+// measurement harness could not reach the provider production actually runs on. A name declared once
+// cannot drift from itself.
 //
 // Each provider has its OWN credential input. That is the other half of the security invariant: the
 // PROVIDER value alone selects the row, credential presence never steers it, so a DeepSeek key can
@@ -108,37 +116,44 @@ const PROVIDERS = {
     preset: 'openai',
     credentialInput: 'OPENAI_API_KEY',
     defaultModel: 'gpt-5.4-mini',
-    fields: i => ({ credential: i.openaiApiKey, model: i.openaiModel, reasoning: i.openaiReasoning, baseUrl: i.openaiBaseUrl }),
+    inputKeys: { credential: 'openaiApiKey', model: 'openaiModel', reasoning: 'openaiReasoning', baseUrl: 'openaiBaseUrl' },
   },
   zai: {
     engine: 'claude-code',
     preset: 'zai',
     credentialInput: 'ZAI_API_KEY',
     defaultModel: 'glm-5.1',
-    fields: i => ({ credential: i.zaiApiKey, model: i.zaiModel, systemPrompt: i.zaiSystemPrompt, baseUrl: i.zaiBaseUrl }),
+    inputKeys: { credential: 'zaiApiKey', model: 'zaiModel', systemPrompt: 'zaiSystemPrompt', baseUrl: 'zaiBaseUrl' },
   },
   deepseek: {
     engine: 'claude-code',
     preset: 'deepseek',
     credentialInput: 'DEEPSEEK_API_KEY',
     defaultModel: 'deepseek-v4-pro',
-    fields: i => ({ credential: i.deepseekApiKey, model: i.deepseekModel, systemPrompt: i.deepseekSystemPrompt, baseUrl: i.deepseekBaseUrl }),
+    inputKeys: { credential: 'deepseekApiKey', model: 'deepseekModel', systemPrompt: 'deepseekSystemPrompt', baseUrl: 'deepseekBaseUrl' },
   },
   // Claude Pro/Max subscription: the same claude-code engine as zai/deepseek, reached with a
-  // long-lived OAuth token instead of an API key. `fields` reads NO base-URL input — there is no
-  // CLAUDE_BASE_URL for it to read — so the preset's pinned host stands.
+  // long-lived OAuth token instead of an API key. It declares NO baseUrl key — there is no
+  // CLAUDE_BASE_URL for it to read — so the preset's pinned host stands, in both directions:
+  // nothing can be read out of a bag, and resolveProviderConfig writes nothing into one.
   'claude-subscription': {
     engine: 'claude-code',
     preset: 'claude-subscription',
     credentialInput: 'CLAUDE_CODE_OAUTH_TOKEN',
     defaultModel: CLAUDE_SUBSCRIPTION_DEFAULT_MODEL,
-    fields: i => ({ credential: i.claudeCodeOauthToken, model: i.claudeModel }),
+    inputKeys: { credential: 'claudeCodeOauthToken', model: 'claudeModel' },
   },
 };
 
+// A provider name with no row. [LAW:dataflow-not-control-flow] An absent spec is an EMPTY spec, not a
+// branch: reading fields off it yields undefined for every field and writing a bag from it writes no
+// keys, so both directions run the same code on a bad name as on a good one — and the one canonical
+// "Unknown PROVIDER" error still comes from synthesizeProviderConfig, which owns that diagnosis.
+const NO_PROVIDER = Object.freeze({ credentialInput: '', inputKeys: Object.freeze({}) });
+
 // [LAW:single-enforcer] PROVIDERS carries the SAME security-critical routing as PRESETS: `preset`
-// picks which endpoint row a credential is sent to, and `fields` is the closure that pulls that
-// credential out of the input bag. Freezing one table and not the other would leave the invariant
+// picks which endpoint row a credential is sent to, and `inputKeys.credential` names the bag key that
+// credential is pulled from. Freezing one table and not the other would leave the invariant
 // half-held — `PROVIDERS['claude-subscription'].preset = 'openai'` is as good as repointing the
 // pinned host. It validates first, for the same reason assertPresetsSafe does: the guarantee is
 // "validated AND unchanged since", which is one fact and wants one enforcer.
@@ -149,6 +164,14 @@ function assertProvidersSafe(providers, presets) {
         `Provider '${name}': names preset '${spec.preset}', which is not defined. Defined: ${Object.keys(presets).join(', ')}.`,
       );
     }
+    // A row with no credential key is a row whose credential can never be read out of an input bag —
+    // synthesizeProviderConfig would reject every call to it as "credential not set", with a message
+    // naming an input nothing writes. Refuse it at load, where the table is, not per run.
+    // [LAW:no-silent-failure]
+    if (typeof spec.inputKeys?.credential !== 'string' || spec.inputKeys.credential === '') {
+      throw new Error(`Provider '${name}': 'inputKeys.credential' must name the action input its credential arrives under.`);
+    }
+    Object.freeze(spec.inputKeys);
     Object.freeze(spec);
   }
   return Object.freeze(providers);
@@ -193,6 +216,31 @@ const PROVIDER_ALIASES = Object.freeze({ auto: 'claude-subscription' });
 // matters only for the "valid providers" message in the unknown-PROVIDER error.
 const PROVIDER_NAMES = [...Object.keys(PROVIDERS), ...Object.keys(PROVIDER_ALIASES)];
 
+// [LAW:effects-at-boundaries] Pure: read one provider's fields out of the flat action-input bag, under
+// the key names its row declares. A field the row does not declare is simply absent — a subscription
+// spec names no baseUrl key, so no baseUrl can be read for it whatever the bag happens to contain.
+function readProviderFields(spec, inputs) {
+  const fields = {};
+  for (const [field, key] of Object.entries(spec.inputKeys)) fields[field] = inputs[key];
+  return fields;
+}
+
+// [LAW:decomposition] One job: resolve a provider name plus overrides into a ReviewConfig, reading the
+// provider's credential from the environment. This is the seam every NON-ACTION entry point uses —
+// scripts/local-review.js and eval/run-case.js — so the flat input bag, which is an artifact of the
+// ACTION's interface, is constructed in exactly one place instead of hand-written at each of them.
+// [LAW:one-source-of-truth] The bag those two used to build by hand had already drifted apart; this is
+// the seam whose absence let it. An overriding `model`/`baseUrl` of undefined leaves the row's own
+// default standing, exactly as an unset action input does.
+// [LAW:effects-at-boundaries] `env` is a parameter, not a read of process.env, so this stays pure.
+function resolveProviderConfig({ provider, model, reasoning, baseUrl, systemPrompt, env }, reg) {
+  const spec = PROVIDERS[PROVIDER_ALIASES[provider] || provider] || NO_PROVIDER;
+  const values = { credential: env[spec.credentialInput], model, reasoning, baseUrl, systemPrompt };
+  const inputs = { provider };
+  for (const [field, key] of Object.entries(spec.inputKeys)) inputs[key] = values[field];
+  return synthesizeProviderConfig(inputs, reg);
+}
+
 // [LAW:effects-at-boundaries] Pure: maps inputs to a ReviewConfig, touches nothing external.
 // [LAW:no-silent-failure] Throws — naming the input to fix — when the provider is unknown,
 // the selected provider's credential is absent, or the reasoning effort is unsupported.
@@ -210,7 +258,7 @@ function synthesizeProviderConfig(inputs, reg) {
     );
   }
 
-  const f = spec.fields(inputs);
+  const f = readProviderFields(spec, inputs);
 
   // [LAW:no-silent-failure] When 'auto' was used, name both it and what it resolved to so the
   // operator knows which input to set.
@@ -255,6 +303,7 @@ function synthesizeProviderConfig(inputs, reg) {
 
 module.exports = {
   synthesizeProviderConfig,
+  resolveProviderConfig,
   PROVIDERS,
   PROVIDER_ALIASES,
   PROVIDER_NAMES,

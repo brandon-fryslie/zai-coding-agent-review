@@ -71,15 +71,21 @@ jobs:
 
       - name: Gate the candidate against the frozen baseline
         env:
-          # Every credential a golden case's pinned provider can use (deepseek/zai/openai — the set
-          # run-case.js's buildProviderInputs wires; CLAUDE_CODE_OAUTH_TOKEN is deliberately not
-          # among them) is forwarded; each case's pin selects which one is actually read, so
-          # re-freezing the baseline onto another of these providers is a data change in eval/ —
-          # this workflow needs no edit. DEEPSEEK_API_KEY also serves the default llm matcher's
-          # judge (score.js reads it unconditionally for that).
+          # Every credential a golden case's pinned provider can use — the set src/provider.js
+          # declares, which the runner now reads through resolveProviderConfig rather than a private
+          # copy. Each case's pin selects which one is actually read, so re-freezing the baseline onto
+          # another of these providers is a data change in eval/ and this workflow needs no edit.
+          # CLAUDE_CODE_OAUTH_TOKEN used to be omitted here on the grounds that the runner could not
+          # reach it; that was true, and it was the bug — it is the credential PROVIDER=auto resolves
+          # to, so its absence made the gate unable to measure the engine production runs.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # The judge's own credential, required unconditionally for the default llm matcher whatever
+          # the cases pin (score.js). Separate from the engine's on purpose: a subscription OAuth token
+          # authenticates the review CLI, not the raw Messages call the judge makes.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         # A fixed --out (not compare.js's timestamped default) so the summary and artifact steps
         # below address the same path without plumbing an output between steps; the runner's
         # workspace is fresh per job, so compare.js's stale-artifact refusal can never fire on it.

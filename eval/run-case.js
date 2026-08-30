@@ -16,8 +16,9 @@
 //
 //   node eval/run-case.js <case-dir> [-n <repeats>] [--out <dir>] [--workers <N>]
 //
-// The provider credential is read from the same env var the action uses (DEEPSEEK_API_KEY /
-// ZAI_API_KEY / OPENAI_API_KEY, selected by the case's pinned provider). See --help.
+// The provider credential is read from the same env var the action uses (CLAUDE_CODE_OAUTH_TOKEN /
+// DEEPSEEK_API_KEY / ZAI_API_KEY / OPENAI_API_KEY, selected by the case's pinned provider — the
+// mapping is src/provider.js's, not a copy). See --help.
 //
 // [LAW:effects-at-boundaries] Module load is PURE: only stdlib + pure helpers. Every world-effect
 // (temp dirs, env mutation, tar, IO) and every engine-stack require lives inside main(), the entry
@@ -143,25 +144,26 @@ function parseCaseManifest(raw, caseDir) {
   };
 }
 
-// [LAW:effects-at-boundaries] Pure: map the pinned engine + an env bag into the input shape
-// synthesizeProviderConfig consumes. This mirrors scripts/local-review.js's resolveConfig exactly —
-// each provider's credential is read from ITS OWN env var, and the pinned model is set under every
-// provider's model key so whichever provider synth selects reads the pin. env is passed in (not read
-// from process.env) so this stays pure and testable.
-function buildProviderInputs(engine, env) {
-  return {
-    provider: engine.provider,
-    openaiApiKey: env.OPENAI_API_KEY, openaiModel: engine.model, openaiReasoning: engine.reasoning || undefined,
-    zaiApiKey: env.ZAI_API_KEY, zaiModel: engine.model,
-    deepseekApiKey: env.DEEPSEEK_API_KEY, deepseekModel: engine.model,
-  };
+// [LAW:parse-dont-validate] THE checkpoint a replay's engine config crosses: a pinned engine plus an
+// environment go in, and what comes out is a ReviewConfig *proven* to match the pin — so no caller can
+// hold an unverified one. Resolution itself is delegated to src/provider.js's resolveProviderConfig,
+// the one seam that owns which env var and which input key each provider's credential and model travel
+// under. [LAW:one-source-of-truth] This file used to hand-build that input bag, and the hand-built copy
+// listed only openai/zai/deepseek keys — so when 1.42.0 retargeted `auto` to claude-subscription, the
+// harness measuring review quality was structurally unable to run the provider production runs on. The
+// bag is not rebuilt here at any price; that is the whole defect.
+// [LAW:effects-at-boundaries] env is a parameter, not a read of process.env, so this stays testable.
+function resolvePinnedConfig(engine, env, reg) {
+  const { resolveProviderConfig } = require('../src/provider');
+  return assertConfigMatchesPin(
+    resolveProviderConfig({ provider: engine.provider, model: engine.model, reasoning: engine.reasoning || undefined, env }, reg),
+    engine,
+  );
 }
 
-// [LAW:parse-dont-validate] The pin-verification checkpoint: a resolved ReviewConfig is only accepted
-// once proven to match the case's pin. It returns the config so every caller obtains its config THROUGH
-// this gate — there is no path to an unverified config. [LAW:no-silent-failure] A drift (the provider
-// default moved, or the pin names a model/reasoning the provider can't carry) is refused loudly, naming
-// both values, because a replay on anything but the pinned engine corrupts baseline comparison.
+// [LAW:no-silent-failure] The pin comparison itself. A drift (the provider default moved, or the pin
+// names a model/reasoning the provider can't carry) is refused loudly, naming both values, because a
+// replay on anything but the pinned engine corrupts baseline comparison.
 function assertConfigMatchesPin(config, engine) {
   if (config.model !== engine.model) {
     throw new Error(
@@ -288,13 +290,10 @@ async function main() {
   try {
     // [LAW:parse-dont-validate] Resolve + verify the pinned config before any expensive work, so a missing
     // credential (thrown by synthesizeProviderConfig, naming the input) or a model-pin mismatch reds the run
-    // immediately. These src requires are lazy (not at module load) so importing this file for the pure-helper
-    // tests loads no engine stack; RUNNER_TEMP is already set above, so debug's TRANSCRIPT_DIR is correct.
-    const { synthesizeProviderConfig } = require('../src/provider');
-    const config = assertConfigMatchesPin(
-      synthesizeProviderConfig(buildProviderInputs(manifest.engine, process.env)),
-      manifest.engine,
-    );
+    // immediately. The src requires inside are lazy (not at module load) so importing this file for the
+    // pure-helper tests loads no engine stack; RUNNER_TEMP is already set above, so debug's TRANSCRIPT_DIR
+    // is correct.
+    const config = resolvePinnedConfig(manifest.engine, process.env);
     const { TRANSCRIPT_DIR } = require('../src/debug');
     const { runMultiScope } = require('../src/multiscope');
     const { defaultEffortProfile } = require('../src/effort');
@@ -370,4 +369,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, parseCaseManifest, buildProviderInputs, assertConfigMatchesPin, runDirName, buildCaseMaterial };
+module.exports = { parseArgs, parseCaseManifest, resolvePinnedConfig, assertConfigMatchesPin, runDirName, buildCaseMaterial };

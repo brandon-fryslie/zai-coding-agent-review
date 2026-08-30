@@ -414,17 +414,34 @@ test('loadCache returns {} when absent and aborts loudly on a corrupt or wrong-t
 
 // ── requireLlmJudgeCredential (the shared llm-matcher credential check) ──────────────────────────────
 
-test('requireLlmJudgeCredential returns the key when set, throws naming DEEPSEEK_API_KEY when absent', () => {
-  const prev = process.env.DEEPSEEK_API_KEY;
+test('requireLlmJudgeCredential returns the key when set, throws naming ANTHROPIC_API_KEY when absent', () => {
+  const prev = process.env.ANTHROPIC_API_KEY;
   try {
-    process.env.DEEPSEEK_API_KEY = 'test-key-123';
+    process.env.ANTHROPIC_API_KEY = 'test-key-123';
     assert.equal(requireLlmJudgeCredential(), 'test-key-123');
 
-    delete process.env.DEEPSEEK_API_KEY;
-    assert.throws(() => requireLlmJudgeCredential(), /DEEPSEEK_API_KEY/);
+    delete process.env.ANTHROPIC_API_KEY;
+    assert.throws(() => requireLlmJudgeCredential(), /ANTHROPIC_API_KEY/);
   } finally {
-    if (prev === undefined) delete process.env.DEEPSEEK_API_KEY;
-    else process.env.DEEPSEEK_API_KEY = prev;
+    if (prev === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prev;
+  }
+});
+
+// The judge's credential must NOT be the engine's. A judge that read whatever the reviewed provider
+// reads would move with the thing it measures — and, concretely, a case pinned to the subscription
+// supplies an OAuth token that is not a usable API key for a raw Messages call. [LAW:one-source-of-truth]
+test('requireLlmJudgeCredential does not fall back to any engine credential', () => {
+  const saved = { ...process.env };
+  try {
+    delete process.env.ANTHROPIC_API_KEY;
+    for (const k of ['DEEPSEEK_API_KEY', 'ZAI_API_KEY', 'OPENAI_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN']) process.env[k] = 'engine-credential';
+    assert.throws(() => requireLlmJudgeCredential(), /ANTHROPIC_API_KEY/);
+  } finally {
+    for (const k of ['ANTHROPIC_API_KEY', 'DEEPSEEK_API_KEY', 'ZAI_API_KEY', 'OPENAI_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN']) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
   }
 });
 

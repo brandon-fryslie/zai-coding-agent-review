@@ -329,9 +329,11 @@ describe('PROVIDERS rows agree with the real adapter capabilities', () => {
     // they did not. [LAW:no-silent-failure]
     test(`'${name}': reads a base-URL input only if its preset allows an override`, () => {
       const preset = PRESETS[spec.preset];
-      const reads = spec.fields({ openaiBaseUrl: 'X', zaiBaseUrl: 'X', deepseekBaseUrl: 'X' }).baseUrl;
       if ('baseUrl' in preset) {
-        assert.equal(reads, undefined, `pinned preset '${spec.preset}' must not read a base-URL input`);
+        assert.ok(
+          !('baseUrl' in spec.inputKeys),
+          `pinned preset '${spec.preset}' must not declare a base-URL input key`,
+        );
       }
     });
   }

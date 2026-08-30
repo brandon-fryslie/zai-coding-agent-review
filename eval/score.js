@@ -23,7 +23,7 @@
 // first scoring populates a content-keyed cache; every later scoring reads it, so the judge is never
 // re-consulted for a pair it has already ruled on. [LAW:one-source-of-truth]
 //
-//   DEEPSEEK_API_KEY=… node eval/score.js <case-out-dir> [--matcher llm|lexical] [--cases-dir <dir>]
+//   ANTHROPIC_API_KEY=… node eval/score.js <case-out-dir> [--matcher llm|lexical] [--cases-dir <dir>]
 //
 // [LAW:effects-at-boundaries] Module load is PURE: only stdlib. Every world-effect (fs, fetch, env) lives
 // inside main() or the boundary judge, so importing this file for the pure-helper tests performs no IO and
@@ -34,19 +34,29 @@ const path = require('path');
 const crypto = require('crypto');
 
 // The judge is the SCORER'S OWN measurement instrument, pinned independently of whatever engine a case
-// replayed on, so a score means the same thing across every case. The DeepSeek Anthropic-compatible
-// Messages endpoint + a cheap model; credential from the same env var the action uses. Kept local (not
-// imported from src/provider.js) because this is the instrument's config, a concern the scorer owns, not
-// the reviewed engine's. [LAW:decomposition]
-const JUDGE_BASE_URL = 'https://api.deepseek.com/anthropic';
-const JUDGE_MODEL = 'deepseek-v4-flash';
-// The single place DEEPSEEK_API_KEY is read for the 'llm' matcher's credential — main() below and
+// replayed on, so a score means the same thing across every case — and, critically, so a change to the
+// engine under test cannot move the ruler measuring it. Anthropic's own Messages API + a cheap DATED
+// model snapshot: a snapshot id, not a floating alias, because an alias that silently rolls to a new
+// model would re-point the instrument between a baseline freeze and the candidate compared against it.
+// Kept local (not imported from src/provider.js) because this is the instrument's config, a concern the
+// scorer owns, not the reviewed engine's. [LAW:decomposition]
+//
+// Was DeepSeek (deepseek-v4-flash) through 2026-08. Moved off it when that account went to a hard 402
+// and the provider left the engine's live set: a judge nobody can call is not an instrument, and a
+// baseline is worthless if its scores cannot be reproduced. [LAW:one-source-of-truth] The cache key
+// hashes JUDGE_MODEL (judgeCacheKey below), so this move invalidates every ruling made by the old judge
+// rather than silently mixing two judges' verdicts in one scorecard.
+const JUDGE_BASE_URL = 'https://api.anthropic.com';
+const JUDGE_MODEL = 'claude-haiku-4-5-20251001';
+// The single place ANTHROPIC_API_KEY is read for the 'llm' matcher's credential — main() below and
 // compare.js's pre-loop guard (checking "would scoring succeed" before any replay spend) both call this,
 // so the requirement can't drift into two independently-typed checks of the same env var.
-// [LAW:one-source-of-truth]
+// [LAW:one-source-of-truth] Deliberately NOT the engine's credential: an api-key judge stays callable
+// and identically-priced whichever provider a case pins, including a subscription one whose OAuth token
+// is valid for the CLI's own calls and nothing else.
 function requireLlmJudgeCredential() {
-  const apiKey = process.env.DEEPSEEK_API_KEY;
-  if (!apiKey) throw new Error('The llm matcher needs DEEPSEEK_API_KEY (or pass --matcher lexical for the offline fallback).');
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error('The llm matcher needs ANTHROPIC_API_KEY (or pass --matcher lexical for the offline fallback).');
   return apiKey;
 }
 // The exact matcher label a scorecard-summary.json's `matcher` field carries for a given --matcher kind —
@@ -77,11 +87,11 @@ const ANNOTATIONS = new Set(['must-find', 'nice-to-find', 'noise']);
 const USAGE = `Score a case's replay artifacts against its frozen expected inventory: must-find recall
 (the primary gate number), plus nice-to-find recall, noise count, and cost (secondary).
 
-Usage: DEEPSEEK_API_KEY=… node eval/score.js <case-out-dir> [options]
+Usage: ANTHROPIC_API_KEY=… node eval/score.js <case-out-dir> [options]
 
   <case-out-dir>       A case's output root under eval/out (e.g. eval/out/cc-candybar-150-transcript-perf).
                        Every run dir under it (a dir containing findings.json) is scored.
-  --matcher <kind>     Semantic matcher: 'llm' (default, DeepSeek judge + cache) or 'lexical' (offline,
+  --matcher <kind>     Semantic matcher: 'llm' (default, pinned Anthropic judge + cache) or 'lexical' (offline,
                        deterministic word-overlap — no network, no credential).
   --cases-dir <dir>    Where the frozen cases live (default: eval/cases). expected.json is read from
                        <cases-dir>/<case>/ (the case name comes from each run's meta.json).
@@ -90,7 +100,7 @@ Usage: DEEPSEEK_API_KEY=… node eval/score.js <case-out-dir> [options]
   --help               Show this help.
 
 Writes scorecard.json into each run dir and scorecard-summary.json at the case-out root, and prints a
-mean/min/max recall table across the runs. The 'llm' matcher reads the credential from DEEPSEEK_API_KEY.
+mean/min/max recall table across the runs. The 'llm' matcher reads the credential from ANTHROPIC_API_KEY.
 `;
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -732,7 +742,7 @@ module.exports = {
   normalizeBody, pairCandidates, computeMetrics, scoreRun, aggregateRuns, renderTable,
   makeLexicalJudge, jaccard, wordSet,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, callJudge, loadCache,
-  // The single place DEEPSEEK_API_KEY is read for the 'llm' matcher — compare.js's pre-loop guard calls
+  // The single place ANTHROPIC_API_KEY is read for the 'llm' matcher — compare.js's pre-loop guard calls
   // this to check "would scoring succeed" before any replay spend, without a second copy of the env var
   // name. [LAW:one-source-of-truth]
   requireLlmJudgeCredential,

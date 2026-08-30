@@ -23,7 +23,7 @@
 # its eligibility rule") for the procedure and the eligibility bar.
 #
 # Usage:
-#   eval/freeze-case.sh <case-name> <owner/repo> <pr-number> <review-id> [exclude-patterns]
+#   eval/freeze-case.sh <case-name> <owner/repo> <pr-number> <review-id> [exclude-patterns] [produced-by]
 #
 # Example:
 #   eval/freeze-case.sh cc-candybar-150-transcript-perf promptctl/cc-candybar 150 4669719961
@@ -34,7 +34,7 @@ set -euo pipefail
 
 # --- args ---------------------------------------------------------------------
 if [ "$#" -lt 4 ]; then
-  echo "usage: $0 <case-name> <owner/repo> <pr-number> <review-id> [exclude-patterns]" >&2
+  echo "usage: $0 <case-name> <owner/repo> <pr-number> <review-id> [exclude-patterns] [produced-by]" >&2
   exit 2
 fi
 NAME="$1"; REPO="$2"; PR="$3"; REVIEW_ID="$4"
@@ -56,11 +56,42 @@ if [ -z "$EXCLUDE" ]; then
   [ -n "$EXCLUDE" ] || { echo "FREEZE ERROR: EXCLUDE_PATTERNS default in action.yml is empty" >&2; exit 1; }
 fi
 
-# The action's current default engine (PROVIDER=auto → deepseek), which is also the
-# config that historically produced every golden review. Pinned explicitly so a later
-# change to the default does not silently move the baseline. [LAW:no-silent-failure]
-PROVIDER="deepseek"
-MODEL="deepseek-v4-pro"
+# The replay pin: the action's current default engine, resolved FROM src/provider.js
+# rather than copied here — the same reasoning as default_exclude() above, applied to
+# the fact next to it. [LAW:one-source-of-truth] These were hand-written literals
+# ("deepseek"/"deepseek-v4-pro") until 2026-08, and when 1.42.0 retargeted PROVIDER=auto
+# to the subscription they silently kept stamping the dead provider onto every new case,
+# so a freshly frozen case was born unreplayable. A literal cannot notice a retarget; a
+# derivation cannot miss one.
+#
+# The pin is still written into case.json as a CONCRETE provider/model, never as 'auto':
+# the manifest must record which engine the numbers came from, and a later retarget must
+# make the pin check fail loudly rather than quietly move an existing case's baseline.
+# [LAW:no-silent-failure]
+# node's own stderr is deliberately NOT silenced: if provider.js cannot load, that stack trace is the
+# only thing that says why, and the generic message below would replace a located cause with a guess.
+# [LAW:no-silent-failure]
+default_engine() {
+  node -e '
+    const { PROVIDERS, PROVIDER_ALIASES } = require("./src/provider");
+    const name = PROVIDER_ALIASES.auto;
+    process.stdout.write(`${name}\t${PROVIDERS[name].defaultModel}`);
+  '
+}
+ENGINE_TSV="$(cd "$SCRIPT_DIR/.." && default_engine)" \
+  || { echo "FREEZE ERROR: could not resolve the action's default engine from src/provider.js" >&2; exit 1; }
+PROVIDER="${ENGINE_TSV%%$'\t'*}"
+MODEL="${ENGINE_TSV##*$'\t'}"
+[ -n "$PROVIDER" ] && [ -n "$MODEL" ] && [ "$PROVIDER" != "$ENGINE_TSV" ] \
+  || { echo "FREEZE ERROR: default engine resolved to an unusable value: '$ENGINE_TSV'" >&2; exit 1; }
+
+# Provenance of the GOLDEN REVIEW — a fact about the historical review this case was
+# curated from, NOT about the replay pin above. The two coincided when every golden
+# review had been produced by the then-current default, and were written as one value
+# because of it; they are separate facts and a case frozen from an older review must be
+# able to say so. Defaults to the current default engine, which is what a review run
+# today was produced by. [FRAMING:representation]
+PRODUCED_BY="${6:-auto→$PROVIDER / claude-code / $MODEL}"
 
 CASE_DIR="eval/cases/$NAME"
 WORK="$(mktemp -d)"
@@ -157,7 +188,8 @@ echo "  expected.json: $N_FINDINGS findings (annotation=UNREVIEWED), diffHunks v
 jq -n \
   --arg name "$NAME" --arg repo "$REPO" --argjson pr "$PR" --argjson rev "$REVIEW_ID" \
   --arg head "$HEAD_SHA" --arg base "$BASE_SHA" \
-  --arg provider "$PROVIDER" --arg model "$MODEL" --arg exclude "$EXCLUDE" '{
+  --arg provider "$PROVIDER" --arg model "$MODEL" --arg exclude "$EXCLUDE" \
+  --arg producedBy "$PRODUCED_BY" '{
   name: $name,
   source: { repo: $repo, pr: $pr, reviewId: $rev, headSha: $head, baseSha: $base },
   diff: "change.diff",
@@ -165,7 +197,7 @@ jq -n \
   expected: "expected.json",
   engine: { provider: $provider, model: $model, reasoning: null },
   excludePatterns: ($exclude | split(",")),
-  producedBy: "auto→deepseek / claude-code / deepseek-v4-pro"
+  producedBy: $producedBy
 }' > "$CASE_DIR/case.json" || fail "building case.json failed"
 
 echo "== froze $NAME -> $CASE_DIR (annotate expected.json by hand) =="

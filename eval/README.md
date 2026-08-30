@@ -66,9 +66,19 @@ eval/cases/<case-name>/
 | `excludePatterns` | the source workflow's `EXCLUDE_PATTERNS` (so the replay matches conditions)|
 | `producedBy`      | provenance: the config that originally produced the golden review          |
 
-The engine is pinned explicitly (currently `deepseek` / `deepseek-v4-pro`, the action's
-default and the config that produced every golden review) so a later change to the
-default cannot silently move the baseline. `[LAW:no-silent-failure]`
+The engine is pinned explicitly (currently `claude-subscription` / `claude-sonnet-5`,
+what `PROVIDER=auto` resolves to and therefore the engine production runs) so a later
+change to the default cannot silently move the baseline. `[LAW:no-silent-failure]`
+`freeze-case.sh` derives the pin it writes from `src/provider.js` rather than carrying a
+copy — a hardcoded pair is what left every case pinned to `deepseek` after 1.42.0
+retargeted `auto`, which is how the harness came to be unable to replay on the provider
+it was measuring.
+
+`producedBy` is a *different* fact from `engine`, and they are not kept in step: it
+records the config that produced the historical golden review this case was curated
+from, which for every case here is `auto→deepseek / claude-code / deepseek-v4-pro`. The
+`engine` pin is what a replay runs on **today**. They coincided once; conflating them
+again would falsify the provenance.
 
 ### `expected.json`
 
@@ -173,15 +183,17 @@ not a second review implementation**: a measured difference between two engine v
 is attributable to the code change under test, never to a replay that drifted.
 
 ```bash
-DEEPSEEK_API_KEY=… node eval/run-case.js eval/cases/<case-name> -n 3
+CLAUDE_CODE_OAUTH_TOKEN=… node eval/run-case.js eval/cases/<case-name> -n 3
 # options: -n/--repeats <N> (default 1), --out <dir> (default eval/out), --workers <N> (default 4)
 ```
 
 It extracts `repo.tar.gz` to a temp dir (that becomes `REVIEWED_REPO_ROOT`), feeds
 `change.diff` through the real diff seam, and drives the engine on the case's **pinned**
 provider/model. The credential is read from the same env var the action uses
-(`DEEPSEEK_API_KEY` / `ZAI_API_KEY` / `OPENAI_API_KEY`, selected by `case.json`'s
-provider). The engine cannot be overridden on the command line — a replay on a different
+(`CLAUDE_CODE_OAUTH_TOKEN` / `DEEPSEEK_API_KEY` / `ZAI_API_KEY` / `OPENAI_API_KEY`,
+selected by `case.json`'s provider) — and that mapping is `src/provider.js`'s own, read
+through `resolveProviderConfig`, not a list this harness keeps. The engine cannot be
+overridden on the command line — a replay on a different
 model than the pin is **refused loudly**, since it would corrupt any baseline comparison.
 It also refuses loudly on a missing credential or a missing/corrupt `repo.tar.gz`.
 
@@ -225,7 +237,7 @@ never re-derives the expected set; it only *matches* the frozen `expected.json` 
 a run's `findings.json` and reduces the match to metrics.
 
 ```bash
-DEEPSEEK_API_KEY=… node eval/score.js eval/out/<case-name> [options]
+ANTHROPIC_API_KEY=… node eval/score.js eval/out/<case-name> [options]
 # options: --matcher llm|lexical (default llm), --cases-dir <dir> (default eval/cases),
 #          --cache <file> (default eval/out/.judge-cache.json)
 ```
@@ -238,8 +250,10 @@ The match is **two stages, cheap first**:
    `MAX_ANCHOR_SNAP_DISTANCE` is the precedent).
 2. **Semantic identity** — does the produced body describe the **same defect** as the
    expected body? This is the one judgment that isn't lexical, so it is the one
-   **effect**: an LLM judge (a cheap pinned model, `deepseek-v4-flash`, over the same
-   `DEEPSEEK_API_KEY`) rules match / no-match on each candidate pair. The scoring core
+   **effect**: an LLM judge (a cheap pinned model snapshot, `claude-haiku-4-5-20251001`,
+   over its own `ANTHROPIC_API_KEY`) rules match / no-match on each candidate pair. The
+   judge's credential is deliberately **not** the engine's: it is the ruler, and a ruler
+   that moved with the thing it measures would measure nothing. The scoring core
    never knows which judge it holds — the offline `--matcher lexical` (deterministic
    word-overlap) is the same `judge(pairs) → decisions` shape and needs no credential.
 
@@ -279,9 +293,9 @@ Full-suite workflow (run → score → freeze):
 
 ```bash
 # 1. Replay every golden case N times (N=5 for the current baseline; rationale below).
-for c in eval/cases/*/; do DEEPSEEK_API_KEY=… node eval/run-case.js "$c" -n 5; done
+for c in eval/cases/*/; do CLAUDE_CODE_OAUTH_TOKEN=… node eval/run-case.js "$c" -n 5; done
 # 2. Score each case (writes scorecard-summary.json per case).
-for c in eval/out/*/; do DEEPSEEK_API_KEY=… node eval/score.js "$c"; done
+for c in eval/out/*/; do ANTHROPIC_API_KEY=… node eval/score.js "$c"; done
 # 3. Freeze the scored suite into a committed baseline (baseline.json + baseline.md).
 node eval/baseline.js
 ```
@@ -400,7 +414,7 @@ change degrade finding quality?"** answered as a measured verdict, not a guess. 
 is simply the code as checked out; no build or publish) against a frozen baseline.
 
 ```bash
-DEEPSEEK_API_KEY=… node eval/compare.js
+ANTHROPIC_API_KEY=… CLAUDE_CODE_OAUTH_TOKEN=… node eval/compare.js
 # options: --baseline <dir|baseline.json> (default: newest under eval/baseline/ by COMMIT-GRAPH order,
 #            not directory-name order — an uncommitted baseline.json always outranks a committed one;
 #            refused if the newest can't be determined unambiguously, e.g. a shallow git clone with
@@ -414,9 +428,12 @@ DEEPSEEK_API_KEY=… node eval/compare.js
 #            mutually exclusive with --out)
 ```
 
-DEEPSEEK_API_KEY is required **unconditionally** for the default `--matcher llm` (the judge's own
+ANTHROPIC_API_KEY is required **unconditionally** for the default `--matcher llm` (the judge's own
 credential), regardless of which provider the baseline's pinned engine itself uses — pass
-`--matcher lexical` to avoid it.
+`--matcher lexical` to avoid it. It is a *second* credential alongside the engine's
+(`CLAUDE_CODE_OAUTH_TOKEN` for the current pins), on purpose: a subscription OAuth token authenticates
+the review CLI, not the raw Messages call the judge makes, and a judge sharing the engine's credential
+would be a ruler that moves with what it measures.
 
 **A candidate is just another suite.** `compare.js` reimplements no pooling, no scoring, and no
 gate predicate — it:
@@ -471,12 +488,12 @@ baseline puts a run at a few dollars and around an hour.
 
 The workflow checks out with `fetch-depth: 0` because the no-`--baseline` newest-pick ranks
 committed baselines by commit-graph order, which a shallow clone collapses to a refused tie. It
-forwards every credential a golden case's pinned provider can use (`DEEPSEEK_API_KEY`,
-`ZAI_API_KEY`, `OPENAI_API_KEY` — the set `run-case.js` wires); the cases' pinned engine selects
-which one is read, so re-freezing the baseline onto another of these providers changes no workflow
-line — but `DEEPSEEK_API_KEY` stays required regardless of the pins: the default `llm` matcher's
-judge reads it unconditionally (`score.js`), and the current baseline's matcher is
-`llm/deepseek-v4-flash`. Runs share one concurrency group — a second trigger
+forwards every credential a golden case's pinned provider can use (`CLAUDE_CODE_OAUTH_TOKEN`,
+`DEEPSEEK_API_KEY`, `ZAI_API_KEY`, `OPENAI_API_KEY` — the set `src/provider.js` declares); the cases'
+pinned engine selects which one is read, so re-freezing the baseline onto another of these providers
+changes no workflow line — but `ANTHROPIC_API_KEY` stays required regardless of the pins: the default
+`llm` matcher's judge reads it unconditionally (`score.js`), and the current baseline's matcher is
+`llm/claude-haiku-4-5-20251001`. Runs share one concurrency group — a second trigger
 queues rather than interleaving spend.
 
 ### The gate's own validation (the sabotage test)
@@ -500,10 +517,16 @@ Like the rest of `eval/`, `compare.js` is dev-only tooling and does **not** bump
    any miss (`[LAW:no-silent-failure]`):
 
    ```bash
-   eval/freeze-case.sh <case-name> <owner/repo> <pr> <review-id> [exclude-patterns]
+   eval/freeze-case.sh <case-name> <owner/repo> <pr> <review-id> [exclude-patterns] [produced-by]
    # e.g.
    eval/freeze-case.sh cc-candybar-150-transcript-perf promptctl/cc-candybar 150 4669719961
    ```
+
+   The `engine` pin it writes is derived from `src/provider.js` (whatever `PROVIDER=auto`
+   currently resolves to), so a retarget can never leave a new case pinned to a retired
+   provider. `[produced-by]` defaults to that same engine — correct for a review run
+   today; pass it explicitly when freezing an **older** review that a different engine
+   produced, since `producedBy` records that history and not the replay pin.
 
    Find the marker-bearing review id with:
    ```bash

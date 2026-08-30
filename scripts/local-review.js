@@ -208,13 +208,13 @@ function resolveConfigChain(opts) {
     const { loadConfig } = require('../src/config');
     return loadConfig(path.resolve(opts.config), opts.use, process.env);
   }
-  const { synthesizeProviderConfig } = require('../src/provider');
-  return [synthesizeProviderConfig({
-    provider: opts.provider,
-    openaiApiKey: process.env.OPENAI_API_KEY, openaiModel: opts.model, openaiBaseUrl: opts.baseUrl,
-    zaiApiKey: process.env.ZAI_API_KEY, zaiModel: opts.model, zaiBaseUrl: opts.baseUrl,
-    deepseekApiKey: process.env.DEEPSEEK_API_KEY, deepseekModel: opts.model, deepseekBaseUrl: opts.baseUrl,
-    claudeCodeOauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN, claudeModel: opts.model,
+  // [LAW:one-source-of-truth] The per-provider input-key names are NOT restated here. This used to
+  // spell out every provider's credential/model/base-url key by hand, and eval/run-case.js carried a
+  // second copy of the same list that silently fell behind. Both now go through the one seam that
+  // owns the mapping, so a new provider row reaches both the day it lands.
+  const { resolveProviderConfig } = require('../src/provider');
+  return [resolveProviderConfig({
+    provider: opts.provider, model: opts.model, baseUrl: opts.baseUrl, env: process.env,
   })];
 }
 

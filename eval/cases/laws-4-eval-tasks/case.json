@@ -11,8 +11,8 @@
   "tree": "repo.tar.gz",
   "expected": "expected.json",
   "engine": {
-    "provider": "deepseek",
-    "model": "deepseek-v4-pro",
+    "provider": "claude-subscription",
+    "model": "claude-sonnet-5",
     "reasoning": null
   },
   "excludePatterns": [
