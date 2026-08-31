@@ -4,7 +4,7 @@ const github = require('@actions/github');
 const fs = require('fs');
 const path = require('path');
 
-const { filterFiles, buildReviewAnchors, diffChurn, excludedPathList } = require('./diff');
+const { filterFiles, noCodeToReview, buildReviewAnchors, diffChurn, excludedPathList } = require('./diff');
 const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentities, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = require('./transport');
 const { buildReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
@@ -665,15 +665,31 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   // [LAW:single-enforcer] "reviewable" is defined ONCE, downstream in buildReviewInput, where a changed
   // file GitHub returned without a patch (too large — roughly >400 changed lines — or binary) is a
   // first-class review target: read in full at its absolute path, reported at its real line numbers.
-  // This gate holds no second, stricter definition. It rejects only what the engine genuinely cannot
-  // review — an empty changed-file set. Filtering on `f.patch` here APPROVED the exact case the engine
-  // handles, and did so most readily on the largest, riskiest changes.
+  // This gate holds no second, stricter definition. It rejects only what the engine cannot usefully
+  // review — a changed set carrying no code, which noCodeToReview answers as ONE value covering the
+  // empty set and the prose-only set alike. Filtering on `f.patch` here APPROVED the exact case the
+  // engine handles, and did so most readily on the largest, riskiest changes.
+  //
+  // A prose-only pull request must still REGISTER AND COMPLETE a run, which is why the skip lives here
+  // and not in the workflow's `paths-ignore`. Filtering at the trigger produces no run at all, and a
+  // consumer polling for one on the head SHA — the address-pr-reviews provider does exactly this —
+  // cannot tell "skipped, nothing to review" from "the workflow is not installed", so it waits out its
+  // whole registration timeout and then reports a false error. Deciding here keeps the job's conclusion
+  // the single signal for "was this reviewed", the same property the transcript-archive step's
+  // continue-on-error protects. [LAW:no-silent-failure] [LAW:one-source-of-truth]
+  //
   // [LAW:no-silent-failure] The refusals travel even on the nothing-to-review path — especially here.
   // "Every changed file was refused" reaches this branch looking exactly like "the PR is empty", and
   // approving it would be approving a PR nobody looked at.
-  if (filteredFiles.length === 0) {
+  if (noCodeToReview(filteredFiles)) {
     await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, {
-      summary: 'This pull request changed no reviewable files.',
+      // [LAW:dataflow-not-control-flow] The two cases differ in what they SAY, not in what runs: an
+      // empty set and a prose-only set take the same path and select a different string. Naming the
+      // prose case honestly matters — "changed no reviewable files" on a PR that rewrote twelve
+      // markdown files is a map that does not match its territory. [FRAMING:representation]
+      summary: filteredFiles.length === 0
+        ? 'This pull request changed no reviewable files.'
+        : `This pull request changed only prose (${filteredFiles.length} file(s), no code), so no review was run.`,
       findings: [],
       unreviewedScopes: [],
       unreviewableFiles: transport.unreviewable,

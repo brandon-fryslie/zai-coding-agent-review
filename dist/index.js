@@ -31441,6 +31441,33 @@ function filterFiles(files, excludePatterns) {
   };
 }
 
+// The prose extensions, as a closed set. This is a BLACKLIST of prose and deliberately not a whitelist of
+// code: the set of code extensions is open and grows with every language a consumer adopts, so a whitelist
+// silently withholds a review the day someone adds a `.zig` file, and withholding is the failure that
+// cannot be seen from the run. Anything unrecognized is therefore code and gets reviewed — the same safe
+// direction parseReviewableFiles takes at its own boundary. [LAW:no-silent-failure]
+const PROSE_EXTENSIONS = new Set(['.md', '.mdx', '.markdown']);
+
+// A leading dot is an extensionless dotfile (`.md` as a whole filename), not a prose extension — `dot > 0`
+// keeps it on the code side, again the safe direction.
+function isProse(filename) {
+  const dot = filename.lastIndexOf('.');
+  return dot > 0 && PROSE_EXTENSIONS.has(filename.slice(dot).toLowerCase());
+}
+
+// [LAW:single-enforcer] The ONE answer to "is there anything in this changed set worth spawning an engine
+// for?", asked by the pre-spawn gate in runPrReview and nowhere else.
+//
+// The empty set is not special-cased: `[].every(...)` is already true, so "nothing changed", "EXCLUDE_PATTERNS
+// removed everything", "every path was refused at the diff boundary", and "this PR is prose only" are one
+// value reaching one gate, not four branches. [LAW:dataflow-not-control-flow]
+//
+// Prose accompanying code is NOT withheld — a README beside a source change still reaches the engine,
+// because `every` is false the moment one code file is present. Only the prose-ONLY change skips the spend.
+function noCodeToReview(files) {
+  return files.every(f => isProse(f.filename));
+}
+
 // [LAW:one-source-of-truth] The one way a withheld set is displayed, wherever it is displayed — the scout
 // prompt, every worker and sweep prompt, the operator log, and the plan-boundary warning. It lives here,
 // beside the record it renders, because "how long may this list be?" is a property of showing a withheld
@@ -31676,6 +31703,7 @@ module.exports = {
   matchesPattern,
   parseReviewableFiles,
   filterFiles,
+  noCodeToReview,
   NO_EXCLUSIONS,
   excludedPathList,
   MAX_EXCLUDED_PATHS_SHOWN,
@@ -36205,7 +36233,7 @@ const github = __nccwpck_require__(3228);
 const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 
-const { filterFiles, buildReviewAnchors, diffChurn, excludedPathList } = __nccwpck_require__(9898);
+const { filterFiles, noCodeToReview, buildReviewAnchors, diffChurn, excludedPathList } = __nccwpck_require__(9898);
 const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentities, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = __nccwpck_require__(7228);
 const { buildReviewInput } = __nccwpck_require__(3479);
 const { partitionFindings } = __nccwpck_require__(1565);
@@ -36866,15 +36894,31 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   // [LAW:single-enforcer] "reviewable" is defined ONCE, downstream in buildReviewInput, where a changed
   // file GitHub returned without a patch (too large — roughly >400 changed lines — or binary) is a
   // first-class review target: read in full at its absolute path, reported at its real line numbers.
-  // This gate holds no second, stricter definition. It rejects only what the engine genuinely cannot
-  // review — an empty changed-file set. Filtering on `f.patch` here APPROVED the exact case the engine
-  // handles, and did so most readily on the largest, riskiest changes.
+  // This gate holds no second, stricter definition. It rejects only what the engine cannot usefully
+  // review — a changed set carrying no code, which noCodeToReview answers as ONE value covering the
+  // empty set and the prose-only set alike. Filtering on `f.patch` here APPROVED the exact case the
+  // engine handles, and did so most readily on the largest, riskiest changes.
+  //
+  // A prose-only pull request must still REGISTER AND COMPLETE a run, which is why the skip lives here
+  // and not in the workflow's `paths-ignore`. Filtering at the trigger produces no run at all, and a
+  // consumer polling for one on the head SHA — the address-pr-reviews provider does exactly this —
+  // cannot tell "skipped, nothing to review" from "the workflow is not installed", so it waits out its
+  // whole registration timeout and then reports a false error. Deciding here keeps the job's conclusion
+  // the single signal for "was this reviewed", the same property the transcript-archive step's
+  // continue-on-error protects. [LAW:no-silent-failure] [LAW:one-source-of-truth]
+  //
   // [LAW:no-silent-failure] The refusals travel even on the nothing-to-review path — especially here.
   // "Every changed file was refused" reaches this branch looking exactly like "the PR is empty", and
   // approving it would be approving a PR nobody looked at.
-  if (filteredFiles.length === 0) {
+  if (noCodeToReview(filteredFiles)) {
     await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, {
-      summary: 'This pull request changed no reviewable files.',
+      // [LAW:dataflow-not-control-flow] The two cases differ in what they SAY, not in what runs: an
+      // empty set and a prose-only set take the same path and select a different string. Naming the
+      // prose case honestly matters — "changed no reviewable files" on a PR that rewrote twelve
+      // markdown files is a map that does not match its territory. [FRAMING:representation]
+      summary: filteredFiles.length === 0
+        ? 'This pull request changed no reviewable files.'
+        : `This pull request changed only prose (${filteredFiles.length} file(s), no code), so no review was run.`,
       findings: [],
       unreviewedScopes: [],
       unreviewableFiles: transport.unreviewable,

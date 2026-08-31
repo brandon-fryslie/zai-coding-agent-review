@@ -29967,6 +29967,33 @@ function filterFiles(files, excludePatterns) {
   };
 }
 
+// The prose extensions, as a closed set. This is a BLACKLIST of prose and deliberately not a whitelist of
+// code: the set of code extensions is open and grows with every language a consumer adopts, so a whitelist
+// silently withholds a review the day someone adds a `.zig` file, and withholding is the failure that
+// cannot be seen from the run. Anything unrecognized is therefore code and gets reviewed — the same safe
+// direction parseReviewableFiles takes at its own boundary. [LAW:no-silent-failure]
+const PROSE_EXTENSIONS = new Set(['.md', '.mdx', '.markdown']);
+
+// A leading dot is an extensionless dotfile (`.md` as a whole filename), not a prose extension — `dot > 0`
+// keeps it on the code side, again the safe direction.
+function isProse(filename) {
+  const dot = filename.lastIndexOf('.');
+  return dot > 0 && PROSE_EXTENSIONS.has(filename.slice(dot).toLowerCase());
+}
+
+// [LAW:single-enforcer] The ONE answer to "is there anything in this changed set worth spawning an engine
+// for?", asked by the pre-spawn gate in runPrReview and nowhere else.
+//
+// The empty set is not special-cased: `[].every(...)` is already true, so "nothing changed", "EXCLUDE_PATTERNS
+// removed everything", "every path was refused at the diff boundary", and "this PR is prose only" are one
+// value reaching one gate, not four branches. [LAW:dataflow-not-control-flow]
+//
+// Prose accompanying code is NOT withheld — a README beside a source change still reaches the engine,
+// because `every` is false the moment one code file is present. Only the prose-ONLY change skips the spend.
+function noCodeToReview(files) {
+  return files.every(f => isProse(f.filename));
+}
+
 // [LAW:one-source-of-truth] The one way a withheld set is displayed, wherever it is displayed — the scout
 // prompt, every worker and sweep prompt, the operator log, and the plan-boundary warning. It lives here,
 // beside the record it renders, because "how long may this list be?" is a property of showing a withheld
@@ -30202,6 +30229,7 @@ module.exports = {
   matchesPattern,
   parseReviewableFiles,
   filterFiles,
+  noCodeToReview,
   NO_EXCLUSIONS,
   excludedPathList,
   MAX_EXCLUDED_PATHS_SHOWN,

@@ -213,6 +213,50 @@ describe('a pull request with no reviewable changed file', () => {
   });
 });
 
+// ── The prose-only change ──
+//
+// A pull request that touches only markdown has nothing an engine can find, and spending a full review on
+// one is the cost this gate exists to refuse. The skip lives HERE rather than in the workflow trigger so
+// the run still registers and completes: a consumer polling the head SHA for a run must be able to read
+// "reviewed, nothing to say" off the conclusion, and `paths-ignore` would leave it polling for a run that
+// never exists.
+describe('a pull request that changed only prose', () => {
+  const doc = (filename) => ({ filename, status: 'modified', patch: '@@ -1 +1 @@\n+text' });
+
+  test('spawns no engine and posts a review that names the prose case', async () => {
+    host.files = [doc('README.md'), doc('docs/guide.md')];
+    await review();
+    assert.equal(engineSpawns.length, 0);
+    assert.equal(host.reviews.length, 1);
+    // Not "changed no reviewable files" — two files changed, and the summary must say what happened.
+    assert.match(host.reviews[0].body, /changed only prose/);
+    assert.match(host.reviews[0].body, /2 file\(s\)/);
+  });
+
+  test('every markdown spelling counts as prose, at any depth', async () => {
+    host.files = [doc('a/b/c/NOTES.MD'), doc('x.mdx'), doc('y.markdown')];
+    await review();
+    assert.equal(engineSpawns.length, 0);
+  });
+
+  // The over-withholding failure, and the one that cannot be seen from a run: a skipped review looks
+  // exactly like a clean one. Prose ACCOMPANYING code must still be reviewed, in full.
+  test('prose beside code still spawns the engine, and the prose reaches it', async () => {
+    host.files = [doc('README.md'), { filename: 'src/engine.js', status: 'modified', patch: '@@ -1 +1 @@\n+code' }];
+    await review();
+    assert.equal(engineSpawns.length, 1);
+    assert.deepEqual(engineSpawns[0].changedPaths, ['README.md', 'src/engine.js']);
+  });
+
+  // The blacklist's safe direction: an extension this action has never heard of is CODE, so adopting a
+  // new language can never silently switch its reviews off.
+  test('an unrecognized extension is treated as code, not prose', async () => {
+    host.files = [doc('main.zig'), doc('Makefile')];
+    await review();
+    assert.equal(engineSpawns.length, 1);
+  });
+});
+
 describe('a pull request whose diffs are shown inline (unchanged behavior)', () => {
   test('spawns the engine and anchors a finding to the diff line', async () => {
     host.files = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,2 +1,3 @@\n const a = 1;\n+const b = 2;' }];
