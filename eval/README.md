@@ -293,12 +293,40 @@ Full-suite workflow (run → score → freeze):
 
 ```bash
 # 1. Replay every golden case N times (N=5 for the current baseline; rationale below).
-for c in eval/cases/*/; do CLAUDE_CODE_OAUTH_TOKEN=… node eval/run-case.js "$c" -n 5; done
+CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/freeze-<sha>
 # 2. Score each case (writes scorecard-summary.json per case).
-for c in eval/out/*/; do ANTHROPIC_API_KEY=… node eval/score.js "$c"; done
+for c in eval/out/freeze-<sha>/*/; do ANTHROPIC_API_KEY=… node eval/score.js "$c"; done
 # 3. Freeze the scored suite into a committed baseline (baseline.json + baseline.md).
-node eval/baseline.js
+node eval/baseline.js --out-dir eval/out/freeze-<sha>
 ```
+
+Step 1 is `eval/freeze-suite.js` and not a shell loop over `run-case.js` because a suite is
+~20 replays over several hours against a subscription that walls for hours at a time, and the
+loop had no way to survive that. The suite runner adds exactly three things and reimplements
+nothing — every job is still `run-case.js -n 1` in its own process:
+
+- **A census, so it resumes.** A completed run is a dir carrying `findings.json` (the
+  scorer's own definition, exported from `score.js` so the two cannot disagree). The runner
+  counts what is already there and plans only the deficit, so re-running the command after a
+  wall picks up where it stopped — there is no resume flag because there is no resume mode.
+- **Level-filling order.** A job exists for case *c* at level *r* iff *c* has fewer than *r*
+  completed runs, so every case is deepened before any one of them is. An interruption leaves
+  an even suite (a valid smaller N — `baseline.js` demands one common N) instead of 5/5/5/0,
+  which freezes nothing. The closing report names the deepest freezable N.
+- **A deadline per replay** (`--job-timeout`, default 120 minutes). A throttled credential does not
+  reliably *fail* — the engine CLI can sit in silent retry — and one lane waiting on it holds the
+  queue forever. On expiry the replay's whole process group is killed (the engine's workers are
+  grandchildren; signalling only the direct child would orphan them still burning quota) and the job
+  is reported as `TIMED OUT`, never as an ordinary non-zero exit.
+- **One lane per credential.** `--credentials VAR1,VAR2,…` names environment variables
+  holding one credential each and replays on all of them concurrently; each lane is
+  sequential, and a lane stops at its first failure (a walled credential fails everything it
+  is handed) after returning the job to the queue for a lane that still works. Which env var
+  the credential travels under is derived from `src/provider.js`, not written here.
+
+The runner exits non-zero whenever any case is still short of the target, and prints every
+attempt with its exit code, wall clock, and log path — the crashed 2026-08-30 freeze left two
+empty run dirs that nobody noticed for five days, which is the failure this makes impossible.
 
 `baseline.js` refuses to freeze an inconsistent suite loudly: every case must have been
 scored over the same N, with the same matcher, on the same pinned engine, and every frozen

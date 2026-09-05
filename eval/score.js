@@ -659,16 +659,29 @@ async function callJudge(doFetch, apiKey, model, batch) {
 // main (effects)
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
 
-// A run dir is any directory under the case-out root that carries a findings.json. Sorted so the scorecard
-// summary lists runs deterministically. [LAW:no-silent-failure] An empty result is a loud error, not an
-// empty scorecard — a case-out dir with no runs means the runner never wrote anything to score.
-function findRunDirs(caseOutDir) {
-  if (!fs.existsSync(caseOutDir)) throw new Error(`Case-out dir not found: ${caseOutDir}. Run eval/run-case.js first.`);
-  const entries = fs.readdirSync(caseOutDir, { withFileTypes: true })
+// THE definition of a completed run: a directory under the case-out root that carries a findings.json.
+// A run dir that never got that far (the engine threw, the token walled) is absent from this list rather
+// than counted as an empty review — which is why a crashed replay leaves debris the scorer ignores instead
+// of a zero-finding run that would silently drag a baseline down. [LAW:no-silent-failure]
+// Sorted so the scorecard summary lists runs deterministically. Missing dir ⇒ no runs: an absence, not an
+// error, because the suite runner (freeze-suite.js) censuses cases that have not been replayed yet.
+// [LAW:one-source-of-truth] Exported, so "what counts as a run" is stated once and the planner that
+// decides how many more to run cannot drift from the scorer that reduces them.
+function listRunDirs(caseOutDir) {
+  if (!fs.existsSync(caseOutDir)) return [];
+  return fs.readdirSync(caseOutDir, { withFileTypes: true })
     .filter(e => e.isDirectory())
     .map(e => path.join(caseOutDir, e.name))
     .filter(d => fs.existsSync(path.join(d, 'findings.json')))
     .sort();
+}
+
+// [LAW:parse-dont-validate] The scorer's checkpoint over the same census: what it returns is a run list
+// PROVEN non-empty, so nothing downstream re-checks. An empty result is a loud error here, not an empty
+// scorecard — a case-out dir with no runs means the runner never wrote anything to score.
+function findRunDirs(caseOutDir) {
+  if (!fs.existsSync(caseOutDir)) throw new Error(`Case-out dir not found: ${caseOutDir}. Run eval/run-case.js first.`);
+  const entries = listRunDirs(caseOutDir);
   if (entries.length === 0) throw new Error(`No run dirs (dirs with findings.json) under ${caseOutDir}. Run eval/run-case.js first.`);
   return entries;
 }
@@ -742,6 +755,9 @@ module.exports = {
   normalizeBody, pairCandidates, computeMetrics, scoreRun, aggregateRuns, renderTable,
   makeLexicalJudge, jaccard, wordSet,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, callJudge, loadCache,
+  // The one definition of "a completed run" — the suite runner's census and this scorer's reduction read
+  // the same predicate, so neither can drift into counting a crashed replay. [LAW:one-source-of-truth]
+  listRunDirs,
   // The single place ANTHROPIC_API_KEY is read for the 'llm' matcher — compare.js's pre-loop guard calls
   // this to check "would scoring succeed" before any replay spend, without a second copy of the env var
   // name. [LAW:one-source-of-truth]
