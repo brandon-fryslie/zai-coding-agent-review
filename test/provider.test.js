@@ -533,6 +533,20 @@ describe('assertPresetsSafe refuses a non-boolean credentialOptional', () => {
   }
 });
 
+// The two columns contradict: `oauth` authenticates every request, `credentialOptional` says none is
+// needed. The existing oauth/pinned check exists so an unsafe row fails at load rather than at request
+// time; this is the parallel combination. [LAW:types-are-the-program]
+describe('assertPresetsSafe refuses an oauth credential declared optional', () => {
+  const { assertPresetsSafe } = require('../src/provider');
+  test('refused at load, not at the first request', () => {
+    const preset = { apiType: 'anthropic-messages', baseUrl: 'https://api.anthropic.com', credentialKind: 'oauth', credentialOptional: true };
+    assert.throws(
+      () => assertPresetsSafe({ contradictory: preset }),
+      { message: /Preset 'contradictory': an 'oauth' credential cannot be 'credentialOptional'/ },
+    );
+  });
+});
+
 describe('the local provider authenticates nothing and stays on this machine', () => {
   test('resolves with no credential supplied at all, where every other provider throws', () => {
     // The contrast is the assertion: same call shape, opposite outcome, decided by the row's column.

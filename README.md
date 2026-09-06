@@ -394,7 +394,7 @@ A config never holds a secret — `credentialEnv` names an env var the **workflo
           GITHUB_REVIEW_TOKEN: ${{ secrets.GITHUB_REVIEW_TOKEN }}
 ```
 
-Every `credentialEnv` reachable in the chain must be set and non-empty at startup, or the run fails fast.
+Every `credentialEnv` reachable in the chain is checked at startup, and an unset one fails the run fast. The one exception is a credential-optional preset (`local`), whose var may stay unset.
 
 ### Per-PR selection
 

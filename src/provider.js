@@ -101,6 +101,12 @@ function assertPresetsSafe(presets) {
     if ('credentialOptional' in p && typeof p.credentialOptional !== 'boolean') {
       throw new Error(`Preset '${name}': 'credentialOptional' must be a boolean (got ${JSON.stringify(p.credentialOptional)}).`);
     }
+    // A subscription endpoint authenticates every request; a row that also says "reachable with no
+    // credential" describes nothing that exists. Refused here for the same reason as the pin below: the
+    // table is validated once, so a contradictory row must not wait for a request to fail.
+    if (p.credentialKind === 'oauth' && p.credentialOptional) {
+      throw new Error(`Preset '${name}': an 'oauth' credential cannot be 'credentialOptional' — a subscription endpoint authenticates every request.`);
+    }
     if (p.credentialKind === 'oauth' && !pinned) {
       throw new Error(
         `Preset '${name}': an 'oauth' credential requires a PINNED 'baseUrl'. An overridable base URL would let a ` +
