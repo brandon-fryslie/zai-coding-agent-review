@@ -391,7 +391,7 @@ describe('resolveChain — chain ordering', () => {
     assert.deepEqual(entry.endpoint, {
       apiType: 'anthropic-messages',
       baseUrl: 'https://api.z.ai/api/anthropic',
-      credential: { kind: 'api-key', env: 'ZAI_API_KEY' },
+      credential: { kind: 'api-key', env: 'ZAI_API_KEY', optional: false },
     });
   });
 
@@ -404,7 +404,7 @@ describe('resolveChain — chain ordering', () => {
     assert.deepEqual(entry.endpoint, {
       apiType: 'anthropic-messages',
       baseUrl: 'https://api.anthropic.com',
-      credential: { kind: 'oauth', env: 'CLAUDE_CODE_OAUTH_TOKEN' },
+      credential: { kind: 'oauth', env: 'CLAUDE_CODE_OAUTH_TOKEN', optional: false },
     });
   });
 
@@ -469,6 +469,31 @@ describe('resolveSecrets — env resolution', () => {
       () => resolveSecrets(chain, { ZAI_API_KEY: '' }),
       { message: /ZAI_API_KEY.*not set or empty/ },
     );
+  });
+
+  // [LAW:single-enforcer] The same endpoint reached through the other door. `local`'s preset declares
+  // its credential optional because a loopback model server authenticates nothing, and that property
+  // has to hold for BOTH consumers of the preset — the PROVIDER input and a config file's `preset:`
+  // form. It once held only for the first, so `preset: local` demanded a key the endpoint never wanted.
+  test('a credential-optional preset resolves with its env var unset, where every other preset rejects', () => {
+    const raw = clone(VALID_RAW);
+    raw.configs['zai-glm'].engine = 'opencode';
+    raw.configs['zai-glm'].model = 'openai/local-model';
+    raw.configs['zai-glm'].endpoint = { preset: 'local', credentialEnv: 'LOCAL_API_KEY' };
+    const chain = resolveChain(raw, null);
+    const resolved = resolveSecrets(chain, { OPENAI_API_KEY: 'k2' });
+    // '' rather than undefined, matching the simple-mode path: nothing downstream receives a hole.
+    assert.deepEqual(resolved[0].endpoint.credential, { kind: 'api-key', value: '' });
+    assert.equal(resolved[0].endpoint.baseUrl, 'http://127.0.0.1:1234/v1');
+  });
+
+  test('a credential-optional preset still takes a key when one is supplied', () => {
+    const raw = clone(VALID_RAW);
+    raw.configs['zai-glm'].engine = 'opencode';
+    raw.configs['zai-glm'].model = 'openai/local-model';
+    raw.configs['zai-glm'].endpoint = { preset: 'local', credentialEnv: 'LOCAL_API_KEY' };
+    const resolved = resolveSecrets(resolveChain(raw, null), { LOCAL_API_KEY: 'sk-local', OPENAI_API_KEY: 'k2' });
+    assert.equal(resolved[0].endpoint.credential.value, 'sk-local');
   });
 });
 

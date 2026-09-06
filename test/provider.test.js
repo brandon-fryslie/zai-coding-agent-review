@@ -436,7 +436,14 @@ describe('resolveProviderConfig threads exactly the fields a provider row declar
   // engine's own capability list, so its value is read from there rather than guessed per provider.
   const FIELD = {
     reasoning: {
-      value: spec => registry.get(spec.engine).capabilities.reasoningEfforts[0],
+      // A legal effort where the engine has any, and otherwise a value that is merely DISTINCT. The
+      // reject half only needs a probe visible if it leaked, and `opencode` declares no efforts at all
+      // — reading `[0]` there yielded undefined, which is also what an undeclared field lands, so the
+      // assertion compared undefined to undefined and could no longer fail. A probe that cannot be
+      // told apart from absence proves nothing about absence. [LAW:behavior-not-structure]
+      // A row DECLARING reasoning on such an engine is a different bug, and the accept half fails it
+      // loudly: this value is not a legal effort, so synthesis throws instead of quietly passing.
+      value: spec => registry.get(spec.engine).capabilities.reasoningEfforts[0] || 'not-a-reasoning-effort',
       lands: config => config.reasoning,
     },
     systemPrompt: { value: () => 'pinned-system-prompt', lands: config => config.systemPrompt },
@@ -504,5 +511,71 @@ describe('resolveProviderConfig hands an unknown provider to the one enforcer th
 
   test('an absent provider fails the same way rather than throwing on an undefined row', () => {
     assert.throws(() => resolveProviderConfig({ env: {} }), /Unknown PROVIDER/);
+  });
+});
+
+// The `local` provider is the only row whose credential is optional and the only one whose endpoint is
+// meant never to leave the machine. Both are properties the table sweeps above cannot see: they check
+// that each row threads the fields it declares, not what those fields are allowed to be.
+// `credentialOptional` decides whether an ENDPOINT may be reached with no credential at all, so a
+// non-boolean read for truthiness is an endpoint that must authenticate quietly becoming one that need
+// not. [LAW:no-silent-failure]
+describe('assertPresetsSafe refuses a non-boolean credentialOptional', () => {
+  const { assertPresetsSafe } = require('../src/provider');
+  for (const [shape, value] of Object.entries({ string: 'no', number: 0, null: null })) {
+    test(`refused at load: credentialOptional is a ${shape}`, () => {
+      const preset = { apiType: 'openai-chat', defaultBaseUrl: 'http://127.0.0.1:1234/v1', credentialKind: 'api-key', credentialOptional: value };
+      assert.throws(
+        () => assertPresetsSafe({ ambiguous: preset }),
+        { message: /Preset 'ambiguous': 'credentialOptional' must be a boolean/ },
+      );
+    });
+  }
+});
+
+// The two columns contradict: `oauth` authenticates every request, `credentialOptional` says none is
+// needed. The existing oauth/pinned check exists so an unsafe row fails at load rather than at request
+// time; this is the parallel combination. [LAW:types-are-the-program]
+describe('assertPresetsSafe refuses an oauth credential declared optional', () => {
+  const { assertPresetsSafe } = require('../src/provider');
+  test('refused at load, not at the first request', () => {
+    const preset = { apiType: 'anthropic-messages', baseUrl: 'https://api.anthropic.com', credentialKind: 'oauth', credentialOptional: true };
+    assert.throws(
+      () => assertPresetsSafe({ contradictory: preset }),
+      { message: /Preset 'contradictory': an 'oauth' credential cannot be 'credentialOptional'/ },
+    );
+  });
+});
+
+describe('the local provider authenticates nothing and stays on this machine', () => {
+  test('resolves with no credential supplied at all, where every other provider throws', () => {
+    // The contrast is the assertion: same call shape, opposite outcome, decided by the row's column.
+    const config = synthesizeProviderConfig({ provider: 'local' }, MOCK_REGISTRY);
+    assert.equal(config.engine, 'opencode');
+    assert.throws(() => synthesizeProviderConfig({ provider: 'zai' }, MOCK_REGISTRY), /requires a credential/);
+  });
+
+  test('an absent credential is the empty string, never undefined', () => {
+    // core.setSecret and the generated opencode config both receive this value. `undefined` would
+    // travel into each as a hole nothing declared. [LAW:types-are-the-program]
+    const { credential } = synthesizeProviderConfig({ provider: 'local' }, MOCK_REGISTRY).endpoint;
+    assert.strictEqual(credential.value, '');
+  });
+
+  // [LAW:no-silent-failure] The point of choosing `local` is that the diff does not leave the machine,
+  // so the endpoint it falls back to when LOCAL_BASE_URL is unset is load-bearing, not cosmetic. This
+  // asserts the PROPERTY — a loopback host, a chat API — rather than reading the expected values back
+  // out of PRESETS, which would make the table its own oracle and pass no matter what it said.
+  test('its default endpoint is loopback, over the API local servers actually speak', () => {
+    const { endpoint } = synthesizeProviderConfig({ provider: 'local' }, MOCK_REGISTRY);
+    const { hostname } = new URL(endpoint.baseUrl);
+    assert.ok(
+      hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1',
+      `the local provider's default endpoint is '${endpoint.baseUrl}', which is not this machine — ` +
+      'an unset LOCAL_BASE_URL would send the reviewed diff to a vendor.',
+    );
+    // mlx_lm.server, LM Studio and Ollama expose chat/completions. 'openai-responses' is OpenAI's
+    // cloud API and no local server implements it, so a row carrying it is one that cannot work.
+    assert.strictEqual(endpoint.apiType, 'openai-chat');
   });
 });

@@ -45,6 +45,26 @@ const REVIEWED_REPO_ROOT = process.env.GITHUB_WORKSPACE || process.cwd();
 // only chooses the `material` (what the scout surveys, what each worker reviews) and the `sink`
 // (how findings leave); it owns no CLI lifecycle and no retry timing. [LAW:types-are-the-program]
 
+// [LAW:one-type-per-behavior] Every auth variant names its credential the same, so masking is one read
+// that covers all of them — a variant added later is masked by construction rather than by someone
+// remembering to extend a per-variant switch. [LAW:single-enforcer] Both config paths mask through
+// here, so neither can grow a masking rule the other lacks.
+//
+// A credential-optional endpoint resolves with an empty credential, and '' is not a secret: there is
+// nothing to mask, and `add-mask` with an empty value is not uniformly a no-op across runner versions.
+// So the list of secrets is what VARIES, not whether the masking runs. [LAW:dataflow-not-control-flow]
+//
+// [LAW:effects-at-boundaries] Which credentials to mask is a decision, and it is pure — so it is its
+// own exported function, testable with no runner and no mock; maskCredentials is only the effect that
+// applies it.
+function credentialsToMask(configs) {
+  return configs.map(c => c.endpoint.credential.value).filter(Boolean);
+}
+
+function maskCredentials(configs) {
+  credentialsToMask(configs).forEach(value => core.setSecret(value));
+}
+
 // [LAW:decomposition] Establish the typed ReviewConfig chain for this run and register its
 // secrets. selection is the value PR/repo modes differ on: a PR run passes its labels + body so a
 // config file can pick a per-PR reviewer; a repo run has no PR, so it passes empty selectors and
@@ -60,10 +80,7 @@ function buildConfigChain(selection) {
     const selectedName = selectConfig(selection, { configInput: configNameInput, configNames, defaultName });
     core.info(`Selected reviewer config: '${selectedName}'`);
     const chain = loadConfig(configFilePath, selectedName, process.env);
-    // [LAW:one-type-per-behavior] Every auth variant names its credential the same, so masking is one
-    // read that covers all of them — a variant added later is masked by construction rather than by
-    // someone remembering to extend a per-variant switch. [LAW:no-silent-failure]
-    chain.forEach(c => core.setSecret(c.endpoint.credential.value));
+    maskCredentials(chain);
     return chain;
   }
 
@@ -87,8 +104,11 @@ function buildConfigChain(selection) {
     // provider row takes no base-URL input and there is nothing here to read. [LAW:types-are-the-program]
     claudeCodeOauthToken: core.getInput('CLAUDE_CODE_OAUTH_TOKEN'),
     claudeModel: core.getInput('CLAUDE_MODEL'),
+    localApiKey: core.getInput('LOCAL_API_KEY'),
+    localModel: core.getInput('LOCAL_MODEL'),
+    localBaseUrl: core.getInput('LOCAL_BASE_URL'),
   });
-  core.setSecret(config.endpoint.credential.value);
+  maskCredentials([config]);
   core.info(
     `Using provider '${config.name}' (engine: ${config.engine}, model: ${config.model}, ` +
     // The auth method is operator news: it is how a run log answers "did this actually bill the
@@ -869,4 +889,4 @@ async function run() {
   }
 }
 
-module.exports = { run, runPrReview, buildReviewFooter, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, MAX_DEPENDENCY_BUMPS_FETCHED };
+module.exports = { run, runPrReview, buildReviewFooter, credentialsToMask, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, MAX_DEPENDENCY_BUMPS_FETCHED };

@@ -108,6 +108,16 @@ describe('buildOpencodeConfig — generated opencode.json content', () => {
     assert.equal(json.includes('{env:'), false, 'no {env:...} indirection — process env stays secret-free');
   });
 
+  // The `local` preset is credential-optional, so this is its default path, not an edge. opencode
+  // accepts `apiKey: ""` for a provider override (verified live against Ollama, opencode-ai@1.17.9,
+  // PR #140); an OMITTED key would be a hole in the file it reads. JSON.stringify drops undefined
+  // values, so the assertion is on the serialized form the engine actually gets.
+  test('an empty credential is written as apiKey: "", never dropped from the file', () => {
+    const config = { ...BASE_CONFIG, endpoint: { ...BASE_CONFIG.endpoint, credential: { kind: 'api-key', value: '' } } };
+    const json = JSON.stringify(buildOpencodeConfig(config, MOCK_COLLECTOR_SPAWN, MOCK_AGENTS_PATH));
+    assert.deepEqual(JSON.parse(json).provider.openai.options, { baseURL: 'https://api.openai.com/v1', apiKey: '' });
+  });
+
   test('provider id tracks the model prefix for a non-openai provider', () => {
     const config = { ...BASE_CONFIG, model: 'anthropic/claude-x', endpoint: { ...BASE_CONFIG.endpoint, apiType: 'anthropic-messages' } };
     const provider = buildOpencodeConfig(config, MOCK_COLLECTOR_SPAWN, MOCK_AGENTS_PATH).provider;

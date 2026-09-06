@@ -61,6 +61,7 @@ That's it. Open a PR and the action reviews it. The checkout is optional context
 | `zai` | Claude Code → Z.ai | `ZAI_API_KEY` | per token | `glm-5.1` |
 | `codex` | Codex → OpenAI | `OPENAI_API_KEY` | per token | `gpt-5.4-mini` |
 | `claude-subscription` | Claude Code → Anthropic | `CLAUDE_CODE_OAUTH_TOKEN` | your Claude Pro/Max plan | `claude-sonnet-5` |
+| `local` | OpenCode → a local OpenAI-compatible server | *(optional)* `LOCAL_API_KEY` | free — the model runs on your machine | `openai/local-model` |
 
 `auto` resolves to whichever provider the action currently points at — **`claude-subscription` since 1.42.0**, DeepSeek before that. Pinning `auto` lets the maintainer retarget every consumer with a release, without anyone editing their workflow; supply the credential for whatever `auto` currently resolves to, or supply several and let the retarget be free. A repo missing the current target's credential **fails at startup naming the input to set** — loudly, before any spend — never by silently falling back to another provider whose key happens to be present.
 
@@ -98,7 +99,7 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 
 | Input | Default | Description |
 |---|---|---|
-| `PROVIDER` | `auto` | Engine: `auto`, `deepseek`, `zai`, `codex`, or `claude-subscription`. Ignored when a `CONFIG_FILE` exists. |
+| `PROVIDER` | `auto` | Engine: `auto`, `deepseek`, `zai`, `codex`, `claude-subscription`, or `local`. Ignored when a `CONFIG_FILE` exists. |
 | `DEEPSEEK_API_KEY` | — | Required for `deepseek`. |
 | `DEEPSEEK_MODEL` | `deepseek-v4-pro` | Model for the `deepseek` provider. |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/anthropic` | Anthropic-compatible endpoint for `deepseek`. |
@@ -112,6 +113,9 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | `OPENAI_MODEL` | `gpt-5.4-mini` | Model for the `codex` provider. |
 | `OPENAI_REASONING_EFFORT` | — | `minimal`, `low`, `medium`, `high`, or `xhigh`. |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-Responses-compatible endpoint (e.g. Azure or a gateway). |
+| `LOCAL_API_KEY` | — | API key for `local`. Optional — most local servers require none, and `local` is the one provider a missing credential does not fail. |
+| `LOCAL_MODEL` | `openai/local-model` | Model for `local`, in OpenCode's `<provider>/<model>` form (e.g. `openai/mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit`). |
+| `LOCAL_BASE_URL` | `http://127.0.0.1:1234/v1` | OpenAI-**chat**-compatible endpoint for `local` (LM Studio's default; Ollama is `http://127.0.0.1:11434/v1`, mlx_lm.server `http://127.0.0.1:8080/v1`). The default is loopback on purpose: an unset endpoint fails against your own machine, never against a vendor. |
 | `MODE` | `pr` | `pr` (review a PR diff, post an inline review) or `repo` ([whole-repo review](#whole-repo-review)). |
 | `SCOPE` | — | Free-text focus for `MODE: repo` (e.g. `the auth layer`). Ignored when `MODE: pr`. |
 | `CONFIG_FILE` | `.github/review-agents.yml` | [Multi-engine config file](#multi-engine-configuration). When present it owns engine selection and the `PROVIDER`/key inputs are ignored. |
@@ -356,9 +360,11 @@ An `endpoint` is exactly one of two forms:
 | **preset** | `preset`, `credentialEnv` | whatever the preset pins — **the only way to get `oauth`** |
 | **manual** | `apiType`, `baseUrl`, `credentialEnv` | always `api-key` |
 
+To run a local model through a config file, use the preset form with `preset: local` and `engine: opencode` — the same endpoint the `PROVIDER: local` input reaches, so its loopback default and optional credential apply there too.
+
 **That asymmetry is a security boundary, not an omission.** A subscription/OAuth token is long-lived and broadly scoped — its blast radius dwarfs a per-service API key — so it may only ever be sent to a host pinned in code. The manual form keeps every degree of freedom that is safe to have (any API shape, any URL, any env var) and simply cannot name a high-blast-radius credential. Reaching "OAuth token at a host of my choosing" therefore takes a code change to the preset table, reviewed like any other — not a YAML typo.
 
-Every field is validated **once, at startup** against the engine's capabilities. An illegal combination (codex with an `anthropic-messages` endpoint, an `oauth` preset on an engine that cannot use one, a `baseUrl` written beside a `preset`, a `credentialKind` in the manual form, an unknown preset, a `reasoning` on opencode, an unknown engine, a `default`/`fallback` naming an undefined config, or a `credentialEnv` whose variable is unset) fails the run with a message naming the config, field, and allowed values.
+Every field is validated **once, at startup** against the engine's capabilities. An illegal combination (codex with an `anthropic-messages` endpoint, an `oauth` preset on an engine that cannot use one, a `baseUrl` written beside a `preset`, a `credentialKind` in the manual form, an unknown preset, a `reasoning` on opencode, an unknown engine, a `default`/`fallback` naming an undefined config, or a `credentialEnv` whose variable is unset) fails the run with a message naming the config, field, and allowed values. The one exception is a **credential-optional** preset — currently only `local`, whose endpoint authenticates nothing: its `credentialEnv` may be unset, and the run proceeds with no credential. That property belongs to the preset, so it holds identically here and on the `PROVIDER: local` path.
 
 > **Schema change in 1.43.0.** `endpoint.kind` is now `endpoint.apiType`, the `endpoint.auth.{method, …}` block is gone, and an endpoint is written as either the **preset** or **manual** form above. (`apiKeyEnv` became `credentialEnv` earlier, in 1.41.0 — unchanged here.) Existing config files need updating — the old shape fails at load with a message naming the field.
 
@@ -388,7 +394,7 @@ A config never holds a secret — `credentialEnv` names an env var the **workflo
           GITHUB_REVIEW_TOKEN: ${{ secrets.GITHUB_REVIEW_TOKEN }}
 ```
 
-Every `credentialEnv` reachable in the chain must be set and non-empty at startup, or the run fails fast.
+Every `credentialEnv` reachable in the chain is checked at startup, and an unset one fails the run fast. The one exception is a credential-optional preset (`local`), whose var may stay unset.
 
 ### Per-PR selection
 

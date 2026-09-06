@@ -14,6 +14,10 @@ const DEEPSEEK_ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic';
 const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 const OPENAI_RESPONSES_BASE_URL = 'https://api.openai.com/v1';
 
+// A local OpenAI-compatible server. LM Studio's default port; Ollama (11434) and mlx_lm.server take a
+// LOCAL_BASE_URL override. The loopback host is the load-bearing part — see the `local` preset.
+const LOCAL_OPENAI_BASE_URL = 'http://127.0.0.1:1234/v1';
+
 // The default model for a Claude Pro/Max subscription run. Sonnet, not Opus: the constraint under a
 // subscription is quota rather than dollars, and a reviewer that exhausts the plan's Opus allowance in
 // a morning is worse than one that keeps running. Consumers override with the CLAUDE_MODEL input.
@@ -46,6 +50,19 @@ const PRESETS = {
   openai: { apiType: 'openai-responses', defaultBaseUrl: OPENAI_RESPONSES_BASE_URL, credentialKind: 'api-key' },
   zai: { apiType: 'anthropic-messages', defaultBaseUrl: ZAI_ANTHROPIC_BASE_URL, credentialKind: 'api-key' },
   deepseek: { apiType: 'anthropic-messages', defaultBaseUrl: DEEPSEEK_ANTHROPIC_BASE_URL, credentialKind: 'api-key' },
+  // A local model server (mlx_lm.server, LM Studio, Ollama). Its OWN row rather than a reuse of
+  // `openai`: that row is OpenAI's CLOUD — the Responses API at api.openai.com — while local servers
+  // expose chat/completions on loopback, so the two agree on neither field. Sharing one row would make
+  // an unset LOCAL_BASE_URL resolve to api.openai.com and ship the diff of a run the operator chose
+  // FOR being local to a vendor, over an apiType that server never speaks. A refused connection on
+  // 127.0.0.1 is the failure that misconfiguration deserves. [LAW:no-silent-failure]
+  // `credentialOptional` rides on the PRESET, not on the provider row, because BOTH consumers of an
+  // endpoint reach it through here: the simple-mode PROVIDER input (synthesizeProviderConfig) and a
+  // config file's `preset:` form (src/config.js resolveSecrets). Declared on the provider row it held
+  // in the first and silently not in the second — so `preset: local` in a config file could never omit
+  // the credential the way PROVIDER=local can, leaving the one property this row exists for true in
+  // one path and false in the other. [LAW:one-source-of-truth]
+  local: { apiType: 'openai-chat', defaultBaseUrl: LOCAL_OPENAI_BASE_URL, credentialKind: 'api-key', credentialOptional: true },
   // Pinned + oauth. Deliberately a preset of its own rather than an "anthropic" preset with a token
   // flavour: an api-key Anthropic endpoint would share this host and apiType and differ ONLY in
   // credential kind, and keeping them separate rows with separate credential inputs is what stops a
@@ -77,6 +94,18 @@ function assertPresetsSafe(presets) {
       throw new Error(
         `Preset '${name}': '${pinned ? 'baseUrl' : 'defaultBaseUrl'}' must be a non-empty string (got ${JSON.stringify(declared)}).`,
       );
+    }
+    // Refused rather than read for truthiness: `credentialOptional: 'no'` is truthy, and this column
+    // decides whether an endpoint may be reached with NO credential at all — a typo must not be the
+    // thing that opens one. [LAW:no-silent-failure]
+    if ('credentialOptional' in p && typeof p.credentialOptional !== 'boolean') {
+      throw new Error(`Preset '${name}': 'credentialOptional' must be a boolean (got ${JSON.stringify(p.credentialOptional)}).`);
+    }
+    // A subscription endpoint authenticates every request; a row that also says "reachable with no
+    // credential" describes nothing that exists. Refused here for the same reason as the pin below: the
+    // table is validated once, so a contradictory row must not wait for a request to fail.
+    if (p.credentialKind === 'oauth' && p.credentialOptional) {
+      throw new Error(`Preset '${name}': an 'oauth' credential cannot be 'credentialOptional' — a subscription endpoint authenticates every request.`);
     }
     if (p.credentialKind === 'oauth' && !pinned) {
       throw new Error(
@@ -142,6 +171,18 @@ const PROVIDERS = {
     credentialInput: 'CLAUDE_CODE_OAUTH_TOKEN',
     defaultModel: CLAUDE_SUBSCRIPTION_DEFAULT_MODEL,
     inputKeys: { credential: 'claudeCodeOauthToken', model: 'claudeModel' },
+  },
+  // A local model reached over an OpenAI-compatible endpoint, run on the opencode engine so the whole
+  // review — scout, workers, multi-scope, PR posting — is the one production runs, not a reduced path.
+  // Its preset declares the credential optional — a loopback server usually authenticates nothing, and
+  // LOCAL_API_KEY is there for the ones that do. The default model carries opencode's `<provider>/<model>` shape: the
+  // prefix names the chat format the server speaks, the suffix the model it serves.
+  local: {
+    engine: 'opencode',
+    preset: 'local',
+    credentialInput: 'LOCAL_API_KEY',
+    defaultModel: 'openai/local-model',
+    inputKeys: { credential: 'localApiKey', model: 'localModel', baseUrl: 'localBaseUrl' },
   },
 };
 
@@ -213,7 +254,11 @@ function resolveEndpoint(preset, { baseUrl, credential }) {
   return {
     apiType: preset.apiType,
     baseUrl: preset.baseUrl || baseUrl || preset.defaultBaseUrl,
-    credential: { kind: preset.credentialKind, value: credential },
+    // [LAW:types-are-the-program] `value` is a string for every row. A required provider's is already
+    // guaranteed non-empty by the credential check; a credentialOptional row declares no key value at
+    // all, and '' is what "no key" is — undefined would travel on into core.setSecret and the engine's
+    // generated config as a hole nothing declared.
+    credential: { kind: preset.credentialKind, value: credential || '' },
   };
 }
 
@@ -297,7 +342,11 @@ function synthesizeProviderConfig(inputs, reg) {
   // [LAW:no-silent-failure] When 'auto' was used, name both it and what it resolved to so the
   // operator knows which input to set.
   const label = requested === provider ? `'${provider}'` : `'${requested}' (→ '${provider}')`;
-  if (!f.credential) {
+  // [LAW:dataflow-not-control-flow] Whether a credential is required is a fact about the ENDPOINT, so
+  // it is a column in the preset like every other — never `provider === 'local'` here. The tables'
+  // contract is that every consumer derives from them and none branches on a hardcoded name; a row
+  // that authenticates nothing must not be the one exception that reintroduces the branch.
+  if (!f.credential && !PRESETS[spec.preset].credentialOptional) {
     throw new Error(
       `PROVIDER ${label} requires a credential, but the '${spec.credentialInput}' input is not set or empty. ` +
       `Set '${spec.credentialInput}', or choose a different provider via the PROVIDER input (valid: ${PROVIDER_NAMES.join(', ')}).`,
