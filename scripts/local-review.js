@@ -265,7 +265,6 @@ async function main() {
   process.env.RUNNER_TEMP = runTemp;
   const { TRANSCRIPT_DIR } = require('../src/debug');
   const { runMultiScope, buildPrMaterial, buildRepoMaterial } = require('../src/multiscope');
-  const { defaultEffortProfile } = require('../src/effort');
   const registry = require('../src/engine/registry');
 
   const repo = path.resolve(opts.repo);
