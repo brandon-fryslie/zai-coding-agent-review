@@ -30677,7 +30677,8 @@ function resolveChain(raw, selectedName) {
     // [LAW:one-source-of-truth] Both forms produce their endpoint through the ONE resolveEndpoint, so
     // a preset endpoint and a manual endpoint cannot drift in shape. Fields are read by name, never
     // spread from the raw block, so a stray key can never ride along into a spawn spec.
-    const { apiType, baseUrl, credential } = resolveEndpoint(presetFor(entry.endpoint), {});
+    const preset = presetFor(entry.endpoint);
+    const { apiType, baseUrl, credential } = resolveEndpoint(preset, {});
     const config = {
       name,
       engine: entry.engine,
@@ -30685,7 +30686,11 @@ function resolveChain(raw, selectedName) {
       // Pre-resolution the credential carries its env var NAME; resolveSecrets swaps env → value.
       // The kind travels with it from the first moment, so nothing downstream has to re-derive
       // how dangerous this credential is.
-      endpoint: { apiType, baseUrl, credential: { kind: credential.kind, env: entry.endpoint.credentialEnv } },
+      // `optional` rides beside `env` for the same reason `kind` does: resolveSecrets is downstream of
+      // the preset and cannot look one up, so an endpoint fact it must honour has to travel to it.
+      // It is a pre-resolution field only — resolveSecrets rebuilds the credential as { kind, value },
+      // so nothing past the swap can read it or has to know it existed. [LAW:types-are-the-program]
+      endpoint: { apiType, baseUrl, credential: { kind: credential.kind, env: entry.endpoint.credentialEnv, optional: preset.credentialOptional === true } },
     };
     if (entry.reasoning !== undefined && entry.reasoning !== null) {
       config.reasoning = entry.reasoning;
@@ -30703,15 +30708,20 @@ function resolveChain(raw, selectedName) {
 // being re-derived downstream, nothing later has to guess how dangerous this credential is.
 function resolveSecrets(chain, env) {
   return chain.map(config => {
-    const { kind, env: credentialEnv } = config.endpoint.credential;
+    const { kind, env: credentialEnv, optional } = config.endpoint.credential;
     const value = env[credentialEnv];
-    if (!value) {
+    // An endpoint whose preset declares the credential optional is reachable with none — the `local`
+    // preset's whole purpose, since a loopback model server authenticates nothing. Without this the
+    // property held for PROVIDER=local and silently not for `preset: local`, which is the same
+    // endpoint reached through the other door. [LAW:single-enforcer]
+    if (!value && !optional) {
       throw new Error(
         `Config '${config.name}': env var '${credentialEnv}' is not set or empty. ` +
         'Ensure the workflow maps a secret to this variable.',
       );
     }
-    return { ...config, endpoint: { ...config.endpoint, credential: { kind, value } } };
+    // Same totality as the simple-mode path: '' is what "no key" is, never undefined.
+    return { ...config, endpoint: { ...config.endpoint, credential: { kind, value: value || '' } } };
   });
 }
 
@@ -35539,7 +35549,13 @@ const PRESETS = {
   // an unset LOCAL_BASE_URL resolve to api.openai.com and ship the diff of a run the operator chose
   // FOR being local to a vendor, over an apiType that server never speaks. A refused connection on
   // 127.0.0.1 is the failure that misconfiguration deserves. [LAW:no-silent-failure]
-  local: { apiType: 'openai-chat', defaultBaseUrl: LOCAL_OPENAI_BASE_URL, credentialKind: 'api-key' },
+  // `credentialOptional` rides on the PRESET, not on the provider row, because BOTH consumers of an
+  // endpoint reach it through here: the simple-mode PROVIDER input (synthesizeProviderConfig) and a
+  // config file's `preset:` form (src/config.js resolveSecrets). Declared on the provider row it held
+  // in the first and silently not in the second — so `preset: local` in a config file could never omit
+  // the credential the way PROVIDER=local can, leaving the one property this row exists for true in
+  // one path and false in the other. [LAW:one-source-of-truth]
+  local: { apiType: 'openai-chat', defaultBaseUrl: LOCAL_OPENAI_BASE_URL, credentialKind: 'api-key', credentialOptional: true },
   // Pinned + oauth. Deliberately a preset of its own rather than an "anthropic" preset with a token
   // flavour: an api-key Anthropic endpoint would share this host and apiType and differ ONLY in
   // credential kind, and keeping them separate rows with separate credential inputs is what stops a
@@ -35571,6 +35587,12 @@ function assertPresetsSafe(presets) {
       throw new Error(
         `Preset '${name}': '${pinned ? 'baseUrl' : 'defaultBaseUrl'}' must be a non-empty string (got ${JSON.stringify(declared)}).`,
       );
+    }
+    // Refused rather than read for truthiness: `credentialOptional: 'no'` is truthy, and this column
+    // decides whether an endpoint may be reached with NO credential at all — a typo must not be the
+    // thing that opens one. [LAW:no-silent-failure]
+    if ('credentialOptional' in p && typeof p.credentialOptional !== 'boolean') {
+      throw new Error(`Preset '${name}': 'credentialOptional' must be a boolean (got ${JSON.stringify(p.credentialOptional)}).`);
     }
     if (p.credentialKind === 'oauth' && !pinned) {
       throw new Error(
@@ -35639,15 +35661,14 @@ const PROVIDERS = {
   },
   // A local model reached over an OpenAI-compatible endpoint, run on the opencode engine so the whole
   // review — scout, workers, multi-scope, PR posting — is the one production runs, not a reduced path.
-  // `credentialOptional` because a loopback server usually authenticates nothing; LOCAL_API_KEY is
-  // there for the ones that do. The default model carries opencode's `<provider>/<model>` shape: the
+  // Its preset declares the credential optional — a loopback server usually authenticates nothing, and
+  // LOCAL_API_KEY is there for the ones that do. The default model carries opencode's `<provider>/<model>` shape: the
   // prefix names the chat format the server speaks, the suffix the model it serves.
   local: {
     engine: 'opencode',
     preset: 'local',
     credentialInput: 'LOCAL_API_KEY',
     defaultModel: 'openai/local-model',
-    credentialOptional: true,
     inputKeys: { credential: 'localApiKey', model: 'localModel', baseUrl: 'localBaseUrl' },
   },
 };
@@ -35697,12 +35718,6 @@ function assertProvidersSafe(providers, presets) {
       if (typeof spec[field] !== 'string' || spec[field] === '') {
         throw new Error(`Provider '${name}': '${field}' must be a non-empty string naming what this row runs.`);
       }
-    }
-    // The column that decides whether a missing credential is fatal. A non-boolean is refused rather
-    // than read for truthiness: `credentialOptional: 'no'` is truthy, and would silently turn a
-    // provider that must authenticate into one that does not. [LAW:no-silent-failure]
-    if ('credentialOptional' in spec && typeof spec.credentialOptional !== 'boolean') {
-      throw new Error(`Provider '${name}': 'credentialOptional' must be a boolean (got ${JSON.stringify(spec.credentialOptional)}).`);
     }
     Object.freeze(spec.inputKeys);
     Object.freeze(spec);
@@ -35814,11 +35829,11 @@ function synthesizeProviderConfig(inputs, reg) {
   // [LAW:no-silent-failure] When 'auto' was used, name both it and what it resolved to so the
   // operator knows which input to set.
   const label = requested === provider ? `'${provider}'` : `'${requested}' (→ '${provider}')`;
-  // [LAW:dataflow-not-control-flow] Whether a credential is required is a fact about the provider, so
-  // it is a column in the row like every other — never `provider === 'local'` here. The table's
-  // contract is that every consumer derives from it and none branches on a hardcoded name; a row that
-  // authenticates nothing must not be the one exception that reintroduces the branch.
-  if (!f.credential && !spec.credentialOptional) {
+  // [LAW:dataflow-not-control-flow] Whether a credential is required is a fact about the ENDPOINT, so
+  // it is a column in the preset like every other — never `provider === 'local'` here. The tables'
+  // contract is that every consumer derives from them and none branches on a hardcoded name; a row
+  // that authenticates nothing must not be the one exception that reintroduces the branch.
+  if (!f.credential && !PRESETS[spec.preset].credentialOptional) {
     throw new Error(
       `PROVIDER ${label} requires a credential, but the '${spec.credentialInput}' input is not set or empty. ` +
       `Set '${spec.credentialInput}', or choose a different provider via the PROVIDER input (valid: ${PROVIDER_NAMES.join(', ')}).`,
@@ -36388,6 +36403,26 @@ const REVIEWED_REPO_ROOT = process.env.GITHUB_WORKSPACE || process.cwd();
 // only chooses the `material` (what the scout surveys, what each worker reviews) and the `sink`
 // (how findings leave); it owns no CLI lifecycle and no retry timing. [LAW:types-are-the-program]
 
+// [LAW:one-type-per-behavior] Every auth variant names its credential the same, so masking is one read
+// that covers all of them — a variant added later is masked by construction rather than by someone
+// remembering to extend a per-variant switch. [LAW:single-enforcer] Both config paths mask through
+// here, so neither can grow a masking rule the other lacks.
+//
+// A credential-optional endpoint resolves with an empty credential, and '' is not a secret: there is
+// nothing to mask, and `add-mask` with an empty value is not uniformly a no-op across runner versions.
+// So the list of secrets is what VARIES, not whether the masking runs. [LAW:dataflow-not-control-flow]
+//
+// [LAW:effects-at-boundaries] Which credentials to mask is a decision, and it is pure — so it is its
+// own exported function, testable with no runner and no mock; maskCredentials is only the effect that
+// applies it.
+function credentialsToMask(configs) {
+  return configs.map(c => c.endpoint.credential.value).filter(Boolean);
+}
+
+function maskCredentials(configs) {
+  credentialsToMask(configs).forEach(value => core.setSecret(value));
+}
+
 // [LAW:decomposition] Establish the typed ReviewConfig chain for this run and register its
 // secrets. selection is the value PR/repo modes differ on: a PR run passes its labels + body so a
 // config file can pick a per-PR reviewer; a repo run has no PR, so it passes empty selectors and
@@ -36403,10 +36438,7 @@ function buildConfigChain(selection) {
     const selectedName = selectConfig(selection, { configInput: configNameInput, configNames, defaultName });
     core.info(`Selected reviewer config: '${selectedName}'`);
     const chain = loadConfig(configFilePath, selectedName, process.env);
-    // [LAW:one-type-per-behavior] Every auth variant names its credential the same, so masking is one
-    // read that covers all of them — a variant added later is masked by construction rather than by
-    // someone remembering to extend a per-variant switch. [LAW:no-silent-failure]
-    chain.forEach(c => core.setSecret(c.endpoint.credential.value));
+    maskCredentials(chain);
     return chain;
   }
 
@@ -36434,7 +36466,7 @@ function buildConfigChain(selection) {
     localModel: core.getInput('LOCAL_MODEL'),
     localBaseUrl: core.getInput('LOCAL_BASE_URL'),
   });
-  core.setSecret(config.endpoint.credential.value);
+  maskCredentials([config]);
   core.info(
     `Using provider '${config.name}' (engine: ${config.engine}, model: ${config.model}, ` +
     // The auth method is operator news: it is how a run log answers "did this actually bill the
@@ -37215,7 +37247,7 @@ async function run() {
   }
 }
 
-module.exports = { run, runPrReview, buildReviewFooter, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, MAX_DEPENDENCY_BUMPS_FETCHED };
+module.exports = { run, runPrReview, buildReviewFooter, credentialsToMask, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, MAX_DEPENDENCY_BUMPS_FETCHED };
 
 
 /***/ }),

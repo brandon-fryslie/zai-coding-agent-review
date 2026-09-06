@@ -86,7 +86,7 @@ test('parseCaseManifest fails loudly on malformed input', () => {
 // a confusing "credential not set". Parameterizing over the real PROVIDERS table means a provider row
 // added tomorrow is covered the day it lands, rather than the day someone notices. [LAW:no-silent-failure]
 describe('resolvePinnedConfig reaches every provider in the table', () => {
-  const { PROVIDERS } = require('../src/provider');
+  const { PROVIDERS, PRESETS } = require('../src/provider');
 
   for (const [name, spec] of Object.entries(PROVIDERS)) {
     test(`'${name}': a case pinned to it resolves to a config carrying the pin`, () => {
@@ -125,7 +125,7 @@ describe('resolvePinnedConfig reaches every provider in the table', () => {
       // sweep, which is the one place the invariant is checked over the whole table.
       // Either way the value is stringified before matching, so an outcome of the wrong SHAPE — an
       // absent key — matches neither pattern and fails here rather than passing vacuously.
-      const expected = spec.credentialOptional
+      const expected = PRESETS[spec.preset].credentialOptional
         ? { key: 'credential', matches: /^$/ }
         : { key: 'error', matches: new RegExp(spec.credentialInput) };
       assert.match(String(outcome[expected.key]), expected.matches);

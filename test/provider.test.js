@@ -404,26 +404,6 @@ describe('assertProvidersSafe — a row must name its credential input, its engi
     });
   }
 
-  // `credentialOptional` decides whether a missing credential is fatal, so a non-boolean read for
-  // truthiness is a provider that must authenticate quietly becoming one that need not. [LAW:no-silent-failure]
-  const rowsWithBadCredentialOptional = {
-    string: 'no',
-    number: 0,
-    null: null,
-  };
-  for (const [shape, value] of Object.entries(rowsWithBadCredentialOptional)) {
-    test(`refused at load: credentialOptional is a ${shape}`, () => {
-      const spec = {
-        preset: 'claude-subscription', engine: 'claude-code', defaultModel: 'm',
-        credentialInput: 'SOME_TOKEN', inputKeys: { credential: 'someToken' }, credentialOptional: value,
-      };
-      assert.throws(
-        () => assertProvidersSafe({ ambiguous: spec }, PRESETS),
-        { message: /Provider 'ambiguous': 'credentialOptional' must be a boolean/ },
-      );
-    });
-  }
-
   test('a complete row passes, and is frozen on the way out', () => {
     const table = { fine: { preset: 'claude-subscription', engine: 'claude-code', defaultModel: 'm', credentialInput: 'SOME_TOKEN', inputKeys: { credential: 'someToken' } } };
     const frozen = assertProvidersSafe(table, PRESETS);
@@ -537,6 +517,22 @@ describe('resolveProviderConfig hands an unknown provider to the one enforcer th
 // The `local` provider is the only row whose credential is optional and the only one whose endpoint is
 // meant never to leave the machine. Both are properties the table sweeps above cannot see: they check
 // that each row threads the fields it declares, not what those fields are allowed to be.
+// `credentialOptional` decides whether an ENDPOINT may be reached with no credential at all, so a
+// non-boolean read for truthiness is an endpoint that must authenticate quietly becoming one that need
+// not. [LAW:no-silent-failure]
+describe('assertPresetsSafe refuses a non-boolean credentialOptional', () => {
+  const { assertPresetsSafe } = require('../src/provider');
+  for (const [shape, value] of Object.entries({ string: 'no', number: 0, null: null })) {
+    test(`refused at load: credentialOptional is a ${shape}`, () => {
+      const preset = { apiType: 'openai-chat', defaultBaseUrl: 'http://127.0.0.1:1234/v1', credentialKind: 'api-key', credentialOptional: value };
+      assert.throws(
+        () => assertPresetsSafe({ ambiguous: preset }),
+        { message: /Preset 'ambiguous': 'credentialOptional' must be a boolean/ },
+      );
+    });
+  }
+});
+
 describe('the local provider authenticates nothing and stays on this machine', () => {
   test('resolves with no credential supplied at all, where every other provider throws', () => {
     // The contrast is the assertion: same call shape, opposite outcome, decided by the row's column.

@@ -199,7 +199,8 @@ function resolveChain(raw, selectedName) {
     // [LAW:one-source-of-truth] Both forms produce their endpoint through the ONE resolveEndpoint, so
     // a preset endpoint and a manual endpoint cannot drift in shape. Fields are read by name, never
     // spread from the raw block, so a stray key can never ride along into a spawn spec.
-    const { apiType, baseUrl, credential } = resolveEndpoint(presetFor(entry.endpoint), {});
+    const preset = presetFor(entry.endpoint);
+    const { apiType, baseUrl, credential } = resolveEndpoint(preset, {});
     const config = {
       name,
       engine: entry.engine,
@@ -207,7 +208,11 @@ function resolveChain(raw, selectedName) {
       // Pre-resolution the credential carries its env var NAME; resolveSecrets swaps env → value.
       // The kind travels with it from the first moment, so nothing downstream has to re-derive
       // how dangerous this credential is.
-      endpoint: { apiType, baseUrl, credential: { kind: credential.kind, env: entry.endpoint.credentialEnv } },
+      // `optional` rides beside `env` for the same reason `kind` does: resolveSecrets is downstream of
+      // the preset and cannot look one up, so an endpoint fact it must honour has to travel to it.
+      // It is a pre-resolution field only — resolveSecrets rebuilds the credential as { kind, value },
+      // so nothing past the swap can read it or has to know it existed. [LAW:types-are-the-program]
+      endpoint: { apiType, baseUrl, credential: { kind: credential.kind, env: entry.endpoint.credentialEnv, optional: preset.credentialOptional === true } },
     };
     if (entry.reasoning !== undefined && entry.reasoning !== null) {
       config.reasoning = entry.reasoning;
@@ -225,15 +230,20 @@ function resolveChain(raw, selectedName) {
 // being re-derived downstream, nothing later has to guess how dangerous this credential is.
 function resolveSecrets(chain, env) {
   return chain.map(config => {
-    const { kind, env: credentialEnv } = config.endpoint.credential;
+    const { kind, env: credentialEnv, optional } = config.endpoint.credential;
     const value = env[credentialEnv];
-    if (!value) {
+    // An endpoint whose preset declares the credential optional is reachable with none — the `local`
+    // preset's whole purpose, since a loopback model server authenticates nothing. Without this the
+    // property held for PROVIDER=local and silently not for `preset: local`, which is the same
+    // endpoint reached through the other door. [LAW:single-enforcer]
+    if (!value && !optional) {
       throw new Error(
         `Config '${config.name}': env var '${credentialEnv}' is not set or empty. ` +
         'Ensure the workflow maps a secret to this variable.',
       );
     }
-    return { ...config, endpoint: { ...config.endpoint, credential: { kind, value } } };
+    // Same totality as the simple-mode path: '' is what "no key" is, never undefined.
+    return { ...config, endpoint: { ...config.endpoint, credential: { kind, value: value || '' } } };
   });
 }
 

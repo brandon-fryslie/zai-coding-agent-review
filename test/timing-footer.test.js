@@ -196,3 +196,24 @@ describe('the repo-mode report', () => {
     assert.match(report, /slowest scope: engine \(3m00s\)/);
   });
 });
+
+// [LAW:no-silent-failure] A credential-optional endpoint (the `local` preset) resolves with an empty
+// credential, and '' is not a secret. Handing it to the Actions toolkit's add-mask is not uniformly a
+// no-op across runner versions, and it is the DEFAULT path for a local run — the common case, not an
+// exotic one. The masking decision is therefore over which values are secrets, never over whether the
+// masking step runs at all.
+describe('credentialsToMask', () => {
+  const { credentialsToMask } = require('../src/run');
+  const withCredential = value => ({ endpoint: { credential: { kind: 'api-key', value } } });
+
+  test('an absent credential is not offered to add-mask', () => {
+    assert.deepEqual(credentialsToMask([withCredential('')]), []);
+  });
+
+  test('real credentials are still masked, and every one of them', () => {
+    assert.deepEqual(
+      credentialsToMask([withCredential('sk-one'), withCredential(''), withCredential('sk-two')]),
+      ['sk-one', 'sk-two'],
+    );
+  });
+});
