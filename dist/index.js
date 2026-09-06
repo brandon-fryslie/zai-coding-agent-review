@@ -35654,6 +35654,18 @@ function assertProvidersSafe(providers, presets) {
     if (typeof spec.inputKeys?.credential !== 'string' || spec.inputKeys.credential === '') {
       throw new Error(`Provider '${name}': 'inputKeys.credential' must name the action input its credential arrives under.`);
     }
+    // `engine` and `defaultModel` are as load-bearing as `preset`: engine picks which CLI runs, and
+    // defaultModel is the model a row contributes when no override is given. Nothing downstream can
+    // tell a missing one from a present one, because both reach consumers through interpolation —
+    // eval/freeze-case.sh stamps `${row.engine}` into a case's provenance string, where a missing
+    // field arrives as the literal text "undefined" and passes every non-empty check downstream. A
+    // row that cannot say what runs it is refused at load, so no consumer needs a check for the word
+    // "undefined". [LAW:parse-dont-validate] [LAW:no-silent-failure]
+    for (const field of ['engine', 'defaultModel']) {
+      if (typeof spec[field] !== 'string' || spec[field] === '') {
+        throw new Error(`Provider '${name}': '${field}' must be a non-empty string naming what this row runs.`);
+      }
+    }
     Object.freeze(spec.inputKeys);
     Object.freeze(spec);
   }
@@ -35699,6 +35711,20 @@ const PROVIDER_ALIASES = Object.freeze({ auto: 'claude-subscription' });
 // matters only for the "valid providers" message in the unknown-PROVIDER error.
 const PROVIDER_NAMES = [...Object.keys(PROVIDERS), ...Object.keys(PROVIDER_ALIASES)];
 
+// [LAW:one-source-of-truth] An alias IS a provider name, so resolving one is part of every lookup, and
+// the resolution has exactly one definition here. A caller that reaches for `PROVIDERS[name]` directly
+// has written a second, alias-blind copy that rejects 'auto' where this one accepts it — which is how
+// eval/freeze-suite.js came to throw "src/provider.js does not define 'auto'" on a pin that replays
+// fine through resolveProviderConfig. Every name→row lookup, in this file and outside it, goes through
+// providerSpec; `undefined` for a name no row claims is the caller's to report, since only the caller
+// knows what it was reading.
+function resolveProviderName(name) {
+  return PROVIDER_ALIASES[name] || name;
+}
+function providerSpec(name) {
+  return PROVIDERS[resolveProviderName(name)];
+}
+
 // [LAW:effects-at-boundaries] Pure: read one provider's fields out of the flat action-input bag, under
 // the key names its row declares. A field the row does not declare is simply absent — a subscription
 // spec names no baseUrl key, so no baseUrl can be read for it whatever the bag happens to contain.
@@ -35717,7 +35743,7 @@ function readProviderFields(spec, inputs) {
 // default standing, exactly as an unset action input does.
 // [LAW:effects-at-boundaries] `env` is a parameter, not a read of process.env, so this stays pure.
 function resolveProviderConfig({ provider, model, reasoning, baseUrl, systemPrompt, env }, reg) {
-  const spec = PROVIDERS[PROVIDER_ALIASES[provider] || provider] || NO_PROVIDER;
+  const spec = providerSpec(provider) || NO_PROVIDER;
   const values = { credential: env[spec.credentialInput], model, reasoning, baseUrl, systemPrompt };
   const inputs = { provider };
   for (const [field, key] of Object.entries(spec.inputKeys)) inputs[key] = values[field];
@@ -35733,7 +35759,7 @@ function synthesizeProviderConfig(inputs, reg) {
   const requested = inputs.provider;
   // [LAW:dataflow-not-control-flow] Resolve the alias to a concrete provider value before any
   // synthesis; everything downstream sees only a real provider, never the alias.
-  const provider = PROVIDER_ALIASES[requested] || requested;
+  const provider = resolveProviderName(requested);
   const spec = PROVIDERS[provider];
   if (!spec) {
     throw new Error(
@@ -35789,6 +35815,8 @@ module.exports = {
   resolveProviderConfig,
   PROVIDERS,
   PROVIDER_ALIASES,
+  resolveProviderName,
+  providerSpec,
   PROVIDER_NAMES,
   // PRESETS + resolveEndpoint are shared with the config-file path (src/config.js): a config file's
   // `preset:` form resolves through the SAME table, so the pinned-host guarantee cannot be bypassed
