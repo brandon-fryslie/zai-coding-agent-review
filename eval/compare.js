@@ -8,7 +8,8 @@
 //   node eval/compare.js [--baseline <dir|baseline.json>] [--matcher llm|lexical] [--out <dir>] ...
 //
 // A CANDIDATE IS JUST ANOTHER SUITE. This file does NOT reimplement pooling or scoring. It:
-//   1. replays every golden case N times against the WORKING TREE's src/ (spawning eval/run-case.js — the
+//   1. replays every baseline case N times against the WORKING TREE's src/ (spawning eval/freeze-suite.js,
+//      the same credential-parallel scheduler the baseline was frozen with, over eval/run-case.js — the
 //      replay runner already drives src/ directly, so "the candidate" is simply the code as checked out;
 //      no build or publish),
 //   2. scores each case (spawning eval/score.js),
@@ -51,7 +52,10 @@ Usage: ANTHROPIC_API_KEY=… CLAUDE_CODE_OAUTH_TOKEN=… node eval/compare.js [o
                          exclusive with --reuse-candidate (refused if both are passed). If it names an
                          existing root with prior run artifacts for a baseline case, refused rather than
                          silently blending old and new runs into one summary.
-  --workers <N>          Max concurrent scope workers per replay (default: 4), forwarded to run-case.js.
+  --credentials <A,B,…>  Names of env vars holding one engine credential each, forwarded to
+                         freeze-suite.js: one replay LANE per name, run concurrently. Default: a single
+                         lane on the pinned provider's own credential input. Three lanes turn a ~6-hour
+                         serial suite into ~2 hours of wall clock and spread the quota across accounts.
   --cases-dir <dir>      Where the frozen golden cases live (default: eval/cases).
   --cache <file>         Judge-decision cache, forwarded to score.js (default: eval/out/.judge-cache.json).
   --reuse-candidate <d>  Skip the replay+score entirely and gate an ALREADY-produced candidate root <d>
@@ -76,11 +80,11 @@ ruler that moved with the thing it measures would measure nothing.
 
 function parseArgs(argv) {
   const opts = {
-    baseline: null, matcher: 'llm', out: null, workers: 4,
+    baseline: null, matcher: 'llm', out: null, credentials: null,
     casesDir: 'eval/cases', cache: 'eval/out/.judge-cache.json', reuseCandidate: null,
   };
   const keyFor = {
-    baseline: 'baseline', matcher: 'matcher', out: 'out', workers: 'workers',
+    baseline: 'baseline', matcher: 'matcher', out: 'out', credentials: 'credentials',
     'cases-dir': 'casesDir', cache: 'cache', 'reuse-candidate': 'reuseCandidate',
   };
   for (let i = 0; i < argv.length; i++) {
@@ -97,16 +101,20 @@ function parseArgs(argv) {
     opts[keyFor[rawName]] = value;
   }
   if (opts.matcher !== 'llm' && opts.matcher !== 'lexical') throw new Error(`--matcher must be 'llm' or 'lexical' (got ${JSON.stringify(opts.matcher)}).`);
-  opts.workers = parsePositiveInt(opts.workers, '--workers');
   return opts;
 }
 
-// [LAW:parse-dont-validate] Positive-integer flag — Number() + Number.isInteger rejects '2.5'/'abc' where
-// parseInt would silently truncate. The rejected value is echoed so a typo is located, not guessed.
-function parsePositiveInt(raw, flag) {
-  const n = Number(raw);
-  if (!Number.isInteger(n) || n < 1) throw new Error(`${flag} must be a positive integer (got ${JSON.stringify(raw)}).`);
-  return n;
+// [LAW:effects-at-boundaries] Pure: the argv the replay step hands eval/freeze-suite.js. Separated from
+// the spawn because this is where the gate's two invariants are pinned as arguments — the BASELINE's case
+// set (--cases: a golden case added since the freeze is not gated, because the baseline does not cover
+// it) at the BASELINE's N — and a wrong argument here silently measures a different population.
+// `credentials` is forwarded verbatim; its shape (names, non-empty, no repeats) is freeze-suite.js's
+// boundary to refuse, and it refuses before any spend. [LAW:single-enforcer]
+function replayArgs({ repeats, candidateRoot, casesDir, caseNames, credentials }) {
+  return [
+    '-n', String(repeats), '--out', candidateRoot, '--cases-dir', casesDir, '--cases', caseNames.join(','),
+    ...(credentials === null ? [] : ['--credentials', credentials]),
+  ];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -386,7 +394,7 @@ function resolveBaselineJsonPath(arg, gitCwd = __dirname) {
   return candidates[0].jsonPath;
 }
 
-// Spawn a dev CLI (run-case.js / score.js) with stdio inherited so its progress streams live, and abort the
+// Spawn a dev CLI (freeze-suite.js / score.js) with stdio inherited so its progress streams live, and abort the
 // whole gate if it fails — a partial or errored candidate must never be silently scored. [LAW:no-silent-failure]
 function runCli(scriptPath, args, label) {
   const res = spawnSync('node', [scriptPath, ...args], { stdio: 'inherit', env: process.env });
@@ -430,7 +438,7 @@ function main() {
   const repeats = baseline.repeats;
 
   const casesDir = path.resolve(opts.casesDir);
-  const runCaseScript = path.join(__dirname, 'run-case.js');
+  const freezeSuiteScript = path.join(__dirname, 'freeze-suite.js');
   const scoreScript = path.join(__dirname, 'score.js');
 
   // The pre-spend guards below (3-3c) all share one shape: refuse BEFORE any replay when the thing they
@@ -526,14 +534,17 @@ function main() {
     process.stderr.write(`\nAbout to replay ${baseline.cases.length} case(s) × N=${repeats} against the WORKING TREE, then score.\n`);
     process.stderr.write(`Estimated cost ≈ ${estUsd === null ? 'unknown (baseline recorded no per-run cost)' : `$${estUsd.toFixed(2)}`} (from the baseline's recorded $/full-run × N). Actual varies with model stochasticity.\n\n`);
 
-    // 7. Replay + score each baseline case into the candidate root. Iterate the BASELINE's case set so the
-    //    candidate covers exactly it (an added-since golden case can't be gated — the baseline doesn't cover
-    //    it). Every pre-spend guard above already ran as a full pass over this same set, so nothing here
-    //    re-checks case.json existence or the engine pin.
-    for (const { case: name } of baseline.cases) {
-      const caseDir = path.join(casesDir, name);
-      process.stderr.write(`\n─── ${name}: replaying ${repeats}× ───\n`);
-      runCli(runCaseScript, [caseDir, '-n', String(repeats), '--out', candidateRoot, '--workers', String(opts.workers)], `run-case (${name})`);
+    // 7. Replay the BASELINE's case set into the candidate root through freeze-suite.js — the scheduler the
+    //    baseline itself was frozen with, so the gate replays on as many credential lanes as it is given and
+    //    a 20-replay suite fits a CI job. Every pre-spend guard above already ran as a full pass over this
+    //    same set, so nothing here re-checks case.json existence or the engine pin. freeze-suite.js exits
+    //    non-zero when any case is still short of N, and runCli turns that into an abort here: a partial
+    //    candidate is never scored. [LAW:no-silent-failure]
+    const caseNames = baseline.cases.map(({ case: name }) => name);
+    process.stderr.write(`\n─── replaying ${caseNames.length} case(s) × N=${repeats} ───\n`);
+    runCli(freezeSuiteScript, replayArgs({ repeats, candidateRoot, casesDir, caseNames, credentials: opts.credentials }), 'freeze-suite');
+    // 7b. Score each case. The judge is one credential and cheap; it needs no lanes.
+    for (const name of caseNames) {
       process.stderr.write(`\n─── ${name}: scoring ───\n`);
       runCli(scoreScript, [path.join(candidateRoot, name), '--matcher', opts.matcher, '--cases-dir', casesDir, '--cache', path.resolve(opts.cache)], `score (${name})`);
     }
@@ -589,6 +600,6 @@ if (require.main === module) {
 }
 
 module.exports = {
-  parseArgs, parsePositiveInt, expectedMatcherLabel, estimateCandidateCostUsd,
+  parseArgs, replayArgs, expectedMatcherLabel, estimateCandidateCostUsd,
   compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath, computeExpectedOpportunities,
 };

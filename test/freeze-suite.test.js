@@ -1,7 +1,7 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { parseArgs, resolveLanes, suitePin, planJobs, runLane, makeLaneGroup, renderReport, formatDuration, outcomeLabel } = require('../eval/freeze-suite');
+const { parseArgs, resolveLanes, selectCases, suitePin, planJobs, runLane, makeLaneGroup, renderReport, formatDuration, outcomeLabel } = require('../eval/freeze-suite');
 
 // The contract these tests hold is the SCHEDULE: how many replays are still owed, in what order, on
 // which credential, and what the operator is told afterwards. The replay itself belongs to run-case.js
@@ -12,12 +12,14 @@ test('parseArgs defaults to the standing baseline depth and the repo layout', ()
   assert.equal(o.repeats, 5);
   assert.equal(o.out, 'eval/out');
   assert.equal(o.casesDir, 'eval/cases');
+  assert.equal(o.cases, null);
   assert.equal(o.credentials, null);
   assert.equal(o.jobTimeout, 120);
 });
 
 test('parseArgs supports -n, --flag=value, and --help', () => {
-  const o = parseArgs(['-n', '3', '--out=tmp/freeze', '--cases-dir', 'tmp/cases', '--credentials', 'A,B']);
+  const o = parseArgs(['-n', '3', '--out=tmp/freeze', '--cases-dir', 'tmp/cases', '--cases=x,y', '--credentials', 'A,B']);
+  assert.equal(o.cases, 'x,y');
   assert.equal(o.repeats, 3);
   assert.equal(o.out, 'tmp/freeze');
   assert.equal(o.casesDir, 'tmp/cases');
@@ -520,5 +522,33 @@ describe('replaySpawnSpec puts the lane credential in the pinned provider slot',
     for (const s of Object.values(PROVIDERS).filter(s => s.credentialInput !== 'CLAUDE_CODE_OAUTH_TOKEN')) {
       assert.equal(env[s.credentialInput], process.env[s.credentialInput], `${s.credentialInput} was rewritten`);
     }
+  });
+});
+
+// ── selectCases (the --cases filter the gate replays through) ───────────────────────────────────────────
+// compare.js names the BASELINE's case set here so a golden case added since the freeze is not spent on.
+
+describe('selectCases — the replayed set is exactly the named set, in census order', () => {
+  const census = [
+    { name: 'a', dir: '/g/a', engine: {}, completed: 0 },
+    { name: 'b', dir: '/g/b', engine: {}, completed: 1 },
+    { name: 'c', dir: '/g/c', engine: {}, completed: 0 },
+  ];
+
+  test('keeps only the named cases and the census order, whatever order the operator wrote', () => {
+    assert.deepEqual(selectCases(census, ['c', 'a']).map(c => c.name), ['a', 'c']);
+    assert.deepEqual(selectCases(census, ['a', 'b', 'c']), census);
+  });
+
+  test('tolerates the whitespace a shell-joined list carries', () => {
+    assert.deepEqual(selectCases(census, [' b', 'c ']).map(c => c.name), ['b', 'c']);
+  });
+
+  test('refuses a name no golden case carries, naming what exists', () => {
+    assert.throws(() => selectCases(census, ['a', 'zed']), /--cases names 'zed'.*have: a, b, c/);
+  });
+
+  test('refuses an empty name rather than silently replaying nothing for it', () => {
+    assert.throws(() => selectCases(census, ['a', '']), /--cases contains an empty name/);
   });
 });

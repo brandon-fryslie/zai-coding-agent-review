@@ -483,7 +483,8 @@ ANTHROPIC_API_KEY=… CLAUDE_CODE_OAUTH_TOKEN=… node eval/compare.js
 #            --reuse-candidate, where the reused summaries' own recorded matcher is checked instead),
 #          --out <dir> (default eval/out/candidate-<ts>, git-ignored; mutually exclusive with
 #            --reuse-candidate; refused if it already holds run artifacts for a case),
-#          --workers <N> (default 4), --cases-dir <dir>, --cache <file>,
+#          --credentials <A,B,…> (env var names, one replay lane each, forwarded to freeze-suite.js;
+#            default: one lane on the pinned provider's own input), --cases-dir <dir>, --cache <file>,
 #          --reuse-candidate <dir> (gate an already-produced candidate root; no replay, no spend;
 #            mutually exclusive with --out)
 ```
@@ -537,11 +538,15 @@ is uploaded as the `eval-candidate` artifact even on a red or aborted run.
 Two triggers, both deliberate spends. `compare.js` prints the authoritative cost estimate (the
 baseline's recorded $/full-run × N) before spending. For the current N=5 × 4-case baseline that
 estimate is **no dollar figure at all** — the pinned engine bills against subscription quota, so the
-baseline records `costPerFullRunUsd: null`. The spend is quota and wall clock: `compare.js` replays
-all 20 runs serially on one credential at 13–27 min each, so a full gate run is **4–9 hours**. That
-does not fit in a GitHub-hosted job (6-hour ceiling), so a CI gate run can be killed before it
-reaches a verdict — see the `timeout-minutes` comment in `.github/workflows/eval.yml`. Read a
-timed-out gate as *not measured*, never as *not degraded*.
+baseline records `costPerFullRunUsd: null`. The spend is quota and wall clock: 20 replays at 13–27 min
+each, which `compare.js` hands to `freeze-suite.js` to spread across credential lanes. The workflow
+names **three lanes** (`--credentials`, one subscription account each, secrets named after the
+keychain items they came from), so a lane carries at most 7 replays and a full gate run is about
+**1.5–3.5 hours** — where the single-lane serial shape it replaced needed 4–9 and did not fit a
+hosted job's 6-hour ceiling. The job's `timeout-minutes` is derived from that lane math (see its
+comment); a timed-out gate is still possible and must be read as *not measured*, never as *not
+degraded*. The same 20 replays cost roughly a day of one account's quota, so the lanes also share the
+spend — and a run competes with PR reviews on those same accounts while it lasts.
 
 - **On demand**: `gh workflow run eval.yml` (optionally `--ref <branch>`) — pressing the button is
   the spend approval. The candidate is that ref's checkout.
@@ -553,10 +558,10 @@ timed-out gate as *not measured*, never as *not degraded*.
 
 The workflow checks out with `fetch-depth: 0` because the no-`--baseline` newest-pick ranks
 committed baselines by commit-graph order, which a shallow clone collapses to a refused tie. It
-forwards every credential a golden case's pinned provider can use (`CLAUDE_CODE_OAUTH_TOKEN`,
-`DEEPSEEK_API_KEY`, `ZAI_API_KEY`, `OPENAI_API_KEY` — the set `src/provider.js` declares); the cases'
-pinned engine selects which one is read, so re-freezing the baseline onto another of these providers
-changes no workflow line — but `ANTHROPIC_API_KEY` stays required regardless of the pins: the default
+forwards the three lane secrets (`CLAUDE_CODE_OAUTH_TOKEN_SSSSSMOKEY`, `_SIGNUP`, `_BRANDROID`); each
+lane's value is placed in the slot the pinned provider reads, so re-freezing the baseline onto a
+metered provider means re-pointing that roster at the new provider's keys, one per lane — and
+`ANTHROPIC_API_KEY` stays required regardless of the pins: the default
 `llm` matcher's judge reads it unconditionally (`score.js`), and the current baseline's matcher is
 `llm/claude-haiku-4-5-20251001`. Runs share one concurrency group — a second trigger
 queues rather than interleaving spend.

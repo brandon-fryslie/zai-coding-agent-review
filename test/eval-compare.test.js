@@ -7,7 +7,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const {
-  parseArgs, parsePositiveInt, expectedMatcherLabel, estimateCandidateCostUsd,
+  parseArgs, replayArgs, expectedMatcherLabel, estimateCandidateCostUsd,
   compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath, computeExpectedOpportunities,
 } = require('../eval/compare');
 const { buildBaseline, parseBaseline } = require('../eval/baseline');
@@ -63,15 +63,15 @@ test('parseArgs applies defaults and honors flags', () => {
   assert.equal(d.baseline, null);
   assert.equal(d.matcher, 'llm');
   assert.equal(d.out, null);
-  assert.equal(d.workers, 4);
+  assert.equal(d.credentials, null);
   assert.equal(d.casesDir, 'eval/cases');
   assert.equal(d.cache, 'eval/out/.judge-cache.json');
   assert.equal(d.reuseCandidate, null);
-  const o = parseArgs(['--baseline', 'b', '--matcher=lexical', '--out', 'o', '--workers=2', '--cases-dir', 'c', '--cache=k', '--reuse-candidate', 'r']);
+  const o = parseArgs(['--baseline', 'b', '--matcher=lexical', '--out', 'o', '--credentials=A,B', '--cases-dir', 'c', '--cache=k', '--reuse-candidate', 'r']);
   assert.equal(o.baseline, 'b');
   assert.equal(o.matcher, 'lexical');
   assert.equal(o.out, 'o');
-  assert.equal(o.workers, 2);
+  assert.equal(o.credentials, 'A,B');
   assert.equal(o.casesDir, 'c');
   assert.equal(o.cache, 'k');
   assert.equal(o.reuseCandidate, 'r');
@@ -86,14 +86,23 @@ test('parseArgs rejects bad input loudly', () => {
   assert.throws(() => parseArgs(['--baseline', '--matcher=llm']), /requires a non-empty value/);
   assert.throws(() => parseArgs(['--out=']), /requires a non-empty value/);
   assert.throws(() => parseArgs(['--matcher', 'fuzzy']), /--matcher must be 'llm' or 'lexical'/);
-  assert.throws(() => parseArgs(['--workers', '2.5']), /--workers must be a positive integer/);
-  assert.throws(() => parseArgs(['--workers', '0']), /--workers must be a positive integer/);
+  assert.throws(() => parseArgs(['--credentials=']), /requires a non-empty value/);
+  assert.throws(() => parseArgs(['--workers', '2']), /Unknown option: --workers/);
 });
 
-test('parsePositiveInt rejects non-integers and echoes the value', () => {
-  assert.equal(parsePositiveInt('3', '--x'), 3);
-  assert.throws(() => parsePositiveInt('3.7', '--x'), /"3.7"/);
-  assert.throws(() => parsePositiveInt('-1', '--x'), /positive integer/);
+// ── replayArgs (what the replay step hands freeze-suite.js) ────────────────────────────────────────────
+// The gate's two invariants live in these arguments: the BASELINE's case set and the BASELINE's N. A
+// candidate replayed over a different set or depth measures a different population.
+
+test('replayArgs pins the baseline case set and N, and forwards the lane roster verbatim', () => {
+  const args = replayArgs({ repeats: 5, candidateRoot: '/c', casesDir: '/g', caseNames: ['b', 'a'], credentials: 'X,Y' });
+  assert.deepEqual(args, ['-n', '5', '--out', '/c', '--cases-dir', '/g', '--cases', 'b,a', '--credentials', 'X,Y']);
+});
+
+test('replayArgs with no --credentials leaves lane selection to freeze-suite.js (its single-lane default)', () => {
+  const args = replayArgs({ repeats: 2, candidateRoot: '/c', casesDir: '/g', caseNames: ['a'], credentials: null });
+  assert.deepEqual(args, ['-n', '2', '--out', '/c', '--cases-dir', '/g', '--cases', 'a']);
+  assert.ok(!args.includes('--credentials'));
 });
 
 // ── expectedMatcherLabel (the fast pre-check) ─────────────────────────────────────────────────────────

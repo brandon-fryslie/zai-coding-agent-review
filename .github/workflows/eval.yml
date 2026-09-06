@@ -48,24 +48,18 @@ jobs:
        contains(github.event.pull_request.labels.*.name, 'eval') &&
        (github.event.action != 'labeled' || github.event.label.name == 'eval'))
     runs-on: ubuntu-latest
-    # Set at the platform ceiling, and that is STILL not enough for the worst case — read this before
-    # trusting a green gate.
+    # Derived from the suite, not the platform: N=5 × 4 cases is 20 replays, spread level-by-level over
+    # the THREE credential lanes below, so a lane carries at most 7. The pinned engine
+    # (claude-subscription/claude-sonnet-5) runs 13–27 min per replay — measured over the 20 replays of
+    # the 2026-09-06 baseline freeze, see eval/README.md — so the longest lane is ~90–190 min, then a few
+    # minutes of judge calls. 240 leaves the worst case ~50 min of headroom and stays well under the
+    # 6-hour ceiling a hosted job cannot exceed. The serial single-lane shape this replaced needed
+    # 260–540 min, which did not fit at all.
     #
-    # compare.js replays every case serially and every repeat serially within a case: N=5 × 4 cases is
-    # 20 sequential reviews on ONE credential. The pinned engine (claude-subscription/claude-sonnet-5)
-    # runs 13–27 min per replay — measured over the 20 replays of the 2026-09-06 baseline freeze, see
-    # eval/README.md — so a full gate run is 260–540 min. The old 180 was calibrated on the retired
-    # deepseek engine at "~1 hour observed at N=5" with triple headroom; that engine is gone and the
-    # headroom went with it.
-    #
-    # A GitHub-hosted job cannot exceed 6 hours, so 350 (leaving setup headroom under that cap) is the
-    # most this job can be given. The upper half of the observed range does not fit in it. A run that
-    # exceeds this is killed mid-suite: real quota spent, no verdict written, and the job reads as
-    # infrastructure failure rather than as a gate that could not finish — which is exactly the shape
-    # [LAW:no-silent-failure] forbids. The structural fix is a resumable multi-lane run
-    # (eval/freeze-suite.js's model) rather than one serial job; until then, a timed-out gate must be
-    # read as "not measured", never as "not degraded".
-    timeout-minutes: 350
+    # A run that exceeds this is killed mid-suite: real quota spent, no verdict written, and the job
+    # reads as infrastructure failure rather than as a gate that could not finish. A timed-out gate must
+    # be read as "not measured", never as "not degraded". [LAW:no-silent-failure]
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -85,17 +79,17 @@ jobs:
 
       - name: Gate the candidate against the frozen baseline
         env:
-          # Every credential a golden case's pinned provider can use — the set src/provider.js
-          # declares, which the runner now reads through resolveProviderConfig rather than a private
-          # copy. Each case's pin selects which one is actually read, so re-freezing the baseline onto
-          # another of these providers is a data change in eval/ and this workflow needs no edit.
-          # CLAUDE_CODE_OAUTH_TOKEN used to be omitted here on the grounds that the runner could not
-          # reach it; that was true, and it was the bug — it is the credential PROVIDER=auto resolves
-          # to, so its absence made the gate unable to measure the engine production runs.
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # THE LANES. One subscription account per lane; freeze-suite.js (which compare.js replays
+          # through) puts each lane's value in the slot the pinned provider reads, so the pinned engine's
+          # own input var (CLAUDE_CODE_OAUTH_TOKEN, the one PROVIDER=auto resolves to) is never read here
+          # and is deliberately absent. Each secret is the same-named item in the maintainer's keychain —
+          # the pool the review action's installer also draws from — so a lane's log names its account.
+          # The suite needs about a day of ONE account's quota; three lanes make it fit a job and share
+          # the spend. Re-freezing the baseline onto a metered provider means re-pointing this roster at
+          # that provider's keys (one per lane), not just changing data under eval/.
+          CLAUDE_CODE_OAUTH_TOKEN_SSSSSMOKEY: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_SSSSSMOKEY }}
+          CLAUDE_CODE_OAUTH_TOKEN_SIGNUP: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_SIGNUP }}
+          CLAUDE_CODE_OAUTH_TOKEN_BRANDROID: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_BRANDROID }}
           # The judge's own credential, required unconditionally for the default llm matcher whatever
           # the cases pin (score.js). Separate from the engine's on purpose: a subscription OAuth token
           # authenticates the review CLI, not the raw Messages call the judge makes.
@@ -103,7 +97,10 @@ jobs:
         # A fixed --out (not compare.js's timestamped default) so the summary and artifact steps
         # below address the same path without plumbing an output between steps; the runner's
         # workspace is fresh per job, so compare.js's stale-artifact refusal can never fire on it.
-        run: node eval/compare.js --out eval/out/candidate-ci
+        # --credentials names the lane env vars above, in the roster's order.
+        run: >-
+          node eval/compare.js --out eval/out/candidate-ci
+          --credentials CLAUDE_CODE_OAUTH_TOKEN_SSSSSMOKEY,CLAUDE_CODE_OAUTH_TOKEN_SIGNUP,CLAUDE_CODE_OAUTH_TOKEN_BRANDROID
 
       - name: Publish the verdict to the Step Summary
         # always(): a DEGRADED gate exits 1 but has already written verdict.md — the red run's
@@ -117,12 +114,16 @@ jobs:
 
       - name: Upload candidate artifacts
         # always(): the artifacts of a DEGRADED or aborted run (per-run findings, scorecards,
-        # engine transcripts, verdict.{md,json}) are the evidence for diagnosing it.
+        # engine transcripts, verdict.{md,json}, and the per-replay lane logs freeze-suite.js writes to
+        # the SIBLING candidate-ci-logs/ — a walled lane shows up there, not under the root) are the
+        # evidence for diagnosing it.
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: eval-candidate
-          path: eval/out/candidate-ci
+          path: |
+            eval/out/candidate-ci
+            eval/out/candidate-ci-logs
           # An abort before the first replay legitimately leaves nothing to upload; the summary
           # step above already reported that state, so an empty upload warns rather than double-fails.
           if-no-files-found: warn
