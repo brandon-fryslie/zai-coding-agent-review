@@ -379,18 +379,41 @@ margin, so the floor is a meaningful line rather than noise. The per-case bands 
 as **diagnostics** — they localize *which* case moved a pooled regression; they do not gate
 on their own.
 
-### The current baseline (v2, inventory-gated)
+### The current baseline (live engine, inventory-gated)
 
 The gate reference is
-[`eval/baseline/2026-08-10-787df41/`](baseline/2026-08-10-787df41/baseline.md) — the engine
-of `main` at `787df41`, `deepseek-v4-pro`, N=5, schema v2. Headline: **pooled inventory
-must-find recall 22 % (22 of 100 opportunities), gate floor 14 %.** The frozen-round pooled
-rate measured 21 % (16/75) — statistically consistent with the v1 baseline's 19 % on the same
-engine, so the instrument is stable; the inventory gate simply measures against the fuller
-ground truth (100 opportunities vs 75). A full suite run still costs ≈ $0.68; the whole N=5
-baseline cost $3.41. The headline result carries over: the engine surfaces roughly **one in
-five** of the pooled inventory's must-finds in a single round — that is the number the recall
-epic (`zai-recall-upr`) exists to raise, and the floor the efficiency work must not sink.
+[`eval/baseline/2026-09-06-ebccbd4/`](baseline/2026-09-06-ebccbd4/baseline.md) — the engine
+tree at `ebccbd4`, `claude-subscription` / `claude-sonnet-5`, N=5, schema v2. Headline:
+**pooled inventory must-find recall 37 % (37 of 100 opportunities), gate floor 28 %.** The
+frozen-round pooled rate measured 35 % (26/75).
+
+**Read the jump from 22 % to 37 % as an ENGINE change, not a recall win.** No prompt moved
+between the two freezes. `PROVIDER: auto` was retargeted from `deepseek-v4-pro` to
+`claude-sonnet-5` in 1.42.0, and this is the first measurement of the engine production
+actually runs. The recall epic (`zai-recall-upr`) has still shipped no lever — its work is
+simply now measured against 37 % instead of 22 %.
+
+**Provenance: the SHA is deliberately not a `main` commit.** `ebccbd4` is a branch commit.
+This repo squash-merges, so the tree that produced these runs never lands on `main` under its
+own SHA — naming a `main` commit would name a tree that produced none of these numbers. The
+freeze names the engine tree instead. Only the `mainSha` field name still carries the old
+assumption; `compare.js` ranks baselines by which commit last touched `baseline.json`, never
+by reachability, so nothing mechanical depends on it.
+
+**Cost basis: subscription quota, not dollars.** No run reports a cost, so `baseline.js`
+records `costPerFullRunUsd: null` with `uncostedRuns: 20` rather than passing a partial sum
+off as a total. The CLI's own meter is notional here — one *failed* `links-317` replay
+reported $4.01 that was never billed. The real currency is wall clock and quota: ~13–27 min
+per replay, ~4.5 h for the suite across three subscription lanes, and the daily wall
+(midnight America/Denver) reached on all three accounts before the last replay landed.
+
+### Superseded: the deepseek baselines
+
+[`eval/baseline/2026-08-10-787df41/`](baseline/2026-08-10-787df41/baseline.md) — `main` at
+`787df41`, `deepseek-v4-pro`, N=5, schema v2. **Pooled inventory must-find recall 22 % (22 of
+100), gate floor 14 %**; frozen-round pooled 21 % (16/75). A full suite run cost ≈ $0.68; the
+whole N=5 baseline $3.41. Kept as history only: the provider was retired (account at 402) and
+`PROVIDER: auto` no longer resolves to it, so it can gate nothing.
 
 ### The first baseline, and the variance that shaped the rule
 
@@ -398,7 +421,7 @@ The first frozen baseline is
 [`eval/baseline/2026-08-01-dc87ee0/`](baseline/2026-08-01-dc87ee0/baseline.md) — `main` at
 `dc87ee0`, engine `deepseek-v4-pro`, N=5, **schema v1** (pre-inventory: its ground truth was
 each case's frozen round only, and its gate metric the frozen-round pooled rate — kept as
-history; the current v2 baseline supersedes it as the gate reference). Headline: **pooled
+history; later baselines supersede it as the gate reference). Headline: **pooled
 must-find recall 19 % (14 of 75 opportunities), gate floor 10 %.** A full suite run (all four
 cases once) costs ≈ $0.70; the whole N=5 baseline cost **$3.48**.
 
@@ -427,9 +450,10 @@ take ~30+ repeats per case (~$20 and hours) — not worth it. So the harness gat
 pooled suite rate, uses the per-case bands only to localize a regression, and **N=5 is the
 standing baseline depth.**
 
-The deeper result is the epic's headline, and it is not a defect in the harness: current
-must-find recall is **~19 %** — the engine reproduces roughly one in five of the golden
-set's hardest findings. The instrument is faithful (the LLM judge agreed with hand-matching
+The deeper result is the epic's headline, and it is not a defect in the harness: pooled
+inventory must-find recall is **37 %** on the live engine — the engine reproduces roughly one
+in three of the golden set's hardest findings in a single round (it was ~19–22 % on the
+retired deepseek engine). The instrument is faithful (the LLM judge agreed with hand-matching
 11/11 during `copirate-eval-harness-2fk.3`); the low number is the truth it was built to
 measure. It is the floor the efficiency epic (`copirate-efficiency-235`) must not push
 lower, and the bar the quality work must raise.

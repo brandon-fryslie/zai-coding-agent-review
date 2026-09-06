@@ -1,0 +1,256 @@
+{
+  "schema": "copirate-eval-baseline/v2",
+  "generatedAt": "2026-09-06",
+  "mainSha": "ebccbd4148c51742248a0669e1aa13de4ffbffcf",
+  "engine": {
+    "provider": "claude-subscription",
+    "model": "claude-sonnet-5",
+    "reasoning": null
+  },
+  "matcher": "llm/claude-haiku-4-5-20251001",
+  "repeats": 5,
+  "degradationRule": {
+    "metric": "pooledInventoryMustFindRecall",
+    "comparator": "lt",
+    "floorSource": "suite.pooledInventoryMustFind.gateFloor",
+    "description": "PRIMARY GATE (pooled): the suite is DEGRADED when a candidate's pooled inventory must-find recall — total inventory must-finds found across all N×cases runs ÷ total inventory must-find opportunities, where a case's inventory pools every distinct must-find from all of its source PR's review rounds that exists in the frozen material — falls below this baseline's pooled gate floor (the baseline pooled rate minus a ~2σ binomial sampling margin). Pooling across runs is used because per-case recall means are too noisy to gate on at these tiny denominators. The frozen-round pooled rate and the per-case bands below are DIAGNOSTICS — they localize which case moved — not independent gates."
+  },
+  "suite": {
+    "cases": 4,
+    "pooledInventoryMustFind": {
+      "found": 37,
+      "opportunities": 100,
+      "rate": 0.37,
+      "gateFloor": 0.2754
+    },
+    "pooledMustFind": {
+      "found": 26,
+      "opportunities": 75,
+      "rate": 0.3467,
+      "gateFloor": 0.239
+    },
+    "meanInventoryMustFindRecall": 0.335,
+    "totalCostUsd": 0,
+    "costPerFullRunUsd": null,
+    "costedRuns": 0,
+    "uncostedRuns": 20
+  },
+  "cases": [
+    {
+      "case": "cc-candybar-150-transcript-perf",
+      "mustFindRecall": {
+        "mean": 0.3142857142857143,
+        "min": 0.14285714285714285,
+        "max": 0.42857142857142855,
+        "n": 5
+      },
+      "inventoryMustFindRecall": {
+        "mean": 0.34,
+        "min": 0.2,
+        "max": 0.5,
+        "n": 5
+      },
+      "niceToFindRecall": {
+        "mean": 0.225,
+        "min": 0,
+        "max": 0.375,
+        "n": 5
+      },
+      "inventoryNiceToFindRecall": {
+        "mean": 0.17333333333333334,
+        "min": 0,
+        "max": 0.26666666666666666,
+        "n": 5
+      },
+      "noiseCount": {
+        "mean": 12,
+        "min": 8,
+        "max": 16,
+        "n": 5
+      },
+      "costUsd": {
+        "mean": null,
+        "min": null,
+        "max": null,
+        "n": 0
+      },
+      "diagnosticFloor": 0.2,
+      "perRun": [
+        "2/7",
+        "1/7",
+        "3/7",
+        "2/7",
+        "3/7"
+      ],
+      "perRunInventory": [
+        "2/10",
+        "2/10",
+        "4/10",
+        "4/10",
+        "5/10"
+      ]
+    },
+    {
+      "case": "copirate-93-dependency-diff",
+      "mustFindRecall": {
+        "mean": 0.5333333333333333,
+        "min": 0.3333333333333333,
+        "max": 0.6666666666666666,
+        "n": 5
+      },
+      "inventoryMustFindRecall": {
+        "mean": 0.65,
+        "min": 0.5,
+        "max": 0.75,
+        "n": 5
+      },
+      "niceToFindRecall": {
+        "mean": 0.25,
+        "min": 0.25,
+        "max": 0.25,
+        "n": 5
+      },
+      "inventoryNiceToFindRecall": {
+        "mean": 0.2,
+        "min": 0.2,
+        "max": 0.2,
+        "n": 5
+      },
+      "noiseCount": {
+        "mean": 9.6,
+        "min": 4,
+        "max": 18,
+        "n": 5
+      },
+      "costUsd": {
+        "mean": null,
+        "min": null,
+        "max": null,
+        "n": 0
+      },
+      "diagnosticFloor": 0.5,
+      "perRun": [
+        "2/3",
+        "2/3",
+        "1/3",
+        "2/3",
+        "1/3"
+      ],
+      "perRunInventory": [
+        "3/4",
+        "3/4",
+        "2/4",
+        "3/4",
+        "2/4"
+      ]
+    },
+    {
+      "case": "laws-4-eval-tasks",
+      "mustFindRecall": {
+        "mean": 0,
+        "min": 0,
+        "max": 0,
+        "n": 5
+      },
+      "inventoryMustFindRecall": {
+        "mean": 0,
+        "min": 0,
+        "max": 0,
+        "n": 5
+      },
+      "niceToFindRecall": {
+        "mean": 0.06666666666666667,
+        "min": 0,
+        "max": 0.3333333333333333,
+        "n": 5
+      },
+      "inventoryNiceToFindRecall": {
+        "mean": 0.1833333333333333,
+        "min": 0,
+        "max": 0.3333333333333333,
+        "n": 5
+      },
+      "noiseCount": {
+        "mean": 8.4,
+        "min": 7,
+        "max": 11,
+        "n": 5
+      },
+      "costUsd": {
+        "mean": null,
+        "min": null,
+        "max": null,
+        "n": 0
+      },
+      "diagnosticFloor": 0,
+      "perRun": [
+        "0/2",
+        "0/2",
+        "0/2",
+        "0/2",
+        "0/2"
+      ],
+      "perRunInventory": [
+        "0/2",
+        "0/2",
+        "0/2",
+        "0/2",
+        "0/2"
+      ]
+    },
+    {
+      "case": "links-317-dolt-telemetry",
+      "mustFindRecall": {
+        "mean": 0.4666666666666666,
+        "min": 0.3333333333333333,
+        "max": 1,
+        "n": 5
+      },
+      "inventoryMustFindRecall": {
+        "mean": 0.35,
+        "min": 0.25,
+        "max": 0.75,
+        "n": 5
+      },
+      "niceToFindRecall": {
+        "mean": 0.13333333333333333,
+        "min": 0,
+        "max": 0.3333333333333333,
+        "n": 5
+      },
+      "inventoryNiceToFindRecall": {
+        "mean": 0.08888888888888888,
+        "min": 0,
+        "max": 0.2222222222222222,
+        "n": 5
+      },
+      "noiseCount": {
+        "mean": 6.4,
+        "min": 4,
+        "max": 10,
+        "n": 5
+      },
+      "costUsd": {
+        "mean": null,
+        "min": null,
+        "max": null,
+        "n": 0
+      },
+      "diagnosticFloor": 0.25,
+      "perRun": [
+        "1/3",
+        "1/3",
+        "1/3",
+        "1/3",
+        "3/3"
+      ],
+      "perRunInventory": [
+        "1/4",
+        "1/4",
+        "1/4",
+        "1/4",
+        "3/4"
+      ]
+    }
+  ]
+}
