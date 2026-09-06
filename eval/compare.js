@@ -20,9 +20,10 @@
 // N and the engine are DERIVED FROM the baseline and asserted, because a candidate run at a different N or
 // engine is not comparable — its pooled rate measures a different thing. [LAW:no-silent-failure]
 //
-// [LAW:effects-at-boundaries] Module load is PURE: only stdlib + the pure reducers imported from baseline.js
-// (buildBaseline/parseBaseline/…). Every world-effect (fs, git, spawning the run/score CLIs) lives inside
-// main(), so importing this file for the pure-core tests performs no IO and spawns no subprocess.
+// [LAW:effects-at-boundaries] Module load is PURE: only stdlib and functions imported from baseline.js (the
+// pure reducers), score.js (parsers, the run census) and run-case.js (the tree identity) — nothing runs at
+// require. Every world-effect (fs, git, spawning the run/score CLIs) lives inside main(), so importing
+// this file for the pure-core tests performs no IO and spawns no subprocess.
 
 const fs = require('fs');
 const path = require('path');
@@ -30,7 +31,8 @@ const { spawnSync, execFileSync } = require('child_process');
 const {
   parseCaseSummary, parseCaseEngine, buildBaseline, parseBaseline, sameEngine, evaluateGate,
 } = require('./baseline');
-const { matcherLabel, parseExpected, requireLlmJudgeCredential } = require('./score');
+const { matcherLabel, parseExpected, parseMeta, listRunDirs, requireLlmJudgeCredential } = require('./score');
+const { workingTree, treeIdentity } = require('./run-case');
 
 const USAGE = `Gate a candidate (the current working tree) against a frozen eval baseline: replay the golden
 suite N times, score it, and print a DEGRADED / OK / IMPROVED verdict. Non-zero exit on DEGRADED.
@@ -49,9 +51,14 @@ Usage: ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js [option
                          that mode; the reused summaries' own recorded matcher is what's checked instead).
   --out <dir>            Candidate artifact root (default: eval/out/candidate-<ts>, git-ignored). Kept
                          isolated from the baseline's own run artifacts under eval/out/<case>/. Mutually
-                         exclusive with --reuse-candidate (refused if both are passed). If it names an
-                         existing root with prior run artifacts for a baseline case, refused rather than
-                         silently blending old and new runs into one summary.
+                         exclusive with --reuse-candidate (refused if both are passed). An existing root
+                         RESUMES: runs already under it that carry this candidate's identity (the same
+                         clean commit — tracked content equal to HEAD; untracked files do not count —
+                         recorded in each run's meta.json) count toward N and only the
+                         deficit is replayed — how a gate survives a quota wall across invocations. Any
+                         run under it that is not provably this candidate's (another commit, a dirty
+                         tree, no identity recorded), or a case already holding more runs than the
+                         baseline's N, is refused by name before any spend rather than silently blended.
   --credentials <A,B,…>  Names of env vars holding one engine credential each, forwarded to
                          freeze-suite.js: one replay LANE per name, run concurrently. Default: a single
                          lane on the pinned provider's own credential input. N lanes cut the suite's
@@ -61,8 +68,10 @@ Usage: ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js [option
   --cache <file>         Judge-decision cache, forwarded to score.js (default: eval/out/.judge-cache.json).
   --reuse-candidate <d>  Skip the replay+score entirely and gate an ALREADY-produced candidate root <d>
                          (one <case>/scorecard-summary.json per baseline case). For re-rendering a verdict
-                         or validating the gate without re-spending. Mutually exclusive with --out and
-                         with --credentials (nothing is replayed, so there is nothing for either to shape).
+                         or validating the gate without re-spending. The verdict names the tree the reused
+                         runs record (each run's meta.json), not the checked-out tree; runs recording
+                         different trees are refused by name. Mutually exclusive with --out and with
+                         --credentials (nothing is replayed, so there is nothing for either to shape).
   --help                 Show this help.
 
 The candidate always runs at the baseline's N and pinned engine (a replay at a different N/engine would
@@ -141,13 +150,61 @@ function replayArgs({ repeats, candidateRoot, casesDir, caseNames, credentials }
 // [LAW:one-source-of-truth]
 const expectedMatcherLabel = matcherLabel;
 
-// The candidate's estimated cost for one gate invocation: one full suite run per repeat. Uses the
-// baseline's own recorded per-full-run cost × N (2fk.4's numbers), so the guardrail is printed BEFORE
-// spending. Null when the baseline never recorded a costed per-run figure (nothing to estimate from).
-function estimateCandidateCostUsd(rawBaselineSuite, repeats) {
+// The candidate's estimated cost for what THIS invocation will replay: `fullRuns` is the deficit in units
+// of one full suite pass (replays still owed ÷ cases — fractional when a resume left the cases uneven),
+// priced at the baseline's own recorded per-full-run cost (2fk.4's numbers), so the guardrail printed
+// BEFORE spending is the spend about to happen, not the suite's. Null when the baseline never recorded a
+// costed per-run figure (nothing to estimate from).
+function estimateCandidateCostUsd(rawBaselineSuite, fullRuns) {
   const perRun = rawBaselineSuite && rawBaselineSuite.costPerFullRunUsd;
   if (typeof perRun !== 'number' || !Number.isFinite(perRun)) return null;
-  return perRun * repeats;
+  return perRun * fullRuns;
+}
+
+// [LAW:effects-at-boundaries] Pure: how many replays the census will plan — per case, the shortfall to N
+// over the runs already accepted as this candidate's. The same level-filling arithmetic freeze-suite.js
+// runs, reduced to its total. No case holds more than N here: excessRuns refused that before this is read.
+function deficitReplays(caseNames, prior, repeats) {
+  return caseNames.reduce((sum, name) => sum + repeats - prior.filter(r => r.case === name).length, 0);
+}
+
+// [LAW:effects-at-boundaries] Pure: the cases holding MORE runs than the baseline's N — a population the
+// gate cannot measure (every case must be scored over the same N), which buildBaseline would refuse only
+// after the other cases' deficit had been replayed and paid for.
+function excessRuns(caseNames, prior, repeats) {
+  return caseNames
+    .map(name => ({ case: name, completed: prior.filter(r => r.case === name).length }))
+    .filter(c => c.completed > repeats);
+}
+
+// [LAW:effects-at-boundaries] Pure: equality of two recorded trees (commit and dirty flag; an unrecorded
+// tree equals only another unrecorded one), not identity: a dirty tree has no identity, yet a replay on
+// it is legitimate and its own runs record the same dirty snapshot; what a dirty tree cannot reveal is
+// movement within its own dirtiness, and the verdict already says 'dirty'.
+function sameTree(a, b) {
+  return a === null || b === null ? a === b : a.sha === b.sha && a.dirty === b.dirty;
+}
+
+// [LAW:effects-at-boundaries] Pure: which runs record a tree OTHER than the one snapshotted before the
+// replay — the tree moved while the suite ran.
+function driftedRuns(snapshot, runs) {
+  return runs
+    .filter(({ candidate }) => !sameTree(candidate, snapshot))
+    .map(({ dir, candidate }) => ({ dir, reason: `recorded ${describeTree(candidate)}; the tree snapshotted before the replay was ${describeTree(snapshot)}` }));
+}
+
+// [LAW:effects-at-boundaries] Pure: the one tree every run records — the tree a verdict over these runs
+// names, read from the runs themselves so a root produced elsewhere is named by its producer, never by the
+// tree that happens to be checked out. No runs (a reused root of summaries alone) is no recorded identity,
+// the same null a pre-provenance run records. Runs recording two trees are not one candidate: refused by
+// name. [LAW:one-source-of-truth] [LAW:no-silent-failure]
+function producedTree(runs) {
+  const tree = runs[0]?.candidate ?? null;
+  const odd = runs.filter(({ candidate }) => !sameTree(candidate, tree));
+  if (odd.length > 0) {
+    throw new Error(`The runs under the candidate root were not produced by one tree:\n${odd.map(r => `  ${r.dir} recorded ${describeTree(r.candidate)}; ${runs[0].dir} recorded ${describeTree(tree)}`).join('\n')}\nA verdict names one candidate; remove the runs that are not its.`);
+  }
+  return tree;
 }
 
 // The total pooled inventory must-find opportunities a candidate suite would report, given each baseline
@@ -270,7 +327,7 @@ function renderVerdictMarkdown(verdict, meta = {}) {
   const lines = [
     `## Eval verdict — ${badge}`,
     '',
-    `Candidate${meta.candidateSha ? ` (working tree \`${meta.candidateSha}\`${meta.dirty ? ', dirty' : ''})` : ''} vs baseline` +
+    `Candidate${meta.candidate === undefined ? '' : ` (${describeTree(meta.candidate)})`} vs baseline` +
       `${meta.baselineSha ? ` \`${meta.baselineSha.slice(0, 7)}\`` : ''}` +
       `${eng ? ` · engine \`${eng.provider}\`/\`${eng.model}\`${eng.reasoning ? `/reasoning=${eng.reasoning}` : ''}` : ''}` +
       ` · N=${verdict.repeats}${verdict.matcher ? ` · matcher \`${verdict.matcher}\`` : ''}.`,
@@ -416,16 +473,35 @@ function runCli(scriptPath, args, label) {
   if (res.status !== 0) throw new Error(`${label} exited ${res.status === null ? `on signal ${res.signal}` : `with code ${res.status}`}.`);
 }
 
-// Two independent facts, two independent failures: a `status` failure (submodule/ownership issue, the
-// process being killed) must never discard a SHA `rev-parse` already obtained — that SHA feeds both the
-// rendered verdict and the candidate's `buildBaseline` provenance, so losing it downgrades a real, known
-// commit to the generic 'working-tree' label with no indication anything went wrong. [LAW:no-silent-failure]
-function gitShaAndDirty() {
-  let sha = null;
-  try { sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: __dirname }).toString().trim(); } catch { /* no git / not a repo */ }
-  let dirty = false;
-  try { dirty = execFileSync('git', ['status', '--porcelain'], { cwd: __dirname }).toString().trim().length > 0; } catch { /* unknown — reported as clean, not fatal */ }
-  return { sha, dirty };
+// A tree as a phrase, for the refusal below: the reader must see BOTH sides to know which to fix.
+function describeTree(candidate) {
+  if (candidate === null) return 'no recorded identity';
+  return `${candidate.dirty ? 'a dirty tree at ' : ''}commit ${candidate.sha.slice(0, 7)}`;
+}
+
+// [LAW:effects-at-boundaries] Pure: which runs under --out cannot be this candidate's. A run is the
+// candidate's own only when both carry the SAME identity — one clean commit (treeIdentity); a dirty tree
+// on either side has none, so nothing can be proven and everything is foreign. Every foreign run is named
+// with both trees, so the operator knows whether to move the runs or commit the tree.
+function foreignRuns(current, runs) {
+  const identity = treeIdentity(current);
+  return runs
+    .filter(({ candidate }) => identity === null || candidate === null || treeIdentity(candidate) !== identity)
+    .map(({ dir, candidate }) => ({ dir, reason: `was replayed on ${describeTree(candidate)}; the tree under gate is ${describeTree(current)}` }));
+}
+
+// Every completed run already under the candidate root for the gated cases, with the tree that produced
+// it. "Completed" is score.js's own predicate (listRunDirs) — the same census freeze-suite.js will take,
+// so what this accepts is exactly what the replay will count. A run whose record names a different case
+// than the directory it sits in is refused here, before the spend, with the check score.js would make
+// after it. [LAW:one-source-of-truth] [LAW:parse-dont-validate]
+function readPriorRuns(candidateRoot, caseNames) {
+  return caseNames.flatMap(name => listRunDirs(path.join(candidateRoot, name)).map(dir => {
+    const metaPath = path.join(dir, 'meta.json');
+    const meta = parseMeta(fs.readFileSync(metaPath, 'utf8'), metaPath);
+    if (meta.case !== name) throw new Error(`${metaPath} names case '${meta.case}' but lives under '${name}' — a misplaced run; move or remove it.`);
+    return { case: name, dir, candidate: meta.candidate };
+  }));
 }
 
 function main() {
@@ -448,14 +524,28 @@ function main() {
   const casesDir = path.resolve(opts.casesDir);
   const freezeSuiteScript = path.join(__dirname, 'freeze-suite.js');
   const scoreScript = path.join(__dirname, 'score.js');
+  const caseNames = baseline.cases.map(({ case: name }) => name);
 
-  // The pre-spend guards below (3-3c) all share one shape: refuse BEFORE any replay when the thing they
+  // 3. Candidate artifact root — isolated from the baseline's own eval/out/<case> runs so score.js never
+  //    pools baseline + candidate run dirs together. Under eval/out/ (git-ignored) by default. Resolved
+  //    BEFORE any refusal below, because the first thing done under it must be undoing the last thing an
+  //    earlier invocation left there: a verdict is the product of ONE invocation over the WHOLE suite, and
+  //    one left under this root would be read as this run's if this run stopped before writing its own —
+  //    at a refusal below or an abort later (eval.yml publishes verdict.md from the root, whatever exit
+  //    it sees). Gone first, unconditionally, in both modes — a fresh root has nothing to remove and the
+  //    same operation runs. [LAW:dataflow-not-control-flow] [LAW:no-silent-failure]
+  const candidateRoot = opts.reuseCandidate
+    ? path.resolve(opts.reuseCandidate)
+    : path.resolve(opts.out || path.join('eval', 'out', `candidate-${new Date().toISOString().replace(/[:.]/g, '-')}`));
+  for (const file of ['verdict.md', 'verdict.json']) fs.rmSync(path.join(candidateRoot, file), { force: true });
+
+  // The pre-spend guards below (4-4c) all share one shape: refuse BEFORE any replay when the thing they
   // check is knowable without running the candidate engine at all. None of them apply under
   // --reuse-candidate, which replays nothing — compareVerdict's own checks (matcher, engine, pooled
   // opportunities), reading the reused summaries' ACTUAL recorded values, are the universal backstop for
   // that path. [LAW:no-silent-failure]
   if (!opts.reuseCandidate) {
-    // 3. Fail BEFORE spending an hour on a matcher that can't be compared: the candidate is scored with
+    // 4. Fail BEFORE spending an hour on a matcher that can't be compared: the candidate is scored with
     //    opts.matcher, which must yield the baseline's exact matcher label.
     if (baseline.matcher) {
       const wouldBe = expectedMatcherLabel(opts.matcher);
@@ -464,13 +554,13 @@ function main() {
       }
     }
 
-    // 3a. Fail BEFORE spending if the 'llm' matcher's credential is missing — score.js's makeLlmJudge
+    // 4a. Fail BEFORE spending if the 'llm' matcher's credential is missing — score.js's makeLlmJudge
     //     would otherwise throw only once a case's replay is already complete and its OWN score.js
     //     invocation runs, wasting that case's real spend on a run this file was never going to be able
     //     to score.
     if (opts.matcher === 'llm') requireLlmJudgeCredential();
 
-    // 3b. Fail BEFORE spending on a denominator that's already known to mismatch: each case's pooled
+    // 4b. Fail BEFORE spending on a denominator that's already known to mismatch: each case's pooled
     //     inventory opportunity count is a PURE function of its current expected.json (findings annotated
     //     must-find, any round) — it does not depend on what the candidate engine produces, so it costs
     //     nothing to check here.
@@ -486,7 +576,7 @@ function main() {
       throw new Error(`Incomparable: the golden suite's current pooled inventory opportunities (${currentOpportunities}) differ from the baseline's (${baseline.pooledInventoryMustFind.opportunities}) — expected.json changed since the baseline was frozen. Re-freeze the baseline before gating against this expected.json.`);
     }
 
-    // 3c. Fail BEFORE spending on engine drift — a FULL pass over every case, not a check folded into the
+    // 4c. Fail BEFORE spending on engine drift — a FULL pass over every case, not a check folded into the
     //     replay loop below: if only a LATER case's engine pin had drifted, folding it into that loop would
     //     let every EARLIER case fully replay and score (real spend) before the mismatch is even reached.
     //     run-case.js's own assertConfigMatchesPin only verifies the resolved config against THIS
@@ -505,12 +595,6 @@ function main() {
     }
   }
 
-  // 4. Candidate artifact root — isolated from the baseline's own eval/out/<case> runs so score.js never
-  //    pools baseline + candidate run dirs together. Under eval/out/ (git-ignored) by default.
-  const candidateRoot = opts.reuseCandidate
-    ? path.resolve(opts.reuseCandidate)
-    : path.resolve(opts.out || path.join('eval', 'out', `candidate-${new Date().toISOString().replace(/[:.]/g, '-')}`));
-
   process.stderr.write(`\nBaseline: ${baselineJsonPath}\n`);
   process.stderr.write(`  ${baseline.mainSha.slice(0, 7)} · engine ${baseline.engine ? `${baseline.engine.provider}/${baseline.engine.model}` : '(unpinned)'} · N=${repeats} · matcher ${baseline.matcher || '(none)'}\n`);
   process.stderr.write(`  gate floor ${pct(baseline.pooledInventoryMustFind.gateFloor)} (baseline pooled ${pct(baseline.pooledInventoryMustFind.rate)}, ${baseline.pooledInventoryMustFind.found}/${baseline.pooledInventoryMustFind.opportunities})\n`);
@@ -522,25 +606,37 @@ function main() {
     // refusal above — except here there's a principled winner (the reused data), just not the flag's value.
     process.stderr.write(`\nReusing candidate artifacts under ${candidateRoot} (no replay, no spend). --matcher is ignored in this mode — the reused summaries' own recorded matcher is what's checked.\n`);
   } else {
-    // 5. Refuse a non-fresh --out: run-case.js is append-only (never cleans <out>/<case>/) and score.js's
-    //    findRunDirs pools EVERY run dir under a case's output root — stale, fresh, whichever — into one
-    //    scorecard-summary.json. Reusing an --out that already has a case's run artifacts would silently
-    //    blend runs from two different working-tree states into a single candidate summary, with no error
-    //    (and possibly no N mismatch either, if the counts happen to add up). The default --out is always a
-    //    fresh timestamped path, so this only fires when --out is passed explicitly at an existing location.
-    for (const { case: name } of baseline.cases) {
-      const caseOutDir = path.join(candidateRoot, name);
-      const hasRunDirs = fs.existsSync(caseOutDir) && fs.readdirSync(caseOutDir, { withFileTypes: true })
-        .some(e => e.isDirectory() && fs.existsSync(path.join(caseOutDir, e.name, 'findings.json')));
-      if (hasRunDirs) {
-        throw new Error(`--out ${candidateRoot} already has run artifacts for case '${name}' at ${caseOutDir} — run-case.js is append-only and would blend them with fresh runs into one summary. Pick a fresh --out, or remove ${caseOutDir} first.`);
-      }
+    // 5. An --out that already holds runs is either this candidate's own partial suite — an earlier gate
+    //    invocation on the same clean commit that walled or timed out, which freeze-suite.js's census then
+    //    tops up to N (the whole reason a hosted gate can outlive a quota wall: eval.yml carries the root
+    //    across dispatches) — or someone else's. run-case.js is append-only and score.js pools EVERY run
+    //    dir under a case into one summary, so one foreign run would blend two trees into a single
+    //    candidate with no error and possibly no N mismatch. Every prior run must therefore carry the
+    //    identity of the tree under gate, and any that cannot is refused by name, before any spend.
+    //    [LAW:no-silent-failure] [LAW:parse-dont-validate]
+    // The tree under gate, snapshotted once before any replay: the census here and the drift check (7a)
+    // both compare against it. [LAW:one-source-of-truth]
+    const candidate = workingTree();
+    const prior = readPriorRuns(candidateRoot, caseNames);
+    const foreign = foreignRuns(candidate, prior);
+    if (foreign.length > 0) {
+      throw new Error(`--out ${candidateRoot} holds ${foreign.length} run(s) that are not this candidate's:\n${foreign.map(f => `  ${f.dir} ${f.reason}`).join('\n')}\nPick a fresh --out, or remove them first.`);
     }
+    const excess = excessRuns(caseNames, prior, repeats);
+    if (excess.length > 0) {
+      throw new Error(`--out ${candidateRoot} holds more runs than the baseline's N=${repeats} for ${excess.map(c => `'${c.case}' (${c.completed})`).join(', ')} — a suite scored over unequal N is not comparable. Remove the surplus runs, or pick a fresh --out.`);
+    }
+    for (const name of caseNames) {
+      process.stderr.write(`  ${name}: ${prior.filter(r => r.case === name).length}/${repeats} run(s) of this candidate already under --out; the replay fills the rest\n`);
+    }
+    const owed = deficitReplays(caseNames, prior, repeats);
 
-    // 6. COST GUARDRAIL — print the estimate up front, before spending. [LAW:verifiable-goals]
-    const estUsd = estimateCandidateCostUsd(rawBaselineSuite, repeats);
-    process.stderr.write(`\nAbout to replay ${baseline.cases.length} case(s) × N=${repeats} against the WORKING TREE, then score.\n`);
-    process.stderr.write(`Estimated cost ≈ ${estUsd === null ? 'unknown (baseline recorded no per-run cost)' : `$${estUsd.toFixed(2)}`} (from the baseline's recorded $/full-run × N). Actual varies with model stochasticity.\n\n`);
+    // 6. COST GUARDRAIL — print the estimate of THIS invocation's spend up front, before it happens: the
+    //    replays still owed, not the suite's size. [LAW:verifiable-goals]
+    const passesOwed = owed / caseNames.length;
+    const estUsd = estimateCandidateCostUsd(rawBaselineSuite, passesOwed);
+    process.stderr.write(`\nAbout to replay the ${owed} replay(s) still owed across the cases above (${passesOwed.toFixed(2)} full-suite pass(es) of ${baseline.cases.length} case(s) at N=${repeats}) against the WORKING TREE, then score.\n`);
+    process.stderr.write(`Estimated cost ≈ ${estUsd === null ? 'unknown (baseline recorded no per-run cost)' : `$${estUsd.toFixed(2)}`} (the baseline's recorded $/full-run × the ${passesOwed.toFixed(2)} full-suite pass(es) owed). Actual varies with model stochasticity.\n\n`);
 
     // 7. Replay the BASELINE's case set into the candidate root through freeze-suite.js — the scheduler the
     //    baseline itself was frozen with, so the gate replays on as many credential lanes as it is given and
@@ -548,9 +644,16 @@ function main() {
     //    same set, so nothing here re-checks case.json existence or the engine pin. freeze-suite.js exits
     //    non-zero when any case is still short of N, and runCli turns that into an abort here: a partial
     //    candidate is never scored. [LAW:no-silent-failure]
-    const caseNames = baseline.cases.map(({ case: name }) => name);
     process.stderr.write(`\n─── replaying ${caseNames.length} case(s) × N=${repeats} ───\n`);
     runCli(freezeSuiteScript, replayArgs({ repeats, candidateRoot, casesDir, caseNames, credentials: opts.credentials }), 'freeze-suite');
+    // 7a. Every run now under --out — inherited and just produced — must record the tree snapshotted
+    //     above: each replay wrote the tree it ran on, so a working tree that moved mid-invocation shows
+    //     up here, refused by name before it can be pooled into a verdict that names the snapshot.
+    //     [LAW:verifiable-goals] [LAW:one-source-of-truth]
+    const drifted = driftedRuns(candidate, readPriorRuns(candidateRoot, caseNames));
+    if (drifted.length > 0) {
+      throw new Error(`The working tree changed while the suite replayed: ${drifted.length} run(s) under ${candidateRoot} carry a different identity:\n${drifted.map(f => `  ${f.dir} ${f.reason}`).join('\n')}\nNo verdict written — it would name a tree that produced none of these runs.`);
+    }
     // 7b. Score each case. The judge is one credential and cheap; it needs no lanes.
     for (const name of caseNames) {
       process.stderr.write(`\n─── ${name}: scoring ───\n`);
@@ -558,10 +661,12 @@ function main() {
     }
   }
 
-  // 8. Reduce the candidate's scored summaries into a suite with the SAME buildBaseline the frozen baseline
-  //    used — producer and comparator can't drift. Read each case's summary + its pinned engine, exactly as
-  //    baseline.js's main() does.
-  const { sha: candidateSha, dirty } = gitShaAndDirty();
+  // 8. The tree the verdict names is the one the runs under the root record — in both modes, so a reused
+  //    root is named by the tree that produced it (7a already proved a replayed root's runs equal the
+  //    snapshot). Then reduce the candidate's scored summaries into a suite with the SAME buildBaseline the
+  //    frozen baseline used — producer and comparator can't drift. Read each case's summary + its pinned
+  //    engine, exactly as baseline.js's main() does.
+  const produced = producedTree(readPriorRuns(candidateRoot, caseNames));
   const candidateCases = baseline.cases.map(({ case: name }) => {
     const summaryPath = path.join(candidateRoot, name, 'scorecard-summary.json');
     if (!fs.existsSync(summaryPath)) throw new Error(`No candidate summary for case '${name}' at ${summaryPath}. ${opts.reuseCandidate ? 'The reused root is incomplete.' : 'The replay/score step did not produce it.'}`);
@@ -570,7 +675,7 @@ function main() {
     const engine = parseCaseEngine(fs.readFileSync(path.join(casesDir, name, 'case.json'), 'utf8'), path.join(casesDir, name, 'case.json'));
     return { summary, engine };
   });
-  const candidateSuite = buildBaseline({ cases: candidateCases, provenance: { sha: candidateSha || 'working-tree', date: new Date().toISOString().slice(0, 10) } });
+  const candidateSuite = buildBaseline({ cases: candidateCases, provenance: { sha: produced === null ? null : produced.sha, date: new Date().toISOString().slice(0, 10) } });
 
   // 9. THE VERDICT.
   const verdict = compareVerdict(baseline, candidateSuite);
@@ -580,7 +685,7 @@ function main() {
     delta: null,
   };
   if (typeof cost.baselinePerRun === 'number' && typeof cost.candidatePerRun === 'number') cost.delta = cost.candidatePerRun - cost.baselinePerRun;
-  const md = renderVerdictMarkdown(verdict, { candidateSha: candidateSha ? candidateSha.slice(0, 7) : null, dirty, baselineSha: baseline.mainSha, cost });
+  const md = renderVerdictMarkdown(verdict, { candidate: produced, baselineSha: baseline.mainSha, cost });
 
   // Write the verdict alongside the candidate artifacts (2fk.6 reads verdict.md into a Step Summary), and
   // print it to stdout so it's pasteable straight into a PR body.
@@ -610,4 +715,5 @@ if (require.main === module) {
 module.exports = {
   parseArgs, replayArgs, expectedMatcherLabel, estimateCandidateCostUsd,
   compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath, computeExpectedOpportunities,
+  foreignRuns, readPriorRuns, deficitReplays, excessRuns, driftedRuns, producedTree,
 };

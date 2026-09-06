@@ -222,15 +222,28 @@ function parseUsage(raw, label) {
   };
 }
 
-// meta.json carries provenance the scorer reads instead of parsing the run-dir name: the case name (which
-// resolves expected.json) and the resolved engine config (echoed into the scorecard). [LAW:one-source-of-truth]
+// meta.json carries provenance read instead of parsing the run-dir name: the case name (which resolves
+// expected.json), the resolved engine config (echoed into the scorecard), and the tree that produced the run
+// (`candidate`, which compare.js reads to tell its own partial suite from a foreign one). [LAW:one-source-of-truth]
 function parseMeta(raw, label) {
   const json = parseJsonObject(raw, label);
   if (typeof json.case !== 'string' || json.case.trim() === '') throw new Error(`${label} has no 'case' name.`);
   if (json.case !== path.basename(json.case) || json.case === '.' || json.case === '..') {
     throw new Error(`${label} 'case' must be a plain directory component, got ${JSON.stringify(json.case)}.`);
   }
-  return { case: json.case, config: json.config ?? null };
+  return { case: json.case, config: json.config ?? null, candidate: parseCandidate(json.candidate, label) };
+}
+
+// The tree that produced a run, as run-case.js's workingTree() recorded it: `{sha: <commit>, dirty:
+// <boolean>}`. Absent on runs replayed before provenance was kept — a typed absence (null), which
+// compare.js reads as "cannot be proven anyone's". Anything else is a malformed record, refused.
+// [LAW:parse-dont-validate]
+function parseCandidate(raw, label) {
+  if (raw === undefined) return null;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw) || typeof raw.sha !== 'string' || raw.sha.trim() === '' || typeof raw.dirty !== 'boolean') {
+    throw new Error(`${label} 'candidate' must be {sha: <commit>, dirty: <boolean>}, got ${JSON.stringify(raw)}.`);
+  }
+  return { sha: raw.sha, dirty: raw.dirty };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────

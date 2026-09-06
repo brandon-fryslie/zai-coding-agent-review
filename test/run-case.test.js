@@ -279,3 +279,68 @@ describe('resolvePinnedConfig carries a pinned reasoning through the rows that d
     });
   }
 });
+
+// ── tree identity: what a run records, what the gate compares ─────────────────────────────────────────
+const { execFileSync } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const { workingTree, treeIdentity, writeRunRecord } = require('../eval/run-case');
+
+test('workingTree reads this checkout: HEAD as git reports it, dirtiness as a known boolean', () => {
+  const tree = workingTree();
+  assert.equal(tree.sha, execFileSync('git', ['rev-parse', 'HEAD'], { cwd: path.join(__dirname, '..') }).toString().trim());
+  assert.equal(typeof tree.dirty, 'boolean');
+});
+
+test('workingTree outside any git repo fails with git\'s own message — never a tree reported clean', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'no-repo-'));
+  try {
+    assert.throws(() => workingTree(dir), /not a git repository/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('workingTree counts tracked modifications as dirty and untracked files as nothing', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tree-'));
+  try {
+    const git = (...args) => execFileSync('git', args, { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
+    git('init', '-q');
+    git('config', 'user.email', 't@example.com'); git('config', 'user.name', 't');
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'a\n');
+    git('add', 'a.txt'); git('commit', '-q', '-m', 'a');
+    const sha = git('rev-parse', 'HEAD');
+    assert.deepEqual(workingTree(dir), { sha, dirty: false });
+    fs.writeFileSync(path.join(dir, 'scratch.txt'), 'untracked\n');
+    assert.deepEqual(workingTree(dir), { sha, dirty: false });
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'changed\n');
+    assert.deepEqual(workingTree(dir), { sha, dirty: true });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('treeIdentity: only a clean commit is an identity', () => {
+  assert.equal(treeIdentity({ sha: 'abc123', dirty: false }), 'abc123');
+  assert.equal(treeIdentity({ sha: 'abc123', dirty: true }), null);
+});
+
+test('writeRunRecord: a counted run dir is a complete one — findings.json lands last, and a record that cannot finish is never counted', () => {
+  const { listRunDirs } = require('../eval/score');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'run-record-'));
+  try {
+    const ok = path.join(root, 'case', 'r1');
+    fs.mkdirSync(ok, { recursive: true });
+    writeRunRecord(ok, { meta: { case: 'case' }, summary: 's', usage: { u: 1 }, findings: [{ path: 'a', line: 1 }] });
+    assert.deepEqual(fs.readdirSync(ok).sort(), ['findings.json', 'meta.json', 'summary.txt', 'usage.json']);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(ok, 'findings.json'), 'utf8')), [{ path: 'a', line: 1 }]);
+
+    const broken = path.join(root, 'case', 'r2');
+    fs.mkdirSync(broken, { recursive: true });
+    assert.throws(() => writeRunRecord(broken, { meta: { case: 'case' }, summary: 's', usage: {}, findings: [1n] }), TypeError);
+    assert.deepEqual(fs.readdirSync(broken).sort(), ['meta.json', 'summary.txt', 'usage.json']);
+    assert.deepEqual(listRunDirs(path.join(root, 'case')), [ok]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

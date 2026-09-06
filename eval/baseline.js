@@ -14,14 +14,14 @@
 //   node eval/baseline.js [--out-dir eval/out] [--cases-dir eval/cases] [--dest eval/baseline]
 //                         [--sha <git-sha>] [--date <YYYY-MM-DD>]
 //
-// [LAW:effects-at-boundaries] Module load is PURE: only stdlib + the pure JSON-object boundary imported
-// from score.js. Every world-effect (fs, git) lives inside main(), so importing this file for the
-// pure-core tests performs no IO.
+// [LAW:effects-at-boundaries] Module load is PURE: only stdlib, the pure JSON-object boundary imported
+// from score.js, and workingTree from run-case.js (a function; nothing runs at require). Every
+// world-effect (fs, git) lives inside main(), so importing this file for the pure-core tests performs no IO.
 
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
 const { parseJsonObject } = require('./score');
+const { workingTree } = require('./run-case');
 
 // The schema id the freezer stamps and the loader demands — one name, written once, so a writer that
 // stamped a version the reader rejects is not expressible. Superseded schemas (the v1 baseline kept under
@@ -499,7 +499,7 @@ function main() {
   // Provenance: the exact main SHA + a date stamp. SHA defaults to git HEAD (the commit this characterizes);
   // date defaults to today (UTC). [LAW:effects-at-boundaries] The git read is the only ambient input, done
   // here at the boundary, never inside buildBaseline.
-  const sha = opts.sha || execFileSync('git', ['rev-parse', 'HEAD'], { cwd: __dirname }).toString().trim();
+  const sha = opts.sha || workingTree().sha;
   const date = opts.date || new Date().toISOString().slice(0, 10);
 
   const baseline = buildBaseline({ cases, provenance: { sha, date } });

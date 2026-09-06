@@ -215,7 +215,9 @@ eval/out/<case-name>/<timestamp>-run<i>/
                     { basis:'unpriced', reason }). A run captured before the token split
                     carries a collapsed inputTokens/outputTokens pair instead, and reads
                     back as tokens: null — absent, never zero.
-  meta.json       — provenance: case, timestamp, run index, the resolved engine config, findingCount.
+  meta.json       — provenance: case, timestamp, run index, the resolved engine config, findingCount,
+                    and candidate ({sha, dirty}: the tree that produced the run; null on runs from
+                    before it was recorded).
   transcripts/    — the full per-spawn session transcripts (scout + one per scope).
 ```
 
@@ -484,11 +486,14 @@ ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js
 #          --matcher llm|lexical (default llm; MUST match the baseline's matcher; IGNORED under
 #            --reuse-candidate, where the reused summaries' own recorded matcher is checked instead),
 #          --out <dir> (default eval/out/candidate-<ts>, git-ignored; mutually exclusive with
-#            --reuse-candidate; refused if it already holds run artifacts for a case),
+#            --reuse-candidate; an existing root resumes — runs under it recorded on this same clean
+#            commit count toward N — and any run that is not provably this candidate's, or a case holding
+#            more runs than the baseline's N, is refused by name),
 #          --credentials <A,B,…> (env var names, one replay lane each, forwarded to freeze-suite.js;
 #            default: one lane on the pinned provider's own input), --cases-dir <dir>, --cache <file>,
-#          --reuse-candidate <dir> (gate an already-produced candidate root; no replay, no spend;
-#            mutually exclusive with --out)
+#          --reuse-candidate <dir> (gate an already-produced candidate root; no replay, no spend; the
+#            verdict names the tree the reused runs record, not the checked-out tree; mutually
+#            exclusive with --out)
 ```
 
 ANTHROPIC_API_KEY is required **unconditionally** for the default `--matcher llm` (the judge's own
@@ -513,7 +518,8 @@ gate predicate — it:
    (`[LAW:single-enforcer]`): **candidate pooled inventory must-find recall < the baseline's pooled
    gate floor ⇒ DEGRADED.**
 
-It prints the **estimated cost up front** (the baseline's recorded `$/full-run` × N), then a
+It prints the **estimated cost up front** (the baseline's recorded `$/full-run` × the full-suite
+passes still owed — N on a fresh root, the deficit on a resumed one), then a
 per-case verdict table and a final `DEGRADED` / `OK` / `IMPROVED` line — Markdown, so it pastes
 straight into a PR body. The per-case bands are diagnostics that localize *which* case moved a
 pooled regression (a `moved?` ⚠️ marks a case whose candidate mean fell below its baseline
@@ -542,7 +548,7 @@ reviewers look: the verdict table lands in the run's **Step Summary**, `DEGRADED
 is uploaded as the `eval-candidate` artifact even on a red or aborted run.
 
 Two triggers, both deliberate spends. `compare.js` prints the authoritative cost estimate (the
-baseline's recorded $/full-run × N) before spending. For the current N=5 × 4-case baseline that
+baseline's recorded $/full-run × the full-suite passes still owed) before spending. For the current N=5 × 4-case baseline that
 estimate is **no dollar figure at all** — the pinned engine bills against subscription quota, so the
 baseline records `costPerFullRunUsd: null`. The spend is quota and wall clock: 20 replays at 13–27 min
 each, which `compare.js` hands to `freeze-suite.js` to spread across credential lanes. The workflow
@@ -561,6 +567,24 @@ spend — and a run competes with PR reviews on those same accounts while it las
   a labeled PR does. The candidate is the PR merge ref — the code as it would land. Fork PRs never
   run the gate: GitHub withholds secrets from fork `pull_request` events, so the job skips them up
   front rather than failing mid-run on empty credentials.
+
+**A walled or timed-out run is not lost.** The workflow carries the candidate root across runs in
+the Actions cache, keyed by the commit under gate. On the next dispatch of the *same* commit,
+`compare.js` finds the earlier replays under `--out`, checks that each carries this commit's identity
+(every run's `meta.json` records the tree that produced it — commit plus dirty flag, from
+`run-case.js`'s `workingTree`, the one function both sides read — and only a clean tree has an identity
+that can match), and `freeze-suite.js`'s census replays only the deficit. A run
+that carries a different identity — another commit, a dirty tree, or none recorded — is refused by
+name, never blended: `score.js` pools every run dir under a case into one summary, so a foreign run
+would corrupt the candidate silently. A different commit (a push to the PR, a merge to `main`)
+matches nothing and starts fresh, as a different candidate should. So when the daily quota walls a
+run, re-dispatching on the same commit once the accounts reset finishes the suite instead of
+re-spending it; the 2026-09-06 acceptance run walled at 11/20 replays, which is the case this
+exists for. Two more refusals guard the same population: a case already holding more runs than the
+baseline's N is refused before any spend (a suite scored over unequal N is not comparable), and after
+the replay every run under `--out` is checked once more against the tree snapshotted before it — a
+working tree that moved mid-invocation is refused by name and no verdict is written, since the
+verdict would name a tree that produced none of those runs.
 
 The workflow checks out with `fetch-depth: 0` because the no-`--baseline` newest-pick ranks
 committed baselines by commit-graph order, which a shallow clone collapses to a refused tie. It

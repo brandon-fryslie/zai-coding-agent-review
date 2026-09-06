@@ -118,8 +118,9 @@ test('expectedMatcherLabel builds the exact label score.js records', () => {
 
 // ── estimateCandidateCostUsd (the cost guardrail) ─────────────────────────────────────────────────────
 
-test('estimateCandidateCostUsd multiplies the baseline per-run cost by N, or null when absent', () => {
+test('estimateCandidateCostUsd prices the full-suite passes still owed — fractional on an uneven resume — or null when uncosted', () => {
   assert.equal(estimateCandidateCostUsd({ costPerFullRunUsd: 0.6952 }, 5), 0.6952 * 5);
+  assert.equal(estimateCandidateCostUsd({ costPerFullRunUsd: 0.6952 }, 9 / 4), 0.6952 * 9 / 4);
   assert.equal(estimateCandidateCostUsd({ costPerFullRunUsd: null }, 5), null);
   assert.equal(estimateCandidateCostUsd({}, 5), null);
   assert.equal(estimateCandidateCostUsd(null, 5), null);
@@ -255,12 +256,14 @@ test('renderVerdictMarkdown surfaces the gate, the per-case table, cost, and a f
   ]);
   const v = compareVerdict(baseline, candidate);
   const md = renderVerdictMarkdown(v, {
-    candidateSha: 'cafe123', dirty: true, baselineSha: 'basesha0deadbeef',
+    candidate: { sha: 'cafe1234', dirty: true }, baselineSha: 'basesha0deadbeef',
     cost: { baselinePerRun: 0.7, candidatePerRun: 0.5, delta: -0.2 },
   });
   assert.match(md, /## Eval verdict — 🔴 DEGRADED/);
   assert.match(md, /PRIMARY GATE — pooled inventory must-find recall/);
-  assert.match(md, /working tree `cafe123`, dirty/);
+  assert.match(md, /Candidate \(a dirty tree at commit cafe123\) vs baseline/);
+  assert.match(renderVerdictMarkdown(v, { candidate: { sha: 'cafe1234', dirty: false }, baselineSha: 'basesha0deadbeef', cost: null }), /Candidate \(commit cafe123\) vs baseline/);
+  assert.match(renderVerdictMarkdown(v, { candidate: null, baselineSha: 'basesha0deadbeef', cost: null }), /Candidate \(no recorded identity/);
   assert.match(md, /\| `case-a` \|/);
   assert.match(md, /⚠️ yes/);
   assert.match(md, /\*\*Cost:\*\*/);
@@ -407,4 +410,103 @@ test('resolveBaselineJsonPath does NOT refuse a shallow clone with an uncommitte
       fs.rmSync(shallow, { recursive: true, force: true });
     }
   });
+});
+
+// ── resume or refuse: prior runs under --out against the tree under gate ──────────────────────────────
+const { foreignRuns, readPriorRuns, deficitReplays, excessRuns, driftedRuns, producedTree } = require('../eval/compare');
+
+test('foreignRuns keeps the runs replayed on this exact clean commit and names every other by both trees', () => {
+  const here = { sha: 'aaaaaaa1', dirty: false };
+  const runs = [
+    { dir: 'r1', candidate: { sha: 'aaaaaaa1', dirty: false } },   // ours
+    { dir: 'r2', candidate: { sha: 'bbbbbbb2', dirty: false } },   // another commit
+    { dir: 'r3', candidate: { sha: 'aaaaaaa1', dirty: true } },    // same commit, dirty when replayed
+    { dir: 'r4', candidate: null },                                // pre-provenance run
+  ];
+  const foreign = foreignRuns(here, runs);
+  assert.deepEqual(foreign.map(f => f.dir), ['r2', 'r3', 'r4']);
+  assert.match(foreign[0].reason, /replayed on commit bbbbbbb; the tree under gate is commit aaaaaaa/);
+  assert.match(foreign[1].reason, /a dirty tree at commit aaaaaaa/);
+  assert.match(foreign[2].reason, /no recorded identity/);
+});
+
+test('foreignRuns under a dirty tree refuses EVERY prior run — nothing can be proven its own', () => {
+  const ours = [{ dir: 'r1', candidate: { sha: 'aaaaaaa1', dirty: false } }];
+  const dirty = foreignRuns({ sha: 'aaaaaaa1', dirty: true }, ours);
+  assert.equal(dirty.length, 1);
+  assert.match(dirty[0].reason, /the tree under gate is a dirty tree at commit aaaaaaa/);
+  assert.deepEqual(foreignRuns({ sha: 'aaaaaaa1', dirty: true }, []), []);
+});
+
+test('deficitReplays is the census arithmetic: per case, the shortfall to N over the accepted prior runs', () => {
+  const prior = [{ case: 'a' }, { case: 'a' }, { case: 'a' }, { case: 'b' }, { case: 'c' }, { case: 'c' }, { case: 'c' }, { case: 'c' }, { case: 'c' }];
+  assert.equal(deficitReplays(['a', 'b', 'c', 'd'], prior, 5), 2 + 4 + 0 + 5);
+  assert.equal(deficitReplays(['a', 'b'], [], 5), 10);
+});
+
+test('excessRuns names every case holding more runs than N — the population the gate cannot measure', () => {
+  const prior = [{ case: 'a' }, { case: 'a' }, { case: 'a' }, { case: 'c' }, { case: 'c' }];
+  assert.deepEqual(excessRuns(['a', 'b', 'c'], prior, 2), [{ case: 'a', completed: 3 }]);
+  assert.deepEqual(excessRuns(['a', 'b', 'c'], prior, 3), []);
+});
+
+test('driftedRuns compares the recorded tree to the snapshot by equality — a dirty tree\'s own fresh runs are NOT drift', () => {
+  const dirty = { sha: 'aaaaaaa1', dirty: true };
+  const clean = { sha: 'aaaaaaa1', dirty: false };
+  assert.deepEqual(driftedRuns(dirty, [{ dir: 'r1', candidate: { sha: 'aaaaaaa1', dirty: true } }]), []);
+  assert.deepEqual(driftedRuns(clean, [{ dir: 'r1', candidate: { sha: 'aaaaaaa1', dirty: false } }]), []);
+  const moved = driftedRuns(clean, [
+    { dir: 'r1', candidate: { sha: 'aaaaaaa1', dirty: false } },
+    { dir: 'r2', candidate: { sha: 'aaaaaaa1', dirty: true } },   // edited mid-run
+    { dir: 'r3', candidate: { sha: 'bbbbbbb2', dirty: false } },  // committed mid-run
+    { dir: 'r4', candidate: null },
+  ]);
+  assert.deepEqual(moved.map(m => m.dir), ['r2', 'r3', 'r4']);
+  assert.match(moved[0].reason, /recorded a dirty tree at commit aaaaaaa; the tree snapshotted before the replay was commit aaaaaaa/);
+});
+
+test('producedTree names the one tree every run records — the verdict\'s provenance comes from the runs, not the checkout', () => {
+  const clean = { sha: 'aaaaaaa1', dirty: false };
+  assert.deepEqual(producedTree([{ dir: 'r1', candidate: clean }, { dir: 'r2', candidate: { sha: 'aaaaaaa1', dirty: false } }]), clean);
+  assert.deepEqual(producedTree([{ dir: 'r1', candidate: { sha: 'aaaaaaa1', dirty: true } }]), { sha: 'aaaaaaa1', dirty: true });
+  // Pre-provenance runs agree with each other on having no identity, and the verdict says so; a reused
+  // root of summaries alone (no run dirs) has none to name either.
+  assert.equal(producedTree([{ dir: 'r1', candidate: null }, { dir: 'r2', candidate: null }]), null);
+  assert.equal(producedTree([]), null);
+  assert.throws(() => producedTree([
+    { dir: 'r1', candidate: clean },
+    { dir: 'r2', candidate: { sha: 'bbbbbbb2', dirty: false } },
+    { dir: 'r3', candidate: null },
+  ]), /not produced by one tree:\n {2}r2 recorded commit bbbbbbb; r1 recorded commit aaaaaaa\n {2}r3 recorded no recorded identity/);
+});
+
+test('readPriorRuns reads the census the replay will take — completed runs only, each with its recorded tree', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'compare-prior-'));
+  try {
+    const mk = (caseName, run, meta, complete = true) => {
+      const dir = path.join(root, caseName, run);
+      fs.mkdirSync(dir, { recursive: true });
+      if (complete) fs.writeFileSync(path.join(dir, 'findings.json'), '[]\n');
+      fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ case: caseName, ...meta }) + '\n');
+      return dir;
+    };
+    const a1 = mk('case-a', '2026-01-01T00-00-00-000Z-run1', { candidate: { sha: 'abc', dirty: false } });
+    const a2 = mk('case-a', '2026-01-01T00-00-01-000Z-run1', {});
+    mk('case-a', '2026-01-01T00-00-02-000Z-run1', { candidate: { sha: 'abc', dirty: false } }, false); // crashed: no findings.json
+    mk('case-c', '2026-01-01T00-00-03-000Z-run1', { candidate: { sha: 'abc', dirty: false } });       // not a gated case
+    const prior = readPriorRuns(root, ['case-a', 'case-b']);
+    const misplaced = path.join(root, 'case-b', '2026-01-01T00-00-04-000Z-run1');
+    fs.mkdirSync(misplaced, { recursive: true });
+    fs.writeFileSync(path.join(misplaced, 'findings.json'), '[]\n');
+    fs.writeFileSync(path.join(misplaced, 'meta.json'), JSON.stringify({ case: 'case-a', candidate: { sha: 'abc', dirty: false } }) + '\n');
+    assert.throws(() => readPriorRuns(root, ['case-a', 'case-b']), /names case 'case-a' but lives under 'case-b'/);
+    fs.rmSync(misplaced, { recursive: true, force: true });
+    assert.deepEqual(prior, [
+      { case: 'case-a', dir: a1, candidate: { sha: 'abc', dirty: false } },
+      { case: 'case-a', dir: a2, candidate: null },
+    ]);
+    assert.deepEqual(readPriorRuns(path.join(root, 'absent'), ['case-a']), []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
