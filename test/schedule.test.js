@@ -276,8 +276,9 @@ describe('renderTimingBreakdown', () => {
     assert.match(line, /scout 2m00s/);
     assert.match(line, /review 5m00s/);
     assert.match(line, /sweep 1 3m00s/);
-    // the slowest CLOCKED worker attempt, named — pass 0's engine at 3 minutes
-    assert.match(line, /slowest scope: engine \(3m00s\)/);
+    // the slowest CHAIN, named: engine 3m+1m and transport 2m+2m both sum to 4 minutes, and the tie
+    // keeps the first recorded — not pass 0's 3-minute engine attempt, which no lane's clock shows
+    assert.match(line, /slowest scope: engine \(4m00s\)/);
     // the schedule sentence that turns spawn time into wall time
     assert.match(line, /2 scope\(s\) on 2 lane\(s\), deepest chain 2 pass\(es\)/);
   });

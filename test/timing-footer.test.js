@@ -27,7 +27,8 @@ const span = (fromMin, toMin) => ({ from: at(fromMin), to: at(toMin) });
 
 const CONFIG = { name: 'zai', engine: 'claude-code', model: 'glm-5' };
 
-// A fabricated pass with known timings: scout 2m, pass-0 workers 3m + 2m, one sweep worker 1m.
+// A fabricated pass with known timings: scout 2m, pass-0 workers 3m + 2m, one sweep worker 1m — so
+// engine's chain is 4m against transport's 2m.
 const SCHEDULE = {
   laneCount: 2,
   sweepCap: 1,
@@ -44,7 +45,7 @@ describe('the pr-mode footer', () => {
   test('renders the breakdown from a fabricated pass with known timings, beside the attribution', () => {
     const footer = buildReviewFooter(null, CONFIG, null, { schedule: SCHEDULE, totalMs: 10 * MIN });
     assert.match(footer, /_Reviewed by config `zai`/);
-    assert.match(footer, /_Timing: 10m00s total · spawns 8m00s \(4 attempt\(s\)\) — scout 2m00s · review 5m00s · sweep 1 1m00s · slowest scope: engine \(3m00s\) · 2 scope\(s\) on 2 lane\(s\), deepest chain 2 pass\(es\)_/);
+    assert.match(footer, /_Timing: 10m00s total · spawns 8m00s \(4 attempt\(s\)\) — scout 2m00s · review 5m00s · sweep 1 1m00s · slowest scope: engine \(4m00s\) · 2 scope\(s\) on 2 lane\(s\), deepest chain 2 pass\(es\)_/);
     assert.match(footer, /<details>\n<summary>Timing by scope<\/summary>/);
     assert.equal(warnings.filter(w => w.includes('Timing')).length, 0);
   });
@@ -193,7 +194,7 @@ describe('the repo-mode report', () => {
       footer,
     });
     assert.match(report, /_Timing: 10m00s total/);
-    assert.match(report, /slowest scope: engine \(3m00s\)/);
+    assert.match(report, /slowest scope: engine \(4m00s\)/);
   });
 });
 

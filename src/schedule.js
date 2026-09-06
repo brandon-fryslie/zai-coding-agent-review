@@ -220,8 +220,9 @@ function scopeText(str) {
 // The line answers "why was this slow?" without the run log: total wall clock (the whole run —
 // preflight, diff fetch and host I/O included, which is why it comes from the run's own clock and
 // not from summing spawns); the spawn time inside it (their ratio separates working from waiting);
-// the split by phase; the slowest scope (every scope runs in its own lane, so the run's wall clock
-// is its slowest chain and nothing else); and the schedule sentence that turns spawn time into
+// the split by phase; the slowest scope (every scope runs its passes back to back in its own lane,
+// so the clause is that scope's summed chain — the run's wall clock and nothing else); and the
+// schedule sentence that turns spawn time into
 // wall time — lanes below scopes names the one thing that can still queue a ready scope, the
 // machine's capacity.
 //
@@ -255,9 +256,14 @@ function renderTimingBreakdown(schedule, totalMs, prTime = '') {
     phaseClause('scout', d.scouts.map(s => s.ms)),
     ...d.passes.map(p => phaseClause(passLabel(p.pass), p.spawns.map(s => s.ms))),
   ].join(' · ');
-  // The slowest CLOCKED worker attempt; ties keep the first recorded. All-unclocked stays an
-  // explicit 'unclocked', never a fabricated winner.
-  const slowest = workerRows.reduce((best, s) => (s.ms != null && (best == null || s.ms > best.ms) ? s : best), null);
+  // The slowest CHAIN, not the slowest attempt: a scope's passes run back to back in its lane, so its
+  // wall clock is the sum of its clocked attempts (a partial clock is the same lower bound the phase
+  // clauses carry). Scopes in first-recorded order, so ties keep the first; a scope with no clocked
+  // attempt sums to null and cannot win; all-unclocked stays an explicit 'unclocked', never a
+  // fabricated winner. [LAW:one-source-of-truth]
+  const chains = [...new Set(workerRows.map(s => s.scope))]
+    .map(scope => ({ scope, ms: sumMs(workerRows.filter(s => s.scope === scope).map(s => s.ms)) }));
+  const slowest = chains.reduce((best, c) => (c.ms != null && (best == null || c.ms > best.ms) ? c : best), null);
   const slowestClause = slowest ? `slowest scope: ${scopeText(slowest.scope)} (${formatMs(slowest.ms)})` : 'slowest scope: unclocked';
   const scheduleSentence = `${d.scopeCount} scope(s) on ${d.laneCount} lane(s), deepest chain ${d.passes.length} pass(es)`;
   const line = `${head} · ${phaseClause('spawns', allDurations)} (${spawnCount} attempt(s))`
