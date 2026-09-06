@@ -292,10 +292,29 @@ test('workingTree reads this checkout: HEAD as git reports it, dirtiness as a kn
   assert.equal(typeof tree.dirty, 'boolean');
 });
 
-test('workingTree outside any git repo has no commit and an UNKNOWN state — never a clean one', () => {
+test('workingTree outside any git repo fails with git\'s own message — never a tree reported clean', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'no-repo-'));
   try {
-    assert.deepEqual(workingTree(dir), { sha: null, dirty: null });
+    assert.throws(() => workingTree(dir), /not a git repository/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('workingTree counts tracked modifications as dirty and untracked files as nothing', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tree-'));
+  try {
+    const git = (...args) => execFileSync('git', args, { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
+    git('init', '-q');
+    git('config', 'user.email', 't@example.com'); git('config', 'user.name', 't');
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'a\n');
+    git('add', 'a.txt'); git('commit', '-q', '-m', 'a');
+    const sha = git('rev-parse', 'HEAD');
+    assert.deepEqual(workingTree(dir), { sha, dirty: false });
+    fs.writeFileSync(path.join(dir, 'scratch.txt'), 'untracked\n');
+    assert.deepEqual(workingTree(dir), { sha, dirty: false });
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'changed\n');
+    assert.deepEqual(workingTree(dir), { sha, dirty: true });
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -304,6 +323,4 @@ test('workingTree outside any git repo has no commit and an UNKNOWN state — ne
 test('treeIdentity: only a clean commit is an identity', () => {
   assert.equal(treeIdentity({ sha: 'abc123', dirty: false }), 'abc123');
   assert.equal(treeIdentity({ sha: 'abc123', dirty: true }), null);
-  assert.equal(treeIdentity({ sha: 'abc123', dirty: null }), null);
-  assert.equal(treeIdentity({ sha: null, dirty: false }), null);
 });

@@ -52,7 +52,8 @@ Usage: ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js [option
                          isolated from the baseline's own run artifacts under eval/out/<case>/. Mutually
                          exclusive with --reuse-candidate (refused if both are passed). An existing root
                          RESUMES: runs already under it that carry this candidate's identity (the same
-                         clean commit, recorded in each run's meta.json) count toward N and only the
+                         clean commit — tracked content equal to HEAD; untracked files do not count —
+                         recorded in each run's meta.json) count toward N and only the
                          deficit is replayed — how a gate survives a quota wall across invocations. Any
                          run under it that is not provably this candidate's (another commit, a dirty
                          tree, no identity recorded) is refused by name rather than silently blended.
@@ -145,13 +146,22 @@ function replayArgs({ repeats, candidateRoot, casesDir, caseNames, credentials }
 // [LAW:one-source-of-truth]
 const expectedMatcherLabel = matcherLabel;
 
-// The candidate's estimated cost for one gate invocation: one full suite run per repeat. Uses the
-// baseline's own recorded per-full-run cost × N (2fk.4's numbers), so the guardrail is printed BEFORE
-// spending. Null when the baseline never recorded a costed per-run figure (nothing to estimate from).
-function estimateCandidateCostUsd(rawBaselineSuite, repeats) {
+// The candidate's estimated cost for what THIS invocation will replay: `fullRuns` is the deficit in units
+// of one full suite pass (replays still owed ÷ cases — fractional when a resume left the cases uneven),
+// priced at the baseline's own recorded per-full-run cost (2fk.4's numbers), so the guardrail printed
+// BEFORE spending is the spend about to happen, not the suite's. Null when the baseline never recorded a
+// costed per-run figure (nothing to estimate from).
+function estimateCandidateCostUsd(rawBaselineSuite, fullRuns) {
   const perRun = rawBaselineSuite && rawBaselineSuite.costPerFullRunUsd;
   if (typeof perRun !== 'number' || !Number.isFinite(perRun)) return null;
-  return perRun * repeats;
+  return perRun * fullRuns;
+}
+
+// [LAW:effects-at-boundaries] Pure: how many replays the census will plan — per case, the shortfall to N
+// over the runs already accepted as this candidate's. The same level-filling arithmetic freeze-suite.js
+// runs, reduced to its total.
+function deficitReplays(caseNames, prior, repeats) {
+  return caseNames.reduce((sum, name) => sum + Math.max(0, repeats - prior.filter(r => r.case === name).length), 0);
 }
 
 // The total pooled inventory must-find opportunities a candidate suite would report, given each baseline
@@ -274,7 +284,7 @@ function renderVerdictMarkdown(verdict, meta = {}) {
   const lines = [
     `## Eval verdict — ${badge}`,
     '',
-    `Candidate${meta.candidateSha ? ` (working tree \`${meta.candidateSha}\`${{ true: ', dirty', false: '', null: ', state unknown' }[meta.dirty]})` : ''} vs baseline` +
+    `Candidate${meta.candidateSha ? ` (working tree \`${meta.candidateSha}\`${meta.dirty ? ', dirty' : ''})` : ''} vs baseline` +
       `${meta.baselineSha ? ` \`${meta.baselineSha.slice(0, 7)}\`` : ''}` +
       `${eng ? ` · engine \`${eng.provider}\`/\`${eng.model}\`${eng.reasoning ? `/reasoning=${eng.reasoning}` : ''}` : ''}` +
       ` · N=${verdict.repeats}${verdict.matcher ? ` · matcher \`${verdict.matcher}\`` : ''}.`,
@@ -423,16 +433,13 @@ function runCli(scriptPath, args, label) {
 // A tree as a phrase, for the refusal below: the reader must see BOTH sides to know which to fix.
 function describeTree(candidate) {
   if (candidate === null) return 'no recorded identity (replayed before provenance was kept)';
-  const at = candidate.sha === null ? 'no git commit' : `commit ${candidate.sha.slice(0, 7)}`;
-  if (candidate.dirty === true) return `a dirty tree at ${at}`;
-  if (candidate.dirty === null) return `a tree of unknown state at ${at}`;
-  return at;
+  return `${candidate.dirty ? 'a dirty tree at ' : ''}commit ${candidate.sha.slice(0, 7)}`;
 }
 
-// [LAW:effects-at-boundaries] Pure: which prior runs under --out cannot be this candidate's. A run is the
-// candidate's own only when both carry the SAME identity — one clean commit (treeIdentity); a dirty or
-// unknown tree on either side has none, so nothing can be proven and everything is foreign. Every
-// foreign run is named with both trees, so the operator knows whether to move the runs or commit the tree.
+// [LAW:effects-at-boundaries] Pure: which runs under --out cannot be this candidate's. A run is the
+// candidate's own only when both carry the SAME identity — one clean commit (treeIdentity); a dirty tree
+// on either side has none, so nothing can be proven and everything is foreign. Every foreign run is named
+// with both trees, so the operator knows whether to move the runs or commit the tree.
 function foreignRuns(current, runs) {
   const identity = treeIdentity(current);
   return runs
@@ -564,16 +571,18 @@ function main() {
     for (const name of caseNames) {
       process.stderr.write(`  ${name}: ${prior.filter(r => r.case === name).length}/${repeats} run(s) of this candidate already under --out; the replay fills the rest\n`);
     }
+    const owed = deficitReplays(caseNames, prior, repeats);
     // A verdict is the product of ONE invocation over the WHOLE suite. One left under this root by an
     // earlier invocation would be read as this run's if this run aborted before writing its own (eval.yml
     // publishes verdict.md from the root, whatever exit it sees). Gone before any spend, unconditionally —
     // a fresh root has nothing to remove and the same operation runs. [LAW:dataflow-not-control-flow]
     for (const file of ['verdict.md', 'verdict.json']) fs.rmSync(path.join(candidateRoot, file), { force: true });
 
-    // 6. COST GUARDRAIL — print the estimate up front, before spending. [LAW:verifiable-goals]
-    const estUsd = estimateCandidateCostUsd(rawBaselineSuite, repeats);
-    process.stderr.write(`\nAbout to replay ${baseline.cases.length} case(s) × N=${repeats} against the WORKING TREE, then score.\n`);
-    process.stderr.write(`Estimated cost ≈ ${estUsd === null ? 'unknown (baseline recorded no per-run cost)' : `$${estUsd.toFixed(2)}`} (from the baseline's recorded $/full-run × N). Actual varies with model stochasticity.\n\n`);
+    // 6. COST GUARDRAIL — print the estimate of THIS invocation's spend up front, before it happens: the
+    //    replays still owed, not the suite's size. [LAW:verifiable-goals]
+    const estUsd = estimateCandidateCostUsd(rawBaselineSuite, owed / caseNames.length);
+    process.stderr.write(`\nAbout to replay ${owed} replay(s) — ${baseline.cases.length} case(s) × N=${repeats} less the ${prior.length} already under --out — against the WORKING TREE, then score.\n`);
+    process.stderr.write(`Estimated cost ≈ ${estUsd === null ? 'unknown (baseline recorded no per-run cost)' : `$${estUsd.toFixed(2)}`} (the baseline's recorded $/full-run × the replays owed). Actual varies with model stochasticity.\n\n`);
 
     // 7. Replay the BASELINE's case set into the candidate root through freeze-suite.js — the scheduler the
     //    baseline itself was frozen with, so the gate replays on as many credential lanes as it is given and
@@ -583,6 +592,15 @@ function main() {
     //    candidate is never scored. [LAW:no-silent-failure]
     process.stderr.write(`\n─── replaying ${caseNames.length} case(s) × N=${repeats} ───\n`);
     runCli(freezeSuiteScript, replayArgs({ repeats, candidateRoot, casesDir, caseNames, credentials: opts.credentials }), 'freeze-suite');
+    // 7a. Every run now under --out — inherited and just produced — must still be this candidate's: each
+    //     replay recorded the tree it ran on, so a working tree that moved mid-invocation shows up here as
+    //     a foreign run, refused by name before it can be pooled into a verdict that names the snapshot.
+    //     Same check, same functions, at the moment the produced artifacts enter the verdict.
+    //     [LAW:verifiable-goals] [LAW:one-source-of-truth]
+    const drifted = foreignRuns(candidate, readPriorRuns(candidateRoot, caseNames));
+    if (drifted.length > 0) {
+      throw new Error(`The working tree changed while the suite replayed: ${drifted.length} run(s) under ${candidateRoot} carry a different identity:\n${drifted.map(f => `  ${f.dir} ${f.reason}`).join('\n')}\nNo verdict written — it would name a tree that produced none of these runs.`);
+    }
     // 7b. Score each case. The judge is one credential and cheap; it needs no lanes.
     for (const name of caseNames) {
       process.stderr.write(`\n─── ${name}: scoring ───\n`);
@@ -602,7 +620,7 @@ function main() {
     const engine = parseCaseEngine(fs.readFileSync(path.join(casesDir, name, 'case.json'), 'utf8'), path.join(casesDir, name, 'case.json'));
     return { summary, engine };
   });
-  const candidateSuite = buildBaseline({ cases: candidateCases, provenance: { sha: candidateSha || 'working-tree', date: new Date().toISOString().slice(0, 10) } });
+  const candidateSuite = buildBaseline({ cases: candidateCases, provenance: { sha: candidateSha, date: new Date().toISOString().slice(0, 10) } });
 
   // 9. THE VERDICT.
   const verdict = compareVerdict(baseline, candidateSuite);
@@ -612,7 +630,7 @@ function main() {
     delta: null,
   };
   if (typeof cost.baselinePerRun === 'number' && typeof cost.candidatePerRun === 'number') cost.delta = cost.candidatePerRun - cost.baselinePerRun;
-  const md = renderVerdictMarkdown(verdict, { candidateSha: candidateSha ? candidateSha.slice(0, 7) : null, dirty, baselineSha: baseline.mainSha, cost });
+  const md = renderVerdictMarkdown(verdict, { candidateSha: candidateSha.slice(0, 7), dirty, baselineSha: baseline.mainSha, cost });
 
   // Write the verdict alongside the candidate artifacts (2fk.6 reads verdict.md into a Step Summary), and
   // print it to stdout so it's pasteable straight into a PR body.
@@ -642,5 +660,5 @@ if (require.main === module) {
 module.exports = {
   parseArgs, replayArgs, expectedMatcherLabel, estimateCandidateCostUsd,
   compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath, computeExpectedOpportunities,
-  foreignRuns, readPriorRuns,
+  foreignRuns, readPriorRuns, deficitReplays,
 };

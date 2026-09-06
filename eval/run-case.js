@@ -199,24 +199,24 @@ function runDirName(timestamp, i) {
   return `${timestamp}-run${i}`;
 }
 
-// The engine tree a replay drives is this checkout's src/, so its identity is this checkout's git state.
-// Read here — the producer's side — and recorded into every run's meta.json; compare.js reads the same
-// function for the tree it gates, so a run and a gate can only agree or disagree about ONE fact.
-// [LAW:one-source-of-truth] Two independent reads, two independent failures: a `status` failure
-// (submodule/ownership issue) must never discard a SHA `rev-parse` already obtained, and an unreadable
-// status is `dirty: null` — unknown — never reported as clean. [LAW:no-silent-failure]
+// The engine tree a replay drives is this checkout's, so its identity is this checkout's git state. Read
+// here — the producer's side — and recorded into every run's meta.json; compare.js reads the same function
+// for the tree it gates, so a run and a gate can only agree or disagree about ONE fact. [LAW:one-source-of-truth]
+// `dirty` means the TRACKED content differs from HEAD (staged or not). Untracked files are not counted: one
+// can only change a replay by being required from a tracked file, which would itself show as modified —
+// while counting them would make every checkout carrying a scratch file or lit's generated files a tree
+// with no identity. Git failing (no repo, ownership refusal, no git) propagates with git's own message;
+// every caller needs git for more than this, and a swallowed failure was a tree reported as clean.
+// [LAW:no-silent-failure]
 function workingTree(cwd = __dirname) {
-  let sha = null;
-  try { sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd }).toString().trim(); } catch { /* no git / not a repo */ }
-  let dirty = null;
-  try { dirty = execFileSync('git', ['status', '--porcelain'], { cwd }).toString().trim().length > 0; } catch { /* unknown */ }
-  return { sha, dirty };
+  const git = args => execFileSync('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
+  return { sha: git(['rev-parse', 'HEAD']), dirty: git(['status', '--porcelain', '--untracked-files=no']).length > 0 };
 }
 
-// [LAW:types-are-the-program] A tree's identity is its commit, and only a CLEAN commit has one: a dirty or
-// unknown-state tree names no reproducible src/, so nothing can be proven to be a replay of it. Pure.
+// [LAW:types-are-the-program] A tree's identity is its commit, and only a CLEAN commit has one: a dirty tree
+// names no reproducible content, so nothing can be proven to be a replay of it. Pure.
 function treeIdentity({ sha, dirty }) {
-  return dirty === false && sha !== null ? sha : null;
+  return dirty ? null : sha;
 }
 
 // The effectful helpers below lazily require their src deps, so importing this module never loads the
@@ -364,12 +364,6 @@ async function main() {
         log: msg => process.stderr.write(`[run ${i}] ${msg}\n`),
       });
 
-      // The raw merged findings from runMultiScope — path/line/body/severity, PRE anchor-partition (the
-      // PR sink's partitionFindings is deliberately NOT applied here; the scorer matches against the
-      // frozen diff itself). [LAW:one-source-of-truth]
-      fs.writeFileSync(path.join(runDir, 'findings.json'), JSON.stringify(review.findings, null, 2) + '\n');
-      fs.writeFileSync(path.join(runDir, 'summary.txt'), (review.summary || '') + '\n');
-      fs.writeFileSync(path.join(runDir, 'usage.json'), JSON.stringify(review.usage, null, 2) + '\n');
       // Provenance the scorer/baseline/gate read instead of re-deriving from the dir name or the clock:
       // `candidate` is the tree that produced this run, which is what lets compare.js tell its own partial
       // suite from a foreign one. [LAW:one-source-of-truth]
@@ -379,6 +373,18 @@ async function main() {
         candidate,
         findingCount: review.findings.length,
       }, null, 2) + '\n');
+      fs.writeFileSync(path.join(runDir, 'summary.txt'), (review.summary || '') + '\n');
+      fs.writeFileSync(path.join(runDir, 'usage.json'), JSON.stringify(review.usage, null, 2) + '\n');
+      // The raw merged findings from runMultiScope — path/line/body/severity, PRE anchor-partition (the
+      // PR sink's partitionFindings is deliberately NOT applied here; the scorer matches against the
+      // frozen diff itself). [LAW:one-source-of-truth]
+      // findings.json is what makes a run dir COMPLETE to every reader (score.js's listRunDirs, the suite
+      // census, the gate's resume), so it lands last and atomically — written beside, then renamed — after
+      // every file those readers go on to open. A replay killed at any instant leaves a dir that is either
+      // complete or ignored, never one that is counted and then unreadable. [LAW:no-ambient-temporal-coupling]
+      const findingsPath = path.join(runDir, 'findings.json');
+      fs.writeFileSync(`${findingsPath}.partial`, JSON.stringify(review.findings, null, 2) + '\n');
+      fs.renameSync(`${findingsPath}.partial`, findingsPath);
       const transcripts = drainTranscripts(TRANSCRIPT_DIR, path.join(runDir, 'transcripts'));
 
       process.stderr.write(`[run ${i}/${opts.repeats}] ${review.findings.length} finding(s), ${transcripts.length} transcript(s) → ${runDir}\n`);

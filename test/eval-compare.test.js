@@ -118,8 +118,9 @@ test('expectedMatcherLabel builds the exact label score.js records', () => {
 
 // ── estimateCandidateCostUsd (the cost guardrail) ─────────────────────────────────────────────────────
 
-test('estimateCandidateCostUsd multiplies the baseline per-run cost by N, or null when absent', () => {
+test('estimateCandidateCostUsd prices the full-suite passes still owed — fractional on an uneven resume — or null when uncosted', () => {
   assert.equal(estimateCandidateCostUsd({ costPerFullRunUsd: 0.6952 }, 5), 0.6952 * 5);
+  assert.equal(estimateCandidateCostUsd({ costPerFullRunUsd: 0.6952 }, 9 / 4), 0.6952 * 9 / 4);
   assert.equal(estimateCandidateCostUsd({ costPerFullRunUsd: null }, 5), null);
   assert.equal(estimateCandidateCostUsd({}, 5), null);
   assert.equal(estimateCandidateCostUsd(null, 5), null);
@@ -261,6 +262,7 @@ test('renderVerdictMarkdown surfaces the gate, the per-case table, cost, and a f
   assert.match(md, /## Eval verdict — 🔴 DEGRADED/);
   assert.match(md, /PRIMARY GATE — pooled inventory must-find recall/);
   assert.match(md, /working tree `cafe123`, dirty/);
+  assert.match(renderVerdictMarkdown(v, { candidateSha: 'cafe123', dirty: false, baselineSha: 'basesha0deadbeef', cost: null }), /working tree `cafe123`\)/);
   assert.match(md, /\| `case-a` \|/);
   assert.match(md, /⚠️ yes/);
   assert.match(md, /\*\*Cost:\*\*/);
@@ -410,7 +412,7 @@ test('resolveBaselineJsonPath does NOT refuse a shallow clone with an uncommitte
 });
 
 // ── resume or refuse: prior runs under --out against the tree under gate ──────────────────────────────
-const { foreignRuns, readPriorRuns } = require('../eval/compare');
+const { foreignRuns, readPriorRuns, deficitReplays } = require('../eval/compare');
 
 test('foreignRuns keeps the runs replayed on this exact clean commit and names every other by both trees', () => {
   const here = { sha: 'aaaaaaa1', dirty: false };
@@ -418,25 +420,27 @@ test('foreignRuns keeps the runs replayed on this exact clean commit and names e
     { dir: 'r1', candidate: { sha: 'aaaaaaa1', dirty: false } },   // ours
     { dir: 'r2', candidate: { sha: 'bbbbbbb2', dirty: false } },   // another commit
     { dir: 'r3', candidate: { sha: 'aaaaaaa1', dirty: true } },    // same commit, dirty when replayed
-    { dir: 'r4', candidate: { sha: 'aaaaaaa1', dirty: null } },    // same commit, state unknown
-    { dir: 'r5', candidate: null },                                // pre-provenance run
+    { dir: 'r4', candidate: null },                                // pre-provenance run
   ];
   const foreign = foreignRuns(here, runs);
-  assert.deepEqual(foreign.map(f => f.dir), ['r2', 'r3', 'r4', 'r5']);
+  assert.deepEqual(foreign.map(f => f.dir), ['r2', 'r3', 'r4']);
   assert.match(foreign[0].reason, /replayed on commit bbbbbbb; the tree under gate is commit aaaaaaa/);
   assert.match(foreign[1].reason, /a dirty tree at commit aaaaaaa/);
-  assert.match(foreign[2].reason, /unknown state at commit aaaaaaa/);
-  assert.match(foreign[3].reason, /no recorded identity/);
+  assert.match(foreign[2].reason, /no recorded identity/);
 });
 
-test('foreignRuns under a dirty or unknown tree refuses EVERY prior run — nothing can be proven its own', () => {
+test('foreignRuns under a dirty tree refuses EVERY prior run — nothing can be proven its own', () => {
   const ours = [{ dir: 'r1', candidate: { sha: 'aaaaaaa1', dirty: false } }];
   const dirty = foreignRuns({ sha: 'aaaaaaa1', dirty: true }, ours);
   assert.equal(dirty.length, 1);
   assert.match(dirty[0].reason, /the tree under gate is a dirty tree at commit aaaaaaa/);
-  assert.equal(foreignRuns({ sha: 'aaaaaaa1', dirty: null }, ours).length, 1);
-  assert.equal(foreignRuns({ sha: null, dirty: false }, ours).length, 1);
   assert.deepEqual(foreignRuns({ sha: 'aaaaaaa1', dirty: true }, []), []);
+});
+
+test('deficitReplays is the census arithmetic: per case, the shortfall to N over the accepted prior runs', () => {
+  const prior = [{ case: 'a' }, { case: 'a' }, { case: 'a' }, { case: 'b' }, { case: 'c' }, { case: 'c' }, { case: 'c' }, { case: 'c' }, { case: 'c' }, { case: 'c' }];
+  assert.equal(deficitReplays(['a', 'b', 'c', 'd'], prior, 5), 2 + 4 + 0 + 5);
+  assert.equal(deficitReplays(['a', 'b'], [], 5), 10);
 });
 
 test('readPriorRuns reads the census the replay will take — completed runs only, each with its recorded tree', () => {

@@ -500,7 +500,6 @@ function main() {
   // date defaults to today (UTC). [LAW:effects-at-boundaries] The git read is the only ambient input, done
   // here at the boundary, never inside buildBaseline.
   const sha = opts.sha || workingTree().sha;
-  if (sha === null) throw new Error('No git HEAD to record as this baseline\'s provenance (not a git checkout?); pass --sha.');
   const date = opts.date || new Date().toISOString().slice(0, 10);
 
   const baseline = buildBaseline({ cases, provenance: { sha, date } });
