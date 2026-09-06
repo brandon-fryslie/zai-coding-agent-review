@@ -1,11 +1,14 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
+const core = require('@actions/core');
 const {
   codexAdapter,
   buildConfigToml,
   CODEX_TIMEOUT_MS,
   buildCommand,
+  appServerSession,
   assertSucceeded,
   classifyError,
 } = require('../src/engine/codex');
@@ -145,26 +148,15 @@ describe('buildCommand', () => {
     assert.ok(args.some(a => a.includes('@openai/codex')), 'codex package not in args');
   });
 
-  test('args include exec --json', () => {
+  test('args run the app-server over stdio — the transport that reports usage per model request', () => {
     const { args } = buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
-    assert.ok(args.includes('exec'), 'exec subcommand missing');
-    assert.ok(args.includes('--json'), '--json flag missing');
+    assert.ok(args.includes('app-server'), 'app-server subcommand missing');
+    assert.equal(args.includes('exec'), false, 'exec --json reports usage only as a turn total');
   });
 
-  test('args include --dangerously-bypass-approvals-and-sandbox for CI MCP execution', () => {
+  test('no sandbox/approval bypass flag — the collector approval is answered on the protocol, sandbox intact', () => {
     const { args } = buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
-    assert.ok(
-      args.includes('--dangerously-bypass-approvals-and-sandbox'),
-      'bypass flag missing — required for MCP tool calls in non-interactive (--json) mode',
-    );
-  });
-
-  test('args include --skip-git-repo-check (cwd is the reviewed repo parent, not a git repo)', () => {
-    const { args } = buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
-    assert.ok(
-      args.includes('--skip-git-repo-check'),
-      'skip-git-repo-check missing — codex exec hangs outside a git repo, and cwd is the non-git parent dir',
-    );
+    assert.equal(args.includes('--dangerously-bypass-approvals-and-sandbox'), false);
   });
 
   test('CODEX_HOME is set to the provided home directory', () => {
@@ -201,62 +193,201 @@ describe('buildCommand', () => {
 // --- assertSucceeded ---
 
 describe('assertSucceeded', () => {
-  test('does not throw when turn.completed is present', () => {
-    const stdout = [
-      '{"type":"thread.started","thread_id":"abc"}',
-      '{"type":"turn.started"}',
-      '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
-      '{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":10}}',
-    ].join('\n');
-    assert.doesNotThrow(() => assertSucceeded(stdout));
+  test('does not throw when the turn completed', () => {
+    assert.doesNotThrow(() => assertSucceeded({ turn: { status: 'completed', error: null }, requests: [] }));
   });
 
-  test('throws when turn.failed is present with error message', () => {
-    const stdout = [
-      '{"type":"thread.started","thread_id":"abc"}',
-      '{"type":"turn.failed","error":{"message":"401 Unauthorized"}}',
-    ].join('\n');
-    assert.throws(
-      () => assertSucceeded(stdout),
-      /Codex review failed.*401 Unauthorized/,
-    );
+  test('throws when the turn failed, carrying the message and the typed error class', () => {
+    const turn = { status: 'failed', error: { message: '401 Unauthorized', codexErrorInfo: 'unauthorized' } };
+    assert.throws(() => assertSucceeded({ turn, requests: [] }), /Codex review failed: 401 Unauthorized \("unauthorized"\)/);
   });
 
-  test('throws when turn.failed has no error.message (unknown error)', () => {
-    const stdout = '{"type":"turn.failed","error":{}}';
-    assert.throws(
-      () => assertSucceeded(stdout),
-      /unknown error/,
-    );
+  test('throws when the turn failed with no error at all', () => {
+    assert.throws(() => assertSucceeded({ turn: { status: 'failed', error: null }, requests: [] }), /Codex review failed: no error reported/);
   });
 
-  test('non-JSON lines (stderr noise) are skipped', () => {
-    const stdout = [
-      '2026-06-12T08:30:28Z ERROR codex_core: something went wrong',
-      '{"type":"turn.completed","usage":{}}',
-    ].join('\n');
-    assert.doesNotThrow(() => assertSucceeded(stdout));
+  test('an interrupted turn is not a success', () => {
+    // Codex can settle a turn as interrupted (a cancel, an internal stop) with no findings collected;
+    // treating anything but 'completed' as success would silently produce an empty review.
+    assert.throws(() => assertSucceeded({ turn: { status: 'interrupted', error: null }, requests: [] }), /Codex review interrupted/);
   });
 
-  test('throws on empty output — turn.completed was never emitted', () => {
-    // Codex can exit 0 mid-turn (interrupted, internal timeout, buffering error) without
-    // emitting turn.completed. Treating this as success would silently produce no findings.
-    assert.throws(
-      () => assertSucceeded(''),
-      /did not complete.*turn\.completed/,
-    );
+  test('a quota wall reported as the typed class classifies transient through classifyError', () => {
+    const turn = { status: 'failed', error: { message: 'usage limit reached', codexErrorInfo: 'usageLimitExceeded' } };
+    let err;
+    try { assertSucceeded({ turn, requests: [] }); } catch (e) { err = e; }
+    assert.ok(classifyError(err, err.message) instanceof TransientError);
+  });
+});
+
+// --- appServerSession ---
+
+// A fake app-server: `serve(msg, io)` answers each client message with the wire lines a real codex
+// would emit, on a later tick as a pipe would. The io mirrors what runEngine hands a session.
+// [LAW:behavior-not-structure] Every assertion is on the wire (what the session sent) or on the
+// record it resolved with.
+function fakeIo(serve) {
+  const lines = new EventEmitter();
+  let closedResolve;
+  const closed = new Promise(resolve => { closedResolve = resolve; });
+  const io = {
+    sent: [],
+    ended: false,
+    write: text => {
+      for (const raw of text.split('\n').filter(Boolean)) {
+        const msg = JSON.parse(raw);
+        io.sent.push(msg);
+        setImmediate(() => { for (const reply of serve(msg, io)) lines.emit('line', JSON.stringify(reply)); });
+      }
+    },
+    end: () => { io.ended = true; setImmediate(() => io.close()); },
+    close: () => { lines.emit('close'); closedResolve('<stdout>'); },
+    lines,
+    closed,
+  };
+  return io;
+}
+
+const usageOf = (inputTokens, cachedInputTokens, outputTokens) =>
+  ({ totalTokens: inputTokens + outputTokens, inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens: 0 });
+
+// The turn codex 0.142.3 emits, as observed live 2026-09-06: a response to each request, one
+// tokenUsage notification per model request, any server requests, then turn/completed.
+function codexLike({ usage = [], serverRequests = [], outcome = { status: 'completed', error: null } } = {}) {
+  return msg => {
+    if (msg.method === 'initialize') return [{ id: msg.id, result: { userAgent: 'codex/0.142.3' } }];
+    if (msg.method === 'thread/start') return [{ id: msg.id, result: { thread: { id: 'thread-1' }, cwd: '/scratch' } }];
+    if (msg.method === 'turn/start') {
+      return [
+        { id: msg.id, result: { turn: { id: 'turn-1', status: 'inProgress' } } },
+        ...usage.map(last => ({ method: 'thread/tokenUsage/updated', params: { threadId: 'thread-1', turnId: 'turn-1', tokenUsage: { last, total: last, modelContextWindow: 258400 } } })),
+        ...serverRequests,
+        { method: 'item/agentMessage/delta', params: { delta: 'noise' } },
+        { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', ...outcome } } },
+      ];
+    }
+    return [];
+  };
+}
+
+const collectorApproval = {
+  id: 0,
+  method: 'mcpServer/elicitation/request',
+  params: { threadId: 'thread-1', turnId: 'turn-1', serverName: 'review_collector', mode: 'form', _meta: { codex_approval_kind: 'mcp_tool_call', tool_name: 'finish_review' } },
+};
+
+async function captureWarnings(fn) {
+  const original = core.warning;
+  const warnings = [];
+  core.warning = msg => warnings.push(msg);
+  try { await fn(); } finally { core.warning = original; }
+  return warnings;
+}
+
+describe('appServerSession — the conversation with codex app-server', () => {
+  test('handshakes, opens a thread, starts the turn with the prompt, and resolves with the completed turn and every request usage', async () => {
+    const usage = [usageOf(16_236, 2_432, 145), usageOf(16_755, 2_432, 32)];
+    const io = fakeIo(codexLike({ usage, serverRequests: [collectorApproval] }));
+    const record = await appServerSession(io, 'Review this diff.');
+
+    assert.deepEqual(record.turn, { id: 'turn-1', status: 'completed', error: null });
+    assert.deepEqual(record.requests, usage);
+    const methods = io.sent.map(m => m.method);
+    assert.deepEqual(methods.slice(0, 4), ['initialize', 'initialized', 'thread/start', 'turn/start']);
+    assert.equal(io.sent[1].id, undefined, 'initialized is a notification, not a request');
+    const turnStart = io.sent.find(m => m.method === 'turn/start');
+    assert.deepEqual(turnStart.params, { threadId: 'thread-1', input: [{ type: 'text', text: 'Review this diff.' }] });
+    assert.equal(io.ended, true, 'the session ends stdin so the server exits');
   });
 
-  test('throws when stdout has events but no turn.completed', () => {
-    const stdout = [
-      '{"type":"thread.started","thread_id":"abc"}',
-      '{"type":"turn.started"}',
-      '{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}',
-    ].join('\n');
-    assert.throws(
-      () => assertSucceeded(stdout),
-      /did not complete/,
-    );
+  test("the collector's tool-call approval is granted — the gate exec needed the bypass flag for", async () => {
+    const io = fakeIo(codexLike({ serverRequests: [collectorApproval] }));
+    const warnings = await captureWarnings(() => appServerSession(io, 'p'));
+    const reply = io.sent.find(m => m.id === 0);
+    assert.deepEqual(reply, { jsonrpc: '2.0', id: 0, result: { action: 'accept' } });
+    assert.deepEqual(warnings, []);
+  });
+
+  test('any other server request is refused with a JSON-RPC error and announced, never granted or left hanging', async () => {
+    const foreign = [
+      { id: 5, method: 'item/commandExecution/requestApproval', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'i' } },
+      { id: 6, method: 'mcpServer/elicitation/request', params: { serverName: 'some_other_server', _meta: { codex_approval_kind: 'mcp_tool_call' } } },
+    ];
+    const io = fakeIo(codexLike({ serverRequests: foreign }));
+    const warnings = await captureWarnings(() => appServerSession(io, 'p'));
+    for (const id of [5, 6]) {
+      const reply = io.sent.find(m => m.id === id);
+      assert.ok(reply.error, `request ${id} must be answered with an error`);
+      assert.equal(reply.result, undefined);
+    }
+    assert.equal(warnings.length, 2);
+    assert.match(warnings[0], /item\/commandExecution\/requestApproval/);
+  });
+
+  test('a failed turn resolves with its status and error for assertSucceeded to judge', async () => {
+    const outcome = { status: 'failed', error: { message: 'usage limit reached', codexErrorInfo: 'usageLimitExceeded' } };
+    const io = fakeIo(codexLike({ outcome }));
+    const record = await appServerSession(io, 'p');
+    assert.equal(record.turn.status, 'failed');
+    assert.throws(() => assertSucceeded(record), /usage limit reached/);
+  });
+
+  test('rejects when the server exits before the turn completes', async () => {
+    const io = fakeIo((msg, io) => {
+      if (msg.method === 'turn/start') { setImmediate(() => io.close()); return [{ id: msg.id, result: { turn: { id: 'turn-1', status: 'inProgress' } } }]; }
+      return codexLike()(msg);
+    });
+    await assert.rejects(appServerSession(io, 'p'), /exited before turn\/completed/);
+  });
+
+  test('rejects with the failing method when a request is answered with an error', async () => {
+    const io = fakeIo(msg => msg.method === 'thread/start'
+      ? [{ id: msg.id, error: { code: -32000, message: 'model_not_found' } }]
+      : codexLike()(msg));
+    await assert.rejects(appServerSession(io, 'p'), /thread\/start failed: model_not_found/);
+  });
+
+  test('rejects when the stream closes with a request still unanswered', async () => {
+    const io = fakeIo((msg, io) => {
+      if (msg.method === 'initialize') setImmediate(() => io.close());
+      return [];
+    });
+    await assert.rejects(appServerSession(io, 'p'), /initialize never answered/);
+  });
+
+  // [LAW:parse-dont-validate] A notification the session cannot read is the session's loud failure,
+  // named with the method and payload — never an exception thrown inside the stream callback.
+  test('rejects, naming the method, when a usage notification carries no request usage', async () => {
+    const io = fakeIo(msg => msg.method === 'turn/start'
+      ? [
+        { id: msg.id, result: { turn: { id: 'turn-1', status: 'inProgress' } } },
+        { method: 'thread/tokenUsage/updated', params: { threadId: 'thread-1', tokenUsage: { total: usageOf(1, 0, 1) } } },
+      ]
+      : codexLike()(msg));
+    await assert.rejects(appServerSession(io, 'p'), /thread\/tokenUsage\/updated carried no request usage/);
+  });
+
+  test('rejects when turn/completed carries no turn', async () => {
+    const io = fakeIo(msg => msg.method === 'turn/start'
+      ? [
+        { id: msg.id, result: { turn: { id: 'turn-1', status: 'inProgress' } } },
+        { method: 'turn/completed', params: { threadId: 'thread-1' } },
+      ]
+      : codexLike()(msg));
+    await assert.rejects(appServerSession(io, 'p'), /turn\/completed carried no turn/);
+  });
+
+  test('a late response to no pending request is dropped, not refused as a server request', async () => {
+    const io = fakeIo(msg => msg.method === 'turn/start'
+      ? [
+        { id: msg.id, result: { turn: { id: 'turn-1', status: 'inProgress' } } },
+        { id: 999, result: { stale: true } },
+        { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } },
+      ]
+      : codexLike()(msg));
+    const warnings = await captureWarnings(() => appServerSession(io, 'p'));
+    assert.equal(io.sent.find(m => m.id === 999), undefined, 'nothing is sent back for id 999');
+    assert.deepEqual(warnings, []);
   });
 });
 

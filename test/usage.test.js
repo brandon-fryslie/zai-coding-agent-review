@@ -8,6 +8,7 @@ const {
   priceFromTable,
   ratesAt,
   spawnFromTokens,
+  spawnFromRequest,
   totalInputTokens,
   renderCostLine,
   renderPrTotal,
@@ -318,15 +319,15 @@ describe('context-length rates', () => {
   });
 });
 
-// --- codexExtractUsage (real codex exec --json shape) ---
+// --- codexExtractUsage (the app-server session record: one usage breakdown per model request) ---
 
 describe('codexExtractUsage', () => {
-  test('reads usage from the final turn.completed and computes USD from the price table', () => {
-    const stdout = [
-      '{"type":"thread.started","thread_id":"abc"}',
-      '{"type":"turn.completed","usage":{"input_tokens":5000,"cached_input_tokens":1000,"output_tokens":500,"reasoning_output_tokens":200}}',
-    ].join('\n');
-    const usage = codexExtractUsage(stdout, CODEX_CONFIG, OFF_PEAK);
+  const request = (inputTokens, cachedInputTokens, outputTokens) =>
+    ({ totalTokens: inputTokens + outputTokens, inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens: 0 });
+  const record = (...requests) => ({ turn: { status: 'completed', error: null }, requests });
+
+  test('sums every request into the token record and computes USD from the price table', () => {
+    const usage = codexExtractUsage(record(request(5000, 1000, 500)), CODEX_CONFIG, OFF_PEAK);
     assert.equal(totalInputTokens(usage.tokens), 5000);
     assert.equal(usage.tokens.output, 500);
     assert.equal(usage.cost.basis, 'dollars');
@@ -334,31 +335,53 @@ describe('codexExtractUsage', () => {
     assert.ok(Math.abs(usage.cost.usd - 0.005325) < 1e-9, `got ${usage.cost.usd}`);
   });
 
-  test('the last turn.completed wins when several are emitted', () => {
-    const stdout = [
-      '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}',
-      '{"type":"turn.completed","usage":{"input_tokens":9000,"output_tokens":300}}',
-    ].join('\n');
-    const usage = codexExtractUsage(stdout, CODEX_CONFIG, OFF_PEAK);
-    assert.equal(totalInputTokens(usage.tokens), 9000);
-    assert.equal(usage.tokens.output, 300);
+  // [LAW:verifiable-goals] AC for zai-cost-truth-p5o.6: a mixed turn — one request at or under 272K and
+  // one over — prices EACH request at its own card. The turn totals 400K, which the old turn-summed
+  // record could prove nothing about (schedule-gap); per-request facts price it exactly.
+  test('a mixed turn prices the short request at the short card and the long request at the long card', () => {
+    const luna = { ...CODEX_CONFIG, model: 'gpt-5.6-luna' };
+    const usage = codexExtractUsage(record(request(100_000, 0, 1000), request(300_000, 0, 1000)), luna, OFF_PEAK);
+    assert.equal(totalInputTokens(usage.tokens), 400_000);
+    assert.deepEqual(usage.requests, [
+      { inputCacheMiss: 100_000, inputCacheHit: 0, output: 1000 },
+      { inputCacheMiss: 300_000, inputCacheHit: 0, output: 1000 },
+    ]);
+    // short: 100k in @0.20 + 1k out @1.20; long: 300k in @0.40 + 1k out @1.80
+    const expected = (100_000 * 0.20 + 1000 * 1.20 + 300_000 * 0.40 + 1000 * 1.80) / 1e6;
+    assert.equal(usage.cost.basis, 'dollars');
+    assert.ok(Math.abs(usage.cost.usd - expected) < 1e-12, `got ${usage.cost.usd}, expected ${expected}`);
+  });
+
+  test('a turn whose TOTAL exceeds 272K on a context-tiered model prints a figure, never schedule-gap', () => {
+    // Twenty requests of 20K each: the review-sized turn that used to print "Cost: unknown".
+    const sol = { ...CODEX_CONFIG, model: 'gpt-5.6-sol' };
+    const usage = codexExtractUsage(record(...Array.from({ length: 20 }, () => request(20_000, 15_000, 100))), sol, OFF_PEAK);
+    assert.equal(totalInputTokens(usage.tokens), 400_000);
+    assert.equal(usage.cost.basis, 'dollars');
+    const expected = 20 * (5_000 * 4.00 + 15_000 * 0.40 + 100 * 20.00) / 1e6;
+    assert.ok(Math.abs(usage.cost.usd - expected) < 1e-12, `got ${usage.cost.usd}, expected ${expected}`);
+  });
+
+  test('one request the vendor publishes no card for makes the whole spawn unpriced with schedule-gap', () => {
+    // gpt-5.5 prices nothing above 272K: that request cannot be priced, so neither can the spawn.
+    const usage = codexExtractUsage(record(request(1000, 0, 10), request(300_000, 0, 10)), { ...CODEX_CONFIG, model: 'gpt-5.5' }, OFF_PEAK);
+    assert.equal(totalInputTokens(usage.tokens), 301_000);
+    assert.deepEqual(usage.cost, { basis: 'unpriced', reason: 'schedule-gap' });
   });
 
   test('cost is unavailable with reason no-price (tokens still reported) when the model has no price', () => {
-    const stdout = '{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":10}}';
-    const usage = codexExtractUsage(stdout, { ...CODEX_CONFIG, model: 'gpt-future' }, OFF_PEAK);
+    const usage = codexExtractUsage(record(request(100, 0, 10)), { ...CODEX_CONFIG, model: 'gpt-future' }, OFF_PEAK);
     assert.equal(totalInputTokens(usage.tokens), 100);
     assert.deepEqual(usage.cost, { basis: 'unpriced', reason: 'no-price' });
   });
 
-  test('returns null when no turn.completed carries usage', () => {
-    const stdout = '{"type":"thread.started","thread_id":"abc"}';
-    assert.equal(codexExtractUsage(stdout, CODEX_CONFIG, OFF_PEAK), null);
+  test('returns null when the turn reported no request usage — never a $0.00 run', () => {
+    assert.equal(codexExtractUsage(record(), CODEX_CONFIG, OFF_PEAK), null);
   });
 
-  test('an empty usage object is reported as no usage, not a $0.00 run', () => {
-    const stdout = '{"type":"turn.completed","usage":{}}';
-    assert.equal(codexExtractUsage(stdout, CODEX_CONFIG, OFF_PEAK), null);
+  test('cached tokens are clamped to the request input at the vendor boundary', () => {
+    const usage = codexExtractUsage(record(request(100, 150, 10)), CODEX_CONFIG, OFF_PEAK);
+    assert.deepEqual(usage.tokens, { inputCacheMiss: 0, inputCacheHit: 100, output: 10 });
   });
 });
 
@@ -1004,5 +1027,31 @@ describe('formatTokenCount', () => {
   test('groups thousands', () => {
     assert.equal(formatTokenCount(1234567), '1,234,567');
     assert.equal(formatTokenCount(0), '0');
+  });
+});
+
+// spawnFromRequest is the claim an adapter that OBSERVES each model request can make: the context is
+// exactly this request's input count, a point every tier decides. spawnFromTokens, from the same
+// numbers, proves only an upper bound. [LAW:one-type-per-behavior]
+describe("spawnFromRequest — a request's context is a point, decided exactly by the tier", () => {
+  const tokens = n => ({ inputCacheMiss: n, inputCacheHit: 0, output: 0 });
+
+  test('the boundary belongs to the short card: 272,000 is short, 272,001 is long', () => {
+    assert.deepEqual(spawnFromRequest(OFF_PEAK, tokens(272_000)).context, { min: 272_000, max: 272_000 });
+    const short = priceFromTable(spawnFromRequest(OFF_PEAK, tokens(272_000)), 'gpt-5.6-luna');
+    const long = priceFromTable(spawnFromRequest(OFF_PEAK, tokens(272_001)), 'gpt-5.6-luna');
+    assert.ok(Math.abs(short.usd - 272_000 * 0.20 / 1e6) < 1e-12, `got ${short.usd}`);
+    assert.ok(Math.abs(long.usd - 272_001 * 0.40 / 1e6) < 1e-12, `got ${long.usd}`);
+  });
+
+  test('the same tokens through spawnFromTokens prove only an upper bound and stay unpriced above 272K', () => {
+    assert.equal(priceFromTable(spawnFromTokens(OFF_PEAK, tokens(300_000)), 'gpt-5.6-luna').reason, 'schedule-gap');
+    assert.equal(priceFromTable(spawnFromRequest(OFF_PEAK, tokens(300_000)), 'gpt-5.6-luna').basis, 'dollars');
+  });
+
+  test('the context counts both input classes — a cached prefix is still context the request carried', () => {
+    const spawn = spawnFromRequest(OFF_PEAK, { inputCacheMiss: 2_000, inputCacheHit: 271_000, output: 5 });
+    assert.deepEqual(spawn.context, { min: 273_000, max: 273_000 });
+    assert.equal(priceFromTable(spawn, 'gpt-5.6-luna').basis, 'dollars');
   });
 });

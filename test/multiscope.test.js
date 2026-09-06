@@ -157,6 +157,18 @@ describe('sumUsage', () => {
     assert.ok(Math.abs(total.cost.usd - 0.3) < 1e-9);
   });
 
+  test('per-request breakdowns concatenate in record order and are absent when no spawn recorded one', () => {
+    const a = [{ inputCacheMiss: 10, inputCacheHit: 0, output: 5 }];
+    const b = [{ inputCacheMiss: 8, inputCacheHit: 12, output: 7 }, { inputCacheMiss: 1, inputCacheHit: 0, output: 1 }];
+    const withRequests = sumUsage([
+      { tokens: a[0], cost: { basis: 'dollars', usd: 0.1 }, requests: a },
+      { tokens: { inputCacheMiss: 9, inputCacheHit: 12, output: 8 }, cost: { basis: 'dollars', usd: 0.2 }, requests: b },
+    ]);
+    assert.deepEqual(withRequests.requests, [...a, ...b]);
+    const without = sumUsage([{ tokens: a[0], cost: { basis: 'dollars', usd: 0.1 } }]);
+    assert.equal(without.requests, null);
+  });
+
   test('any unpriced spawn makes the total unpriced, carrying its reason', () => {
     const total = sumUsage([
       { tokens: { inputCacheMiss: 10, inputCacheHit: 0, output: 5 }, cost: { basis: 'dollars', usd: 0.1 } },

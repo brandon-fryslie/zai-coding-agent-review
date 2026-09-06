@@ -1,16 +1,19 @@
 'use strict';
 const { spawn } = require('child_process');
+const readline = require('readline');
 const core = require('@actions/core');
 const { emitTranscript } = require('../debug');
 const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = require('../deadline');
 
 // [LAW:no-ambient-temporal-coupling] An engine may legitimately emit an arbitrarily large
-// stream — codex `exec --json` streams every reasoning delta and tool call as a JSONL line,
+// stream — codex's app-server streams every reasoning delta and tool call as a JSON-RPC line,
 // so a dense, law-comment-heavy diff easily produces many megabytes. What we RETAIN is bounded
 // to a trailing window so memory stays flat on a big review; the engine is NOT killed for being
 // verbose. "The process never terminates" is owned by the per-invocation timeout below — never
-// by output volume. The events the caller needs (turn.completed / turn.failed and the cumulative
-// usage that rides the terminal event) are the LAST emitted, so a tail preserves exactly them.
+// by output volume. A stdin engine's session reads this retained tail back, and the events it
+// needs (the terminal result envelope and the usage riding it) are the LAST emitted, so the tail
+// preserves exactly them; a session that reads the stream LIVE (codex's appServerSession) is never
+// clipped at all.
 const MAX_RETAINED_OUTPUT = 8 * 1024 * 1024;
 
 // [LAW:one-type-per-behavior] stdout and stderr are the same behavior — captured child output
@@ -86,11 +89,30 @@ function formatOutputTail(label, value) {
   return `${label}:\n${trimmed.slice(-4000)}`;
 }
 
+// [LAW:one-type-per-behavior] THE SESSION is how an engine is talked to — the one primitive that
+// differs between a CLI that takes its prompt on stdin and prints until it exits (claude-code,
+// opencode) and a server that holds a JSON-RPC conversation over the same two pipes (codex's
+// app-server). Each spec names its session as a VALUE and runEngine drives whichever it is handed
+// through the one lifecycle below. A session receives `io` — write/end on the child's stdin,
+// `lines` (a readline over its stdout: every line as it arrives, never clipped) and `closed` (a
+// promise of the retained stdout, settled once the child has exited and released its pipes) — and
+// resolves with the engine's OUTPUT VALUE, the thing the spec's assertSucceeded and extractUsage
+// read. [LAW:dataflow-not-control-flow] runEngine never asks which kind of engine it is running;
+// the session is a value that flows through the same spawn, capture, timeout and settle.
+//
+// promptOnStdin is the stdin-engine session: deliver the prompt, wait for the exit, and the output
+// is the retained stdout — exactly what those adapters parsed before the session existed as a seam.
+function promptOnStdin(io, prompt) {
+  io.end(prompt);
+  return io.closed;
+}
+
 // [LAW:decomposition] Generic spawn runner: owns timeout, size-cap, and process lifecycle.
-// All engine-specific logic (args, env, success check, error classification) lives in the adapter.
-// Resolves with { stdout, span }: the child's captured stdout so the caller can extract usage/cost
-// from it, and the spawn's wall-clock span ({ from, to }, ISO-8601 UTC) stamped by this module's
-// own clock — the one owner of the child's lifetime (zai-timing-31d.4).
+// All engine-specific logic (args, env, session, success check, error classification) lives in the
+// adapter. Resolves with { output, span }: the session's output value (the retained stdout for a
+// stdin engine, the protocol record for a server engine) so the caller can extract usage/cost from
+// it, and the spawn's wall-clock span ({ from, to }, ISO-8601 UTC) stamped by this module's own
+// clock — the one owner of the child's lifetime (zai-timing-31d.4).
 // [LAW:no-ambient-temporal-coupling] The per-invocation timeout is owned here, not in callers.
 // [LAW:effects-at-boundaries] This is the only place that spawns a child process.
 // cwd is the engine's working directory — an isolated scratch dir outside the reviewed repo tree
@@ -230,18 +252,44 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
       truncated = truncated || clipped;
     });
     child.stderr.on('data', chunk => { stderr = appendBounded(stderr, chunk, maxRetained).text; });
+    // [LAW:no-silent-failure] exception: a write to a child that has already died raises EPIPE on
+    // stdin, and the child's death is the fact — reported by the 'close' path below with its exit
+    // code and output tails. Left unhandled it would surface as an uncaught exception naming the
+    // pipe instead, so the pipe error is the one signal here that is genuinely irrelevant.
+    child.stdin.on('error', () => {});
+
+    // [LAW:no-ambient-temporal-coupling] The session reads stdout LIVE through its own readline — a
+    // second reader beside the bounded capture above — so a protocol conversation, and every usage
+    // notification an engine emits mid-stream, is seen whole even when the retained window later
+    // clips the stream's head. `closed` settles on 'close' with the retained stdout on EVERY exit
+    // path, so a session still awaiting a completion the engine never sent settles too, instead of
+    // hanging past the child's death; its rejection is then the loudest cause on the settle.
+    let closedResolve;
+    const closed = new Promise(resolve => { closedResolve = resolve; });
+    const io = {
+      write: text => child.stdin.write(text),
+      end: text => child.stdin.end(text),
+      lines: readline.createInterface({ input: child.stdout, crlfDelay: Infinity }),
+      closed,
+    };
+    const session = Promise.resolve().then(() => adapter.session(io, prompt));
+    // A session that fails mid-conversation closes stdin, so a server that exits on EOF (codex
+    // app-server does) exits on its own; one that does not is still bounded by the timeout. The
+    // rejection is remembered by the promise, never thrown here: 'close' is the one settle path.
+    session.catch(() => child.stdin.end());
 
     child.on('error', err => {
       finish(() => fail(adapter.classifyError(err, '')));
     });
 
     child.on('close', code => {
-      finish(() => {
-        // [LAW:types-are-the-program] A close after a kill is the KILL settling, not an engine exit
-        // to classify: which bound fired decides the type — the deadline kill is the budget working
-        // as designed (absorbed upstream as an unreviewed scope); the adapter-cap kill is an engine
-        // that outlived any sane review and stays the loud failure it always was.
-        if (timedOut) {
+      closedResolve(stdout);
+      // [LAW:types-are-the-program] A close after a kill is the KILL settling, not an engine exit
+      // to classify: which bound fired decides the type — the deadline kill is the budget working
+      // as designed (absorbed upstream as an unreviewed scope); the adapter-cap kill is an engine
+      // that outlived any sane review and stays the loud failure it always was.
+      if (timedOut) {
+        finish(() => {
           // One unconditional SIGKILL sweep before settling: 'close' proves the direct child and
           // every PIPE HOLDER are gone — not the whole group. A pipe-less grandchild that ignored
           // SIGTERM (stdio 'ignore'/re-detached) would otherwise be spared exactly here, when the
@@ -253,9 +301,11 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
               `${adapter.name} spawn killed: the review's time budget ran out mid-spawn. ${BUDGET_REMEDY}`,
             )
             : new Error(`${adapter.name} review timed out.`));
-          return;
-        }
-        if (code !== 0) {
+        });
+        return;
+      }
+      if (code !== 0) {
+        finish(() => {
           const msg = [
             `${adapter.name} exited with status ${code}.`,
             `Command: ${command} ${args.map(a => JSON.stringify(a)).join(' ')}`,
@@ -263,33 +313,50 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
             formatOutputTail('stdout tail', stdout),
           ].join('\n\n');
           fail(adapter.classifyError(new Error(msg), `${stdout}\n${stderr}`));
-          return;
-        }
-        try {
-          adapter.assertSucceeded(stdout);
-          // [LAW:no-silent-failure] The trailing window holds the terminal completion event and
-          // last-event usage (codex/claude), so completion and their usage are exact. A stream-
-          // summed usage (OpenCode adds per-event tokens/cost) loses the dropped prefix, so the
-          // loss is announced here rather than reported as an exact figure.
-          if (truncated) {
-            core.warning(
-              `${adapter.name} output exceeded the ${maxRetained} byte retention window; ` +
-              'kept the trailing window. Completion and last-event usage are intact; a stream-summed ' +
-              'usage/cost for this run may be a lower bound.',
-            );
+        });
+        return;
+      }
+      // [LAW:no-silent-failure] A clean exit settles on the SESSION's verdict: its output goes
+      // through assertSucceeded exactly as the retained stdout always did, and a session that
+      // failed mid-conversation — a refused request, an exit before the turn completed — is the
+      // loud cause even though the process itself exited 0.
+      // [LAW:no-ambient-temporal-coupling] `closed` is every session's floor, and this module owns
+      // the child's lifetime, so it is the one place that holds a session to it: a session that has
+      // not settled once every reaction to `closed` has run never will — its engine is gone — and
+      // the spawn would hang until the timeout found a dead tree. The check is deterministic, not a
+      // grace period: `closed` resolved synchronously above, so every reaction to it runs as a
+      // microtask before the setImmediate macrotask fires.
+      const sessionOutcome = Promise.race([
+        session,
+        new Promise((_, reject) => setImmediate(() => reject(new Error(`${adapter.name} session did not settle when the engine exited.`)))),
+      ]);
+      sessionOutcome.then(
+        output => finish(() => {
+          try {
+            adapter.assertSucceeded(output);
+            // The trailing window holds a stdin engine's terminal event and last-event usage, and a
+            // live session saw every line, so completion and their usage are exact. A stream-summed
+            // usage (OpenCode adds per-event tokens/cost) loses the dropped prefix, so the loss is
+            // announced here rather than reported as an exact figure.
+            if (truncated) {
+              core.warning(
+                `${adapter.name} output exceeded the ${maxRetained} byte retention window; ` +
+                'kept the trailing window. Completion and last-event usage are intact; a stream-summed ' +
+                'usage/cost for this run may be a lower bound.',
+              );
+            }
+            // [LAW:dataflow-not-control-flow] The session's output is the engine's output value; the
+            // caller derives usage/cost from it via the adapter's extractUsage. Findings still flow
+            // out-of-band through the MCP collector — the output carries only usage.
+            resolve({ output, span });
+          } catch (err) {
+            fail(adapter.classifyError(err, stdout));
           }
-          // [LAW:dataflow-not-control-flow] The captured stdout is the engine's output value;
-          // the caller derives usage/cost from it via the adapter's extractUsage. Findings
-          // still flow out-of-band through the MCP collector — stdout carries only usage.
-          resolve({ stdout, span });
-        } catch (err) {
-          fail(adapter.classifyError(err, stdout));
-        }
-      });
+        }),
+        err => finish(() => fail(adapter.classifyError(err, `${stdout}\n${stderr}`))),
+      );
     });
-
-    child.stdin.end(prompt);
   });
 }
 
-module.exports = { parseJsonEnvelope, formatOutputTail, runEngine, appendBounded, reapLiveEngineGroups, MAX_RETAINED_OUTPUT };
+module.exports = { parseJsonEnvelope, formatOutputTail, runEngine, promptOnStdin, appendBounded, reapLiveEngineGroups, MAX_RETAINED_OUTPUT };

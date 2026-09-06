@@ -32178,7 +32178,7 @@ const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 const os = __nccwpck_require__(857);
 const { parseRetryAfterMs, classifyTransient } = __nccwpck_require__(2887);
-const { parseJsonEnvelope, formatOutputTail } = __nccwpck_require__(8861);
+const { parseJsonEnvelope, formatOutputTail, promptOnStdin } = __nccwpck_require__(8861);
 const { makeCliAdapter } = __nccwpck_require__(2890);
 const { isAnthropicEndpoint, isSubscription, priceFromTable, spawnFromTokens } = __nccwpck_require__(9614);
 const { resolveReasoningTier } = __nccwpck_require__(4652);
@@ -32484,6 +32484,7 @@ const claudeCodeAdapter = makeCliAdapter({
   toolNames: TOOL_NAMES,
   materializeHome,
   buildCommand,
+  session: promptOnStdin,
   assertSucceeded,
   classifyError,
   extractUsage,
@@ -32537,8 +32538,8 @@ function removeQuietly(dir, label) {
 
 // [LAW:one-type-per-behavior] claude-code and codex are ONE behavior — a CLI agent spawned as a
 // subprocess that returns findings out-of-band through the MCP collector. They differ only in
-// their spawn primitives (the spec: materializeHome/buildCommand/assertSucceeded/extractUsage/...),
-// never in the lifecycle that drives them. This factory holds that single produceReview
+// their spawn primitives (the spec: materializeHome/buildCommand/session/assertSucceeded/
+// extractUsage/...), never in the lifecycle that drives them. This factory holds that single produceReview
 // implementation; each engine module supplies its spec.
 //
 // [FRAMING:parts-and-seams] The adapter contract is lifted to the judgment-vs-transport seam:
@@ -32600,7 +32601,7 @@ function makeCliAdapter(spec) {
             // say which one lied. Time is a pricing input (DeepSeek's peak/off-peak windows), so
             // this spawn is priced at the tier it actually ran in; extractUsage stays a pure
             // function of the engine's output and the instant it was given. [LAW:effects-at-boundaries]
-            const { stdout: output, span } = await runEngine(spec, config, prompt, home, collector, cwd, deadline);
+            const { output, span } = await runEngine(spec, config, prompt, home, collector, cwd, deadline);
             // [LAW:no-silent-failure] From here the spawn HAS run and its span is known, so any
             // failure past this point — a throwing extractUsage, a ProtocolError from an engine
             // that never called finish_review — still burned real wall clock and provider cost.
@@ -32649,17 +32650,28 @@ module.exports = { makeCliAdapter, removeQuietly };
 const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 const os = __nccwpck_require__(857);
+const core = __nccwpck_require__(7484);
 const { TransientError, classifyTransient } = __nccwpck_require__(2887);
-const { priceFromTable, spawnFromTokens } = __nccwpck_require__(9614);
+const { priceFromTable, spawnFromRequest, sumCost, emptyTokens, addTokens } = __nccwpck_require__(9614);
 const { makeCliAdapter } = __nccwpck_require__(2890);
+const { createJsonRpcClient } = __nccwpck_require__(1129);
 const { resolveReasoningTier } = __nccwpck_require__(4652);
+const { version: ACTION_VERSION } = __nccwpck_require__(8330);
 
 // [LAW:no-ambient-temporal-coupling] Pin off '@latest' — the same trap claude-code hit: an unowned,
 // time-varying input that lets an upstream npm release break a run with nothing here changing. Pinned
-// to a known-good release; CODEX_VERSION overrides it without cutting a release. [LAW:one-source-of-truth]
-const CODEX_VERSION = process.env.CODEX_VERSION || '0.141.0';
+// to the release the app-server conversation below was verified against (2026-09-06); CODEX_VERSION
+// overrides it without cutting a release. [LAW:one-source-of-truth]
+const CODEX_VERSION = process.env.CODEX_VERSION || '0.142.3';
 const CODEX_PACKAGE = `@openai/codex@${CODEX_VERSION}`;
 const CODEX_TIMEOUT_MS = 3_000_000;
+
+// What this client calls itself in the app-server handshake; codex echoes it into its user agent.
+const CLIENT_INFO = { name: 'copirate-code-review-agent', version: ACTION_VERSION };
+
+// [LAW:one-source-of-truth] The collector's name in codex's MCP registry, declared once: it heads the
+// config.toml section below and is the server whose tool-call approvals the session grants.
+const COLLECTOR_SERVER_NAME = 'review_collector';
 
 // [LAW:one-source-of-truth] The engine's reasoning-effort range, declared once (low→high) and
 // referenced by BOTH the capability declaration (config validation) and buildConfigToml (resolving an
@@ -32689,9 +32701,9 @@ const TOOL_NAMES = {
 // form is sent verbatim to the API and 400s as model_not_found); REVIEW_COLLECTOR_RECORDS in
 // the mcp_servers env sub-table. The credential is NOT carried by a provider env_key — Codex
 // authenticates the Responses transport from auth.json (written in materializeHome).
-// --dangerously-bypass-approvals-and-sandbox is required in the spawn invocation because
-// approval_policy = "never" only covers shell commands; MCP tool calls have a separate
-// approval gate that requires this flag in non-interactive (--json) mode.
+// approval_policy = "never" covers shell commands only; MCP tool calls have their own approval
+// gate, which the app-server surfaces as an elicitation request the session answers (see
+// appServerSession) — so the sandbox stays read-only instead of being bypassed wholesale.
 function buildConfigToml(config, collectorSpawn) {
   const { command, args, env: collectorEnv } = collectorSpawn;
 
@@ -32732,11 +32744,11 @@ function buildConfigToml(config, collectorSpawn) {
     // auth.json credential, rather than relying on implicit fallback. [LAW:types-are-the-program]
     `requires_openai_auth = true`,
     '',
-    '[mcp_servers.review_collector]',
+    `[mcp_servers.${COLLECTOR_SERVER_NAME}]`,
     `command = ${q(command)}`,
     `args = ${arr(args)}`,
     '',
-    '[mcp_servers.review_collector.env]',
+    `[mcp_servers.${COLLECTOR_SERVER_NAME}.env]`,
     `REVIEW_COLLECTOR_RECORDS = ${q(collectorEnv.REVIEW_COLLECTOR_RECORDS)}`,
   );
 
@@ -32772,10 +32784,11 @@ function materializeHome({ config, instructionsPath, collector }) {
 // [LAW:effects-at-boundaries] Pure: returns a full spawn spec from the validated ReviewConfig.
 // The credential is not passed via env — it lives in CODEX_HOME/auth.json (materializeHome),
 // the one channel Codex reads for the Responses transport. [LAW:single-enforcer]
-// --dangerously-bypass-approvals-and-sandbox is intentional for CI: GitHub Actions is an
-// externally sandboxed environment (per Codex docs: "Intended solely for running in
-// environments that are externally sandboxed"). MCP tool calls do not auto-execute in
-// --json mode without this flag regardless of approval_policy in config.toml.
+// The engine is codex's app-server over stdio: a JSON-RPC conversation (appServerSession) rather
+// than `exec --json`, because only the app-server reports usage PER MODEL REQUEST — the fact a
+// context-tiered price needs (see extractUsage). The thread it opens inherits the process cwd (the
+// isolated scratch dir cli.js owns; verified live, and it need not be a git repo) and config.toml's
+// read-only sandbox and never-approve policy — no bypass flag, so the sandbox stays in force.
 //
 // Env is an explicit allowlist — never process.env spread. Codex is an AI agent that can
 // read env vars via shell expressions; spreading process.env would expose GITHUB_TOKEN and
@@ -32785,11 +32798,7 @@ function materializeHome({ config, instructionsPath, collector }) {
 function buildCommand({ home }) {
   return {
     command: 'npx',
-    // --skip-git-repo-check: the engine's cwd is an isolated scratch dir (an instruction-injection
-    // guard owned in cli.js), which is NOT a git repo. Without this flag `codex exec` refuses to run
-    // outside a git repo and hangs waiting on stdin. The repo itself is read by absolute path; the
-    // sandbox bypass already permits reads anywhere. [LAW:no-silent-failure]
-    args: ['-y', CODEX_PACKAGE, 'exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check'],
+    args: ['-y', CODEX_PACKAGE, 'app-server'],
     env: {
       PATH: process.env.PATH,
       HOME: process.env.HOME,
@@ -32798,85 +32807,138 @@ function buildCommand({ home }) {
   };
 }
 
-// Parse the JSONL event stream from codex exec --json. Non-JSON lines (stderr noise) are skipped.
-// [LAW:no-silent-failure] Both failure modes are surfaced:
-//   turn.failed  — explicit engine error (throw immediately)
-//   no turn.completed — Codex exited 0 but the turn never finished (interrupted mid-turn,
-//     internal timeout, buffering error). Without this check a clean-exit incomplete turn
-//     silently passes as success with no findings collected.
-function assertSucceeded(stdout) {
-  let completed = false;
-  for (const line of stdout.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let event;
-    try { event = JSON.parse(trimmed); } catch { continue; }
-    if (event.type === 'turn.failed') {
-      throw new Error(`Codex review failed: ${event.error?.message ?? 'unknown error'}`);
-    }
-    if (event.type === 'turn.completed') completed = true;
-  }
-  if (!completed) {
-    throw new Error('Codex review did not complete: turn.completed event was not emitted.');
-  }
+// [LAW:parse-dont-validate] The two notifications the session reads are parsed HERE, at the wire,
+// into the values the record carries — a request's usage counts and the completed turn — and a
+// notification missing them throws, naming the method and the payload. The throw is what the JSON-RPC
+// client turns into the session's loud failure (rpc.failed); the handler and everything downstream
+// take the parsed values at face value, so no consumer guards a field the wire might have dropped.
+// The three counts are what tokensOfRequest bills; total and reasoning tokens are not read.
+function requestUsageOf(params) {
+  const last = params?.tokenUsage?.last;
+  const counted = last && ['inputTokens', 'cachedInputTokens', 'outputTokens'].every(k => Number.isInteger(last[k]));
+  if (!counted) throw new Error(`codex thread/tokenUsage/updated carried no request usage: ${JSON.stringify(params)}`);
+  return last;
 }
 
-// [LAW:effects-at-boundaries] Pure: reads usage from the engine's own JSONL output and returns
-// a Usage value, or null when no usage was reported. Codex emits NO USD — 'actual USD' is
+function turnOf(params) {
+  const turn = params?.turn;
+  if (!turn || typeof turn.status !== 'string') throw new Error(`codex turn/completed carried no turn: ${JSON.stringify(params)}`);
+  return turn;
+}
+
+// [LAW:effects-at-boundaries] The one conversation this engine holds, over the io runEngine owns:
+//
+//   initialize -> initialized -> thread/start -> turn/start -> ...notifications... -> turn/completed -> EOF
+//
+// Verified live against codex-cli 0.142.3 (2026-09-06). Every model request the turn makes emits one
+// thread/tokenUsage/updated whose `last` is THAT request's usage — six requests of ~16-17K context
+// each summed exactly to `total` — which is the per-request context `exec --json` collapsed into one
+// turn total. The collector's tool calls arrive as mcpServer/elicitation/request approvals even under
+// approval_policy "never" (the gate `exec` needed --dangerously-bypass-approvals-and-sandbox for);
+// they are granted here for the collector alone, so the read-only sandbox stays in force. The server
+// exits on stdin EOF, which is how the session ends it.
+//
+// [LAW:no-silent-failure] Any other server request is REFUSED with a JSON-RPC error and announced —
+// a command approval under a never-approve policy, a file-change approval in a read-only sandbox —
+// never granted by default, and never left unanswered, which would stall the turn until the timeout.
+// The session resolves with THE SESSION RECORD, { turn, requests }: the completed turn as codex
+// reported it (status + error) and one usage breakdown per model request, in order. A stream that
+// closes before the turn completes rejects, so an engine that dies mid-review is the loud cause; so
+// does a notification the parsers above cannot read (rpc.failed), so a wire change in a codex
+// release is reported as the cause rather than surfacing as an exception inside a stream callback.
+async function appServerSession(io, prompt) {
+  const requests = [];
+  let settleTurn;
+  const completed = new Promise(resolve => { settleTurn = resolve; });
+  const rpc = createJsonRpcClient(io, msg => {
+    if (msg.id !== undefined) {
+      const approval = msg.params?._meta?.codex_approval_kind === 'mcp_tool_call' && msg.params.serverName === COLLECTOR_SERVER_NAME;
+      if (msg.method === 'mcpServer/elicitation/request' && approval) {
+        rpc.respond(msg.id, { action: 'accept' });
+      } else {
+        core.warning(`codex asked for ${msg.method}, which the review engine does not grant; refused.`);
+        rpc.refuse(msg.id, `${msg.method} is not granted to a review engine`);
+      }
+      return;
+    }
+    if (msg.method === 'thread/tokenUsage/updated') requests.push(requestUsageOf(msg.params));
+    if (msg.method === 'turn/completed') settleTurn(turnOf(msg.params));
+  });
+  await rpc.request('initialize', { clientInfo: CLIENT_INFO });
+  rpc.notify('initialized');
+  const { thread } = await rpc.request('thread/start', {});
+  await rpc.request('turn/start', { threadId: thread.id, input: [{ type: 'text', text: prompt }] });
+  const turn = await Promise.race([
+    completed,
+    rpc.failed,
+    io.closed.then(() => { throw new Error('Codex review did not complete: the app-server exited before turn/completed.'); }),
+  ]);
+  io.end();
+  return { turn, requests };
+}
+
+// [LAW:no-silent-failure] The turn's own status is the verdict: 'completed' is the one success, and
+// 'failed' / 'interrupted' surface codex's error, with its typed class (codexErrorInfo) in the text
+// so classifyError can read a quota wall or an overloaded server off it.
+function assertSucceeded({ turn }) {
+  if (turn.status === 'completed') return;
+  const detail = turn.error
+    ? `${turn.error.message}${turn.error.codexErrorInfo ? ` (${JSON.stringify(turn.error.codexErrorInfo)})` : ''}`
+    : 'no error reported';
+  throw new Error(`Codex review ${turn.status}: ${detail}`);
+}
+
+// [LAW:parse-dont-validate] OpenAI reports an input total that INCLUDES its cached subset, so this is
+// the one place that overlap is resolved into THE TOKEN RECORD's disjoint classes (src/usage.js). The
+// clamp belongs here, at the vendor boundary, and nowhere downstream: a foreign payload reporting more
+// cached than total tokens is the only way that state can arise, so absorbing it where the foreign
+// shape is read is what lets every consumer take the classes at face value. reasoningOutputTokens is
+// a subset of outputTokens (verified: totalTokens = inputTokens + outputTokens) and bills as output.
+function tokensOfRequest(u) {
+  const inputCacheHit = Math.min(u.cachedInputTokens, u.inputTokens);
+  return { inputCacheMiss: u.inputTokens - inputCacheHit, inputCacheHit, output: u.outputTokens };
+}
+
+// [LAW:effects-at-boundaries] Pure: reads usage from the session record and returns a Usage value, or
+// null when the turn made no model request that reported usage. Codex emits NO USD — 'actual USD' is
 // tokens x the centralized price table (priceFromTable), which reports its own reason when it cannot
 // price a spawn and never a fabricated zero. [LAW:no-silent-failure]
-// The cumulative turn usage rides on the final turn.completed event; later events overwrite
-// earlier ones so the last wins. An absent/empty usage object (no token fields) is reported as
-// no usage (null), not as a $0.00 run. [LAW:dataflow-not-control-flow]
 //
-// input_tokens is a SUM ACROSS THE TURN'S MODEL REQUESTS, not the size of any one prompt — measured
-// 2026-08-27 against a live codex run, where one turn making three requests of ~26K context each
-// reported 78,338 with cached_input_tokens 52,352 (the two later requests re-reading the same prefix).
-// That is why a context-tiered model prices from an interval rather than from this number; see
-// THE SPAWN FACTS in src/usage.js. usage appears on turn.completed and on no other event, so a
-// per-request context length cannot be recovered from this stream at all.
-function extractUsage(stdout, config, startedAt) {
-  let usage = null;
-  for (const line of stdout.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let event;
-    try { event = JSON.parse(trimmed); } catch { continue; }
-    if (event.type === 'turn.completed' && event.usage) usage = event.usage;
-  }
-  if (!usage || (usage.input_tokens == null && usage.output_tokens == null)) return null;
-  // [LAW:parse-dont-validate] OpenAI reports an input total that INCLUDES its cached subset, so this
-  // is the one place that overlap is resolved into THE TOKEN RECORD's disjoint classes (src/usage.js).
-  // The clamp belongs here, at the vendor boundary, and nowhere downstream: a foreign payload
-  // reporting more cached than total tokens is the only way that state can arise, so absorbing it
-  // where the foreign shape is read is what lets every consumer take the classes at face value.
-  const inputTokens = usage.input_tokens ?? 0;
-  const inputCacheHit = Math.min(usage.cached_input_tokens ?? 0, inputTokens);
-  const tokens = {
-    inputCacheMiss: inputTokens - inputCacheHit,
-    inputCacheHit,
-    output: usage.output_tokens ?? 0,
-  };
-  // `startedAt` is the spawn's start instant, supplied by makeCliAdapter — the price table is a
-  // schedule, so the rate is selected by WHEN this spawn ran, not by a clock read in here.
-  // [LAW:types-are-the-program] cost is a discriminated value, and priceFromTable returns it whole —
-  // dollars, or unpriced carrying the reason it discovered. This adapter never manufactures that
-  // reason: codex can reach two of them (the model is absent from the table, or its schedule covers
-  // no card for this spawn) and telling them apart is the price table's job, not the adapter's.
-  // The basis is never 'subscription': codex declares credentialKinds ['api-key'], so no codex run can
-  // ever be billed to a subscription and this adapter has no notional arm to reach.
-  const cost = priceFromTable(spawnFromTokens(startedAt, tokens), config.model);
-  return { tokens, cost };
+// Each request is priced ON ITS OWN, at the card its own context length selects, and the spawn's
+// cost is the sum (sumCost — one unpriced request makes the whole spawn unpriced, carrying its
+// reason). That is what makes a context-tiered model (gpt-5.6-*, ≤272K / >272K per request) price
+// exactly: a review turn totals well over 272K across its requests while no single request need be,
+// and pricing the total at either card would be the confident misprice zai-cost-truth-p5o exists to
+// end. spawnFromRequest is the narrow claim each request supports — its context is exactly its own
+// input count. The usage record keeps the per-request breakdown beside the summed tokens for this
+// run — the pass fold carries it and the transcript holds the notifications — while the persisted
+// cost marker records the sum alone, so an audit-time restatement of a context-tiered review still
+// reads the schedule gap (zai-cost-truth-p5o.7 makes the marker carry it). [FRAMING:representation]
+//
+// `startedAt` is the spawn's start instant, supplied by makeCliAdapter — the price table is a
+// schedule, so the rate is selected by WHEN this spawn ran, not by a clock read in here.
+// [LAW:types-are-the-program] cost is a discriminated value, and priceFromTable returns it whole —
+// dollars, or unpriced carrying the reason it discovered. This adapter never manufactures that
+// reason: codex can reach two of them (the model is absent from the table, or its schedule covers
+// no card for a request) and telling them apart is the price table's job, not the adapter's.
+// The basis is never 'subscription': codex declares credentialKinds ['api-key'], so no codex run can
+// ever be billed to a subscription and this adapter has no notional arm to reach.
+function extractUsage({ requests }, config, startedAt) {
+  if (requests.length === 0) return null;
+  const perRequest = requests.map(tokensOfRequest);
+  const costs = perRequest.map(tokens => priceFromTable(spawnFromRequest(startedAt, tokens), config.model));
+  return { tokens: perRequest.reduce(addTokens, emptyTokens()), cost: sumCost(costs), requests: perRequest };
 }
 
 // [LAW:single-enforcer] The shared transient vocabulary (429/529/network drop) is classified once in
 // src/failover.js (classifyTransient); codex consumes it and adds only its genuinely OpenAI-specific
-// class — insufficient_quota, a billing limit that also clears with time or a new quota window. codex
-// doesn't surface Retry-After in a parseable form, so it omits the extractor and rate-limits fall to
-// exponential backoff. [LAW:one-source-of-truth] No local copy of the 429/529/network patterns to drift.
+// class — a billing limit (insufficient_quota on the wire, usageLimitExceeded as the app-server's typed
+// class) that also clears with time or a new quota window. codex doesn't surface Retry-After in a
+// parseable form, so it omits the extractor and rate-limits fall to exponential backoff.
+// [LAW:one-source-of-truth] No local copy of the 429/529/network patterns to drift.
 function classifyError(err, text) {
   return classifyTransient(err, text)
-    ?? (/insufficient.quota|quota.exceeded/i.test(text) ? new TransientError(`quota exceeded: ${err.message}`) : err);
+    ?? (/insufficient.quota|quota.exceeded|usageLimitExceeded/i.test(text) ? new TransientError(`quota exceeded: ${err.message}`) : err);
 }
 
 // [LAW:one-type-per-behavior] The CLI lifecycle is identical across engines, so the adapter is built
@@ -32897,6 +32959,7 @@ const codexAdapter = makeCliAdapter({
   toolNames: TOOL_NAMES,
   materializeHome,
   buildCommand,
+  session: appServerSession,
   assertSucceeded,
   classifyError,
   extractUsage,
@@ -32910,10 +32973,93 @@ module.exports = {
   buildConfigToml,
   materializeHome,
   buildCommand,
+  appServerSession,
   assertSucceeded,
   classifyError,
   extractUsage,
 };
+
+
+/***/ }),
+
+/***/ 1129:
+/***/ ((module) => {
+
+"use strict";
+
+
+// [LAW:decomposition] A JSON-RPC 2.0 peer over line-delimited pipes: correlate our requests with
+// their responses and hand every other message to one handler. It knows nothing about codex — the
+// methods, params and lifecycle are the caller's — so any engine that speaks an app-server-shaped
+// protocol is driven through this one client. [LAW:composability]
+//
+// `io` is the session io runEngine hands a session (write on stdin, `lines` over stdout).
+// `onMessage(msg)` receives every message that is not a response: server notifications (no id) and
+// server requests (id + method), which the caller answers through respond/refuse. A line that is not
+// JSON is the engine's own noise on stdout and is skipped, as every stream parser here skips it; the
+// raw stream is in the transcript regardless.
+//
+// [LAW:types-are-the-program] `method` is the wire's own discriminator: a message without one is a
+// RESPONSE and can only correlate with a request of ours. One whose id is not pending — a late or
+// orphan reply — correlates with nothing and is dropped, never handed to the handler as if the server
+// had asked something.
+//
+// [LAW:no-silent-failure] A response carrying `error` rejects the request with the method it
+// answered and the server's message, and every request still pending when the stream closes is
+// rejected with that fact — a promise that never settles would leave a session hanging on an engine
+// that has already exited, when its death is the thing to report. A handler that THROWS is the
+// conversation failing to parse what the server sent: the throw rejects every pending request and
+// `failed`, the promise a session races beside its own completion, so a malformed notification is
+// the loud cause of the session's end and never an uncaught exception inside a stream callback.
+function createJsonRpcClient(io, onMessage) {
+  let nextId = 1;
+  const pending = new Map();
+  let fail;
+  const failed = new Promise((_, reject) => { fail = reject; });
+  failed.catch(() => {}); // observed by the session's race; never an unhandled rejection on its own
+  const send = msg => io.write(JSON.stringify({ jsonrpc: '2.0', ...msg }) + '\n');
+  const rejectPending = errorFor => {
+    for (const [id, reply] of pending) {
+      pending.delete(id);
+      reply.reject(errorFor(reply));
+    }
+  };
+  io.lines.on('line', line => {
+    let msg;
+    try { msg = JSON.parse(line); } catch { return; }
+    if (msg === null || typeof msg !== 'object') return;
+    if (msg.method === undefined) {
+      const reply = pending.get(msg.id);
+      if (!reply) return;
+      pending.delete(msg.id);
+      if (msg.error) reply.reject(new Error(`${reply.method} failed: ${msg.error.message ?? JSON.stringify(msg.error)}`));
+      else reply.resolve(msg.result);
+      return;
+    }
+    try {
+      onMessage(msg);
+    } catch (err) {
+      fail(err);
+      rejectPending(() => err);
+    }
+  });
+  io.lines.on('close', () => {
+    rejectPending(reply => new Error(`${reply.method} never answered: the engine's output stream closed first.`));
+  });
+  return {
+    request: (method, params) => new Promise((resolve, reject) => {
+      const id = nextId++;
+      pending.set(id, { method, resolve, reject });
+      send({ id, method, params });
+    }),
+    notify: (method, params) => send({ method, params }),
+    respond: (id, result) => send({ id, result }),
+    refuse: (id, message) => send({ id, error: { code: -32601, message } }),
+    failed,
+  };
+}
+
+module.exports = { createJsonRpcClient };
 
 
 /***/ }),
@@ -32928,6 +33074,7 @@ const path = __nccwpck_require__(6928);
 const os = __nccwpck_require__(857);
 const { classifyTransient } = __nccwpck_require__(2887);
 const { emptyTokens, addTokens } = __nccwpck_require__(9614);
+const { promptOnStdin } = __nccwpck_require__(8861);
 const { makeCliAdapter, removeQuietly } = __nccwpck_require__(2890);
 
 // [LAW:no-ambient-temporal-coupling] Pin off '@latest' — the same trap claude-code hit: an unowned,
@@ -33202,6 +33349,7 @@ const opencodeAdapter = makeCliAdapter({
   toolNames: TOOL_NAMES,
   materializeHome,
   buildCommand,
+  session: promptOnStdin,
   assertSucceeded,
   classifyError,
   extractUsage,
@@ -33261,17 +33409,20 @@ module.exports = { get };
 "use strict";
 
 const { spawn } = __nccwpck_require__(5317);
+const readline = __nccwpck_require__(3785);
 const core = __nccwpck_require__(7484);
 const { emitTranscript } = __nccwpck_require__(9806);
 const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = __nccwpck_require__(6757);
 
 // [LAW:no-ambient-temporal-coupling] An engine may legitimately emit an arbitrarily large
-// stream — codex `exec --json` streams every reasoning delta and tool call as a JSONL line,
+// stream — codex's app-server streams every reasoning delta and tool call as a JSON-RPC line,
 // so a dense, law-comment-heavy diff easily produces many megabytes. What we RETAIN is bounded
 // to a trailing window so memory stays flat on a big review; the engine is NOT killed for being
 // verbose. "The process never terminates" is owned by the per-invocation timeout below — never
-// by output volume. The events the caller needs (turn.completed / turn.failed and the cumulative
-// usage that rides the terminal event) are the LAST emitted, so a tail preserves exactly them.
+// by output volume. A stdin engine's session reads this retained tail back, and the events it
+// needs (the terminal result envelope and the usage riding it) are the LAST emitted, so the tail
+// preserves exactly them; a session that reads the stream LIVE (codex's appServerSession) is never
+// clipped at all.
 const MAX_RETAINED_OUTPUT = 8 * 1024 * 1024;
 
 // [LAW:one-type-per-behavior] stdout and stderr are the same behavior — captured child output
@@ -33347,11 +33498,30 @@ function formatOutputTail(label, value) {
   return `${label}:\n${trimmed.slice(-4000)}`;
 }
 
+// [LAW:one-type-per-behavior] THE SESSION is how an engine is talked to — the one primitive that
+// differs between a CLI that takes its prompt on stdin and prints until it exits (claude-code,
+// opencode) and a server that holds a JSON-RPC conversation over the same two pipes (codex's
+// app-server). Each spec names its session as a VALUE and runEngine drives whichever it is handed
+// through the one lifecycle below. A session receives `io` — write/end on the child's stdin,
+// `lines` (a readline over its stdout: every line as it arrives, never clipped) and `closed` (a
+// promise of the retained stdout, settled once the child has exited and released its pipes) — and
+// resolves with the engine's OUTPUT VALUE, the thing the spec's assertSucceeded and extractUsage
+// read. [LAW:dataflow-not-control-flow] runEngine never asks which kind of engine it is running;
+// the session is a value that flows through the same spawn, capture, timeout and settle.
+//
+// promptOnStdin is the stdin-engine session: deliver the prompt, wait for the exit, and the output
+// is the retained stdout — exactly what those adapters parsed before the session existed as a seam.
+function promptOnStdin(io, prompt) {
+  io.end(prompt);
+  return io.closed;
+}
+
 // [LAW:decomposition] Generic spawn runner: owns timeout, size-cap, and process lifecycle.
-// All engine-specific logic (args, env, success check, error classification) lives in the adapter.
-// Resolves with { stdout, span }: the child's captured stdout so the caller can extract usage/cost
-// from it, and the spawn's wall-clock span ({ from, to }, ISO-8601 UTC) stamped by this module's
-// own clock — the one owner of the child's lifetime (zai-timing-31d.4).
+// All engine-specific logic (args, env, session, success check, error classification) lives in the
+// adapter. Resolves with { output, span }: the session's output value (the retained stdout for a
+// stdin engine, the protocol record for a server engine) so the caller can extract usage/cost from
+// it, and the spawn's wall-clock span ({ from, to }, ISO-8601 UTC) stamped by this module's own
+// clock — the one owner of the child's lifetime (zai-timing-31d.4).
 // [LAW:no-ambient-temporal-coupling] The per-invocation timeout is owned here, not in callers.
 // [LAW:effects-at-boundaries] This is the only place that spawns a child process.
 // cwd is the engine's working directory — an isolated scratch dir outside the reviewed repo tree
@@ -33491,18 +33661,44 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
       truncated = truncated || clipped;
     });
     child.stderr.on('data', chunk => { stderr = appendBounded(stderr, chunk, maxRetained).text; });
+    // [LAW:no-silent-failure] exception: a write to a child that has already died raises EPIPE on
+    // stdin, and the child's death is the fact — reported by the 'close' path below with its exit
+    // code and output tails. Left unhandled it would surface as an uncaught exception naming the
+    // pipe instead, so the pipe error is the one signal here that is genuinely irrelevant.
+    child.stdin.on('error', () => {});
+
+    // [LAW:no-ambient-temporal-coupling] The session reads stdout LIVE through its own readline — a
+    // second reader beside the bounded capture above — so a protocol conversation, and every usage
+    // notification an engine emits mid-stream, is seen whole even when the retained window later
+    // clips the stream's head. `closed` settles on 'close' with the retained stdout on EVERY exit
+    // path, so a session still awaiting a completion the engine never sent settles too, instead of
+    // hanging past the child's death; its rejection is then the loudest cause on the settle.
+    let closedResolve;
+    const closed = new Promise(resolve => { closedResolve = resolve; });
+    const io = {
+      write: text => child.stdin.write(text),
+      end: text => child.stdin.end(text),
+      lines: readline.createInterface({ input: child.stdout, crlfDelay: Infinity }),
+      closed,
+    };
+    const session = Promise.resolve().then(() => adapter.session(io, prompt));
+    // A session that fails mid-conversation closes stdin, so a server that exits on EOF (codex
+    // app-server does) exits on its own; one that does not is still bounded by the timeout. The
+    // rejection is remembered by the promise, never thrown here: 'close' is the one settle path.
+    session.catch(() => child.stdin.end());
 
     child.on('error', err => {
       finish(() => fail(adapter.classifyError(err, '')));
     });
 
     child.on('close', code => {
-      finish(() => {
-        // [LAW:types-are-the-program] A close after a kill is the KILL settling, not an engine exit
-        // to classify: which bound fired decides the type — the deadline kill is the budget working
-        // as designed (absorbed upstream as an unreviewed scope); the adapter-cap kill is an engine
-        // that outlived any sane review and stays the loud failure it always was.
-        if (timedOut) {
+      closedResolve(stdout);
+      // [LAW:types-are-the-program] A close after a kill is the KILL settling, not an engine exit
+      // to classify: which bound fired decides the type — the deadline kill is the budget working
+      // as designed (absorbed upstream as an unreviewed scope); the adapter-cap kill is an engine
+      // that outlived any sane review and stays the loud failure it always was.
+      if (timedOut) {
+        finish(() => {
           // One unconditional SIGKILL sweep before settling: 'close' proves the direct child and
           // every PIPE HOLDER are gone — not the whole group. A pipe-less grandchild that ignored
           // SIGTERM (stdio 'ignore'/re-detached) would otherwise be spared exactly here, when the
@@ -33514,9 +33710,11 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
               `${adapter.name} spawn killed: the review's time budget ran out mid-spawn. ${BUDGET_REMEDY}`,
             )
             : new Error(`${adapter.name} review timed out.`));
-          return;
-        }
-        if (code !== 0) {
+        });
+        return;
+      }
+      if (code !== 0) {
+        finish(() => {
           const msg = [
             `${adapter.name} exited with status ${code}.`,
             `Command: ${command} ${args.map(a => JSON.stringify(a)).join(' ')}`,
@@ -33524,36 +33722,53 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
             formatOutputTail('stdout tail', stdout),
           ].join('\n\n');
           fail(adapter.classifyError(new Error(msg), `${stdout}\n${stderr}`));
-          return;
-        }
-        try {
-          adapter.assertSucceeded(stdout);
-          // [LAW:no-silent-failure] The trailing window holds the terminal completion event and
-          // last-event usage (codex/claude), so completion and their usage are exact. A stream-
-          // summed usage (OpenCode adds per-event tokens/cost) loses the dropped prefix, so the
-          // loss is announced here rather than reported as an exact figure.
-          if (truncated) {
-            core.warning(
-              `${adapter.name} output exceeded the ${maxRetained} byte retention window; ` +
-              'kept the trailing window. Completion and last-event usage are intact; a stream-summed ' +
-              'usage/cost for this run may be a lower bound.',
-            );
+        });
+        return;
+      }
+      // [LAW:no-silent-failure] A clean exit settles on the SESSION's verdict: its output goes
+      // through assertSucceeded exactly as the retained stdout always did, and a session that
+      // failed mid-conversation — a refused request, an exit before the turn completed — is the
+      // loud cause even though the process itself exited 0.
+      // [LAW:no-ambient-temporal-coupling] `closed` is every session's floor, and this module owns
+      // the child's lifetime, so it is the one place that holds a session to it: a session that has
+      // not settled once every reaction to `closed` has run never will — its engine is gone — and
+      // the spawn would hang until the timeout found a dead tree. The check is deterministic, not a
+      // grace period: `closed` resolved synchronously above, so every reaction to it runs as a
+      // microtask before the setImmediate macrotask fires.
+      const sessionOutcome = Promise.race([
+        session,
+        new Promise((_, reject) => setImmediate(() => reject(new Error(`${adapter.name} session did not settle when the engine exited.`)))),
+      ]);
+      sessionOutcome.then(
+        output => finish(() => {
+          try {
+            adapter.assertSucceeded(output);
+            // The trailing window holds a stdin engine's terminal event and last-event usage, and a
+            // live session saw every line, so completion and their usage are exact. A stream-summed
+            // usage (OpenCode adds per-event tokens/cost) loses the dropped prefix, so the loss is
+            // announced here rather than reported as an exact figure.
+            if (truncated) {
+              core.warning(
+                `${adapter.name} output exceeded the ${maxRetained} byte retention window; ` +
+                'kept the trailing window. Completion and last-event usage are intact; a stream-summed ' +
+                'usage/cost for this run may be a lower bound.',
+              );
+            }
+            // [LAW:dataflow-not-control-flow] The session's output is the engine's output value; the
+            // caller derives usage/cost from it via the adapter's extractUsage. Findings still flow
+            // out-of-band through the MCP collector — the output carries only usage.
+            resolve({ output, span });
+          } catch (err) {
+            fail(adapter.classifyError(err, stdout));
           }
-          // [LAW:dataflow-not-control-flow] The captured stdout is the engine's output value;
-          // the caller derives usage/cost from it via the adapter's extractUsage. Findings
-          // still flow out-of-band through the MCP collector — stdout carries only usage.
-          resolve({ stdout, span });
-        } catch (err) {
-          fail(adapter.classifyError(err, stdout));
-        }
-      });
+        }),
+        err => finish(() => fail(adapter.classifyError(err, `${stdout}\n${stderr}`))),
+      );
     });
-
-    child.stdin.end(prompt);
   });
 }
 
-module.exports = { parseJsonEnvelope, formatOutputTail, runEngine, appendBounded, reapLiveEngineGroups, MAX_RETAINED_OUTPUT };
+module.exports = { parseJsonEnvelope, formatOutputTail, runEngine, promptOnStdin, appendBounded, reapLiveEngineGroups, MAX_RETAINED_OUTPUT };
 
 
 /***/ }),
@@ -34169,8 +34384,14 @@ function sumUsage(usages) {
   if (present.length === 0) return null;
   const tokens = present.map(u => u.tokens).filter(Boolean);
   const costs = present.map(u => u.cost).filter(Boolean);
+  const requests = present.map(u => u.requests).filter(Boolean);
   return {
     tokens: tokens.length > 0 ? tokens.reduce(addTokens, emptyTokens()) : null,
+    // The per-request breakdown an engine that observes each model request records (codex, via its
+    // app-server session) is carried whole — the pass's requests are its spawns' requests, in the
+    // order the spawns settled — and absent when no spawn recorded one, exactly as tokens are. It is the primary fact
+    // behind a context-tiered cost, so the fold keeps it beside the sum it derives from.
+    requests: requests.length > 0 ? requests.flat() : null,
     // The pass's SPAN is the envelope of its spawns' spans — earliest start, latest end — which is
     // the honest answer for a scheduler that runs workers in waves: the pass occupied that window,
     // and a restatement that needs to know which price epoch applies can see whether the window sits
@@ -35637,15 +35858,13 @@ const PROVIDERS = {
     engine: 'codex',
     preset: 'openai',
     credentialInput: 'OPENAI_API_KEY',
-    // gpt-5.4-mini is the default because it is the one OpenAI row that prices exactly (decided
-    // 2026-09-06, zai-cost-truth-p5o.5). OpenAI prices its current gpt-5.6 models per REQUEST context
-    // (≤272K / >272K), and codex's `exec --json` reports usage once per turn, summed across its
-    // requests — a review spawn is well over 272K in total, so it can prove neither card and would
-    // print "Cost: unknown" on every run. gpt-5.4-mini carries one flat card (src/usage.js), so it
-    // prices at any size. This is a limit of the usage RECORD, not the model: codex's app-server
-    // protocol emits per-request usage (thread/tokenUsage/updated, verified in codex-cli 0.142.3), and
-    // once the engine reads that stream every gpt-5.6 row prices exactly. Re-decide this default when
-    // zai-cost-truth-p5o.6 lands. [LAW:no-silent-failure]
+    // gpt-5.4-mini stays the default by the owner's standing choice of the cheapest OpenAI card, and
+    // for no pricing reason any more (revisited 2026-09-06, zai-cost-truth-p5o.6). It was first chosen
+    // because it was the one OpenAI row that priced exactly: OpenAI prices its gpt-5.6 models per
+    // REQUEST context (≤272K / >272K) and codex's `exec --json` reported usage only as a turn total.
+    // The engine now reads codex's app-server stream, which reports every model request's own usage
+    // (src/engine/codex.js), so every gpt-5.6 row prices as exactly as this one — OPENAI_MODEL selects
+    // any of them with no loss of a figure. [LAW:no-silent-failure]
     defaultModel: 'gpt-5.4-mini',
     inputKeys: { credential: 'openaiApiKey', model: 'openaiModel', reasoning: 'openaiReasoning', baseUrl: 'openaiBaseUrl' },
   },
@@ -39169,9 +39388,10 @@ const PRICE_SOURCES = [
     // OpenAI also publishes a FOURTH class, "cache writes" ($5.00 for sol against $4.00 input). THE
     // TOKEN RECORD folds cache creation into the cache-MISS class, which is exact for DeepSeek and
     // Anthropic (both bill it at the full input rate) and approximate here. It costs nothing today
-    // because codex reports no cache-write count to price — its usage payload carries input_tokens,
-    // cached_input_tokens and output_tokens only — so there is no number being multiplied by the wrong
-    // rate, and inventing one to fill the class would be a guess wearing a number.
+    // because codex reports no cache-write count to price — its per-request usage carries inputTokens,
+    // cachedInputTokens and outputTokens (plus reasoning, a subset of output) only — so there is no
+    // number being multiplied by the wrong rate, and inventing one to fill the class would be a guess
+    // wearing a number.
     models: {
       'gpt-5.6-sol': {
         tiers: [
@@ -39446,10 +39666,23 @@ function ratesAt(entry, facts) {
 // proves. [LAW:one-source-of-truth] What the sum proves is an upper bound — no single request's
 // context exceeded the total — so the interval is [0, total]: a spawn totalling under 272K is PROVABLY
 // short and prices correctly, while a larger one proves neither card and is reported unpriced rather
-// than guessed. An adapter that can one day observe a per-request context builds a narrower interval
-// and the long card becomes reachable with no change to any of this. [FRAMING:representation]
+// than guessed. An adapter that observes a per-request context builds a narrower interval through
+// spawnFromRequest below, and the long card becomes reachable with no change to the matcher.
+// [FRAMING:representation]
 function spawnFromTokens(at, tokens) {
   return { at, tokens, context: { min: 0, max: totalInputTokens(tokens) } };
+}
+
+// spawnFromRequest is the narrower claim an adapter that OBSERVES each model request can make: these
+// tokens were ONE request, so its context is exactly its own input count — a point interval, which
+// every context tier decides exactly (half-open ranges put 272,000 on the short card and 272,001 on
+// the long one). codex's app-server session builds one per request it saw and sums the priced
+// results (sumCost), so a turn that straddles 272K prices each request at its own card and never
+// the whole turn at one. The two constructors differ in what their facts PROVE, which is why they
+// are two functions and not one with a flag. [LAW:one-type-per-behavior]
+function spawnFromRequest(at, tokens) {
+  const context = totalInputTokens(tokens);
+  return { at, tokens, context: { min: context, max: context } };
 }
 
 // The coordinates a constraint is matched against, parsed from the spawn once per price lookup. The
@@ -40155,8 +40388,8 @@ const UNPRICED_REMEDY = {
     + 'Add the model to PRICE_SOURCES in src/usage.js, under the vendor page that prices it.',
   'schedule-gap': (tag) => `${tag} is in the price table, but no rate card in its schedule covers this `
     + 'spawn, so the review footer shows cost as "unknown". Either the vendor publishes no rate for '
-    + 'this spawn (OpenAI prices gpt-5.5 and gpt-5.4 only up to 272K context), or the spawn is too '
-    + "large for its per-request context length to be proven from the run's token totals. Nothing is "
+    + 'this spawn (OpenAI prices gpt-5.5 and gpt-5.4 only up to 272K context), or the engine reports '
+    + 'usage only as a turn total too large for its per-request context length to be proven. Nothing is '
     + 'wrong with the table: a rate that cannot be shown to apply is reported unknown rather than guessed.',
   'not-reported': (tag, config) => `${config.engine} reported no cost (no USD in its output) for ${tag}; `
     + 'the review footer shows cost as "unknown".',
@@ -40179,6 +40412,7 @@ module.exports = {
   // and deserves to be driven directly, including its loud arm. [LAW:behavior-not-structure]
   ratesAt,
   spawnFromTokens,
+  spawnFromRequest,
   totalInputTokens,
   emptyTokens,
   addTokens,
@@ -40386,6 +40620,14 @@ module.exports = require("process");
 
 "use strict";
 module.exports = require("querystring");
+
+/***/ }),
+
+/***/ 3785:
+/***/ ((module) => {
+
+"use strict";
+module.exports = require("readline");
 
 /***/ }),
 
@@ -50726,6 +50968,14 @@ function replaceNode(key, path, node) {
 exports.visit = visit;
 exports.visitAsync = visitAsync;
 
+
+/***/ }),
+
+/***/ 8330:
+/***/ ((module) => {
+
+"use strict";
+module.exports = /*#__PURE__*/JSON.parse('{"name":"copirate-code-review-agent","version":"1.59.0","description":"AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER","license":"MIT","repository":{"type":"git","url":"git+https://github.com/promptctl/copirate-code-review-agent.git"},"author":"Brandon Fryslie","main":"dist/index.js","engines":{"node":">=24"},"scripts":{"build":"ncc build src/index.js -o dist --license licenses.txt && ncc build src/dismiss-index.js -o dismiss-block/dist --license licenses.txt","test":"node --test","review:local":"node scripts/local-review.js","review:case":"node eval/run-case.js","review:suite":"node eval/freeze-suite.js","review:score":"node eval/score.js","review:baseline":"node eval/baseline.js","review:compare":"node eval/compare.js"},"dependencies":{"@actions/core":"^1.10.1","@actions/github":"^6.0.0","yaml":"^2.9.0"},"devDependencies":{"@vercel/ncc":"^0.38.1"}}');
 
 /***/ })
 

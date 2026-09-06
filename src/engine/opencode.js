@@ -4,6 +4,7 @@ const path = require('path');
 const os = require('os');
 const { classifyTransient } = require('../failover');
 const { emptyTokens, addTokens } = require('../usage');
+const { promptOnStdin } = require('./run');
 const { makeCliAdapter, removeQuietly } = require('./cli');
 
 // [LAW:no-ambient-temporal-coupling] Pin off '@latest' — the same trap claude-code hit: an unowned,
@@ -278,6 +279,7 @@ const opencodeAdapter = makeCliAdapter({
   toolNames: TOOL_NAMES,
   materializeHome,
   buildCommand,
+  session: promptOnStdin,
   assertSucceeded,
   classifyError,
   extractUsage,
