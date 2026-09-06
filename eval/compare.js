@@ -35,7 +35,7 @@ const { matcherLabel, parseExpected, requireLlmJudgeCredential } = require('./sc
 const USAGE = `Gate a candidate (the current working tree) against a frozen eval baseline: replay the golden
 suite N times, score it, and print a DEGRADED / OK / IMPROVED verdict. Non-zero exit on DEGRADED.
 
-Usage: ANTHROPIC_API_KEY=… CLAUDE_CODE_OAUTH_TOKEN=… node eval/compare.js [options]
+Usage: ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js [options]
 
   --baseline <path>      Frozen baseline dir (or its baseline.json) to gate against. Default: the newest
                          committed baseline under eval/baseline/, by commit-graph order — NOT directory-name
@@ -65,9 +65,11 @@ Usage: ANTHROPIC_API_KEY=… CLAUDE_CODE_OAUTH_TOKEN=… node eval/compare.js [o
   --help                 Show this help.
 
 The candidate always runs at the baseline's N and pinned engine (a replay at a different N/engine would
-measure something else). Estimated cost is printed up front. Reads the provider credential from the same
-env var the action uses (CLAUDE_CODE_OAUTH_TOKEN / DEEPSEEK_API_KEY / ZAI_API_KEY / OPENAI_API_KEY), per the
-case's pinned provider — PLUS, unconditionally, ANTHROPIC_API_KEY for the default '--matcher llm' judge,
+measure something else). Estimated cost is printed up front. The engine credential is read one of two
+ways: with no --credentials, from the pinned provider's own input var (the one the action reads, e.g.
+CLAUDE_CODE_OAUTH_TOKEN for claude-subscription); with --credentials, from each named var in turn, one
+lane each (.github/workflows/eval.yml runs this way) — PLUS, unconditionally, ANTHROPIC_API_KEY for the
+default '--matcher llm' judge,
 regardless of which provider the pinned engine itself uses (pass --matcher lexical to avoid this second
 credential). The judge is deliberately a separate credential from the engine's: it is the ruler, and a
 ruler that moved with the thing it measures would measure nothing.

@@ -51,15 +51,17 @@ jobs:
     # Derived from the suite, not the platform: N=5 × 4 cases is 20 replays, spread level-by-level over
     # the THREE credential lanes below, so a lane carries at most 7. The pinned engine
     # (claude-subscription/claude-sonnet-5) runs 13–27 min per replay — measured over the 20 replays of
-    # the 2026-09-06 baseline freeze, see eval/README.md — so the longest lane is ~90–190 min, then a few
-    # minutes of judge calls. 240 leaves the worst case ~50 min of headroom and stays well under the
-    # 6-hour ceiling a hosted job cannot exceed. The serial single-lane shape this replaced needed
-    # 260–540 min, which did not fit at all.
+    # the 2026-09-06 baseline freeze, see eval/README.md. The worst lane is not 7 × 27: freeze-suite.js
+    # kills a replay that stalls (a throttled CLI sits in silent retry) at its 120-minute deadline and
+    # hands the job to another lane, so one stall on the busiest lane costs 6 × 27 + 120 ≈ 282 min, plus
+    # setup and a few minutes of judge calls. 300 covers that with headroom and stays under the 6-hour
+    # ceiling a hosted job cannot exceed; two stalls on one lane do not fit and are read as below. The
+    # serial single-lane shape this replaced needed 260–540 min before any stall, which did not fit.
     #
     # A run that exceeds this is killed mid-suite: real quota spent, no verdict written, and the job
     # reads as infrastructure failure rather than as a gate that could not finish. A timed-out gate must
     # be read as "not measured", never as "not degraded". [LAW:no-silent-failure]
-    timeout-minutes: 240
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:

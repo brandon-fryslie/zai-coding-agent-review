@@ -59,27 +59,29 @@ test('parseCaseManifest resolves paths and normalizes reasoning', () => {
 test('parseCaseManifest defaults absent reasoning to null and excludePatterns to []', () => {
   const m = parseCaseManifest(JSON.stringify({
     name: 'x', diff: 'd', tree: 't', engine: { provider: 'deepseek', model: 'm' },
-  }), '/c');
+  }), '/cases/x');
   assert.equal(m.engine.reasoning, null);
   assert.deepEqual(m.excludePatterns, []);
 });
 
 test('parseCaseManifest fails loudly on malformed input', () => {
-  assert.throws(() => parseCaseManifest('{not json', '/c'), /not valid JSON/);
-  assert.throws(() => parseCaseManifest('{}', '/c'), /missing a valid string 'name'/);
-  assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'x', diff: 'd', tree: 't' }), '/c'), /missing an 'engine'/);
-  assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'x', diff: 'd', tree: 't', engine: { model: 'm' } }), '/c'), /engine\.provider/);
-  assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'x', diff: 'd', tree: 't', engine: { provider: 'p' } }), '/c'), /engine\.model/);
-  assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'x', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm' }, excludePatterns: 'no' }), '/c'), /excludePatterns.*array/);
-  assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'x', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm', reasoning: 3 } }), '/c'), /reasoning.*non-empty string/);
+  assert.throws(() => parseCaseManifest('{not json', '/cases/x'), /not valid JSON/);
+  assert.throws(() => parseCaseManifest('{}', '/cases/x'), /missing a valid string 'name'/);
+  assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'x', diff: 'd', tree: 't' }), '/cases/x'), /missing an 'engine'/);
+  assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'x', diff: 'd', tree: 't', engine: { model: 'm' } }), '/cases/x'), /engine\.provider/);
+  assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'x', diff: 'd', tree: 't', engine: { provider: 'p' } }), '/cases/x'), /engine\.model/);
+  assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'x', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm' }, excludePatterns: 'no' }), '/cases/x'), /excludePatterns.*array/);
+  assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'x', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm', reasoning: 3 } }), '/cases/x'), /reasoning.*non-empty string/);
   // An empty-string reasoning is rejected at the boundary, not surfaced as a confusing pin mismatch later.
-  assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'x', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm', reasoning: '' } }), '/c'), /reasoning.*non-empty string/);
+  assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'x', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm', reasoning: '' } }), '/cases/x'), /reasoning.*non-empty string/);
   // A name that isn't a plain path component can't reach path.join.
   assert.throws(() => parseCaseManifest(JSON.stringify({ name: '../evil', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm' } }), '/c'), /plain directory component/);
   assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'a/b', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm' } }), '/c'), /plain directory component/);
   assert.throws(() => parseCaseManifest(JSON.stringify({ name: '..', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm' } }), '/c'), /plain directory component/);
   // A name carrying a comma cannot travel on freeze-suite.js's comma-separated --cases.
   assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'a,b', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm' } }), '/c'), /plain directory component.*commas/);
+  // One identity per case: the manifest's name must be its directory's name.
+  assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'alpha', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm' } }), '/cases/renamed'), /"alpha" but its directory is "renamed"/);
 });
 
 // THE regression this file exists to hold. The harness used to hand-build the provider input bag from a

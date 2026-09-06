@@ -141,14 +141,18 @@ function resolveLanes(names, env) {
 // a half-written case elsewhere under the golden root cannot abort a suite that was never asked to
 // replay it. A name no directory carries is the operator's typo (or a case the golden set no longer
 // holds), and a suite that silently replays the others has spent hours proving less than it was asked
-// to; refused here, before any spend. [LAW:no-silent-failure] The comma split is exact because a case
-// name cannot carry one — run-case.js's parseCaseManifest refuses it, the one place a name is parsed.
+// to; refused here, before any spend — as is a repeated name, which would otherwise collapse into a
+// smaller set than the operator wrote. [LAW:no-silent-failure] (A directory whose name holds a comma is
+// unnameable on this list; parseCaseManifest refuses such a name, so no replayable case is unnameable.)
 function selectCaseDirs(caseDirs, names) {
   const wanted = names.map(raw => raw.trim());
   const have = caseDirs.map(dir => path.basename(dir));
+  const seen = new Set();
   for (const name of wanted) {
     if (name === '') throw new Error(`--cases contains an empty name: ${JSON.stringify(names.join(','))}.`);
     if (!have.includes(name)) throw new Error(`--cases names '${name}', but no golden case carries that name (have: ${have.join(', ')}).`);
+    if (seen.has(name)) throw new Error(`--cases names '${name}' more than once.`);
+    seen.add(name);
   }
   return caseDirs.filter(dir => wanted.includes(path.basename(dir)));
 }
@@ -512,9 +516,8 @@ async function main() {
 
   const outRoot = path.resolve(opts.out);
   const golden = discoverCaseDirs(path.resolve(opts.casesDir));
-  // The selection is unconditional; what varies is the list flowing into it, which names every golden
-  // case when the operator named none. [LAW:dataflow-not-control-flow]
-  const cases = censusCases(selectCaseDirs(golden, (opts.cases ?? golden.map(dir => path.basename(dir)).join(',')).split(',')), outRoot);
+  // --cases absent means the whole golden set; that is the option's own enum, so the one branch is on it.
+  const cases = censusCases(opts.cases === null ? golden : selectCaseDirs(golden, opts.cases.split(',')), outRoot);
   const pin = suitePin(cases);
   const credentialInput = credentialInputFor(pin.provider);
 

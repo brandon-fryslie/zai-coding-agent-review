@@ -119,6 +119,14 @@ function parseCaseManifest(raw, caseDir) {
   if (name !== path.basename(name) || name === '.' || name === '..' || name.includes(',')) {
     throw new Error(`case.json (${caseDir}) 'name' must be a plain directory component (no path separators, '..', or commas), got ${JSON.stringify(name)}.`);
   }
+  // [LAW:one-source-of-truth] A case has ONE identity: its directory's name. The manifest's name is the
+  // same fact written a second time (freeze-case.sh writes both from one value), and every consumer
+  // downstream — compare.js resolving path.join(casesDir, name), freeze-suite.js selecting directories
+  // by basename before parsing — reads whichever copy it has. A renamed directory or a hand-edited name
+  // would make those readers disagree silently; refused here, where the two copies first meet.
+  if (name !== path.basename(caseDir)) {
+    throw new Error(`case.json (${caseDir}) 'name' is ${JSON.stringify(name)} but its directory is ${JSON.stringify(path.basename(caseDir))} — a case's name is its directory's name.`);
+  }
   const diff = req(json.diff, 'diff');
   const tree = req(json.tree, 'tree');
   const engine = json.engine;

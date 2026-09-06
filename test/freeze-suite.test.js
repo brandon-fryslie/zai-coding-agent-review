@@ -323,16 +323,16 @@ const writeRun = (outRoot, caseName, runName, findings) => {
 };
 
 describe('censusCases counts what the scorer will actually find', () => {
-  test('the count keys off the manifest name, not the case directory name', () => {
+  // A case has one identity, its directory's name; a manifest that says otherwise is refused at the census
+  // rather than counted under either name. Two readers (the selector, on directories; the scorer, on
+  // manifest names) would otherwise silently disagree about which runs belong to it.
+  test('a manifest whose name is not its directory name is refused, not counted', () => {
     const root = tmpTree();
     const casesDir = path.join(root, 'cases');
     const outRoot = path.join(root, 'out');
-    // The dir and the manifest name deliberately DISAGREE: joined on the dir's basename this returns 0
-    // for a case with two completed runs, and the suite replays work it already has.
     const dir = writeCase(casesDir, 'dir-name-differs', 'alpha');
     writeRun(outRoot, 'alpha', 'run-1', true);
-    writeRun(outRoot, 'alpha', 'run-2', true);
-    assert.deepEqual(censusCases([dir], outRoot).map(c => [c.name, c.completed]), [['alpha', 2]]);
+    assert.throws(() => censusCases([dir], outRoot), /"alpha" but its directory is "dir-name-differs"/);
     fs.rmSync(root, { recursive: true, force: true });
   });
 
@@ -548,5 +548,9 @@ describe('selectCaseDirs — the replayed set is exactly the named set, in disco
 
   test('refuses an empty name rather than silently replaying nothing for it', () => {
     assert.throws(() => selectCaseDirs(dirs, ['a', '']), /--cases contains an empty name/);
+  });
+
+  test('refuses a repeated name rather than silently replaying a smaller set', () => {
+    assert.throws(() => selectCaseDirs(dirs, ['a', 'b', 'a']), /--cases names 'a' more than once/);
   });
 });
