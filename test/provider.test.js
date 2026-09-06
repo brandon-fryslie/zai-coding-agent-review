@@ -468,6 +468,23 @@ describe('resolveProviderConfig threads exactly the fields a provider row declar
       });
     }
   }
+
+  // `model` deliberately stays OUT of FIELD, and the reason is the whole value of this test. The sweep
+  // above reads `declared` from the very table it is checking, so deleting a row's `model` key fails
+  // nothing: the row silently crosses from the accept half to the reject half, where the fallback to
+  // `defaultModel` makes the reject assertion pass — same test count, all green, mapping gone. A map that
+  // is its own territory cannot show drift. [LAW:one-source-of-truth]
+  // Taking a model override is a contract over the WHOLE table rather than a field a row may or may not
+  // declare, so it is asserted unconditionally, from outside `inputKeys` — which is what makes a dropped
+  // mapping visible. [LAW:behavior-not-structure]
+  for (const [name, spec] of Object.entries(PROVIDERS)) {
+    test(`'${name}' threads a pinned model override, whatever its row declares`, () => {
+      const config = resolveProviderConfig({
+        provider: name, model: 'test-model-override', env: { [spec.credentialInput]: 'test-credential' },
+      });
+      assert.strictEqual(config.model, 'test-model-override');
+    });
+  }
 });
 
 // The NO_PROVIDER fallback is reachable from two real non-Action callers — a typo'd `provider` in a
