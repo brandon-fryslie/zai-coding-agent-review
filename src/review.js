@@ -56,10 +56,10 @@ function parseReviewValue(parsed, context) {
   if (typeof parsed.summary !== 'string' || parsed.summary.trim().length === 0) {
     throw new Error(`${context} must include a non-empty summary.`);
   }
-  // [LAW:parse-dont-validate] A spawn's summary is a single-line value in every sink that consumes it —
-  // composeSummary's `**scope** — summary` line, and the scout's summary interpolated as a worker's
-  // structural context. Stamping it here is what makes those sinks safe by construction rather than by
-  // each remembering to flatten a model-authored string. [LAW:single-enforcer]
+  // [LAW:parse-dont-validate] A spawn's summary is a single-line value in both sinks that consume the
+  // scout's: composeSummary's leading line, and the planning context interpolated into a worker's
+  // prompt. Stamping it here is what makes those sinks safe by construction rather than by each
+  // remembering to flatten a model-authored string. [LAW:single-enforcer]
   const summary = flattenBody(parsed.summary);
   if (!Array.isArray(parsed.findings)) {
     throw new Error(`${context} must include a findings array.`);

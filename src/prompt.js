@@ -423,8 +423,9 @@ function scoutOutputContract(toolNames, { assignFiles = false } = {}) {
     ? `The summary says what this pull request changes and why — the change in the author's own terms, `
       + `not a file-by-file list. TWO readers get it verbatim: every scope worker, as the orientation it `
       + `reviews against, and the pull request author, as the ONLY summary this review posts.`
-    : `The summary says what this codebase is and how its main parts relate. Every scope worker gets it `
-      + `verbatim, as the orientation it reviews against.`;
+    : `The summary says what this codebase is and how its main parts relate. TWO readers get it verbatim: `
+      + `every scope worker, as the orientation it reviews against, and the report's reader, as the ONLY `
+      + `summary this review posts.`;
   return `Do NOT call ${toolNames.requestChange}. You are planning the review here, not reviewing code.
 
     Record your plan by calling ${toolNames.addScope} ONCE PER SCOPE, providing:

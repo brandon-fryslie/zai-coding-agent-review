@@ -49,10 +49,13 @@ const {
 // (brackets in free text), and the whole class of prose-parsing bugs went with it.
 
 // [LAW:effects-at-boundaries] Pure: compose the single focus string a worker receives — the scout's
-// structural context (when present) plus this scope's name and focus. The material turns it into the
+// planning context (when present) plus this scope's name and focus. The material turns it into the
 // engine prompt (a PR worker's CONCENTRATE block, a repo worker's scope focus).
+// [LAW:one-source-of-truth] The label is mode-neutral because what that context DESCRIBES is decided in
+// scoutOutputContract, not here: a change narrative in PR mode, the codebase's structure in repo mode.
+// A label naming either shape would be a second, divergable statement of a fact this file does not own.
 function workerFocusText(scope, context) {
-  const prefix = context ? `Structural context from the planning pass:\n${context}\n\n---\n\n` : '';
+  const prefix = context ? `Context from the planning pass:\n${context}\n\n---\n\n` : '';
   return `${prefix}${scope.name} — ${scope.focus}`;
 }
 

@@ -34126,10 +34126,13 @@ const {
 // (brackets in free text), and the whole class of prose-parsing bugs went with it.
 
 // [LAW:effects-at-boundaries] Pure: compose the single focus string a worker receives — the scout's
-// structural context (when present) plus this scope's name and focus. The material turns it into the
+// planning context (when present) plus this scope's name and focus. The material turns it into the
 // engine prompt (a PR worker's CONCENTRATE block, a repo worker's scope focus).
+// [LAW:one-source-of-truth] The label is mode-neutral because what that context DESCRIBES is decided in
+// scoutOutputContract, not here: a change narrative in PR mode, the codebase's structure in repo mode.
+// A label naming either shape would be a second, divergable statement of a fact this file does not own.
 function workerFocusText(scope, context) {
-  const prefix = context ? `Structural context from the planning pass:\n${context}\n\n---\n\n` : '';
+  const prefix = context ? `Context from the planning pass:\n${context}\n\n---\n\n` : '';
   return `${prefix}${scope.name} — ${scope.focus}`;
 }
 
@@ -35351,8 +35354,9 @@ function scoutOutputContract(toolNames, { assignFiles = false } = {}) {
     ? `The summary says what this pull request changes and why — the change in the author's own terms, `
       + `not a file-by-file list. TWO readers get it verbatim: every scope worker, as the orientation it `
       + `reviews against, and the pull request author, as the ONLY summary this review posts.`
-    : `The summary says what this codebase is and how its main parts relate. Every scope worker gets it `
-      + `verbatim, as the orientation it reviews against.`;
+    : `The summary says what this codebase is and how its main parts relate. TWO readers get it verbatim: `
+      + `every scope worker, as the orientation it reviews against, and the report's reader, as the ONLY `
+      + `summary this review posts.`;
   return `Do NOT call ${toolNames.requestChange}. You are planning the review here, not reviewing code.
 
     Record your plan by calling ${toolNames.addScope} ONCE PER SCOPE, providing:
@@ -35885,10 +35889,10 @@ function parseReviewValue(parsed, context) {
   if (typeof parsed.summary !== 'string' || parsed.summary.trim().length === 0) {
     throw new Error(`${context} must include a non-empty summary.`);
   }
-  // [LAW:parse-dont-validate] A spawn's summary is a single-line value in every sink that consumes it —
-  // composeSummary's `**scope** — summary` line, and the scout's summary interpolated as a worker's
-  // structural context. Stamping it here is what makes those sinks safe by construction rather than by
-  // each remembering to flatten a model-authored string. [LAW:single-enforcer]
+  // [LAW:parse-dont-validate] A spawn's summary is a single-line value in both sinks that consume the
+  // scout's: composeSummary's leading line, and the planning context interpolated into a worker's
+  // prompt. Stamping it here is what makes those sinks safe by construction rather than by each
+  // remembering to flatten a model-authored string. [LAW:single-enforcer]
   const summary = flattenBody(parsed.summary);
   if (!Array.isArray(parsed.findings)) {
     throw new Error(`${context} must include a findings array.`);

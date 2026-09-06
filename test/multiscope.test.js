@@ -64,9 +64,9 @@ describe('parseScopeValue', () => {
 });
 
 describe('workerFocusText', () => {
-  test('prepends structural context when present', () => {
+  test('prepends the planning context when present', () => {
     const text = workerFocusText({ name: 'cost', focus: 'src/usage.js' }, 'A CLI tool.');
-    assert.match(text, /Structural context from the planning pass:\nA CLI tool\./);
+    assert.match(text, /Context from the planning pass:\nA CLI tool\./);
     assert.match(text, /cost — src\/usage\.js/);
   });
   test('omits the context block when context is empty', () => {
