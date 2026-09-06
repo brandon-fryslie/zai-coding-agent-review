@@ -7,7 +7,12 @@ const {
   sumUsage,
   composeSummary,
   planScopes,
+  LANE_MEMORY_BYTES,
+  laneCeilingFromMemory,
+  findingsLedger,
+  sweepsByDepth,
   runScopeWorkers,
+  runScopeChain,
   runMultiScopePass,
   runMultiScope,
   buildPrMaterial,
@@ -192,7 +197,7 @@ describe('sumUsage', () => {
   });
 
   // The pass's span is the ENVELOPE of its spawns' — earliest start, latest end — because workers run
-  // in waves and overlap. Taking the first or last spawn's own span would understate the window a
+  // in lanes and overlap. Taking the first or last spawn's own span would understate the window a
   // later repricing has to place inside a rate epoch.
   test('the span is the envelope of every spawn, not the first or last one', () => {
     const usage = (from, to) => ({ tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 1 }, span: { from, to }, cost: { basis: 'dollars', usd: 0 } });
@@ -288,16 +293,33 @@ describe('runScopeWorkers', () => {
       await new Promise(r => setTimeout(r, s.name === 'a' ? 5 : 0)); // a finishes last
       return { name: s.name };
     };
-    const outcomes = await runScopeWorkers({ scopes, runOne, maxConcurrent: 3 });
-    assert.deepEqual(outcomes.map(o => o.status), ['reviewed', 'reviewed', 'reviewed']);
-    assert.deepEqual(outcomes.map(o => o.result.name), ['a', 'b', 'c']);
+    const outcomes = await runScopeWorkers({ scopes, runOne, laneCount: 3 });
+    assert.deepEqual(outcomes.map(o => o.name), ['a', 'b', 'c']);
+  });
+
+  test('runs at most laneCount scopes at once, and every scope exactly once', async () => {
+    const scopes = [{ name: 'a' }, { name: 'b' }, { name: 'c' }, { name: 'd' }];
+    let inFlight = 0;
+    let peak = 0;
+    const ran = [];
+    const runOne = async (s) => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await new Promise(r => setTimeout(r, 1));
+      inFlight--;
+      ran.push(s.name);
+      return s.name;
+    };
+    await runScopeWorkers({ scopes, runOne, laneCount: 2 });
+    assert.equal(peak, 2);
+    assert.deepEqual(ran.sort(), ['a', 'b', 'c', 'd']);
   });
 
   test('rethrows the first error, preserving its type, so failover can classify it', async () => {
     const scopes = [{ name: 'a' }, { name: 'b' }];
     const runOne = async (s) => { if (s.name === 'b') throw new TransientError('rate-limited'); return { name: s.name }; };
     await assert.rejects(
-      runScopeWorkers({ scopes, runOne, maxConcurrent: 1 }),
+      runScopeWorkers({ scopes, runOne, laneCount: 1 }),
       (err) => err instanceof TransientError && /rate-limited/.test(err.message),
     );
   });
@@ -305,36 +327,149 @@ describe('runScopeWorkers', () => {
   test('a non-transient worker error propagates (never swallowed into an empty result)', async () => {
     const scopes = [{ name: 'a' }];
     const runOne = async () => { throw new Error('engine produced garbage'); };
-    await assert.rejects(runScopeWorkers({ scopes, runOne, maxConcurrent: 2 }), /engine produced garbage/);
+    await assert.rejects(runScopeWorkers({ scopes, runOne, laneCount: 2 }), /engine produced garbage/);
   });
+});
 
-  test('a deadline-killed worker becomes an unreviewed outcome; siblings keep their results', async () => {
-    const scopes = [{ name: 'a' }, { name: 'b' }, { name: 'c' }];
-    const runOne = async (s) => {
-      if (s.name === 'b') throw new DeadlineExceededError('killed at the deadline');
-      return { name: s.name };
-    };
-    const outcomes = await runScopeWorkers({ scopes, runOne, maxConcurrent: 3 });
-    assert.deepEqual(outcomes.map(o => o.status), ['reviewed', 'unreviewed', 'reviewed']);
-    assert.deepEqual(outcomes.filter(o => o.status === 'reviewed').map(o => o.result.name), ['a', 'c']);
+// ── the lane ceiling is machine capacity; the lane count is the plan's width under it ────────────
+describe('laneCeilingFromMemory', () => {
+  test('one lane per LANE_MEMORY_BYTES of memory — a 7 GiB hosted runner holds 14', () => {
+    assert.equal(laneCeilingFromMemory(7 * 1024 ** 3), 14);
+    assert.equal(laneCeilingFromMemory(4 * LANE_MEMORY_BYTES), 4);
   });
+  test('a machine too small for one lane still gets one — the review runs one scope at a time', () => {
+    assert.equal(laneCeilingFromMemory(LANE_MEMORY_BYTES - 1), 1);
+  });
+  test('a lost host figure is refused, never silently one lane', () => {
+    assert.throws(() => laneCeilingFromMemory(undefined), /positive number of bytes/);
+    assert.throws(() => laneCeilingFromMemory(0), /positive number of bytes/);
+  });
+});
 
-  // The time a killed spawn burned is deliberately NOT this pool's concern (zai-timing-31d.5): it
-  // is metered at the pass's spawn seam, which records err.span before the pool absorbs the error.
-  // The pass-level contract — a killed scope's elapsed time reaches the envelope and the schedule —
-  // is asserted in the wall-clock time budget and schedule suites below.
-  test('once shouldStart says no, remaining scopes are unreviewed without spawning', async () => {
-    const scopes = [{ name: 'a' }, { name: 'b' }, { name: 'c' }];
-    const started = [];
-    let budget = 1; // one start allowed, then the budget is spent
-    const outcomes = await runScopeWorkers({
-      scopes,
-      maxConcurrent: 1,
-      shouldStart: () => budget-- > 0,
-      runOne: async (s) => { started.push(s.name); return { name: s.name }; },
+describe('findingsLedger', () => {
+  const bug = (path) => ({ path, line: 1, body: `bug in ${path}`, severity: 3 });
+  test('merge returns how many findings were genuinely new, and the ledger holds the deduped union', () => {
+    const ledger = findingsLedger();
+    assert.equal(ledger.merge([bug('a.js')]), 1);
+    assert.equal(ledger.merge([bug('a.js'), bug('b.js')]), 1); // a.js is a re-record
+    assert.equal(ledger.merge([bug('b.js')]), 0);
+    assert.deepEqual(ledger.findings.map(f => f.path), ['a.js', 'b.js']);
+  });
+  test('a snapshot taken before a merge is untouched by it — a sweep sees what existed when it started', () => {
+    const ledger = findingsLedger();
+    ledger.merge([bug('a.js')]);
+    const before = ledger.findings;
+    ledger.merge([bug('b.js')]);
+    assert.deepEqual(before.map(f => f.path), ['a.js']);
+    assert.deepEqual(ledger.findings.map(f => f.path), ['a.js', 'b.js']);
+  });
+});
+
+describe('sweepsByDepth', () => {
+  test('folds uneven chains per depth: added sums over the chains that ran it, curtailed if any was', () => {
+    const chains = [
+      [{ added: 2, curtailed: false }, { added: 0, curtailed: false }], // converged at sweep 2
+      [{ added: 0, curtailed: false }],                                  // converged at sweep 1
+      [{ added: 1, curtailed: false }, { added: 0, curtailed: true }],   // the budget took its sweep 2
+    ];
+    assert.deepEqual(sweepsByDepth(chains), [{ added: 3, curtailed: false }, { added: 0, curtailed: true }]);
+  });
+  test('no sweeps anywhere folds to [] — the value the summary renders as nothing', () => {
+    assert.deepEqual(sweepsByDepth([[], []]), []);
+    assert.deepEqual(sweepsByDepth([]), []);
+  });
+});
+
+// ── runScopeChain — one scope's whole convergence chain, and the one place the budget meets it ────
+describe('runScopeChain', () => {
+  const scope = { name: 'a', focus: 'fa', files: [] };
+  const material = { buildWorkerPrompt: (focusText, _t, _f, prior) => `${focusText}||prior:${prior.map(f => f.body).join(',')}` };
+  const bug = (body) => ({ path: 'a.js', line: 1, body, severity: 3 });
+  const chainArgs = (spawn, extra = {}) => ({
+    scope, context: '', material, spawn, log: () => {}, ledger: findingsLedger(), sweepCap: 3,
+    deadline: null, now: Date.now, runningTotal: () => 'elapsed unclocked (no budget)', ...extra,
+  });
+  // A fake spawn seam: findingsFor(pass, prompt) answers this scope's pass-th spawn.
+  const spawnOf = (findingsFor) => {
+    let pass = 0;
+    return async (buildPromptFor) => ({ summary: 's', findings: await findingsFor(pass++, buildPromptFor({})), assessments: [], usage: null });
+  };
+
+  test('pass 0 then sweeps, each seeded with the ledger as it stands, stopping when a sweep adds nothing', async () => {
+    const prompts = [];
+    const spawn = spawnOf((pass, prompt) => {
+      prompts.push(prompt);
+      return pass === 0 ? [bug('one')] : pass === 1 ? [bug('one'), bug('two')] : [bug('two')];
     });
-    assert.deepEqual(started, ['a']);
-    assert.deepEqual(outcomes.map(o => o.status), ['reviewed', 'unreviewed', 'unreviewed']);
+    const ledger = findingsLedger();
+    const out = await runScopeChain(chainArgs(spawn, { ledger }));
+    assert.deepEqual(out.passes, [{ added: 1, curtailed: false }, { added: 1, curtailed: false }, { added: 0, curtailed: false }]);
+    assert.deepEqual(prompts.map(p => p.split('||prior:')[1]), ['', 'one', 'one,two']);
+    assert.deepEqual(ledger.findings.map(f => f.body), ['one', 'two']);
+  });
+
+  test("a sibling's findings landing mid-chain are in the next sweep's seed", async () => {
+    const ledger = findingsLedger();
+    const prompts = [];
+    const spawn = spawnOf((pass, prompt) => {
+      prompts.push(prompt);
+      // A sibling chain merges while this scope's pass 0 is in flight.
+      if (pass === 0) ledger.merge([{ path: 'b.js', line: 1, body: 'sibling', severity: 3 }]);
+      return [bug('one')];
+    });
+    await runScopeChain(chainArgs(spawn, { ledger }));
+    assert.match(prompts[1], /prior:sibling,one$/);
+  });
+
+  test("pass 0 is seeded with nothing even when siblings already recorded findings — the review of record's prompt never changes", async () => {
+    const ledger = findingsLedger();
+    ledger.merge([{ path: 'b.js', line: 1, body: 'sibling', severity: 3 }]); // a sibling chain settled before this scope got a lane
+    const prompts = [];
+    const spawn = spawnOf((pass, prompt) => { prompts.push(prompt); return [bug('one')]; });
+    await runScopeChain(chainArgs(spawn, { ledger }));
+    assert.match(prompts[0], /\|\|prior:$/);
+    assert.match(prompts[1], /prior:sibling,one$/);
+  });
+
+  test('the budget refusing pass 0 is the coverage gap: one curtailed entry, nothing spawned', async () => {
+    let spawned = 0;
+    const spawn = async () => { spawned++; };
+    const out = await runScopeChain(chainArgs(spawn, { deadline: 100, now: () => 200 }));
+    assert.deepEqual(out.passes, [{ added: 0, curtailed: true }]);
+    assert.equal(spawned, 0);
+  });
+
+  test('a deadline kill at pass 0 settles the same way as a refusal', async () => {
+    const spawn = async () => { throw new DeadlineExceededError('killed'); };
+    const out = await runScopeChain(chainArgs(spawn, { deadline: Date.now() + 3_600_000 }));
+    assert.deepEqual(out.passes, [{ added: 0, curtailed: true }]);
+  });
+
+  test("the budget taking a SWEEP curtails the chain; pass 0's judgment stands", async () => {
+    const spawn = spawnOf((pass) => { if (pass > 0) throw new DeadlineExceededError('killed in the sweep'); return [bug('one')]; });
+    const ledger = findingsLedger();
+    const out = await runScopeChain(chainArgs(spawn, { ledger, deadline: Date.now() + 3_600_000 }));
+    assert.deepEqual(out.passes, [{ added: 1, curtailed: false }, { added: 0, curtailed: true }]);
+    assert.deepEqual(ledger.findings.map(f => f.body), ['one']);
+  });
+
+  test('the sweep bound ends a chain that keeps finding more', async () => {
+    const spawn = spawnOf((pass) => [bug(`new-${pass}`)]);
+    const out = await runScopeChain(chainArgs(spawn, { sweepCap: 2 }));
+    assert.equal(out.passes.length, 3); // pass 0 + the two capped sweeps, every one adding
+    assert.ok(out.passes.every(p => p.added === 1 && !p.curtailed));
+  });
+
+  test('any other error propagates unchanged — a failed scope is never a quiet empty one', async () => {
+    const spawn = async () => { throw new TransientError('rate-limited'); };
+    await assert.rejects(runScopeChain(chainArgs(spawn)), TransientError);
+  });
+
+  test('assessments from every completed pass reach the outcome', async () => {
+    let pass = 0;
+    const spawn = async () => ({ summary: 's', findings: pass === 0 ? [bug('one')] : [], assessments: [{ module: `m${pass++}` }], usage: null });
+    const out = await runScopeChain(chainArgs(spawn));
+    assert.deepEqual(out.assessments, [{ module: 'm0' }, { module: 'm1' }]);
   });
 });
 
@@ -355,7 +490,7 @@ describe('runMultiScopePass — spawn-level transient resilience', () => {
   };
   const config = { engine: 'fake', name: 'c1' };
   const passArgs = (registry) => ({
-    config, material, registry, instructionsPath: 'x', maxConcurrent: 4, sweepCap: 0, log: () => {}, sleepFn: async () => {},
+    config, material, registry, instructionsPath: 'x', laneCeiling: 4, sweepCap: 0, log: () => {}, sleepFn: async () => {},
   });
 
   // A fake engine adapter: the scout returns SCOPES; each worker returns one finding tagged with its
@@ -630,7 +765,7 @@ describe('runMultiScopePass — scout coverage sweep', () => {
     runMultiScopePass({
       config,
       material: { changedPaths, buildScoutPrompt: () => 'SCOUT', buildWorkerPrompt: (f) => f },
-      registry, instructionsPath: 'x', maxConcurrent: 4, sweepCap: 0, log, sleepFn: async () => {},
+      registry, instructionsPath: 'x', laneCeiling: 4, sweepCap: 0, log, sleepFn: async () => {},
     });
 
   test('an unassigned changed file gets its own worker (the synthetic scope) and a warning', async () => {
@@ -686,7 +821,7 @@ describe('runMultiScopePass — convergence sweeps', () => {
   };
   const config = { engine: 'fake', name: 'c1' };
   const args = (registry, sweepCap, log = () => {}) => ({
-    config, material, registry, instructionsPath: 'x', maxConcurrent: 4, sweepCap, log, sleepFn: async () => {},
+    config, material, registry, instructionsPath: 'x', laneCeiling: 4, sweepCap, log, sleepFn: async () => {},
   });
 
   // A fake adapter: the scout plans SCOPES; each worker spawn returns findingsFor(scopeName, pass),
@@ -730,17 +865,37 @@ describe('runMultiScopePass — convergence sweeps', () => {
     assert.ok(logs.some(m => m.includes('convergence sweep 2: 2 new finding(s) — sweep cap reached')), `logs: ${logs}`);
   });
 
-  test('sweep workers receive the cumulative prior findings; the initial pass receives none', async () => {
-    const { registry, seenPrompts } = sweepRegistry((name) => oneBug(name));
-    await runMultiScopePass(args(registry, 3));
+  test('a sweep is seeded with every finding recorded when it starts — its own, and any sibling\'s that has landed; the initial pass receives none', async () => {
+    // Chains run per scope, so a sweep's seed is a snapshot, not a pass boundary. Ordering is pinned
+    // by DATA, not timing: scope a's initial review is held until scope b's SWEEP is requested — which
+    // by construction means b's pass-0 merge landed — so a's sweep provably carries both findings,
+    // while b's sweep, which started before a's pass 0 settled, provably carries only its own.
+    const seenPrompts = [];
+    let releaseA;
+    const aHeld = new Promise(r => { releaseA = r; });
+    const adapter = {
+      async produceReview({ buildPromptFor }) {
+        const prompt = buildPromptFor({});
+        if (prompt === 'SCOUT') return { summary: 'ctx', findings: [], scopes: SCOPES, assessments: [], usage: null };
+        seenPrompts.push(prompt);
+        const scope = SCOPES.find(s => prompt.includes(`${s.name} — ${s.focus}`));
+        const sweep = !prompt.endsWith('||prior:');
+        if (scope.name === 'b' && sweep) releaseA();
+        if (scope.name === 'a' && !sweep) await aHeld;
+        return { summary: 's', findings: oneBug(scope.name), assessments: [], usage: null };
+      },
+    };
+    await runMultiScopePass(args({ get: () => adapter }, 3));
     const initial = seenPrompts.filter(p => p.endsWith('||prior:'));
     const sweeps = seenPrompts.filter(p => !p.endsWith('||prior:'));
     assert.equal(initial.length, 2); // both scopes' initial prompts carry no prior list
-    assert.equal(sweeps.length, 2);
-    for (const p of sweeps) { // every sweep prompt carries BOTH scopes' cumulative findings
-      assert.match(p, /bug in a/);
-      assert.match(p, /bug in b/);
-    }
+    assert.equal(sweeps.length, 2); // one sweep each: a re-record adds nothing, so both converge
+    const sweepA = sweeps.find(p => p.includes('a — fa'));
+    const sweepB = sweeps.find(p => p.includes('b — fb'));
+    assert.match(sweepA, /bug in a/);
+    assert.match(sweepA, /bug in b/);
+    assert.match(sweepB, /bug in b/);
+    assert.doesNotMatch(sweepB, /bug in a/);
   });
 
   test('a clean initial pass converges immediately — no sweep spawns, no sweep log', async () => {
@@ -1311,7 +1466,7 @@ describe('runMultiScopePass — wall-clock time budget', () => {
     usage: null,
   });
   const passArgs = (registry, extra = {}) => ({
-    config, material, registry, instructionsPath: 'x', maxConcurrent: 4, sweepCap: 0, log: () => {}, sleepFn: async () => {}, ...extra,
+    config, material, registry, instructionsPath: 'x', laneCeiling: 4, sweepCap: 0, log: () => {}, sleepFn: async () => {}, ...extra,
   });
 
   test("a deadline-killed pass-0 worker yields a PARTIAL review: siblings' findings delivered, the gap carried as data, no in-place retry", async () => {
@@ -1375,21 +1530,25 @@ describe('runMultiScopePass — wall-clock time budget', () => {
     assert.match(review.summary, /every scope was reviewed, but convergence sweeps were cut short/);
   });
 
-  test('a deadline that passes between pass 0 and the first sweep trips the sweep gate — no sweep spawns', async () => {
+  test('a deadline that passes once the first scope reports done refuses every sweep at its gate — no sweep spawns', async () => {
     let clock = 0;
     const { registry, calls } = makeRegistry({ workerBehavior: ({ scope }) => okResult(scope) });
     const logs = [];
-    let doneCount = 0;
     const log = (msg) => {
       logs.push(msg);
-      // The deterministic clock: the budget runs out the moment the last pass-0 worker reports done.
-      if (/ done — /.test(msg) && ++doneCount === SCOPES.length) clock = 200;
+      // The deterministic clock: the budget runs out the moment the first pass-0 WORKER reports done
+      // (the scout's done line comes first and must not count). Every pass-0 gate was already passed
+      // by then — each lane runs synchronously to its first await — and no chain has reached its
+      // sweep gate, since a chain's done line precedes it.
+      if (/^scope '.*' done — /.test(msg)) clock = 200;
     };
     const review = await runMultiScopePass(passArgs(registry, { sweepCap: 2, deadline: 100, now: () => clock, log }));
     assert.deepEqual(review.findings.map(f => f.path).sort(), ['a.js', 'b.js', 'c.js']);
     assert.equal(review.budgetExhausted, true);
+    assert.deepEqual(review.unreviewedScopes, []);
     assert.equal(Object.values(calls.workers).reduce((a, b) => a + b, 0), SCOPES.length); // pass 0 only — no sweep spawned
-    assert.ok(logs.some(m => /convergence sweeps stopped before sweep 1 — time budget exhausted/.test(m)));
+    for (const s of SCOPES) assert.ok(logs.includes(`sweep 1 scope '${s.name}' not reviewed — time budget exhausted`), JSON.stringify(logs));
+    assert.ok(logs.includes('convergence sweep 1: 0 new finding(s) — cut short (time budget)'), JSON.stringify(logs));
     assert.match(review.summary, /convergence sweeps were cut short/);
   });
 
@@ -1413,8 +1572,8 @@ describe('runMultiScopePass — wall-clock time budget', () => {
 // ── the pass records its phase and schedule (zai-timing-31d.5) ────────────────────────────────────
 // Every engine spawn ATTEMPT leaves one tagged record at the pass's spawn seam, and the pass total
 // usage folds from that same list — so a spawn in the schedule is in the total and vice versa. The
-// derivation of the reportable breakdown (scout time, per-scope times, sweep grouping, wave count)
-// is asserted in test/schedule.test.js over describeSchedule; here the contract is that the pass
+// derivation of the reportable breakdown (scout time, per-scope times, sweep grouping) is
+// asserted in test/schedule.test.js over describeSchedule; here the contract is that the pass
 // RECORDS the right facts: tags, outcomes, spans, and the scheduling values as actually used.
 describe('runMultiScopePass — the pass records its phase and schedule', () => {
   const SCOPES = [
@@ -1431,7 +1590,7 @@ describe('runMultiScopePass — the pass records its phase and schedule', () => 
   const at = (min) => `2026-08-22T03:${String(min).padStart(2, '0')}:00.000Z`;
   const span = (fromMin, toMin) => ({ from: at(fromMin), to: at(toMin) });
   const passArgs = (registry, extra = {}) => ({
-    config, material, registry, instructionsPath: 'x', maxConcurrent: 2, sweepCap: 0, log: () => {}, sleepFn: async () => {}, ...extra,
+    config, material, registry, instructionsPath: 'x', laneCeiling: 2, sweepCap: 0, log: () => {}, sleepFn: async () => {}, ...extra,
   });
 
   // A fake engine with known per-spawn durations: the scout runs minutes 0–2; worker for scope s in
@@ -1461,17 +1620,17 @@ describe('runMultiScopePass — the pass records its phase and schedule', () => 
     return { get: () => adapter };
   }
 
-  test('a non-positive maxConcurrent is refused loudly — the recorded schedule must match what the pool did', async () => {
-    // The pool would silently clamp 0 to one lane, but the schedule records scopeConcurrency AS USED
-    // and the wave derivation divides by it — so the pass gate refuses the value before either lies.
-    await assert.rejects(runMultiScopePass(passArgs(makeRegistry(), { maxConcurrent: 0 })), /positive integer maxConcurrent/);
-    await assert.rejects(runMultiScopePass(passArgs(makeRegistry(), { maxConcurrent: 2.5 })), /positive integer maxConcurrent/);
+  test('a non-positive laneCeiling is refused loudly — the recorded schedule must match what the pool did', async () => {
+    // The schedule records the lane count AS USED, so the pass gate refuses a width the pool could
+    // not have run before the record can claim it.
+    await assert.rejects(runMultiScopePass(passArgs(makeRegistry(), { laneCeiling: 0 })), /positive integer laneCeiling/);
+    await assert.rejects(runMultiScopePass(passArgs(makeRegistry(), { laneCeiling: 2.5 })), /positive integer laneCeiling/);
   });
 
   test('a clean pass records one tagged record per spawn, plus the scheduling facts as used', async () => {
     const review = await runMultiScopePass(passArgs(makeRegistry()));
     const { schedule } = review;
-    assert.equal(schedule.scopeConcurrency, 2);
+    assert.equal(schedule.laneCount, 2); // three scopes under a ceiling of two
     assert.equal(schedule.sweepCap, 0);
     assert.equal(schedule.scopeCount, 3);
     // One scout record and one worker record per scope, all completed, tagged pass 0.
@@ -1488,6 +1647,15 @@ describe('runMultiScopePass — the pass records its phase and schedule', () => 
     // Envelope: earliest start is the scout (min 0), latest end the slowest worker (scope c, min 13).
     assert.deepEqual(review.usage.span, { from: at(0), to: at(13) });
     assert.deepEqual(review.usage.span, sumUsage(review.schedule.spawns.map(r => r.usage)).span);
+  });
+
+  test("the lane count is the plan's width under the ceiling, recorded and logged as used", async () => {
+    const logs = [];
+    const wide = await runMultiScopePass(passArgs(makeRegistry(), { laneCeiling: 8, log: (m) => logs.push(m) }));
+    assert.equal(wide.schedule.laneCount, 3); // three scopes, a ceiling of eight: one lane per scope
+    assert.ok(logs.includes('3 scope(s) on 3 lane(s)'), JSON.stringify(logs));
+    const capped = await runMultiScopePass(passArgs(makeRegistry(), { laneCeiling: 2 }));
+    assert.equal(capped.schedule.laneCount, 2); // the machine holds two: scopes queue, and the record says so
   });
 
   test('convergence-sweep spawns are recorded under their own pass index', async () => {
@@ -1645,8 +1813,8 @@ describe('runMultiScope — failover budget bounded by the deadline', () => {
 // gate), each worker's done line carrying its own span, and one running-total line per pass — all
 // formatted from the SAME spans the schedule records, through the same spanMs/formatMs derivation
 // the footer uses, so the live lines and the breakdown cannot disagree. [LAW:one-source-of-truth]
-// Waves are deliberately absent: the pool is lane-based and waves exist only as describeSchedule's
-// post-hoc derivation, so no "wave done" line fakes an event no scheduler observed.
+// Pass boundaries are deliberately absent: every scope runs its own chain, so the running total
+// lands when each chain settles and once more when all have — events the scheduler observed.
 describe('runMultiScopePass — phase timings stream to the run log live', () => {
   const MIN = 60_000;
   const SCOPES = [
@@ -1689,7 +1857,7 @@ describe('runMultiScopePass — phase timings stream to the run log live', () =>
   const run = async (extra = {}, registry = makeRegistry()) => {
     const logs = [];
     await runMultiScopePass({
-      config, material, registry, instructionsPath: 'x', maxConcurrent: 2, sweepCap: 0,
+      config, material, registry, instructionsPath: 'x', laneCeiling: 2, sweepCap: 0,
       log: (m) => logs.push(m), sleepFn: async () => {}, ...extra,
     });
     return logs;
@@ -1715,16 +1883,16 @@ describe('runMultiScopePass — phase timings stream to the run log live', () =>
     assert.ok(logs.includes("scope 'a' done — 1 finding(s) — unclocked"), JSON.stringify(logs));
   });
 
-  test('every pass completion logs a running total counted from the run mint, against the budget', async () => {
+  test('each chain settling logs its depth and a running total counted from the run mint, against the budget; so does the whole', async () => {
     // The injected clock reads 6m32s after the mint; the deadline is 15m from the same mint.
     const startedAt = 1_000_000;
     const logs = await run({ startedAt, deadline: startedAt + 15 * MIN, now: () => startedAt + 6 * MIN + 32_000, sweepCap: 1 });
-    assert.ok(logs.includes('review workers done — elapsed 6m32s of 15m00s budget'), JSON.stringify(logs));
-    assert.ok(logs.includes('sweep 1 workers done — elapsed 6m32s of 15m00s budget'), JSON.stringify(logs));
+    assert.ok(logs.includes("scope 'a' finished after 2 pass(es) — elapsed 6m32s of 15m00s budget"), JSON.stringify(logs));
+    assert.ok(logs.includes('all scopes done — elapsed 6m32s of 15m00s budget'), JSON.stringify(logs));
   });
 
   test('a caller without a start mint or budget logs the typed absences, not a second clock', async () => {
     const logs = await run();
-    assert.ok(logs.includes('review workers done — elapsed unclocked (no budget)'), JSON.stringify(logs));
+    assert.ok(logs.includes('all scopes done — elapsed unclocked (no budget)'), JSON.stringify(logs));
   });
 });

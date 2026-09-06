@@ -30,18 +30,22 @@ describe('spawnRecord', () => {
   });
 });
 
-// The outer envelope's mint, mirroring spawnRecord: a drifted field name fails here, never as
-// describeSchedule deriving NaN waves from an undefined count. [LAW:one-source-of-truth]
+// The outer envelope's mint, mirroring spawnRecord: a drifted field name fails here, never as a
+// footer rendering 'undefined lane(s)'. [LAW:one-source-of-truth]
 describe('scheduleRecord', () => {
-  const good = { scopeConcurrency: 2, sweepCap: 1, scopeCount: 3, spawns: [] };
+  const good = { laneCount: 2, sweepCap: 1, scopeCount: 3, spawns: [] };
   test('mints the envelope as given', () => {
     assert.deepEqual(scheduleRecord(good), good);
   });
   test('rejects a missing or out-of-domain field loudly', () => {
-    assert.throws(() => scheduleRecord({ ...good, scopeConcurrency: 0 }), /scopeConcurrency must be a positive integer/);
+    assert.throws(() => scheduleRecord({ ...good, laneCount: 0 }), /laneCount must be a positive integer/);
+    assert.throws(() => scheduleRecord({ ...good, laneCount: 2.5 }), /laneCount must be a positive integer/);
     assert.throws(() => scheduleRecord({ ...good, sweepCap: -1 }), /sweepCap must be a non-negative integer/);
     assert.throws(() => scheduleRecord({ ...good, scopeCount: undefined }), /scopeCount must be a positive integer/);
     assert.throws(() => scheduleRecord({ ...good, spawns: undefined }), /spawns must be an array/);
+  });
+  test('a lane count wider than the plan is refused — a lane is only ever occupied by a scope', () => {
+    assert.throws(() => scheduleRecord({ ...good, laneCount: 4 }), /laneCount \(4\) cannot exceed scopeCount \(3\)/);
   });
 });
 
@@ -75,14 +79,14 @@ describe('sumMs', () => {
 });
 
 // The accept case (zai-timing-31d.5): a fabricated pass with known per-spawn durations — a scout,
-// four scopes at concurrency 2, one convergence sweep — must report the right scout time, the right
-// per-scope times, the right per-sweep grouping, and the wave count derived from scope count and
-// concurrency. [LAW:behavior-not-structure] the assertions read only the derived breakdown.
+// four scopes on two lanes, one convergence sweep — must report the right scout time, the right
+// per-scope times, the right per-depth grouping, and echo the lane count as recorded.
+// [LAW:behavior-not-structure] the assertions read only the derived breakdown.
 describe('describeSchedule', () => {
   const worker = (scope, pass, fromMin, toMin, outcome = 'completed') =>
     ({ phase: 'worker', scope, pass, outcome, usage: { span: span(fromMin, toMin) } });
   const schedule = {
-    scopeConcurrency: 2,
+    laneCount: 2,
     sweepCap: 2,
     scopeCount: 4,
     spawns: [
@@ -98,7 +102,7 @@ describe('describeSchedule', () => {
     ],
   };
 
-  test('reports the scout time, per-scope times grouped per pass, and the derived wave count', () => {
+  test('reports the scout time, per-scope times grouped per pass, and the scheduling facts as recorded', () => {
     const d = describeSchedule(schedule);
     assert.equal(d.scoutMs, 2 * MIN);
     assert.equal(d.passes.length, 2);
@@ -111,19 +115,15 @@ describe('describeSchedule', () => {
       d.passes[1].spawns.map(({ scope, ms }) => ({ scope, ms })),
       [{ scope: 's1', ms: 1 * MIN }, { scope: 's2', ms: 2 * MIN }, { scope: 's3', ms: 1 * MIN }, { scope: 's4', ms: 1 * MIN }],
     );
-    // 4 distinct scopes spawned at concurrency 2 = 2 waves in each pass; 4 waves total. Derived from
-    // the records, never stored — the count cannot contradict its own arithmetic. [LAW:one-source-of-truth]
-    assert.deepEqual(d.passes.map(p => p.waves), [2, 2]);
-    assert.equal(d.waveCount, 4);
     // The scheduling facts are echoed as recorded.
     assert.equal(d.scopeCount, 4);
-    assert.equal(d.scopeConcurrency, 2);
+    assert.equal(d.laneCount, 2);
     assert.equal(d.sweepCap, 2);
   });
 
   test('a deadline-killed scope still contributes its elapsed time to the breakdown', () => {
     const d = describeSchedule({
-      scopeConcurrency: 2,
+      laneCount: 2,
       sweepCap: 0,
       scopeCount: 2,
       spawns: [
@@ -137,7 +137,7 @@ describe('describeSchedule', () => {
 
   test('a retried attempt is its own row beside the attempt that settled', () => {
     const d = describeSchedule({
-      scopeConcurrency: 1,
+      laneCount: 1,
       sweepCap: 0,
       scopeCount: 1,
       spawns: [
@@ -150,34 +150,29 @@ describe('describeSchedule', () => {
       d.passes[0].spawns,
       [{ scope: 's1', outcome: 'retried', ms: 3 * MIN }, { scope: 's1', outcome: 'completed', ms: 2 * MIN }],
     );
-    // Two records, ONE scope: a retried attempt reoccupies the same wave slot, never inflates waves.
-    assert.equal(d.passes[0].waves, 1);
-    assert.equal(d.waveCount, 1);
   });
 
-  test('a pass the budget cut short mid-wave reports only the waves its spawned scopes filled', () => {
-    // The plan said 3 scopes at concurrency 2 (2 waves), but shouldStart refused the third scope
-    // before it spawned: only wave 1 ran, and the count must say so — an operator diagnosing a
-    // budget-exhausted run must not be told to raise concurrency for a wave that never happened.
+  test('a pass the budget cut short reports only the spawns that ran; the plan is still echoed', () => {
+    // The plan said 3 scopes, but the budget refused the third before it spawned: the breakdown rows
+    // exactly the two that ran, and scopeCount still says 3 — the gap between them IS the diagnosis.
     const d = describeSchedule({
-      scopeConcurrency: 2,
+      laneCount: 2,
       sweepCap: 0,
       scopeCount: 3,
       spawns: [
         { phase: 'scout', outcome: 'completed', usage: { span: span(0, 1) } },
         worker('s1', 0, 1, 3),
         worker('s2', 0, 1, 4),
-        // s3 never spawned — no record, exactly as the pool's pre-spawn refusal leaves it.
+        // s3 never spawned — no record, exactly as the chain's pre-spawn refusal leaves it.
       ],
     });
-    assert.equal(d.passes[0].waves, 1);
-    assert.equal(d.waveCount, 1);
-    assert.equal(d.scopeCount, 3); // the plan is still echoed; the gap between them IS the diagnosis
+    assert.deepEqual(d.passes[0].spawns.map(s => s.scope), ['s1', 's2']);
+    assert.equal(d.scopeCount, 3);
   });
 
   test('a spawn that never ran (usage null) reports a null duration, never zero', () => {
     const d = describeSchedule({
-      scopeConcurrency: 1,
+      laneCount: 1,
       sweepCap: 0,
       scopeCount: 1,
       spawns: [{ phase: 'worker', scope: 's1', pass: 0, outcome: 'failed', usage: null }],
@@ -188,14 +183,14 @@ describe('describeSchedule', () => {
 
   test('a record with a phase outside the vocabulary fails the derive loudly, never vanishing', () => {
     assert.throws(
-      () => describeSchedule({ scopeConcurrency: 1, sweepCap: 0, scopeCount: 1, spawns: [{ phase: 'sweeper', outcome: 'completed', usage: null }] }),
+      () => describeSchedule({ laneCount: 1, sweepCap: 0, scopeCount: 1, spawns: [{ phase: 'sweeper', outcome: 'completed', usage: null }] }),
       /unknown phase "sweeper"/,
     );
   });
 
   test('a scout retried before settling reports the summed spawn time of all its attempts', () => {
     const d = describeSchedule({
-      scopeConcurrency: 1,
+      laneCount: 1,
       sweepCap: 0,
       scopeCount: 1,
       spawns: [
@@ -260,7 +255,7 @@ describe('renderTimingBreakdown', () => {
     ({ phase: 'worker', scope, pass, outcome, usage: { span: span(fromMin, toMin) } });
   // The hand-measured shape from the epic: a scout, then two passes of workers.
   const schedule = {
-    scopeConcurrency: 2,
+    laneCount: 2,
     sweepCap: 1,
     scopeCount: 2,
     spawns: [
@@ -284,7 +279,7 @@ describe('renderTimingBreakdown', () => {
     // the slowest CLOCKED worker attempt, named — pass 0's engine at 3 minutes
     assert.match(line, /slowest scope: engine \(3m00s\)/);
     // the schedule sentence that turns spawn time into wall time
-    assert.match(line, /2 scope\(s\) at concurrency 2 over 2 pass\(es\) = 2 wave\(s\)/);
+    assert.match(line, /2 scope\(s\) on 2 lane\(s\), deepest chain 2 pass\(es\)/);
   });
 
   test('the per-attempt table sits behind <details>, one row per spawn attempt', () => {
@@ -299,7 +294,7 @@ describe('renderTimingBreakdown', () => {
     // [LAW:no-silent-failure] a schedule with no scout record (the phase never ran or its record
     // was lost) names the gap rather than pretending the phase was free.
     const block = renderTimingBreakdown({
-      scopeConcurrency: 1, sweepCap: 0, scopeCount: 1,
+      laneCount: 1, sweepCap: 0, scopeCount: 1,
       spawns: [worker('only', 0, 0, 1)],
     }, 2 * MIN);
     assert.match(block, /scout missing/);
@@ -307,7 +302,7 @@ describe('renderTimingBreakdown', () => {
 
   test('an unclocked spawn marks its phase sum as a lower bound and never wins slowest-scope', () => {
     const block = renderTimingBreakdown({
-      scopeConcurrency: 2, sweepCap: 0, scopeCount: 2,
+      laneCount: 2, sweepCap: 0, scopeCount: 2,
       spawns: [
         { phase: 'scout', outcome: 'completed', usage: { span: span(0, 1) } },
         worker('clocked', 0, 1, 3),
@@ -325,7 +320,7 @@ describe('renderTimingBreakdown', () => {
     // Scope names are LLM-minted free text; the renderer's one escape kills the characters that
     // ARE the structure (pipes, newlines) and neuters markdown/HTML metacharacters.
     const block = renderTimingBreakdown({
-      scopeConcurrency: 1, sweepCap: 0, scopeCount: 1,
+      laneCount: 1, sweepCap: 0, scopeCount: 1,
       spawns: [worker('a | b\n<x>_y_', 0, 0, 1)],
     }, MIN);
     assert.doesNotMatch(block, /\| a \| b/);
@@ -336,7 +331,7 @@ describe('renderTimingBreakdown', () => {
 
   test('a wholly unclocked worker phase reports slowest scope as unclocked, never a fabricated winner', () => {
     const block = renderTimingBreakdown({
-      scopeConcurrency: 1, sweepCap: 0, scopeCount: 1,
+      laneCount: 1, sweepCap: 0, scopeCount: 1,
       spawns: [{ phase: 'worker', scope: 's', pass: 0, outcome: 'failed', usage: null }],
     }, MIN);
     assert.match(block, /slowest scope: unclocked/);

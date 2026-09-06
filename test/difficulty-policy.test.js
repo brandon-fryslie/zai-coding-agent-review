@@ -146,7 +146,8 @@ describe('difficultyCandidates — propose an effort ladder that only ever LOWER
 
   test('only roundCap moves — the profile\'s other axes are preserved', () => {
     for (const c of difficultyCandidates(diff(3, { source: 1 }), top5)) {
-      assert.equal(c.scopeConcurrency, top5.scopeConcurrency);
+      assert.equal(c.sweepCap, top5.sweepCap);
+      assert.equal(c.reasoningTier, top5.reasoningTier);
     }
   });
 

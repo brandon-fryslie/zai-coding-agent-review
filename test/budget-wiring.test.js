@@ -66,7 +66,7 @@ describe('defaultBudgetCandidates', () => {
     const candidates = defaultBudgetCandidates(top);
     // Behavioral (not identity): the configured ceiling is offered as a candidate — asserted by value so
     // a future copy (`{ ...topProfile }`) that preserves behavior doesn't break the test.
-    assert.ok(candidates.some((c) => c.roundCap === top.roundCap && c.scopeConcurrency === top.scopeConcurrency));
+    assert.ok(candidates.some((c) => c.roundCap === top.roundCap && c.sweepCap === top.sweepCap));
     const maxEst = Math.max(...candidates.map((c) => estimatedCostUsd(c, 100)));
     assert.equal(estimatedCostUsd(top, 100), maxEst);
   });
@@ -95,7 +95,7 @@ describe('defaultBudgetCandidates', () => {
   test('de-rating preserves the profile\'s other axes (only roundCap moves)', () => {
     const top = defaultEffortProfile({ roundCap: 5 });
     for (const c of defaultBudgetCandidates(top)) {
-      assert.equal(c.scopeConcurrency, top.scopeConcurrency);
+      assert.equal(c.sweepCap, top.sweepCap);
     }
   });
 });

@@ -47,7 +47,6 @@ Usage: node scripts/local-review.js [options]
   --repo <path>       Reviewed repo root (default: current directory). Read by the engine by absolute path.
   --mode <pr|repo>    Review mode (default: pr). repo = whole-repo exploration, no diff.
   --scope <text>      Optional free-text scope, repo mode only.
-  --workers <N>       Max concurrent scope workers (default: 4).
   --model <id>        Override the provider's default model.
   --base-url <url>    Override the provider's endpoint base URL (api-key providers only).
   --help              Show this help.
@@ -56,8 +55,8 @@ Usage: node scripts/local-review.js [options]
 // [LAW:effects-at-boundaries] Pure arg parse: flags map to a plain options value; no IO, no defaults
 // that touch the world. `--flag value` and `--flag=value` both supported.
 function parseArgs(argv) {
-  const opts = { provider: 'auto', range: 'HEAD~1 HEAD', repo: process.cwd(), mode: 'pr', scope: '', workers: 4 };
-  const known = new Set(['provider', 'range', 'diff', 'repo', 'mode', 'scope', 'workers', 'model', 'base-url', 'config', 'use']);
+  const opts = { provider: 'auto', range: 'HEAD~1 HEAD', repo: process.cwd(), mode: 'pr', scope: '' };
+  const known = new Set(['provider', 'range', 'diff', 'repo', 'mode', 'scope', 'model', 'base-url', 'config', 'use']);
   // The options that pick between two sources via truthiness downstream — see the rejection below.
   const NON_EMPTY_OPTIONS = new Set(['config', 'use', 'diff', 'base-url', 'model', 'provider']);
   const written = new Set(); // flag names the caller actually typed, for exclusivity checks below
@@ -76,7 +75,7 @@ function parseArgs(argv) {
     // --diff vs --range pick, the pinned-base-url guard, the model override) and silently select
     // the OTHER source. Reject it here, at the parse boundary, so empty is unrepresentable inland
     // and those truthiness checks stay exact. The set is only the two-source options: for the rest
-    // (scope, repo, range, mode, workers) empty either equals the default or already fails loudly.
+    // (scope, repo, range, mode) empty either equals the default or already fails loudly.
     if (value === '' && NON_EMPTY_OPTIONS.has(name)) throw new Error(`Option --${name} requires a non-empty value.`);
     written.add(name);
     opts[name === 'base-url' ? 'baseUrl' : name] = value;
@@ -121,8 +120,6 @@ function parseArgs(argv) {
       );
     }
   }
-  opts.workers = parseInt(opts.workers, 10);
-  if (isNaN(opts.workers) || opts.workers < 1) throw new Error('--workers must be a positive integer.');
   return opts;
 }
 
@@ -289,10 +286,7 @@ async function main() {
 
   process.stderr.write(`Running multi-scope ${opts.mode} review: ${config.name} (${config.model}) over ${opts.mode === 'pr' ? `${files.length} file(s)` : 'whole repo'}…\n`);
   const { review, configUsed } = await runMultiScope({
-    // The --workers flag is this dev tool's one effort knob; it produces a profile with that scope
-    // concurrency, spread over the default so it stays complete as the profile grows fields.
     chain, material, registry, instructionsPath,
-    effort: { ...defaultEffortProfile(), scopeConcurrency: opts.workers },
     log: msg => process.stderr.write(`[local-review] ${msg}\n`),
     // [LAW:one-source-of-truth] The same start instant formatReport's total counts from, so the
     // live running totals and the report's figure share one clock.
