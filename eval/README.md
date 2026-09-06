@@ -304,7 +304,7 @@ node eval/baseline.js --out-dir eval/out/freeze-<sha>
 
 Step 1 is `eval/freeze-suite.js` and not a shell loop over `run-case.js` because a suite is
 ~20 replays over several hours against a subscription that walls for hours at a time, and the
-loop had no way to survive that. The suite runner adds exactly three things and reimplements
+loop had no way to survive that. The suite runner adds exactly four things and reimplements
 nothing — every job is still `run-case.js -n 1` in its own process:
 
 - **A census, so it resumes.** A completed run is a dir carrying `findings.json` (the
@@ -322,9 +322,15 @@ nothing — every job is still `run-case.js -n 1` in its own process:
   is reported as `TIMED OUT`, never as an ordinary non-zero exit.
 - **One lane per credential.** `--credentials VAR1,VAR2,…` names environment variables
   holding one credential each and replays on all of them concurrently; each lane is
-  sequential, and a lane stops at its first failure (a walled credential fails everything it
-  is handed) after returning the job to the queue for a lane that still works. Which env var
-  the credential travels under is derived from `src/provider.js`, not written here.
+  sequential. A lane takes the first queued job it has not already attempted, and a failure
+  requeues that job to the back rather than ending the lane — so a walled credential crosses
+  the whole queue in seconds, putting every job back for a healthy lane, while one bad job
+  costs a single attempt instead of abandoning the rest of the suite. A lane returns only when
+  every job left in the queue is one it has already tried. Which env var the credential travels
+  under is derived from `src/provider.js`, not written here.
+  An interrupt (Ctrl-C) is forwarded to every replay still running before the runner exits;
+  replays run in their own process groups for the deadline's sake, which also puts them out of
+  reach of the terminal's own signal.
 
 The runner exits non-zero whenever any case is still short of the target, and prints every
 attempt with its exit code, wall clock, and log path — the crashed 2026-08-30 freeze left two

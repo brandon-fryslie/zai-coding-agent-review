@@ -234,11 +234,33 @@ function discoverCaseDirs(casesDir) {
 // [LAW:one-source-of-truth] Which env var a provider's credential travels under is src/provider.js's fact,
 // derived here exactly as freeze-case.sh derives the default engine pin. A literal cannot notice a retarget.
 function credentialInputFor(provider) {
-  const { PROVIDERS } = require('../src/provider');
-  const spec = PROVIDERS[provider];
+  const { PROVIDERS, providerSpec } = require('../src/provider');
+  // [LAW:one-source-of-truth] `providerSpec`, not `PROVIDERS[provider]`: an alias is a provider name,
+  // and run-case.js's own resolution accepts one. Looking the row up directly here made this a second,
+  // alias-blind copy that refused a pin — even on a pure status re-invocation that spends nothing —
+  // which the very same pin replays fine through resolveProviderConfig.
+  const spec = providerSpec(provider);
   if (!spec) throw new Error(`Cases pin provider '${provider}', which src/provider.js does not define. Known: ${Object.keys(PROVIDERS).join(', ')}.`);
   return spec.credentialInput;
 }
+
+// SIGTERM first so run-case.js's own cleanup can run, SIGKILL after a grace period for a tree that
+// ignores it. Signalling the negative pid is the process GROUP. A group that has already exited raises
+// ESRCH — that is the race resolving in our favour, not an error to report. Module-scope because the
+// deadline and the operator's Ctrl-C both need it and two definitions of "signal a group" is one too many.
+const signalGroup = (pid, sig) => { try { process.kill(-pid, sig); } catch { /* already gone */ } };
+
+// How long a tree gets to honour SIGTERM before SIGKILL. A default, not a constant a caller must accept:
+// runReplay takes it as a parameter so the escalation can be asserted in a test without waiting it out.
+const KILL_GRACE_MS = 20000;
+
+// [LAW:no-shared-mutable-globals] The set of replays running right now is one fact with exactly one
+// writer — runReplay, across its own spawn/close lifecycle — and one other reader, the interrupt handler
+// main() installs. It has to exist somewhere both can see: `detached` (below) puts every replay outside
+// this process's group, so a Ctrl-C the terminal delivers reaches this parent and nothing else, and
+// without a list there is nothing to forward it to. Add on spawn, remove when the child ends; that is
+// the whole API.
+const inFlight = new Set();
 
 // One replay, in its own process, with this lane's credential in the slot the pinned provider reads. The
 // child's whole output is kept — a failure's cause is in it, and a four-hour suite must not make the
@@ -254,24 +276,32 @@ function credentialInputFor(provider) {
 // `detached` makes the replay its own process-group leader so the deadline can take down the WHOLE tree.
 // The engine spawns four claude-code workers per pass; signalling only the direct child would orphan them
 // to keep burning quota against a parent that is already gone.
-function runReplay({ job, lane, credentialInput, outRoot, logPath, timeoutMinutes }) {
+// [LAW:decomposition] Supervising a child under a deadline and DECIDING WHAT TO REPLAY are two jobs, and
+// they were one function. Fused, the supervision could only ever be exercised by really replaying a
+// golden case through a real engine, which is to say never — so the deadline, the escalation, and the
+// timer cleanup shipped untested through two review rounds. Split at the joint, the supervision is
+// generic over any child and the replay above is the argv that names one.
+// [LAW:effects-at-boundaries] `signal` and `killGraceMs` are parameters for the same reason `replay` is
+// one in runLane: killing a process group and waiting out a grace period are the two effects this
+// function owns, and a test that cannot observe them cannot check that the escalation timer is cancelled
+// when the child already exited — a negative about a signal 20 seconds out, otherwise only assertable by
+// sleeping through it. [LAW:no-ambient-temporal-coupling]
+function superviseSpawn({ command, args, cwd, env, logPath, timeoutMinutes, signal = signalGroup, killGraceMs = KILL_GRACE_MS }) {
   return new Promise(resolve => {
     const started = Date.now();
     const logStream = fs.createWriteStream(logPath);
-    const child = spawn(process.execPath, [path.join(__dirname, 'run-case.js'), job.dir, '-n', '1', '--out', outRoot], {
-      cwd: path.join(__dirname, '..'),
-      env: { ...process.env, [credentialInput]: lane.value },
+    const child = spawn(command, args, {
+      cwd,
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: true,
     });
     child.stdout.pipe(logStream, { end: false });
     child.stderr.pipe(logStream, { end: false });
+    inFlight.add(child.pid);
 
     let timedOut = false;
-    // SIGTERM first so run-case.js's own cleanup can run, SIGKILL after a grace period for a tree that
-    // ignores it. Signalling the negative pid is the process GROUP. A group that has already exited
-    // raises ESRCH — that is the race resolving in our favour, not an error to report.
-    const signalGroup = sig => { try { process.kill(-child.pid, sig); } catch { /* already gone */ } };
+    const signalThisGroup = sig => signal(child.pid, sig);
     // Both timers are cleared by whichever handler ends this replay. The escalation timer especially:
     // a tree that honours SIGTERM exits at once, and an uncancelled SIGKILL still fires 20s later —
     // long enough for the OS to have reissued that pid to a process this suite never spawned. The
@@ -279,25 +309,38 @@ function runReplay({ job, lane, credentialInput, outRoot, logPath, timeoutMinute
     // timer runs. A signal's blast radius belongs to the spawn that armed it.
     // [LAW:no-ambient-temporal-coupling]
     let escalation = null;
-    const clearTimers = () => { clearTimeout(deadline); clearTimeout(escalation); };
+    const finish = () => { clearTimeout(deadline); clearTimeout(escalation); inFlight.delete(child.pid); };
     const deadline = setTimeout(() => {
       timedOut = true;
       logStream.write(`\nfreeze-suite: replay exceeded its ${timeoutMinutes}m deadline — killing the process group.\n`);
-      signalGroup('SIGTERM');
-      escalation = setTimeout(() => signalGroup('SIGKILL'), 20000);
+      signalThisGroup('SIGTERM');
+      escalation = setTimeout(() => signalThisGroup('SIGKILL'), killGraceMs);
       escalation.unref();
     }, timeoutMinutes * MS_PER_MINUTE);
 
     child.on('error', err => {
-      clearTimers();
+      finish();
       logStream.end(`\nfreeze-suite: could not spawn the replay: ${err.message}\n`);
       resolve({ exitCode: -1, signal: null, timedOut, durationMs: Date.now() - started });
     });
-    child.on('close', (exitCode, signal) => {
-      clearTimers();
+    child.on('close', (exitCode, closeSignal) => {
+      finish();
       logStream.end();
-      resolve({ exitCode, signal, timedOut, durationMs: Date.now() - started });
+      resolve({ exitCode, signal: closeSignal, timedOut, durationMs: Date.now() - started });
     });
+  });
+}
+
+// [LAW:decomposition] One job: name the command a replay is. Everything about surviving it — the
+// deadline, the process group, the log — belongs to superviseSpawn above.
+function runReplay({ job, lane, credentialInput, outRoot, logPath, timeoutMinutes }) {
+  return superviseSpawn({
+    command: process.execPath,
+    args: [path.join(__dirname, 'run-case.js'), job.dir, '-n', '1', '--out', outRoot],
+    cwd: path.join(__dirname, '..'),
+    env: { ...process.env, [credentialInput]: lane.value },
+    logPath,
+    timeoutMinutes,
   });
 }
 
@@ -373,6 +416,21 @@ async function main() {
   const logDir = `${outRoot}-logs`;
   fs.mkdirSync(logDir, { recursive: true });
 
+  // [LAW:no-silent-failure] `detached` takes every replay out of this process's group, so a Ctrl-C the
+  // terminal delivers arrives HERE and reaches no replay — and the deadline timers that would eventually
+  // have killed them die with this process. A suite interrupted at hour three would leave engine workers
+  // running against a subscription with nobody left to stop or report them, which is the unwatched-spend
+  // failure this tool was written to make impossible. 128+signum is the shell's own convention for
+  // "killed by this signal", so a wrapping script reads the interrupt as an interrupt.
+  const SIGNUM = { SIGINT: 2, SIGTERM: 15 };
+  for (const sig of Object.keys(SIGNUM)) {
+    process.on(sig, () => {
+      log(`freeze-suite: ${sig} — signalling ${inFlight.size} in-flight replay(s) before exiting.`);
+      for (const pid of inFlight) signalGroup(pid, 'SIGTERM');
+      process.exit(128 + SIGNUM[sig]);
+    });
+  }
+
   const queue = jobs.slice();
   const done = [];
   const started = Date.now();
@@ -394,4 +452,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, parsePositiveInt, resolveLanes, suitePin, planJobs, runLane, renderReport, formatDuration, outcomeLabel };
+module.exports = { parseArgs, parsePositiveInt, resolveLanes, suitePin, planJobs, runLane, runReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };
