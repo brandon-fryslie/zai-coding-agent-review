@@ -35637,6 +35637,15 @@ const PROVIDERS = {
     engine: 'codex',
     preset: 'openai',
     credentialInput: 'OPENAI_API_KEY',
+    // gpt-5.4-mini is the default because it is the one OpenAI row that prices exactly (decided
+    // 2026-09-06, zai-cost-truth-p5o.5). OpenAI prices its current gpt-5.6 models per REQUEST context
+    // (≤272K / >272K), and codex's `exec --json` reports usage once per turn, summed across its
+    // requests — a review spawn is well over 272K in total, so it can prove neither card and would
+    // print "Cost: unknown" on every run. gpt-5.4-mini carries one flat card (src/usage.js), so it
+    // prices at any size. This is a limit of the usage RECORD, not the model: codex's app-server
+    // protocol emits per-request usage (thread/tokenUsage/updated, verified in codex-cli 0.142.3), and
+    // once the engine reads that stream every gpt-5.6 row prices exactly. Re-decide this default when
+    // zai-cost-truth-p5o.6 lands. [LAW:no-silent-failure]
     defaultModel: 'gpt-5.4-mini',
     inputKeys: { credential: 'openaiApiKey', model: 'openaiModel', reasoning: 'openaiReasoning', baseUrl: 'openaiBaseUrl' },
   },
