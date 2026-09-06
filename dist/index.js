@@ -32807,6 +32807,25 @@ function buildCommand({ home }) {
   };
 }
 
+// [LAW:parse-dont-validate] The two notifications the session reads are parsed HERE, at the wire,
+// into the values the record carries — a request's usage counts and the completed turn — and a
+// notification missing them throws, naming the method and the payload. The throw is what the JSON-RPC
+// client turns into the session's loud failure (rpc.failed); the handler and everything downstream
+// take the parsed values at face value, so no consumer guards a field the wire might have dropped.
+// The three counts are what tokensOfRequest bills; total and reasoning tokens are not read.
+function requestUsageOf(params) {
+  const last = params?.tokenUsage?.last;
+  const counted = last && ['inputTokens', 'cachedInputTokens', 'outputTokens'].every(k => Number.isInteger(last[k]));
+  if (!counted) throw new Error(`codex thread/tokenUsage/updated carried no request usage: ${JSON.stringify(params)}`);
+  return last;
+}
+
+function turnOf(params) {
+  const turn = params?.turn;
+  if (!turn || typeof turn.status !== 'string') throw new Error(`codex turn/completed carried no turn: ${JSON.stringify(params)}`);
+  return turn;
+}
+
 // [LAW:effects-at-boundaries] The one conversation this engine holds, over the io runEngine owns:
 //
 //   initialize -> initialized -> thread/start -> turn/start -> ...notifications... -> turn/completed -> EOF
@@ -32824,7 +32843,9 @@ function buildCommand({ home }) {
 // never granted by default, and never left unanswered, which would stall the turn until the timeout.
 // The session resolves with THE SESSION RECORD, { turn, requests }: the completed turn as codex
 // reported it (status + error) and one usage breakdown per model request, in order. A stream that
-// closes before the turn completes rejects, so an engine that dies mid-review is the loud cause.
+// closes before the turn completes rejects, so an engine that dies mid-review is the loud cause; so
+// does a notification the parsers above cannot read (rpc.failed), so a wire change in a codex
+// release is reported as the cause rather than surfacing as an exception inside a stream callback.
 async function appServerSession(io, prompt) {
   const requests = [];
   let settleTurn;
@@ -32840,8 +32861,8 @@ async function appServerSession(io, prompt) {
       }
       return;
     }
-    if (msg.method === 'thread/tokenUsage/updated') requests.push(msg.params.tokenUsage.last);
-    if (msg.method === 'turn/completed') settleTurn(msg.params.turn);
+    if (msg.method === 'thread/tokenUsage/updated') requests.push(requestUsageOf(msg.params));
+    if (msg.method === 'turn/completed') settleTurn(turnOf(msg.params));
   });
   await rpc.request('initialize', { clientInfo: CLIENT_INFO });
   rpc.notify('initialized');
@@ -32849,6 +32870,7 @@ async function appServerSession(io, prompt) {
   await rpc.request('turn/start', { threadId: thread.id, input: [{ type: 'text', text: prompt }] });
   const turn = await Promise.race([
     completed,
+    rpc.failed,
     io.closed.then(() => { throw new Error('Codex review did not complete: the app-server exited before turn/completed.'); }),
   ]);
   io.end();
@@ -32888,8 +32910,10 @@ function tokensOfRequest(u) {
 // exactly: a review turn totals well over 272K across its requests while no single request need be,
 // and pricing the total at either card would be the confident misprice zai-cost-truth-p5o exists to
 // end. spawnFromRequest is the narrow claim each request supports — its context is exactly its own
-// input count. The usage record keeps the per-request breakdown beside the summed tokens, so the
-// figure can be re-derived request by request later. [FRAMING:representation]
+// input count. The usage record keeps the per-request breakdown beside the summed tokens for this
+// run — the pass fold carries it and the transcript holds the notifications — while the persisted
+// cost marker records the sum alone, so an audit-time restatement of a context-tiered review still
+// reads the schedule gap (zai-cost-truth-p5o.7 makes the marker carry it). [FRAMING:representation]
 //
 // `startedAt` is the spawn's start instant, supplied by makeCliAdapter — the price table is a
 // schedule, so the rate is selected by WHEN this spawn ran, not by a clock read in here.
@@ -32970,34 +32994,57 @@ module.exports = {
 // protocol is driven through this one client. [LAW:composability]
 //
 // `io` is the session io runEngine hands a session (write on stdin, `lines` over stdout).
-// `onMessage(msg)` receives every message that is not a response to one of OUR requests: server
-// notifications (no id) and server requests (id + method), which the caller answers through
-// respond/refuse. A line that is not JSON is the engine's own noise on stdout and is skipped, as
-// every stream parser here skips it; the raw stream is in the transcript regardless.
+// `onMessage(msg)` receives every message that is not a response: server notifications (no id) and
+// server requests (id + method), which the caller answers through respond/refuse. A line that is not
+// JSON is the engine's own noise on stdout and is skipped, as every stream parser here skips it; the
+// raw stream is in the transcript regardless.
+//
+// [LAW:types-are-the-program] `method` is the wire's own discriminator: a message without one is a
+// RESPONSE and can only correlate with a request of ours. One whose id is not pending — a late or
+// orphan reply — correlates with nothing and is dropped, never handed to the handler as if the server
+// had asked something.
 //
 // [LAW:no-silent-failure] A response carrying `error` rejects the request with the method it
 // answered and the server's message, and every request still pending when the stream closes is
 // rejected with that fact — a promise that never settles would leave a session hanging on an engine
-// that has already exited, when its death is the thing to report.
+// that has already exited, when its death is the thing to report. A handler that THROWS is the
+// conversation failing to parse what the server sent: the throw rejects every pending request and
+// `failed`, the promise a session races beside its own completion, so a malformed notification is
+// the loud cause of the session's end and never an uncaught exception inside a stream callback.
 function createJsonRpcClient(io, onMessage) {
   let nextId = 1;
   const pending = new Map();
+  let fail;
+  const failed = new Promise((_, reject) => { fail = reject; });
+  failed.catch(() => {}); // observed by the session's race; never an unhandled rejection on its own
   const send = msg => io.write(JSON.stringify({ jsonrpc: '2.0', ...msg }) + '\n');
+  const rejectPending = errorFor => {
+    for (const [id, reply] of pending) {
+      pending.delete(id);
+      reply.reject(errorFor(reply));
+    }
+  };
   io.lines.on('line', line => {
     let msg;
     try { msg = JSON.parse(line); } catch { return; }
     if (msg === null || typeof msg !== 'object') return;
-    const reply = msg.method === undefined ? pending.get(msg.id) : undefined;
-    if (!reply) { onMessage(msg); return; }
-    pending.delete(msg.id);
-    if (msg.error) reply.reject(new Error(`${reply.method} failed: ${msg.error.message ?? JSON.stringify(msg.error)}`));
-    else reply.resolve(msg.result);
+    if (msg.method === undefined) {
+      const reply = pending.get(msg.id);
+      if (!reply) return;
+      pending.delete(msg.id);
+      if (msg.error) reply.reject(new Error(`${reply.method} failed: ${msg.error.message ?? JSON.stringify(msg.error)}`));
+      else reply.resolve(msg.result);
+      return;
+    }
+    try {
+      onMessage(msg);
+    } catch (err) {
+      fail(err);
+      rejectPending(() => err);
+    }
   });
   io.lines.on('close', () => {
-    for (const [id, reply] of pending) {
-      pending.delete(id);
-      reply.reject(new Error(`${reply.method} never answered: the engine's output stream closed first.`));
-    }
+    rejectPending(reply => new Error(`${reply.method} never answered: the engine's output stream closed first.`));
   });
   return {
     request: (method, params) => new Promise((resolve, reject) => {
@@ -33008,6 +33055,7 @@ function createJsonRpcClient(io, onMessage) {
     notify: (method, params) => send({ method, params }),
     respond: (id, result) => send({ id, result }),
     refuse: (id, message) => send({ id, error: { code: -32601, message } }),
+    failed,
   };
 }
 
@@ -33373,8 +33421,8 @@ const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = __nccwpck_require_
 // verbose. "The process never terminates" is owned by the per-invocation timeout below — never
 // by output volume. A stdin engine's session reads this retained tail back, and the events it
 // needs (the terminal result envelope and the usage riding it) are the LAST emitted, so the tail
-// preserves exactly them; a session that reads the stream LIVE (codex's app-server conversation —
-// see promptOnStdin) is never clipped at all.
+// preserves exactly them; a session that reads the stream LIVE (codex's appServerSession) is never
+// clipped at all.
 const MAX_RETAINED_OUTPUT = 8 * 1024 * 1024;
 
 // [LAW:one-type-per-behavior] stdout and stderr are the same behavior — captured child output
@@ -33681,7 +33729,17 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
       // through assertSucceeded exactly as the retained stdout always did, and a session that
       // failed mid-conversation — a refused request, an exit before the turn completed — is the
       // loud cause even though the process itself exited 0.
-      session.then(
+      // [LAW:no-ambient-temporal-coupling] `closed` is every session's floor, and this module owns
+      // the child's lifetime, so it is the one place that holds a session to it: a session that has
+      // not settled once every reaction to `closed` has run never will — its engine is gone — and
+      // the spawn would hang until the timeout found a dead tree. The check is deterministic, not a
+      // grace period: `closed` resolved synchronously above, so every reaction to it runs as a
+      // microtask before the setImmediate macrotask fires.
+      const settled = Promise.race([
+        session,
+        new Promise((_, reject) => setImmediate(() => reject(new Error(`${adapter.name} session did not settle when the engine exited.`)))),
+      ]);
+      settled.then(
         output => finish(() => {
           try {
             adapter.assertSucceeded(output);
@@ -34330,8 +34388,8 @@ function sumUsage(usages) {
   return {
     tokens: tokens.length > 0 ? tokens.reduce(addTokens, emptyTokens()) : null,
     // The per-request breakdown an engine that observes each model request records (codex, via its
-    // app-server session) is carried whole — the pass's requests are its spawns' requests, in spawn
-    // order — and absent when no spawn recorded one, exactly as tokens are. It is the primary fact
+    // app-server session) is carried whole — the pass's requests are its spawns' requests, in the
+    // order the spawns settled — and absent when no spawn recorded one, exactly as tokens are. It is the primary fact
     // behind a context-tiered cost, so the fold keeps it beside the sum it derives from.
     requests: requests.length > 0 ? requests.flat() : null,
     // The pass's SPAN is the envelope of its spawns' spans — earliest start, latest end — which is

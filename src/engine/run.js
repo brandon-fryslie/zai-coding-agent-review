@@ -12,8 +12,8 @@ const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = require('../deadli
 // verbose. "The process never terminates" is owned by the per-invocation timeout below — never
 // by output volume. A stdin engine's session reads this retained tail back, and the events it
 // needs (the terminal result envelope and the usage riding it) are the LAST emitted, so the tail
-// preserves exactly them; a session that reads the stream LIVE (codex's app-server conversation —
-// see promptOnStdin) is never clipped at all.
+// preserves exactly them; a session that reads the stream LIVE (codex's appServerSession) is never
+// clipped at all.
 const MAX_RETAINED_OUTPUT = 8 * 1024 * 1024;
 
 // [LAW:one-type-per-behavior] stdout and stderr are the same behavior — captured child output
@@ -320,7 +320,17 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
       // through assertSucceeded exactly as the retained stdout always did, and a session that
       // failed mid-conversation — a refused request, an exit before the turn completed — is the
       // loud cause even though the process itself exited 0.
-      session.then(
+      // [LAW:no-ambient-temporal-coupling] `closed` is every session's floor, and this module owns
+      // the child's lifetime, so it is the one place that holds a session to it: a session that has
+      // not settled once every reaction to `closed` has run never will — its engine is gone — and
+      // the spawn would hang until the timeout found a dead tree. The check is deterministic, not a
+      // grace period: `closed` resolved synchronously above, so every reaction to it runs as a
+      // microtask before the setImmediate macrotask fires.
+      const settled = Promise.race([
+        session,
+        new Promise((_, reject) => setImmediate(() => reject(new Error(`${adapter.name} session did not settle when the engine exited.`)))),
+      ]);
+      settled.then(
         output => finish(() => {
           try {
             adapter.assertSucceeded(output);

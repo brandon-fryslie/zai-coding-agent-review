@@ -157,7 +157,7 @@ describe('sumUsage', () => {
     assert.ok(Math.abs(total.cost.usd - 0.3) < 1e-9);
   });
 
-  test('per-request breakdowns concatenate in spawn order and are absent when no spawn recorded one', () => {
+  test('per-request breakdowns concatenate in record order and are absent when no spawn recorded one', () => {
     const a = [{ inputCacheMiss: 10, inputCacheHit: 0, output: 5 }];
     const b = [{ inputCacheMiss: 8, inputCacheHit: 12, output: 7 }, { inputCacheMiss: 1, inputCacheHit: 0, output: 1 }];
     const withRequests = sumUsage([

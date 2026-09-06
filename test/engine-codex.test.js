@@ -354,6 +354,41 @@ describe('appServerSession — the conversation with codex app-server', () => {
     });
     await assert.rejects(appServerSession(io, 'p'), /initialize never answered/);
   });
+
+  // [LAW:parse-dont-validate] A notification the session cannot read is the session's loud failure,
+  // named with the method and payload — never an exception thrown inside the stream callback.
+  test('rejects, naming the method, when a usage notification carries no request usage', async () => {
+    const io = fakeIo(msg => msg.method === 'turn/start'
+      ? [
+        { id: msg.id, result: { turn: { id: 'turn-1', status: 'inProgress' } } },
+        { method: 'thread/tokenUsage/updated', params: { threadId: 'thread-1', tokenUsage: { total: usageOf(1, 0, 1) } } },
+      ]
+      : codexLike()(msg));
+    await assert.rejects(appServerSession(io, 'p'), /thread\/tokenUsage\/updated carried no request usage/);
+  });
+
+  test('rejects when turn/completed carries no turn', async () => {
+    const io = fakeIo(msg => msg.method === 'turn/start'
+      ? [
+        { id: msg.id, result: { turn: { id: 'turn-1', status: 'inProgress' } } },
+        { method: 'turn/completed', params: { threadId: 'thread-1' } },
+      ]
+      : codexLike()(msg));
+    await assert.rejects(appServerSession(io, 'p'), /turn\/completed carried no turn/);
+  });
+
+  test('a late response to no pending request is dropped, not refused as a server request', async () => {
+    const io = fakeIo(msg => msg.method === 'turn/start'
+      ? [
+        { id: msg.id, result: { turn: { id: 'turn-1', status: 'inProgress' } } },
+        { id: 999, result: { stale: true } },
+        { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } },
+      ]
+      : codexLike()(msg));
+    const warnings = await captureWarnings(() => appServerSession(io, 'p'));
+    assert.equal(io.sent.find(m => m.id === 999), undefined, 'nothing is sent back for id 999');
+    assert.deepEqual(warnings, []);
+  });
 });
 
 // --- classifyError ---

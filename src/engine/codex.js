@@ -159,6 +159,25 @@ function buildCommand({ home }) {
   };
 }
 
+// [LAW:parse-dont-validate] The two notifications the session reads are parsed HERE, at the wire,
+// into the values the record carries — a request's usage counts and the completed turn — and a
+// notification missing them throws, naming the method and the payload. The throw is what the JSON-RPC
+// client turns into the session's loud failure (rpc.failed); the handler and everything downstream
+// take the parsed values at face value, so no consumer guards a field the wire might have dropped.
+// The three counts are what tokensOfRequest bills; total and reasoning tokens are not read.
+function requestUsageOf(params) {
+  const last = params?.tokenUsage?.last;
+  const counted = last && ['inputTokens', 'cachedInputTokens', 'outputTokens'].every(k => Number.isInteger(last[k]));
+  if (!counted) throw new Error(`codex thread/tokenUsage/updated carried no request usage: ${JSON.stringify(params)}`);
+  return last;
+}
+
+function turnOf(params) {
+  const turn = params?.turn;
+  if (!turn || typeof turn.status !== 'string') throw new Error(`codex turn/completed carried no turn: ${JSON.stringify(params)}`);
+  return turn;
+}
+
 // [LAW:effects-at-boundaries] The one conversation this engine holds, over the io runEngine owns:
 //
 //   initialize -> initialized -> thread/start -> turn/start -> ...notifications... -> turn/completed -> EOF
@@ -176,7 +195,9 @@ function buildCommand({ home }) {
 // never granted by default, and never left unanswered, which would stall the turn until the timeout.
 // The session resolves with THE SESSION RECORD, { turn, requests }: the completed turn as codex
 // reported it (status + error) and one usage breakdown per model request, in order. A stream that
-// closes before the turn completes rejects, so an engine that dies mid-review is the loud cause.
+// closes before the turn completes rejects, so an engine that dies mid-review is the loud cause; so
+// does a notification the parsers above cannot read (rpc.failed), so a wire change in a codex
+// release is reported as the cause rather than surfacing as an exception inside a stream callback.
 async function appServerSession(io, prompt) {
   const requests = [];
   let settleTurn;
@@ -192,8 +213,8 @@ async function appServerSession(io, prompt) {
       }
       return;
     }
-    if (msg.method === 'thread/tokenUsage/updated') requests.push(msg.params.tokenUsage.last);
-    if (msg.method === 'turn/completed') settleTurn(msg.params.turn);
+    if (msg.method === 'thread/tokenUsage/updated') requests.push(requestUsageOf(msg.params));
+    if (msg.method === 'turn/completed') settleTurn(turnOf(msg.params));
   });
   await rpc.request('initialize', { clientInfo: CLIENT_INFO });
   rpc.notify('initialized');
@@ -201,6 +222,7 @@ async function appServerSession(io, prompt) {
   await rpc.request('turn/start', { threadId: thread.id, input: [{ type: 'text', text: prompt }] });
   const turn = await Promise.race([
     completed,
+    rpc.failed,
     io.closed.then(() => { throw new Error('Codex review did not complete: the app-server exited before turn/completed.'); }),
   ]);
   io.end();
@@ -240,8 +262,10 @@ function tokensOfRequest(u) {
 // exactly: a review turn totals well over 272K across its requests while no single request need be,
 // and pricing the total at either card would be the confident misprice zai-cost-truth-p5o exists to
 // end. spawnFromRequest is the narrow claim each request supports — its context is exactly its own
-// input count. The usage record keeps the per-request breakdown beside the summed tokens, so the
-// figure can be re-derived request by request later. [FRAMING:representation]
+// input count. The usage record keeps the per-request breakdown beside the summed tokens for this
+// run — the pass fold carries it and the transcript holds the notifications — while the persisted
+// cost marker records the sum alone, so an audit-time restatement of a context-tiered review still
+// reads the schedule gap (zai-cost-truth-p5o.7 makes the marker carry it). [FRAMING:representation]
 //
 // `startedAt` is the spawn's start instant, supplied by makeCliAdapter — the price table is a
 // schedule, so the rate is selected by WHEN this spawn ran, not by a clock read in here.

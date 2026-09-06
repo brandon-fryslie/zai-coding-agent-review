@@ -519,4 +519,16 @@ describe('runEngine session seam', () => {
     };
     await assert.rejects(runEngine(spec, {}, 'hello', '/tmp', {}, process.cwd()), /exited before completing/);
   });
+
+  test('a session that never settles after the engine exits fails the spawn instead of hanging to the timeout', async () => {
+    const spec = {
+      name: 'fake-server',
+      timeoutMs: 30_000,
+      buildCommand: () => ({ command: process.execPath, args: ['-e', 'process.exit(0)'], env: { PATH: process.env.PATH } }),
+      session: () => new Promise(() => {}),
+      assertSucceeded: () => {},
+      classifyError: err => err,
+    };
+    await assert.rejects(runEngine(spec, {}, 'hello', '/tmp', {}, process.cwd()), /fake-server session did not settle when the engine exited/);
+  });
 });

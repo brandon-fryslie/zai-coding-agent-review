@@ -86,8 +86,8 @@ function sumUsage(usages) {
   return {
     tokens: tokens.length > 0 ? tokens.reduce(addTokens, emptyTokens()) : null,
     // The per-request breakdown an engine that observes each model request records (codex, via its
-    // app-server session) is carried whole — the pass's requests are its spawns' requests, in spawn
-    // order — and absent when no spawn recorded one, exactly as tokens are. It is the primary fact
+    // app-server session) is carried whole — the pass's requests are its spawns' requests, in the
+    // order the spawns settled — and absent when no spawn recorded one, exactly as tokens are. It is the primary fact
     // behind a context-tiered cost, so the fold keeps it beside the sum it derives from.
     requests: requests.length > 0 ? requests.flat() : null,
     // The pass's SPAN is the envelope of its spawns' spans — earliest start, latest end — which is
