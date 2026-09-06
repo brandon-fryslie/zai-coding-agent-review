@@ -515,7 +515,9 @@ It prints the **estimated cost up front** (the baseline's recorded `$/full-run` 
 per-case verdict table and a final `DEGRADED` / `OK` / `IMPROVED` line — Markdown, so it pastes
 straight into a PR body. The per-case bands are diagnostics that localize *which* case moved a
 pooled regression (a `moved?` ⚠️ marks a case whose candidate mean fell below its baseline
-diagnostic floor); they never gate on their own. Artifacts land at `<out>/verdict.{md,json}`.
+diagnostic floor); they never gate on their own. Artifacts land at `<out>/verdict.{md,json}`, and
+the per-replay lane logs `freeze-suite.js` writes land in the sibling `<out>-logs/` (a sibling, not a
+child, so every child of `<out>` stays a case run dir the scorer can pool).
 
 **Exit codes are a trichotomy** so a CI gate (`copirate-eval-harness-2fk.6`) can tell the three
 outcomes apart: `0` = ran and OK/IMPROVED, `1` = ran and **DEGRADED** (the gate tripped), `2` =

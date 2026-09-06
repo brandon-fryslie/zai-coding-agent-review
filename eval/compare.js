@@ -54,8 +54,9 @@ Usage: ANTHROPIC_API_KEY=… CLAUDE_CODE_OAUTH_TOKEN=… node eval/compare.js [o
                          silently blending old and new runs into one summary.
   --credentials <A,B,…>  Names of env vars holding one engine credential each, forwarded to
                          freeze-suite.js: one replay LANE per name, run concurrently. Default: a single
-                         lane on the pinned provider's own credential input. Three lanes turn a ~6-hour
-                         serial suite into ~2 hours of wall clock and spread the quota across accounts.
+                         lane on the pinned provider's own credential input. N lanes cut the suite's
+                         wall clock by about N and spread its quota across N accounts; the measured
+                         figures are in .github/workflows/eval.yml and eval/README.md.
   --cases-dir <dir>      Where the frozen golden cases live (default: eval/cases).
   --cache <file>         Judge-decision cache, forwarded to score.js (default: eval/out/.judge-cache.json).
   --reuse-candidate <d>  Skip the replay+score entirely and gate an ALREADY-produced candidate root <d>

@@ -134,21 +134,23 @@ function resolveLanes(names, env) {
   return lanes;
 }
 
-// [LAW:parse-dont-validate] A comma list of case NAMES in, the census entries that carry them out — in
-// census order, so the level-filling plan below is the same plan whichever way the operator spelled the
-// list. A name no case carries is the operator's typo (or a case the golden set no longer holds), and a
-// suite that silently replays the others has spent hours proving less than it was asked to; refused
-// here, before any spend. [LAW:no-silent-failure] The comma split is exact because a case name cannot
-// carry one — run-case.js's parseCaseManifest refuses it, the one place a name is parsed.
-function selectCases(cases, names) {
+// [LAW:parse-dont-validate] A comma list of case NAMES in, the case DIRECTORIES that carry them out — in
+// discovery order, so the level-filling plan below is the same plan whichever way the operator spelled
+// the list. A case's name is its directory's name, the identity compare.js already resolves a case by
+// (path.join(casesDir, name)), and selecting on it means the census parses only the selected manifests:
+// a half-written case elsewhere under the golden root cannot abort a suite that was never asked to
+// replay it. A name no directory carries is the operator's typo (or a case the golden set no longer
+// holds), and a suite that silently replays the others has spent hours proving less than it was asked
+// to; refused here, before any spend. [LAW:no-silent-failure] The comma split is exact because a case
+// name cannot carry one — run-case.js's parseCaseManifest refuses it, the one place a name is parsed.
+function selectCaseDirs(caseDirs, names) {
   const wanted = names.map(raw => raw.trim());
+  const have = caseDirs.map(dir => path.basename(dir));
   for (const name of wanted) {
     if (name === '') throw new Error(`--cases contains an empty name: ${JSON.stringify(names.join(','))}.`);
-    if (!cases.some(c => c.name === name)) {
-      throw new Error(`--cases names '${name}', but no golden case carries that name (have: ${cases.map(c => c.name).join(', ')}).`);
-    }
+    if (!have.includes(name)) throw new Error(`--cases names '${name}', but no golden case carries that name (have: ${have.join(', ')}).`);
   }
-  return cases.filter(c => wanted.includes(c.name));
+  return caseDirs.filter(dir => wanted.includes(path.basename(dir)));
 }
 
 // [LAW:parse-dont-validate] The suite's engine pin: one engine out, or a loud refusal. This is the SAME
@@ -509,10 +511,10 @@ async function main() {
   }
 
   const outRoot = path.resolve(opts.out);
-  const golden = censusCases(discoverCaseDirs(path.resolve(opts.casesDir)), outRoot);
+  const golden = discoverCaseDirs(path.resolve(opts.casesDir));
   // The selection is unconditional; what varies is the list flowing into it, which names every golden
   // case when the operator named none. [LAW:dataflow-not-control-flow]
-  const cases = selectCases(golden, (opts.cases ?? golden.map(c => c.name).join(',')).split(','));
+  const cases = censusCases(selectCaseDirs(golden, (opts.cases ?? golden.map(dir => path.basename(dir)).join(',')).split(',')), outRoot);
   const pin = suitePin(cases);
   const credentialInput = credentialInputFor(pin.provider);
 
@@ -580,4 +582,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, parsePositiveInt, resolveLanes, selectCases, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, superviseSpawn, censusCases, credentialInputFor, renderReport, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };
+module.exports = { parseArgs, parsePositiveInt, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, superviseSpawn, censusCases, credentialInputFor, renderReport, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };
