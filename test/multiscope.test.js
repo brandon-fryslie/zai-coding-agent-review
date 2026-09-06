@@ -64,9 +64,9 @@ describe('parseScopeValue', () => {
 });
 
 describe('workerFocusText', () => {
-  test('prepends structural context when present', () => {
+  test('prepends the planning context when present', () => {
     const text = workerFocusText({ name: 'cost', focus: 'src/usage.js' }, 'A CLI tool.');
-    assert.match(text, /Structural context from the planning pass:\nA CLI tool\./);
+    assert.match(text, /Context from the planning pass:\nA CLI tool\./);
     assert.match(text, /cost — src\/usage\.js/);
   });
   test('omits the context block when context is empty', () => {
@@ -251,19 +251,19 @@ describe('sumUsage', () => {
 
 describe('composeSummary', () => {
   const scopes = [{ name: 'cost', focus: 'x', files: [] }, { name: 'diff', focus: 'y', files: [] }];
-  test('names every scope and carries each worker summary, never raw JSON', () => {
-    const summary = composeSummary(scopes, [
-      { name: 'cost', summary: 'Looks fine.' },
-      { name: 'diff', summary: 'One issue.' },
-    ]);
+  test('leads with the scout summary and names every scope, never raw JSON', () => {
+    const summary = composeSummary('Adds a retry budget to the spawn seam.', scopes);
+    assert.match(summary, /^Adds a retry budget to the spawn seam\./);
     assert.match(summary, /Reviewed 2 scope\(s\): cost, diff\./);
-    assert.match(summary, /\*\*cost\*\* — Looks fine\./);
-    assert.match(summary, /\*\*diff\*\* — One issue\./);
     assert.doesNotMatch(summary, /[[{]"name"/);
   });
-  test('renders a placeholder for an empty worker summary', () => {
-    const summary = composeSummary([{ name: 'a', focus: 'x', files: [] }], [{ name: 'a', summary: '' }]);
-    assert.match(summary, /\*\*a\*\* — \(no summary\)/);
+  // The point of the scout owning the summary: N workers each describing their own slice used to
+  // render N paragraphs restating one change N times. Only the scout's one description ships.
+  test('renders no per-scope paragraph, however many scopes were reviewed', () => {
+    const summary = composeSummary('One sentence about the change.', scopes);
+    assert.doesNotMatch(summary, /\*\*cost\*\* —/);
+    assert.doesNotMatch(summary, /\*\*diff\*\* —/);
+    assert.equal(summary.split('\n').filter(l => l.trim() !== '').length, 2);
   });
 });
 
@@ -765,8 +765,10 @@ describe('runMultiScopePass — convergence sweeps', () => {
   test('the aggregate summary names each sweep; sweepCap 0 restores the single-pass shape', async () => {
     const swept = await runMultiScopePass(args(sweepRegistry((name) => oneBug(name)).registry, 3));
     assert.match(swept.summary, /\*\*convergence sweep 1\*\* — nothing new; the review converged\./);
-    assert.match(swept.summary, /sum-a-p0/); // the initial pass's judgments remain the summaries of record
-    assert.doesNotMatch(swept.summary, /sum-a-p1/); // sweep narration does not bloat the posted summary
+    // No worker's summary reaches the posted text — not pass 0's, not a sweep's. The scout's is the
+    // only description of the change, so sweeps add one line each and nothing else.
+    assert.doesNotMatch(swept.summary, /sum-a-p0/);
+    assert.doesNotMatch(swept.summary, /sum-a-p1/);
     const single = await runMultiScopePass(args(sweepRegistry((name) => oneBug(name)).registry, 0));
     assert.doesNotMatch(single.summary, /convergence sweep/);
   });
@@ -1576,8 +1578,8 @@ describe('planScopes — unique scope names', () => {
     // Two same-named scopes, one deadline-killed: the summary must count the reviewed one as
     // reviewed, not subtract both via the shared name.
     const summary = composeSummary(
+      'Splits the sync path in two.',
       [{ name: 'sync', focus: 'f1', files: [] }, { name: 'sync (2)', focus: 'f2', files: [] }],
-      [{ name: 'sync', summary: 'ok' }],
       [],
       { exhausted: true, unreviewedScopes: ['sync (2)'] },
     );

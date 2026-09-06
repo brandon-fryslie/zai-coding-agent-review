@@ -417,16 +417,32 @@ function scoutOutputContract(toolNames, { assignFiles = false } = {}) {
     ? `\n      - files: the array of changed file paths this scope owns, copied EXACTLY as listed above. `
       + `Every changed file must appear in exactly ONE scope's files — the worker for that scope reads those files in full.`
     : '';
+  // The summary's SUBJECT and its second reader both vary by mode, and nothing else about the
+  // contract does. [LAW:dataflow-not-control-flow] one contract, varied by a value, not two copies.
+  const summaryContract = assignFiles
+    ? `The summary says what this pull request changes and why — the change in the author's own terms, `
+      + `not a file-by-file list. TWO readers get it verbatim: every scope worker, as the orientation it `
+      + `reviews against, and the pull request author, as the ONLY summary this review posts.`
+    : `The summary says what this codebase is and how its main parts relate. TWO readers get it verbatim: `
+      + `every scope worker, as the orientation it reviews against, and the report's reader, as the ONLY `
+      + `summary this review posts.`;
   return `Do NOT call ${toolNames.requestChange}. You are planning the review here, not reviewing code.
 
     Record your plan by calling ${toolNames.addScope} ONCE PER SCOPE, providing:
       - name: a short label (for example "cost", "line-anchoring", or "parser→renderer" for a boundary).
       - focus: one or two sentences naming the exact files and what to examine in them.${filesField}
 
-    Then call ${toolNames.finishReview} exactly once, with a summary of two to four plain sentences
-    describing what this codebase is and how its main parts relate. Do NOT list the scopes in the
-    summary — the scopes ARE your ${toolNames.addScope} calls. These collector tools are your only
-    output channel; never print the plan as text.`;
+    Then call ${toolNames.finishReview} exactly once. ${summaryContract}
+
+    ONE TO FOUR plain sentences, and never more. This bound bites at the end, after you have planned
+    every scope and your head is full of detail that all feels worth saying — a summary that runs past
+    a short paragraph is wrong even when every word of it is true. Do NOT list the scopes; the scopes
+    ARE your ${toolNames.addScope} calls. Do NOT narrate your planning, your reading, or what you
+    checked — "I examined X and confirmed Y" is never a summary. Do NOT state a verdict: whether the
+    change is good, risky, or needs fixing is the HOST's call, derived from what the workers record,
+    and a verdict here would be a second one contradicting it. [LAW:one-source-of-truth]
+
+    These collector tools are your only output channel; never print the plan as text.`;
 }
 
 // [LAW:decomposition] The PR scout MATERIAL: it is handed the list of files this pull request changed

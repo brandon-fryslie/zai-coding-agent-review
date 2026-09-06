@@ -49,10 +49,13 @@ const {
 // (brackets in free text), and the whole class of prose-parsing bugs went with it.
 
 // [LAW:effects-at-boundaries] Pure: compose the single focus string a worker receives — the scout's
-// structural context (when present) plus this scope's name and focus. The material turns it into the
+// planning context (when present) plus this scope's name and focus. The material turns it into the
 // engine prompt (a PR worker's CONCENTRATE block, a repo worker's scope focus).
+// [LAW:one-source-of-truth] The label is mode-neutral because what that context DESCRIBES is decided in
+// scoutOutputContract, not here: a change narrative in PR mode, the codebase's structure in repo mode.
+// A label naming either shape would be a second, divergable statement of a fact this file does not own.
 function workerFocusText(scope, context) {
-  const prefix = context ? `Structural context from the planning pass:\n${context}\n\n---\n\n` : '';
+  const prefix = context ? `Context from the planning pass:\n${context}\n\n---\n\n` : '';
   return `${prefix}${scope.name} — ${scope.focus}`;
 }
 
@@ -106,29 +109,31 @@ function sumSpan(spans) {
   };
 }
 
-// [LAW:effects-at-boundaries] Pure: the aggregated review summary. It names every scope reviewed and
-// carries each worker's own summary verbatim — never the scout's raw JSON, which stays out of the
-// author-facing text. [LAW:one-source-of-truth]
-// workerResults are the INITIAL pass's — the judgments of record. Each convergence sweep contributes
-// one line stating what it added; its workers' own summaries are mostly "nothing new" narration, so
-// their findings flow to the merged set while the sweep line carries the summary-level story. sweeps
-// is a value: [] (sweepCap 0, or the shape predating sweeps) renders nothing. [LAW:dataflow-not-control-flow]
+// [LAW:effects-at-boundaries] Pure: the aggregated review summary. It leads with the SCOUT's summary —
+// the one whole-change description this run produces — and then names every scope reviewed.
+// [LAW:one-source-of-truth] That summary has one author and two readers: it is the orientation every
+// worker reviews against (handed to them as `context`) and the author-facing summary here, written once
+// for both. Per-scope worker summaries are deliberately NOT rendered. N workers each describing their
+// own slice produced N paragraphs restating one change N times, and no worker can see the change whole
+// enough to summarize it anyway — the scout is the only agent that does. A worker's output is its
+// findings; its summary is not output.
+// Each convergence sweep contributes one line stating what it added; sweeps is a value: [] (sweepCap 0,
+// or the shape predating sweeps) renders nothing. [LAW:dataflow-not-control-flow]
 // budget is the time-budget outcome: the default (not exhausted, nothing unreviewed) renders nothing,
 // so a run without a deadline — and a run that fit its deadline — is byte-identical to before.
-// [LAW:no-silent-failure] When the budget DID bite, the summary leads with the truth: the headline
-// count names only the scopes actually reviewed, the unreviewed ones are listed by name, and a
-// curtailed convergence is called out — a partial review must never read like a clean bill.
-function composeSummary(scopes, workerResults, sweeps = [], budget = { exhausted: false, unreviewedScopes: [] }) {
+// [LAW:no-silent-failure] When the budget DID bite, the coverage line names only the scopes actually
+// reviewed, the unreviewed ones are listed by name, and a curtailed convergence is called out — a
+// partial review must never read like a clean bill. The scout summary standing above it describes the
+// CHANGE and never the review, so it cannot soften that report into one.
+function composeSummary(scoutSummary, scopes, sweeps = [], budget = { exhausted: false, unreviewedScopes: [] }) {
   const unreviewed = new Set(budget.unreviewedScopes);
   const reviewed = scopes.filter(s => !unreviewed.has(s.name));
   // [LAW:parse-dont-validate] Nothing is flattened here. A scope's name comes stamped single-line from
-  // parseScopeValue and a worker's summary from parseReviewValue, so neither can break this
-  // line-structured summary. This sink previously flattened the name and NOT the summary — the exact
-  // shape of bug that call-site discipline produces, and the reason the rule moved to the boundary.
-  const lines = [`Reviewed ${reviewed.length} scope(s): ${reviewed.map(s => s.name).join(', ')}.`, ''];
-  for (const r of workerResults) {
-    lines.push(`**${r.name}** — ${r.summary || '(no summary)'}`);
-  }
+  // parseScopeValue and the scout's summary from parseReviewValue — which also refuses an empty one, so
+  // there is no absent-summary state for this sink to represent. Neither can break this line-structured
+  // summary. This sink previously flattened the name and NOT the summary — the exact shape of bug that
+  // call-site discipline produces, and the reason the rule moved to the boundary.
+  const lines = [scoutSummary, '', `Reviewed ${reviewed.length} scope(s): ${reviewed.map(s => s.name).join(', ')}.`];
   for (const [i, s] of sweeps.entries()) {
     // [FRAMING:representation] A curtailed sweep must never render as convergence: "added nothing
     // because it was killed" and "searched and found nothing" are different facts.
@@ -498,7 +503,6 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     startedAt == null ? null : now() - startedAt,
     startedAt == null || deadline == null ? null : deadline - startedAt,
   );
-  const initialResults = [];
   const allResults = [];
   const sweeps = [];
   const unreviewedScopes = [];
@@ -544,7 +548,6 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
           `The review's time budget expired before any scope completed — no review to deliver. ${BUDGET_REMEDY}`,
         );
       }
-      initialResults.push(...results);
     }
     allResults.push(...results);
     const merged = dedupeFindings([...findings, ...results.flatMap(r => r.findings)]);
@@ -559,7 +562,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   }
 
   return {
-    summary: composeSummary(scopes, initialResults, sweeps, { exhausted: budgetExhausted, unreviewedScopes }),
+    summary: composeSummary(context, scopes, sweeps, { exhausted: budgetExhausted, unreviewedScopes }),
     findings,
     // [LAW:dataflow-not-control-flow] Dependency assessments aggregate exactly like findings — a flatMap
     // over the workers plus one dedup — and with the SAME shape: no `|| []` fallback, because every worker
