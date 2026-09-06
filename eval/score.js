@@ -23,7 +23,7 @@
 // first scoring populates a content-keyed cache; every later scoring reads it, so the judge is never
 // re-consulted for a pair it has already ruled on. [LAW:one-source-of-truth]
 //
-//   DEEPSEEK_API_KEY=… node eval/score.js <case-out-dir> [--matcher llm|lexical] [--cases-dir <dir>]
+//   ANTHROPIC_API_KEY=… node eval/score.js <case-out-dir> [--matcher llm|lexical] [--cases-dir <dir>]
 //
 // [LAW:effects-at-boundaries] Module load is PURE: only stdlib. Every world-effect (fs, fetch, env) lives
 // inside main() or the boundary judge, so importing this file for the pure-helper tests performs no IO and
@@ -34,19 +34,29 @@ const path = require('path');
 const crypto = require('crypto');
 
 // The judge is the SCORER'S OWN measurement instrument, pinned independently of whatever engine a case
-// replayed on, so a score means the same thing across every case. The DeepSeek Anthropic-compatible
-// Messages endpoint + a cheap model; credential from the same env var the action uses. Kept local (not
-// imported from src/provider.js) because this is the instrument's config, a concern the scorer owns, not
-// the reviewed engine's. [LAW:decomposition]
-const JUDGE_BASE_URL = 'https://api.deepseek.com/anthropic';
-const JUDGE_MODEL = 'deepseek-v4-flash';
-// The single place DEEPSEEK_API_KEY is read for the 'llm' matcher's credential — main() below and
+// replayed on, so a score means the same thing across every case — and, critically, so a change to the
+// engine under test cannot move the ruler measuring it. Anthropic's own Messages API + a cheap DATED
+// model snapshot: a snapshot id, not a floating alias, because an alias that silently rolls to a new
+// model would re-point the instrument between a baseline freeze and the candidate compared against it.
+// Kept local (not imported from src/provider.js) because this is the instrument's config, a concern the
+// scorer owns, not the reviewed engine's. [LAW:decomposition]
+//
+// Was DeepSeek (deepseek-v4-flash) through 2026-08. Moved off it when that account went to a hard 402
+// and the provider left the engine's live set: a judge nobody can call is not an instrument, and a
+// baseline is worthless if its scores cannot be reproduced. [LAW:one-source-of-truth] The cache key
+// hashes JUDGE_MODEL (judgeCacheKey below), so this move invalidates every ruling made by the old judge
+// rather than silently mixing two judges' verdicts in one scorecard.
+const JUDGE_BASE_URL = 'https://api.anthropic.com';
+const JUDGE_MODEL = 'claude-haiku-4-5-20251001';
+// The single place ANTHROPIC_API_KEY is read for the 'llm' matcher's credential — main() below and
 // compare.js's pre-loop guard (checking "would scoring succeed" before any replay spend) both call this,
 // so the requirement can't drift into two independently-typed checks of the same env var.
-// [LAW:one-source-of-truth]
+// [LAW:one-source-of-truth] Deliberately NOT the engine's credential: an api-key judge stays callable
+// and identically-priced whichever provider a case pins, including a subscription one whose OAuth token
+// is valid for the CLI's own calls and nothing else.
 function requireLlmJudgeCredential() {
-  const apiKey = process.env.DEEPSEEK_API_KEY;
-  if (!apiKey) throw new Error('The llm matcher needs DEEPSEEK_API_KEY (or pass --matcher lexical for the offline fallback).');
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error('The llm matcher needs ANTHROPIC_API_KEY (or pass --matcher lexical for the offline fallback).');
   return apiKey;
 }
 // The exact matcher label a scorecard-summary.json's `matcher` field carries for a given --matcher kind —
@@ -77,11 +87,11 @@ const ANNOTATIONS = new Set(['must-find', 'nice-to-find', 'noise']);
 const USAGE = `Score a case's replay artifacts against its frozen expected inventory: must-find recall
 (the primary gate number), plus nice-to-find recall, noise count, and cost (secondary).
 
-Usage: DEEPSEEK_API_KEY=… node eval/score.js <case-out-dir> [options]
+Usage: ANTHROPIC_API_KEY=… node eval/score.js <case-out-dir> [options]
 
   <case-out-dir>       A case's output root under eval/out (e.g. eval/out/cc-candybar-150-transcript-perf).
                        Every run dir under it (a dir containing findings.json) is scored.
-  --matcher <kind>     Semantic matcher: 'llm' (default, DeepSeek judge + cache) or 'lexical' (offline,
+  --matcher <kind>     Semantic matcher: 'llm' (default, pinned Anthropic judge + cache) or 'lexical' (offline,
                        deterministic word-overlap — no network, no credential).
   --cases-dir <dir>    Where the frozen cases live (default: eval/cases). expected.json is read from
                        <cases-dir>/<case>/ (the case name comes from each run's meta.json).
@@ -90,7 +100,7 @@ Usage: DEEPSEEK_API_KEY=… node eval/score.js <case-out-dir> [options]
   --help               Show this help.
 
 Writes scorecard.json into each run dir and scorecard-summary.json at the case-out root, and prints a
-mean/min/max recall table across the runs. The 'llm' matcher reads the credential from DEEPSEEK_API_KEY.
+mean/min/max recall table across the runs. The 'llm' matcher reads the credential from ANTHROPIC_API_KEY.
 `;
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -485,8 +495,8 @@ function buildJudgePrompt(batch) {
   return header.join('\n') + '\n' + body.join('\n');
 }
 
-// The DeepSeek Anthropic-compatible endpoint leads its content with a `thinking` block, so the answer is
-// the LAST `text` block — never content[0]. [LAW:no-silent-failure] A missing text block is a loud failure.
+// Content blocks may precede the answer, so the answer is the LAST `text` block — never content[0].
+// [LAW:no-silent-failure] A missing text block is a loud failure.
 function extractText(envelope) {
   const blocks = Array.isArray(envelope.content) ? envelope.content : [];
   const texts = blocks.filter(b => b && b.type === 'text' && typeof b.text === 'string');
@@ -621,10 +631,10 @@ async function callJudge(doFetch, apiKey, model, batch) {
     body: JSON.stringify({
       model,
       max_tokens: 2048,
-      // Disable the model's own chain-of-thought: the judge must emit ONLY the JSON array. Left on, the
-      // reasoning-heavy flash model spends the whole token budget thinking and returns no text block at
-      // all (extractText then aborts loudly). The prompt already carries the discrimination rules, so the
-      // reasoning that matters is in the instruction, not a hidden scratchpad. [LAW:no-silent-failure]
+      // The judge must emit ONLY the JSON array. A model left free to think can spend the whole token
+      // budget on it and return no text block at all (extractText then aborts loudly); the discrimination
+      // rules live in the prompt, so the reasoning that matters is the instruction, not a hidden
+      // scratchpad. [LAW:no-silent-failure]
       thinking: { type: 'disabled' },
       messages: [{ role: 'user', content: buildJudgePrompt(batch) }],
     }),
@@ -649,16 +659,29 @@ async function callJudge(doFetch, apiKey, model, batch) {
 // main (effects)
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
 
-// A run dir is any directory under the case-out root that carries a findings.json. Sorted so the scorecard
-// summary lists runs deterministically. [LAW:no-silent-failure] An empty result is a loud error, not an
-// empty scorecard — a case-out dir with no runs means the runner never wrote anything to score.
-function findRunDirs(caseOutDir) {
-  if (!fs.existsSync(caseOutDir)) throw new Error(`Case-out dir not found: ${caseOutDir}. Run eval/run-case.js first.`);
-  const entries = fs.readdirSync(caseOutDir, { withFileTypes: true })
+// THE definition of a completed run: a directory under the case-out root that carries a findings.json.
+// A run dir that never got that far (the engine threw, the token walled) is absent from this list rather
+// than counted as an empty review — which is why a crashed replay leaves debris the scorer ignores instead
+// of a zero-finding run that would silently drag a baseline down. [LAW:no-silent-failure]
+// Sorted so the scorecard summary lists runs deterministically. Missing dir ⇒ no runs: an absence, not an
+// error, because the suite runner (freeze-suite.js) censuses cases that have not been replayed yet.
+// [LAW:one-source-of-truth] Exported, so "what counts as a run" is stated once and the planner that
+// decides how many more to run cannot drift from the scorer that reduces them.
+function listRunDirs(caseOutDir) {
+  if (!fs.existsSync(caseOutDir)) return [];
+  return fs.readdirSync(caseOutDir, { withFileTypes: true })
     .filter(e => e.isDirectory())
     .map(e => path.join(caseOutDir, e.name))
     .filter(d => fs.existsSync(path.join(d, 'findings.json')))
     .sort();
+}
+
+// [LAW:parse-dont-validate] The scorer's checkpoint over the same census: what it returns is a run list
+// PROVEN non-empty, so nothing downstream re-checks. An empty result is a loud error here, not an empty
+// scorecard — a case-out dir with no runs means the runner never wrote anything to score.
+function findRunDirs(caseOutDir) {
+  if (!fs.existsSync(caseOutDir)) throw new Error(`Case-out dir not found: ${caseOutDir}. Run eval/run-case.js first.`);
+  const entries = listRunDirs(caseOutDir);
   if (entries.length === 0) throw new Error(`No run dirs (dirs with findings.json) under ${caseOutDir}. Run eval/run-case.js first.`);
   return entries;
 }
@@ -732,7 +755,10 @@ module.exports = {
   normalizeBody, pairCandidates, computeMetrics, scoreRun, aggregateRuns, renderTable,
   makeLexicalJudge, jaccard, wordSet,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, callJudge, loadCache,
-  // The single place DEEPSEEK_API_KEY is read for the 'llm' matcher — compare.js's pre-loop guard calls
+  // The one definition of "a completed run" — the suite runner's census and this scorer's reduction read
+  // the same predicate, so neither can drift into counting a crashed replay. [LAW:one-source-of-truth]
+  listRunDirs,
+  // The single place ANTHROPIC_API_KEY is read for the 'llm' matcher — compare.js's pre-loop guard calls
   // this to check "would scoring succeed" before any replay spend, without a second copy of the env var
   // name. [LAW:one-source-of-truth]
   requireLlmJudgeCredential,

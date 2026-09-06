@@ -2,7 +2,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert');
 
-const { synthesizeProviderConfig, PROVIDER_NAMES } = require('../src/provider');
+const { synthesizeProviderConfig, PROVIDER_NAMES, PROVIDERS, PRESETS, assertProvidersSafe } = require('../src/provider');
 
 // [LAW:verifiable-goals] AC: in simple mode the PROVIDER value alone selects the engine;
 // credential presence never steers it; the selected provider's missing key fails loud;
@@ -329,10 +329,180 @@ describe('PROVIDERS rows agree with the real adapter capabilities', () => {
     // they did not. [LAW:no-silent-failure]
     test(`'${name}': reads a base-URL input only if its preset allows an override`, () => {
       const preset = PRESETS[spec.preset];
-      const reads = spec.fields({ openaiBaseUrl: 'X', zaiBaseUrl: 'X', deepseekBaseUrl: 'X' }).baseUrl;
       if ('baseUrl' in preset) {
-        assert.equal(reads, undefined, `pinned preset '${spec.preset}' must not read a base-URL input`);
+        assert.ok(
+          !('baseUrl' in spec.inputKeys),
+          `pinned preset '${spec.preset}' must not declare a base-URL input key`,
+        );
       }
     });
   }
+});
+
+// assertProvidersSafe carries a security-critical routing invariant: `inputKeys.credential` names the
+// input bag key a row's credential is read out of, so a row without one routes a request to a pinned
+// host with a credential nothing can supply. Until this block the throw had no test — test/config.test.js
+// exercises only the sibling unknown-preset arm — which left the guard's own failure path unexecuted.
+//
+// Asserted against the contract (refused at load, with a message naming the offending row), not against
+// how the check is spelled. [LAW:behavior-not-structure] [LAW:verifiable-goals]
+describe('assertProvidersSafe — a row must name its credential input, its engine, and its default model', () => {
+  const rowsMissingCredential = {
+    'inputKeys absent entirely': { preset: 'claude-subscription' },
+    'inputKeys present but credential absent': { preset: 'claude-subscription', inputKeys: {} },
+    'credential set to the empty string': { preset: 'claude-subscription', inputKeys: { credential: '' } },
+    'credential set to a non-string': { preset: 'claude-subscription', inputKeys: { credential: 42 } },
+  };
+
+  for (const [shape, spec] of Object.entries(rowsMissingCredential)) {
+    test(`refused at load: ${shape}`, () => {
+      assert.throws(
+        () => assertProvidersSafe({ unroutable: spec }, PRESETS),
+        { message: /Provider 'unroutable': 'inputKeys\.credential' must name the action input/ },
+      );
+    });
+  }
+
+  // `engine` and `defaultModel` are checked at the same border and for the same reason. Both reach
+  // consumers through interpolation — eval/freeze-case.sh stamps `${row.engine}` into the provenance
+  // string of every case it freezes — where a missing field arrives as the literal text "undefined",
+  // passes every non-empty check downstream, and is written into a committed case.json as the name of
+  // the engine that produced it. Refusing the row here is what makes that string unrepresentable, so
+  // no consumer has to check for the word "undefined". [LAW:parse-dont-validate]
+  const rowsMissingProvenance = {
+    'engine absent': { preset: 'claude-subscription', credentialInput: 'SOME_TOKEN', inputKeys: { credential: 'T' }, defaultModel: 'm' },
+    'engine empty': { preset: 'claude-subscription', credentialInput: 'SOME_TOKEN', inputKeys: { credential: 'T' }, engine: '', defaultModel: 'm' },
+    'engine non-string': { preset: 'claude-subscription', credentialInput: 'SOME_TOKEN', inputKeys: { credential: 'T' }, engine: 7, defaultModel: 'm' },
+    'defaultModel absent': { preset: 'claude-subscription', credentialInput: 'SOME_TOKEN', inputKeys: { credential: 'T' }, engine: 'claude-code' },
+    'defaultModel empty': { preset: 'claude-subscription', credentialInput: 'SOME_TOKEN', inputKeys: { credential: 'T' }, engine: 'claude-code', defaultModel: '' },
+    'defaultModel non-string': { preset: 'claude-subscription', credentialInput: 'SOME_TOKEN', inputKeys: { credential: 'T' }, engine: 'claude-code', defaultModel: 7 },
+  };
+  for (const [shape, spec] of Object.entries(rowsMissingProvenance)) {
+    test(`refused at load: ${shape}`, () => {
+      assert.throws(
+        () => assertProvidersSafe({ unstampable: spec }, PRESETS),
+        { message: /Provider 'unstampable': '(engine|defaultModel)' must be a non-empty string/ },
+      );
+    });
+  }
+
+  // `inputKeys.credential` names the input-bag KEY; `credentialInput` names the ENV VAR the credential is
+  // actually read from (`env[spec.credentialInput]`). Validating the first and not the second left a row
+  // whose credential can never be found failing later as an empty-key env miss, reported as "credential
+  // not set" with the real cause — a malformed row — named nowhere. [LAW:no-silent-failure]
+  const rowsMissingCredentialInput = {
+    'credentialInput absent': { preset: 'claude-subscription', engine: 'claude-code', defaultModel: 'm', inputKeys: { credential: 'T' } },
+    'credentialInput empty': { preset: 'claude-subscription', engine: 'claude-code', defaultModel: 'm', credentialInput: '', inputKeys: { credential: 'T' } },
+    'credentialInput non-string': { preset: 'claude-subscription', engine: 'claude-code', defaultModel: 'm', credentialInput: 7, inputKeys: { credential: 'T' } },
+  };
+  for (const [shape, spec] of Object.entries(rowsMissingCredentialInput)) {
+    test(`refused at load: ${shape}`, () => {
+      assert.throws(
+        () => assertProvidersSafe({ unreadable: spec }, PRESETS),
+        { message: /Provider 'unreadable': 'credentialInput' must name the environment variable/ },
+      );
+    });
+  }
+
+  test('a complete row passes, and is frozen on the way out', () => {
+    const table = { fine: { preset: 'claude-subscription', engine: 'claude-code', defaultModel: 'm', credentialInput: 'SOME_TOKEN', inputKeys: { credential: 'someToken' } } };
+    const frozen = assertProvidersSafe(table, PRESETS);
+    assert.ok(Object.isFrozen(frozen) && Object.isFrozen(frozen.fine) && Object.isFrozen(frozen.fine.inputKeys));
+  });
+
+  // The shipped table is the one that actually routes credentials, so it is the one that must hold.
+  test('every shipped provider row names its credential input, its engine, and its default model', () => {
+    for (const [name, spec] of Object.entries(PROVIDERS)) {
+      assert.equal(typeof spec.inputKeys.credential, 'string', `provider row '${name}'`);
+      assert.notEqual(spec.inputKeys.credential, '', `provider row '${name}'`);
+      for (const field of ['engine', 'defaultModel', 'credentialInput']) {
+        assert.equal(typeof spec[field], 'string', `provider row '${name}'.${field}`);
+        assert.notEqual(spec[field], '', `provider row '${name}'.${field}`);
+      }
+    }
+  });
+});
+
+// [LAW:verifiable-goals] Every field a row DECLARES must arrive at its destination, and every field it
+// does NOT declare must arrive nowhere. Until now only `credential` and `model` were ever carried
+// end-to-end, and only across claude-subscription's two-field row — so a scrambled
+// `Object.entries(spec.inputKeys)` mapping was caught for the first two fields of one provider and for
+// nothing else. The table drives both halves, so the row added tomorrow is covered the day it lands
+// rather than the day someone notices its third field never arrived.
+describe('resolveProviderConfig threads exactly the fields a provider row declares', () => {
+  const { resolveProviderConfig } = require('../src/provider');
+  const registry = require('../src/engine/registry');
+  // Where each optional field lands, and a value legal for it. `reasoning` is validated against the
+  // engine's own capability list, so its value is read from there rather than guessed per provider.
+  const FIELD = {
+    reasoning: {
+      value: spec => registry.get(spec.engine).capabilities.reasoningEfforts[0],
+      lands: config => config.reasoning,
+    },
+    systemPrompt: { value: () => 'pinned-system-prompt', lands: config => config.systemPrompt },
+    baseUrl: { value: () => 'http://gateway.example/v1', lands: config => config.endpoint.baseUrl },
+  };
+
+  for (const [name, spec] of Object.entries(PROVIDERS)) {
+    const declared = Object.keys(spec.inputKeys).filter(f => f in FIELD);
+
+    for (const field of declared) {
+      test(`'${name}' declares '${field}', so a pinned '${field}' reaches the config`, () => {
+        const value = FIELD[field].value(spec);
+        const config = resolveProviderConfig({
+          provider: name, [field]: value, env: { [spec.credentialInput]: 'test-credential' },
+        });
+        assert.strictEqual(FIELD[field].lands(config), value);
+      });
+    }
+
+    for (const field of Object.keys(FIELD).filter(f => !declared.includes(f))) {
+      test(`'${name}' declares no '${field}' key, so a supplied '${field}' reaches nothing`, () => {
+        // The other half of the enumeration. claude-subscription's pinned host is the case that matters:
+        // a baseUrl it never declared must not become the endpoint a credential is sent to, whatever the
+        // caller passes. [LAW:single-enforcer]
+        const config = resolveProviderConfig({
+          provider: name, [field]: FIELD[field].value(spec), env: { [spec.credentialInput]: 'test-credential' },
+        });
+        assert.notStrictEqual(FIELD[field].lands(config), FIELD[field].value(spec));
+      });
+    }
+  }
+
+  // `model` deliberately stays OUT of FIELD, and the reason is the whole value of this test. The sweep
+  // above reads `declared` from the very table it is checking, so deleting a row's `model` key fails
+  // nothing: the row silently crosses from the accept half to the reject half, where the fallback to
+  // `defaultModel` makes the reject assertion pass — same test count, all green, mapping gone. A map that
+  // is its own territory cannot show drift. [LAW:one-source-of-truth]
+  // Taking a model override is a contract over the WHOLE table rather than a field a row may or may not
+  // declare, so it is asserted unconditionally, from outside `inputKeys` — which is what makes a dropped
+  // mapping visible. [LAW:behavior-not-structure]
+  for (const [name, spec] of Object.entries(PROVIDERS)) {
+    test(`'${name}' threads a pinned model override, whatever its row declares`, () => {
+      const config = resolveProviderConfig({
+        provider: name, model: 'test-model-override', env: { [spec.credentialInput]: 'test-credential' },
+      });
+      assert.strictEqual(config.model, 'test-model-override');
+    });
+  }
+});
+
+// The NO_PROVIDER fallback is reachable from two real non-Action callers — a typo'd `provider` in a
+// case.json through eval/run-case.js, and a `--provider` typo through scripts/local-review.js — and it
+// exists so an unknown name reaches synthesizeProviderConfig's own "Unknown PROVIDER" error instead of
+// crashing on `Object.entries(undefined)`. That is a contract about which error the operator sees, and
+// nothing exercised it. [LAW:verifiable-goals]
+describe('resolveProviderConfig hands an unknown provider to the one enforcer that rejects it', () => {
+  const { resolveProviderConfig } = require('../src/provider');
+
+  test('a typo resolves to the Unknown PROVIDER error, naming every valid value', () => {
+    assert.throws(
+      () => resolveProviderConfig({ provider: 'claude-subscripton', env: {} }),
+      err => /Unknown PROVIDER "claude-subscripton"/.test(err.message) && PROVIDER_NAMES.every(n => err.message.includes(n)),
+    );
+  });
+
+  test('an absent provider fails the same way rather than throwing on an undefined row', () => {
+    assert.throws(() => resolveProviderConfig({ env: {} }), /Unknown PROVIDER/);
+  });
 });

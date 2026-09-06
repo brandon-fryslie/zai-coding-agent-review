@@ -100,14 +100,18 @@ function parseArgs(argv) {
   // future pinned provider is covered the day its row lands. The require is lazy to keep module load
   // free of the engine stack (see the header); parseArgs stays pure — a require performs no IO here.
   if (opts.baseUrl) {
-    const { PROVIDERS, PRESETS, PROVIDER_ALIASES } = require('../src/provider');
+    const { PRESETS, resolveProviderName, providerSpec } = require('../src/provider');
     // Resolve the alias FIRST. The default provider is 'auto', which forwards to a concrete row — ask
     // before resolving and the common no-`--provider` invocation slips past this guard entirely.
+    // [LAW:one-source-of-truth] Through providerSpec, not a `PROVIDERS[name]` lookup beside a
+    // hand-written alias step: that spelling is the second, alias-blind copy src/provider.js's own
+    // resolveProviderName/providerSpec exist to delete, and it gave the same answer here only for as
+    // long as PROVIDER_ALIASES has exactly one entry.
     const requested = opts.provider;
-    const provider = PROVIDER_ALIASES[requested] || requested;
+    const provider = resolveProviderName(requested);
     // An unknown provider is not this guard's business: synthesizeProviderConfig rejects it loudly,
     // naming every valid value. Duplicating that here would be a second enforcer of one rule.
-    const spec = PROVIDERS[provider];
+    const spec = providerSpec(requested);
     const pinned = spec && PRESETS[spec.preset].baseUrl;
     if (pinned) {
       const label = requested === provider ? `'${provider}'` : `'${requested}' (→ '${provider}')`;
@@ -208,13 +212,13 @@ function resolveConfigChain(opts) {
     const { loadConfig } = require('../src/config');
     return loadConfig(path.resolve(opts.config), opts.use, process.env);
   }
-  const { synthesizeProviderConfig } = require('../src/provider');
-  return [synthesizeProviderConfig({
-    provider: opts.provider,
-    openaiApiKey: process.env.OPENAI_API_KEY, openaiModel: opts.model, openaiBaseUrl: opts.baseUrl,
-    zaiApiKey: process.env.ZAI_API_KEY, zaiModel: opts.model, zaiBaseUrl: opts.baseUrl,
-    deepseekApiKey: process.env.DEEPSEEK_API_KEY, deepseekModel: opts.model, deepseekBaseUrl: opts.baseUrl,
-    claudeCodeOauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN, claudeModel: opts.model,
+  // [LAW:one-source-of-truth] The per-provider input-key names are NOT restated here. This used to
+  // spell out every provider's credential/model/base-url key by hand, and eval/run-case.js carried a
+  // second copy of the same list that silently fell behind. Both now go through the one seam that
+  // owns the mapping, so a new provider row reaches both the day it lands.
+  const { resolveProviderConfig } = require('../src/provider');
+  return [resolveProviderConfig({
+    provider: opts.provider, model: opts.model, baseUrl: opts.baseUrl, env: process.env,
   })];
 }
 

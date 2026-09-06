@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const {
   parseArgs, parseBand, parseCaseSummary, parseCaseEngine, parseFraction,
   sameEngine, pooledFloor, buildBaseline, parseBaseline, evaluateGate, renderBaselineMarkdown, DEGRADATION_RULE,
+  BASELINE_SCHEMA,
 } = require('../eval/baseline');
 
 // [LAW:verifiable-goals] AC: baseline.js reduces the golden cases' scored summaries into one frozen
@@ -289,8 +290,12 @@ test('parseBaseline round-trips a frozen baseline and rejects a foreign one', ()
   assert.ok(typeof loaded.pooledInventoryMustFind.gateFloor === 'number');
   // A non-v2 schema (including a pre-inventory v1 baseline), a missing sha, a missing pooled gate, or an
   // empty case set is refused.
-  assert.throws(() => parseBaseline('{}', 'x'), /not a v2 baseline/);
-  assert.throws(() => parseBaseline(JSON.stringify({ ...frozen, schema: 'copirate-eval-baseline/v1' }), 'x'), /not a v2 baseline/);
+  // Derived from the constant, not the current spelling: an assertion pinned to "v2" goes red on the
+  // schema bump this constant exists to make safe, which is the test asserting a message's wording
+  // rather than its contract. [LAW:behavior-not-structure] [LAW:one-source-of-truth]
+  const wrongSchema = new RegExp(`is not schema ${BASELINE_SCHEMA.replace(/[/]/g, '\\/')}`);
+  assert.throws(() => parseBaseline('{}', 'x'), wrongSchema);
+  assert.throws(() => parseBaseline(JSON.stringify({ ...frozen, schema: 'copirate-eval-baseline/v1' }), 'x'), wrongSchema);
   assert.throws(() => parseBaseline(JSON.stringify({ ...frozen, mainSha: '' }), 'x'), /no 'mainSha'/);
   assert.throws(() => parseBaseline(JSON.stringify({ ...frozen, cases: [] }), 'x'), /no 'cases'/);
   assert.throws(() => parseBaseline(JSON.stringify({ ...frozen, suite: { ...frozen.suite, pooledInventoryMustFind: undefined } }), 'x'), /no 'suite.pooledInventoryMustFind'/);

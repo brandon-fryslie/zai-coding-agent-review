@@ -66,9 +66,19 @@ eval/cases/<case-name>/
 | `excludePatterns` | the source workflow's `EXCLUDE_PATTERNS` (so the replay matches conditions)|
 | `producedBy`      | provenance: the config that originally produced the golden review          |
 
-The engine is pinned explicitly (currently `deepseek` / `deepseek-v4-pro`, the action's
-default and the config that produced every golden review) so a later change to the
-default cannot silently move the baseline. `[LAW:no-silent-failure]`
+The engine is pinned explicitly (currently `claude-subscription` / `claude-sonnet-5`,
+what `PROVIDER=auto` resolves to and therefore the engine production runs) so a later
+change to the default cannot silently move the baseline. `[LAW:no-silent-failure]`
+`freeze-case.sh` derives the pin it writes from `src/provider.js` rather than carrying a
+copy — a hardcoded pair is what left every case pinned to `deepseek` after 1.42.0
+retargeted `auto`, which is how the harness came to be unable to replay on the provider
+it was measuring.
+
+`producedBy` is a *different* fact from `engine`, and they are not kept in step: it
+records the config that produced the historical golden review this case was curated
+from, which for every case here is `auto→deepseek / claude-code / deepseek-v4-pro`. The
+`engine` pin is what a replay runs on **today**. They coincided once; conflating them
+again would falsify the provenance.
 
 ### `expected.json`
 
@@ -173,15 +183,17 @@ not a second review implementation**: a measured difference between two engine v
 is attributable to the code change under test, never to a replay that drifted.
 
 ```bash
-DEEPSEEK_API_KEY=… node eval/run-case.js eval/cases/<case-name> -n 3
+CLAUDE_CODE_OAUTH_TOKEN=… node eval/run-case.js eval/cases/<case-name> -n 3
 # options: -n/--repeats <N> (default 1), --out <dir> (default eval/out), --workers <N> (default 4)
 ```
 
 It extracts `repo.tar.gz` to a temp dir (that becomes `REVIEWED_REPO_ROOT`), feeds
 `change.diff` through the real diff seam, and drives the engine on the case's **pinned**
 provider/model. The credential is read from the same env var the action uses
-(`DEEPSEEK_API_KEY` / `ZAI_API_KEY` / `OPENAI_API_KEY`, selected by `case.json`'s
-provider). The engine cannot be overridden on the command line — a replay on a different
+(`CLAUDE_CODE_OAUTH_TOKEN` / `DEEPSEEK_API_KEY` / `ZAI_API_KEY` / `OPENAI_API_KEY`,
+selected by `case.json`'s provider) — and that mapping is `src/provider.js`'s own, read
+through `resolveProviderConfig`, not a list this harness keeps. The engine cannot be
+overridden on the command line — a replay on a different
 model than the pin is **refused loudly**, since it would corrupt any baseline comparison.
 It also refuses loudly on a missing credential or a missing/corrupt `repo.tar.gz`.
 
@@ -225,7 +237,7 @@ never re-derives the expected set; it only *matches* the frozen `expected.json` 
 a run's `findings.json` and reduces the match to metrics.
 
 ```bash
-DEEPSEEK_API_KEY=… node eval/score.js eval/out/<case-name> [options]
+ANTHROPIC_API_KEY=… node eval/score.js eval/out/<case-name> [options]
 # options: --matcher llm|lexical (default llm), --cases-dir <dir> (default eval/cases),
 #          --cache <file> (default eval/out/.judge-cache.json)
 ```
@@ -238,8 +250,10 @@ The match is **two stages, cheap first**:
    `MAX_ANCHOR_SNAP_DISTANCE` is the precedent).
 2. **Semantic identity** — does the produced body describe the **same defect** as the
    expected body? This is the one judgment that isn't lexical, so it is the one
-   **effect**: an LLM judge (a cheap pinned model, `deepseek-v4-flash`, over the same
-   `DEEPSEEK_API_KEY`) rules match / no-match on each candidate pair. The scoring core
+   **effect**: an LLM judge (a cheap pinned model snapshot, `claude-haiku-4-5-20251001`,
+   over its own `ANTHROPIC_API_KEY`) rules match / no-match on each candidate pair. The
+   judge's credential is deliberately **not** the engine's: it is the ruler, and a ruler
+   that moved with the thing it measures would measure nothing. The scoring core
    never knows which judge it holds — the offline `--matcher lexical` (deterministic
    word-overlap) is the same `judge(pairs) → decisions` shape and needs no credential.
 
@@ -271,7 +285,7 @@ the version.
 (`copirate-eval-harness-2fk.5`) measures a candidate engine change against. It is an
 instrument, not a third scorer: it never re-runs the engine and never re-scores. It only
 *collects* the per-case `scorecard-summary.json` bands `score.js` already wrote, tags them
-with the exact `main` SHA + pinned engine that produced them, derives the suite's pooled gate
+with the exact commit whose engine tree produced them + the pinned engine, derives the suite's pooled gate
 floor + each case's diagnostic floor and the suite cost, and writes the result under
 `eval/baseline/<date>-<short-sha>/`.
 
@@ -279,12 +293,48 @@ Full-suite workflow (run → score → freeze):
 
 ```bash
 # 1. Replay every golden case N times (N=5 for the current baseline; rationale below).
-for c in eval/cases/*/; do DEEPSEEK_API_KEY=… node eval/run-case.js "$c" -n 5; done
+#    Per-replay logs land in the SIBLING eval/out/freeze-<sha>-logs/, so every child of the out
+#    root below is a case run dir and the glob in step 2 needs no exclusions.
+CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/freeze-<sha>
 # 2. Score each case (writes scorecard-summary.json per case).
-for c in eval/out/*/; do DEEPSEEK_API_KEY=… node eval/score.js "$c"; done
+for c in eval/out/freeze-<sha>/*/; do ANTHROPIC_API_KEY=… node eval/score.js "$c"; done
 # 3. Freeze the scored suite into a committed baseline (baseline.json + baseline.md).
-node eval/baseline.js
+node eval/baseline.js --out-dir eval/out/freeze-<sha>
 ```
+
+Step 1 is `eval/freeze-suite.js` and not a shell loop over `run-case.js` because a suite is
+~20 replays over several hours against a subscription that walls for hours at a time, and the
+loop had no way to survive that. The suite runner adds exactly four things and reimplements
+nothing — every job is still `run-case.js -n 1` in its own process:
+
+- **A census, so it resumes.** A completed run is a dir carrying `findings.json` (the
+  scorer's own definition, exported from `score.js` so the two cannot disagree). The runner
+  counts what is already there and plans only the deficit, so re-running the command after a
+  wall picks up where it stopped — there is no resume flag because there is no resume mode.
+- **Level-filling order.** A job exists for case *c* at level *r* iff *c* has fewer than *r*
+  completed runs, so every case is deepened before any one of them is. An interruption leaves
+  an even suite (a valid smaller N — `baseline.js` demands one common N) instead of 5/5/5/0,
+  which freezes nothing. The closing report names the deepest freezable N.
+- **A deadline per replay** (`--job-timeout`, default 120 minutes). A throttled credential does not
+  reliably *fail* — the engine CLI can sit in silent retry — and one lane waiting on it holds the
+  queue forever. On expiry the replay's whole process group is killed (the engine's workers are
+  grandchildren; signalling only the direct child would orphan them still burning quota) and the job
+  is reported as `TIMED OUT`, never as an ordinary non-zero exit.
+- **One lane per credential.** `--credentials VAR1,VAR2,…` names environment variables
+  holding one credential each and replays on all of them concurrently; each lane is
+  sequential. A lane takes the first queued job it has not already attempted, and a failure
+  requeues that job to the back rather than ending the lane — so a walled credential crosses
+  the whole queue in seconds, putting every job back for a healthy lane, while one bad job
+  costs a single attempt instead of abandoning the rest of the suite. A lane returns only when
+  every job left in the queue is one it has already tried. Which env var the credential travels
+  under is derived from `src/provider.js`, not written here.
+  An interrupt (Ctrl-C) is forwarded to every replay still running before the runner exits;
+  replays run in their own process groups for the deadline's sake, which also puts them out of
+  reach of the terminal's own signal.
+
+The runner exits non-zero whenever any case is still short of the target, and prints every
+attempt with its exit code, wall clock, and log path — the crashed 2026-08-30 freeze left two
+empty run dirs that nobody noticed for five days, which is the failure this makes impossible.
 
 `baseline.js` refuses to freeze an inconsistent suite loudly: every case must have been
 scored over the same N, with the same matcher, on the same pinned engine, and every frozen
@@ -337,18 +387,41 @@ margin, so the floor is a meaningful line rather than noise. The per-case bands 
 as **diagnostics** — they localize *which* case moved a pooled regression; they do not gate
 on their own.
 
-### The current baseline (v2, inventory-gated)
+### The current baseline (live engine, inventory-gated)
 
 The gate reference is
-[`eval/baseline/2026-08-10-787df41/`](baseline/2026-08-10-787df41/baseline.md) — the engine
-of `main` at `787df41`, `deepseek-v4-pro`, N=5, schema v2. Headline: **pooled inventory
-must-find recall 22 % (22 of 100 opportunities), gate floor 14 %.** The frozen-round pooled
-rate measured 21 % (16/75) — statistically consistent with the v1 baseline's 19 % on the same
-engine, so the instrument is stable; the inventory gate simply measures against the fuller
-ground truth (100 opportunities vs 75). A full suite run still costs ≈ $0.68; the whole N=5
-baseline cost $3.41. The headline result carries over: the engine surfaces roughly **one in
-five** of the pooled inventory's must-finds in a single round — that is the number the recall
-epic (`zai-recall-upr`) exists to raise, and the floor the efficiency work must not sink.
+[`eval/baseline/2026-09-06-ebccbd4/`](baseline/2026-09-06-ebccbd4/baseline.md) — the engine
+tree at `ebccbd4`, `claude-subscription` / `claude-sonnet-5`, N=5, schema v2. Headline:
+**pooled inventory must-find recall 37 % (37 of 100 opportunities), gate floor 28 %.** The
+frozen-round pooled rate measured 35 % (26/75).
+
+**Read the jump from 22 % to 37 % as an ENGINE change, not a recall win.** No prompt moved
+between the two freezes. `PROVIDER: auto` was retargeted from `deepseek-v4-pro` to
+`claude-sonnet-5` in 1.42.0, and this is the first measurement of the engine production
+actually runs. The recall epic (`zai-recall-upr`) has still shipped no lever — its work is
+simply now measured against 37 % instead of 22 %.
+
+**Provenance: the SHA is deliberately not a `main` commit.** `ebccbd4` is a branch commit.
+This repo squash-merges, so the tree that produced these runs never lands on `main` under its
+own SHA — naming a `main` commit would name a tree that produced none of these numbers. The
+freeze names the engine tree instead. Only the `mainSha` field name still carries the old
+assumption; `compare.js` ranks baselines by which commit last touched `baseline.json`, never
+by reachability, so nothing mechanical depends on it.
+
+**Cost basis: subscription quota, not dollars.** No run reports a cost, so `baseline.js`
+records `costPerFullRunUsd: null` with `uncostedRuns: 20` rather than passing a partial sum
+off as a total. The CLI's own meter is notional here — one *failed* `links-317` replay
+reported $4.01 that was never billed. The real currency is wall clock and quota: ~13–27 min
+per replay, ~4.5 h for the suite across three subscription lanes, and the daily wall
+(midnight America/Denver) reached on all three accounts before the last replay landed.
+
+### Superseded: the deepseek baselines
+
+[`eval/baseline/2026-08-10-787df41/`](baseline/2026-08-10-787df41/baseline.md) — `main` at
+`787df41`, `deepseek-v4-pro`, N=5, schema v2. **Pooled inventory must-find recall 22 % (22 of
+100), gate floor 14 %**; frozen-round pooled 21 % (16/75). A full suite run cost ≈ $0.68; the
+whole N=5 baseline $3.41. Kept as history only: the provider was retired (account at 402) and
+`PROVIDER: auto` no longer resolves to it, so it can gate nothing.
 
 ### The first baseline, and the variance that shaped the rule
 
@@ -356,7 +429,7 @@ The first frozen baseline is
 [`eval/baseline/2026-08-01-dc87ee0/`](baseline/2026-08-01-dc87ee0/baseline.md) — `main` at
 `dc87ee0`, engine `deepseek-v4-pro`, N=5, **schema v1** (pre-inventory: its ground truth was
 each case's frozen round only, and its gate metric the frozen-round pooled rate — kept as
-history; the current v2 baseline supersedes it as the gate reference). Headline: **pooled
+history; later baselines supersede it as the gate reference). Headline: **pooled
 must-find recall 19 % (14 of 75 opportunities), gate floor 10 %.** A full suite run (all four
 cases once) costs ≈ $0.70; the whole N=5 baseline cost **$3.48**.
 
@@ -385,9 +458,10 @@ take ~30+ repeats per case (~$20 and hours) — not worth it. So the harness gat
 pooled suite rate, uses the per-case bands only to localize a regression, and **N=5 is the
 standing baseline depth.**
 
-The deeper result is the epic's headline, and it is not a defect in the harness: current
-must-find recall is **~19 %** — the engine reproduces roughly one in five of the golden
-set's hardest findings. The instrument is faithful (the LLM judge agreed with hand-matching
+The deeper result is the epic's headline, and it is not a defect in the harness: pooled
+inventory must-find recall is **37 %** on the live engine — the engine reproduces roughly one
+in three of the golden set's hardest findings in a single round (it was ~19–22 % on the
+retired deepseek engine). The instrument is faithful (the LLM judge agreed with hand-matching
 11/11 during `copirate-eval-harness-2fk.3`); the low number is the truth it was built to
 measure. It is the floor the efficiency epic (`copirate-efficiency-235`) must not push
 lower, and the bar the quality work must raise.
@@ -400,7 +474,7 @@ change degrade finding quality?"** answered as a measured verdict, not a guess. 
 is simply the code as checked out; no build or publish) against a frozen baseline.
 
 ```bash
-DEEPSEEK_API_KEY=… node eval/compare.js
+ANTHROPIC_API_KEY=… CLAUDE_CODE_OAUTH_TOKEN=… node eval/compare.js
 # options: --baseline <dir|baseline.json> (default: newest under eval/baseline/ by COMMIT-GRAPH order,
 #            not directory-name order — an uncommitted baseline.json always outranks a committed one;
 #            refused if the newest can't be determined unambiguously, e.g. a shallow git clone with
@@ -414,9 +488,12 @@ DEEPSEEK_API_KEY=… node eval/compare.js
 #            mutually exclusive with --out)
 ```
 
-DEEPSEEK_API_KEY is required **unconditionally** for the default `--matcher llm` (the judge's own
+ANTHROPIC_API_KEY is required **unconditionally** for the default `--matcher llm` (the judge's own
 credential), regardless of which provider the baseline's pinned engine itself uses — pass
-`--matcher lexical` to avoid it.
+`--matcher lexical` to avoid it. It is a *second* credential alongside the engine's
+(`CLAUDE_CODE_OAUTH_TOKEN` for the current pins), on purpose: a subscription OAuth token authenticates
+the review CLI, not the raw Messages call the judge makes, and a judge sharing the engine's credential
+would be a ruler that moves with what it measures.
 
 **A candidate is just another suite.** `compare.js` reimplements no pooling, no scoring, and no
 gate predicate — it:
@@ -458,8 +535,13 @@ reviewers look: the verdict table lands in the run's **Step Summary**, `DEGRADED
 is uploaded as the `eval-candidate` artifact even on a red or aborted run.
 
 Two triggers, both deliberate spends. `compare.js` prints the authoritative cost estimate (the
-baseline's recorded $/full-run × N) before spending; as orientation, the current N=5 × 4-case
-baseline puts a run at a few dollars and around an hour.
+baseline's recorded $/full-run × N) before spending. For the current N=5 × 4-case baseline that
+estimate is **no dollar figure at all** — the pinned engine bills against subscription quota, so the
+baseline records `costPerFullRunUsd: null`. The spend is quota and wall clock: `compare.js` replays
+all 20 runs serially on one credential at 13–27 min each, so a full gate run is **4–9 hours**. That
+does not fit in a GitHub-hosted job (6-hour ceiling), so a CI gate run can be killed before it
+reaches a verdict — see the `timeout-minutes` comment in `.github/workflows/eval.yml`. Read a
+timed-out gate as *not measured*, never as *not degraded*.
 
 - **On demand**: `gh workflow run eval.yml` (optionally `--ref <branch>`) — pressing the button is
   the spend approval. The candidate is that ref's checkout.
@@ -471,12 +553,12 @@ baseline puts a run at a few dollars and around an hour.
 
 The workflow checks out with `fetch-depth: 0` because the no-`--baseline` newest-pick ranks
 committed baselines by commit-graph order, which a shallow clone collapses to a refused tie. It
-forwards every credential a golden case's pinned provider can use (`DEEPSEEK_API_KEY`,
-`ZAI_API_KEY`, `OPENAI_API_KEY` — the set `run-case.js` wires); the cases' pinned engine selects
-which one is read, so re-freezing the baseline onto another of these providers changes no workflow
-line — but `DEEPSEEK_API_KEY` stays required regardless of the pins: the default `llm` matcher's
-judge reads it unconditionally (`score.js`), and the current baseline's matcher is
-`llm/deepseek-v4-flash`. Runs share one concurrency group — a second trigger
+forwards every credential a golden case's pinned provider can use (`CLAUDE_CODE_OAUTH_TOKEN`,
+`DEEPSEEK_API_KEY`, `ZAI_API_KEY`, `OPENAI_API_KEY` — the set `src/provider.js` declares); the cases'
+pinned engine selects which one is read, so re-freezing the baseline onto another of these providers
+changes no workflow line — but `ANTHROPIC_API_KEY` stays required regardless of the pins: the default
+`llm` matcher's judge reads it unconditionally (`score.js`), and the current baseline's matcher is
+`llm/claude-haiku-4-5-20251001`. Runs share one concurrency group — a second trigger
 queues rather than interleaving spend.
 
 ### The gate's own validation (the sabotage test)
@@ -500,10 +582,16 @@ Like the rest of `eval/`, `compare.js` is dev-only tooling and does **not** bump
    any miss (`[LAW:no-silent-failure]`):
 
    ```bash
-   eval/freeze-case.sh <case-name> <owner/repo> <pr> <review-id> [exclude-patterns]
+   eval/freeze-case.sh <case-name> <owner/repo> <pr> <review-id> [exclude-patterns] [produced-by]
    # e.g.
    eval/freeze-case.sh cc-candybar-150-transcript-perf promptctl/cc-candybar 150 4669719961
    ```
+
+   The `engine` pin it writes is derived from `src/provider.js` (whatever `PROVIDER=auto`
+   currently resolves to), so a retarget can never leave a new case pinned to a retired
+   provider. `[produced-by]` defaults to that same engine — correct for a review run
+   today; pass it explicitly when freezing an **older** review that a different engine
+   produced, since `producedBy` records that history and not the replay pin.
 
    Find the marker-bearing review id with:
    ```bash

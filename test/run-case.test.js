@@ -1,8 +1,8 @@
 'use strict';
-const { test } = require('node:test');
+const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('path');
-const { parseArgs, parseCaseManifest, buildProviderInputs, assertConfigMatchesPin, runDirName, buildCaseMaterial } = require('../eval/run-case');
+const { parseArgs, parseCaseManifest, resolvePinnedConfig, assertConfigMatchesPin, runDirName, buildCaseMaterial } = require('../eval/run-case');
 
 test('parseArgs takes the required positional and applies defaults', () => {
   const o = parseArgs(['eval/cases/foo']);
@@ -80,21 +80,69 @@ test('parseCaseManifest fails loudly on malformed input', () => {
   assert.throws(() => parseCaseManifest(JSON.stringify({ name: '..', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm' } }), '/c'), /plain directory component/);
 });
 
-test('buildProviderInputs reads each provider credential from its own env var and pins the model', () => {
-  const env = { DEEPSEEK_API_KEY: 'ds-key', ZAI_API_KEY: 'z-key', OPENAI_API_KEY: 'o-key' };
-  const inputs = buildProviderInputs({ provider: 'deepseek', model: 'deepseek-v4-pro', reasoning: null }, env);
-  assert.equal(inputs.provider, 'deepseek');
-  assert.equal(inputs.deepseekApiKey, 'ds-key');
-  assert.equal(inputs.deepseekModel, 'deepseek-v4-pro');
-  // pinned model set under every provider's model key so whichever provider synth selects reads the pin
-  assert.equal(inputs.zaiModel, 'deepseek-v4-pro');
-  assert.equal(inputs.openaiModel, 'deepseek-v4-pro');
-  assert.equal(inputs.openaiReasoning, undefined);
+// THE regression this file exists to hold. The harness used to hand-build the provider input bag from a
+// list of key names it kept privately, and that list omitted claude-subscription — so the instrument
+// that measures review quality could not replay on the provider production runs on, and said so only as
+// a confusing "credential not set". Parameterizing over the real PROVIDERS table means a provider row
+// added tomorrow is covered the day it lands, rather than the day someone notices. [LAW:no-silent-failure]
+describe('resolvePinnedConfig reaches every provider in the table', () => {
+  const { PROVIDERS } = require('../src/provider');
+
+  for (const [name, spec] of Object.entries(PROVIDERS)) {
+    test(`'${name}': a case pinned to it resolves to a config carrying the pin`, () => {
+      const engine = { provider: name, model: spec.defaultModel, reasoning: null };
+      const config = resolvePinnedConfig(engine, { [spec.credentialInput]: 'test-credential' });
+      assert.equal(config.model, spec.defaultModel);
+      assert.equal(config.engine, spec.engine);
+      assert.equal(config.endpoint.credential.value, 'test-credential');
+    });
+
+    // The credential must come from the row's OWN env var: a case pinned to one provider must never
+    // resolve by picking up whatever other credential happens to be in the environment.
+    test(`'${name}': refuses to resolve from another provider's credential`, () => {
+      const foreign = Object.values(PROVIDERS)
+        .filter(s => s.credentialInput !== spec.credentialInput)
+        .reduce((env, s) => ({ ...env, [s.credentialInput]: 'wrong-credential' }), {});
+      assert.throws(
+        () => resolvePinnedConfig({ provider: name, model: spec.defaultModel, reasoning: null }, foreign),
+        new RegExp(spec.credentialInput),
+      );
+    });
+  }
 });
 
-test('buildProviderInputs threads a non-null reasoning to the reasoning key', () => {
-  const inputs = buildProviderInputs({ provider: 'codex', model: 'gpt-5.4-mini', reasoning: 'high' }, { OPENAI_API_KEY: 'o' });
-  assert.equal(inputs.openaiReasoning, 'high');
+test('resolvePinnedConfig pins a non-default model through the provider it names', () => {
+  const config = resolvePinnedConfig(
+    { provider: 'claude-subscription', model: 'claude-opus-5', reasoning: null },
+    { CLAUDE_CODE_OAUTH_TOKEN: 'oauth-token' },
+  );
+  assert.equal(config.model, 'claude-opus-5');
+});
+
+test('resolvePinnedConfig refuses a pin the resolved provider cannot carry', () => {
+  // claude-subscription's row declares no reasoning key, so a reasoning pin has nowhere to land and is
+  // silently dropped by resolution. The checkpoint is what turns that into a loud refusal — replaying
+  // at a different effort than the case pins would corrupt every number measured against it.
+  assert.throws(
+    () => resolvePinnedConfig(
+      { provider: 'claude-subscription', model: 'claude-sonnet-5', reasoning: 'high' },
+      { CLAUDE_CODE_OAUTH_TOKEN: 'oauth-token' },
+    ),
+    /Reasoning-pin mismatch/,
+  );
+});
+
+test('resolvePinnedConfig resolves the `auto` alias to the provider production runs on', () => {
+  // The drift this whole change exists to close: `auto` is what production names, and a case pinned to
+  // it must reach the concrete provider the alias currently points at, credential and all.
+  const { PROVIDER_ALIASES, PROVIDERS } = require('../src/provider');
+  const target = PROVIDERS[PROVIDER_ALIASES.auto];
+  const config = resolvePinnedConfig(
+    { provider: 'auto', model: target.defaultModel, reasoning: null },
+    { [target.credentialInput]: 'live-credential' },
+  );
+  assert.equal(config.endpoint.credential.value, 'live-credential');
+  assert.equal(config.model, target.defaultModel);
 });
 
 test('assertConfigMatchesPin returns the config when the pin holds', () => {
@@ -170,4 +218,38 @@ test('buildCaseMaterial refuses a case whose patterns exclude everything, rather
     () => buildCaseMaterial({ allFiles: CASE_FILES, excludePatterns: ['**'], reviewedRepoRoot: '/tmp/tree' }),
     /All 2 changed file\(s\) were excluded/,
   );
+});
+
+// The `reasoning` coverage above proves only that the field is correctly ABSENT: it goes through
+// claude-subscription, whose row declares no `reasoning` key, so no reasoning value is ever threaded
+// through the assembly loop at all. `credential` and `model` on that two-field row were the only fields
+// any test carried end-to-end — a scrambled `Object.entries(spec.inputKeys)` mapping would go unseen on
+// the third and fourth field every other row declares. Parameterized over the table for the same reason
+// the block above is: a row that grows a field tomorrow is covered the day it lands. [LAW:no-silent-failure]
+describe('resolvePinnedConfig carries a pinned reasoning through the rows that declare one', () => {
+  const { PROVIDERS } = require('../src/provider');
+  const registry = require('../src/engine/registry');
+
+  for (const [name, spec] of Object.entries(PROVIDERS).filter(([, s]) => 'reasoning' in s.inputKeys)) {
+    for (const effort of registry.get(spec.engine).capabilities.reasoningEfforts) {
+      test(`'${name}' pinned to reasoning '${effort}' resolves to a config carrying it`, () => {
+        const config = resolvePinnedConfig(
+          { provider: name, model: spec.defaultModel, reasoning: effort },
+          { [spec.credentialInput]: 'test-credential' },
+        );
+        assert.equal(config.reasoning, effort);
+        assert.equal(config.model, spec.defaultModel);
+      });
+    }
+
+    test(`'${name}' rejects a reasoning its engine does not offer, naming what is allowed`, () => {
+      assert.throws(
+        () => resolvePinnedConfig(
+          { provider: name, model: spec.defaultModel, reasoning: 'ludicrous' },
+          { [spec.credentialInput]: 'test-credential' },
+        ),
+        /reasoning 'ludicrous' is not valid for engine/,
+      );
+    });
+  }
 });

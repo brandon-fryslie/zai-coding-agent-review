@@ -23,6 +23,11 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { parseJsonObject } = require('./score');
 
+// The schema id the freezer stamps and the loader demands — one name, written once, so a writer that
+// stamped a version the reader rejects is not expressible. Superseded schemas (the v1 baseline kept under
+// eval/baseline/ as history) are identified by NOT being this. [LAW:one-source-of-truth]
+const BASELINE_SCHEMA = 'copirate-eval-baseline/v2';
+
 // [LAW:one-source-of-truth] THE degradation rule, defined once — evaluateGate applies it, the compare
 // CLI (2fk.5) wraps it, README.md documents it, baseline.md renders it: one wording, several consumers.
 // The gated metric is INVENTORY must-find recall — recall against each case's pooled multi-round finding
@@ -76,7 +81,7 @@ Usage: node eval/baseline.js [options]
                      silently completed). A scored dir under <out-dir> with no matching golden case is not
                      part of the suite and is ignored.
   --dest <dir>       Baseline output root (default: eval/baseline). Writes <dest>/<date>-<shortsha>/.
-  --sha <git-sha>    The main commit this baseline characterizes (default: git rev-parse HEAD).
+  --sha <git-sha>    The commit whose engine tree produced these runs (default: git rev-parse HEAD).
   --date <date>      YYYY-MM-DD stamp for the baseline dir (default: today, UTC).
   --help             Show this help.
 `;
@@ -300,7 +305,7 @@ function buildBaseline({ cases, provenance }) {
   const suiteMeanRecall = caseMeans.length ? caseMeans.reduce((a, b) => a + b, 0) / caseMeans.length : null;
 
   return {
-    schema: 'copirate-eval-baseline/v2',
+    schema: BASELINE_SCHEMA,
     generatedAt: provenance.date,
     mainSha: provenance.sha,
     engine,
@@ -349,7 +354,7 @@ function buildBaseline({ cases, provenance }) {
 // re-read from baseline.md, never re-rendered from a loaded value.
 function parseBaseline(raw, label) {
   const json = parseJsonObject(raw, label);
-  if (json.schema !== 'copirate-eval-baseline/v2') throw new Error(`${label} is not a v2 baseline (schema=${JSON.stringify(json.schema)}). Re-freeze it with eval/baseline.js.`);
+  if (json.schema !== BASELINE_SCHEMA) throw new Error(`${label} is not schema ${BASELINE_SCHEMA} (schema=${JSON.stringify(json.schema)}). Re-freeze it with eval/baseline.js.`);
   if (typeof json.mainSha !== 'string' || json.mainSha.trim() === '') throw new Error(`${label} has no 'mainSha'.`);
   if (!Number.isInteger(json.repeats) || json.repeats < 1) throw new Error(`${label} 'repeats' must be a positive integer.`);
   if (typeof json.suite !== 'object' || json.suite === null) throw new Error(`${label} has no 'suite'.`);
@@ -411,7 +416,10 @@ function renderBaselineMarkdown(baseline) {
   const lines = [
     `# Eval baseline — ${baseline.mainSha.slice(0, 7)} (${baseline.generatedAt})`,
     '',
-    `Frozen distribution of must-find recall for the golden case suite on \`main\` at commit \`${baseline.mainSha}\`.`,
+    // [FRAMING:representation] The freezer knows which TREE produced the runs, never which branch that
+    // commit sits on. This repo squash-merges, so a branch-tip freeze is never reachable from main — a
+    // doc asserting `main` would be false for exactly the freezes that matter most. State the commit.
+    `Frozen distribution of must-find recall for the golden case suite at commit \`${baseline.mainSha}\` — the engine tree that produced these runs.`,
     `This is the reference the compare gate (\`copirate-eval-harness-2fk.5\`) measures a candidate engine change against.`,
     '',
     `- **Engine (pinned):** \`${eng.provider}\` / \`${eng.model}\`${eng.reasoning ? ` / reasoning=${eng.reasoning}` : ''}`,
@@ -519,5 +527,5 @@ if (require.main === module) {
 module.exports = {
   parseArgs, parseBand, parseCaseSummary, parseCaseEngine, parseFraction,
   sameEngine, pooledFloor, buildBaseline, parseBaseline, evaluateGate, renderBaselineMarkdown,
-  DEGRADATION_RULE,
+  DEGRADATION_RULE, BASELINE_SCHEMA,
 };

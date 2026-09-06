@@ -1,5 +1,5 @@
 'use strict';
-const { test } = require('node:test');
+const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
@@ -7,7 +7,7 @@ const {
   normalizeBody, pairCandidates, computeMetrics, scoreRun, aggregateRuns, renderTable,
   makeLexicalJudge, jaccard, wordSet,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, loadCache,
-  requireLlmJudgeCredential,
+  requireLlmJudgeCredential, listRunDirs, JUDGE_MODEL,
 } = require('../eval/score');
 
 // [LAW:verifiable-goals] AC: the scorer reduces a run's findings.json + a case's expected.json to
@@ -414,17 +414,34 @@ test('loadCache returns {} when absent and aborts loudly on a corrupt or wrong-t
 
 // ── requireLlmJudgeCredential (the shared llm-matcher credential check) ──────────────────────────────
 
-test('requireLlmJudgeCredential returns the key when set, throws naming DEEPSEEK_API_KEY when absent', () => {
-  const prev = process.env.DEEPSEEK_API_KEY;
+test('requireLlmJudgeCredential returns the key when set, throws naming ANTHROPIC_API_KEY when absent', () => {
+  const prev = process.env.ANTHROPIC_API_KEY;
   try {
-    process.env.DEEPSEEK_API_KEY = 'test-key-123';
+    process.env.ANTHROPIC_API_KEY = 'test-key-123';
     assert.equal(requireLlmJudgeCredential(), 'test-key-123');
 
-    delete process.env.DEEPSEEK_API_KEY;
-    assert.throws(() => requireLlmJudgeCredential(), /DEEPSEEK_API_KEY/);
+    delete process.env.ANTHROPIC_API_KEY;
+    assert.throws(() => requireLlmJudgeCredential(), /ANTHROPIC_API_KEY/);
   } finally {
-    if (prev === undefined) delete process.env.DEEPSEEK_API_KEY;
-    else process.env.DEEPSEEK_API_KEY = prev;
+    if (prev === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prev;
+  }
+});
+
+// The judge's credential must NOT be the engine's. A judge that read whatever the reviewed provider
+// reads would move with the thing it measures — and, concretely, a case pinned to the subscription
+// supplies an OAuth token that is not a usable API key for a raw Messages call. [LAW:one-source-of-truth]
+test('requireLlmJudgeCredential does not fall back to any engine credential', () => {
+  const saved = { ...process.env };
+  try {
+    delete process.env.ANTHROPIC_API_KEY;
+    for (const k of ['DEEPSEEK_API_KEY', 'ZAI_API_KEY', 'OPENAI_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN']) process.env[k] = 'engine-credential';
+    assert.throws(() => requireLlmJudgeCredential(), /ANTHROPIC_API_KEY/);
+  } finally {
+    for (const k of ['ANTHROPIC_API_KEY', 'DEEPSEEK_API_KEY', 'ZAI_API_KEY', 'OPENAI_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN']) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
   }
 });
 
@@ -440,5 +457,79 @@ test('makeLlmJudge names the judge when a 200 body is not JSON', async () => {
   // A 200 whose body is an HTML proxy page: json() throws a bare parse error, re-thrown with judge context.
   const judge = makeLlmJudge({ apiKey: 'k', model: 'm', cacheFile: tmp, fetchImpl: async () => ({ ok: true, status: 200, json: async () => { throw new Error('Unexpected token <'); } }) });
   await assert.rejects(() => judge([{ key: '0:0', expectedBody: 'E', producedBody: 'P' }]), /Judge response was HTTP 200 but not valid JSON/);
+  require('fs').rmSync(tmp, { force: true });
+});
+
+// listRunDirs is the ONE definition of "a completed run", read by this scorer's reduction and by
+// freeze-suite.js's census (eval/freeze-suite.js:218) so the planner deciding how many replays are still
+// owed cannot drift from the scorer that reduces them. That shared predicate had no direct test.
+//
+// The missing-dir arm carries the weight: it is the only place listRunDirs differs from findRunDirs, the
+// scorer's checkpoint, which throws. The census depends on absence meaning "zero runs so far" — a case
+// never replayed must plan a full deficit, not abort the plan. A regression there would not crash, it
+// would quietly plan the wrong number of replays. [LAW:behavior-not-structure]
+describe('listRunDirs — what counts as a completed run', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+
+  const tree = spec => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'listrundirs-'));
+    for (const [name, hasFindings] of Object.entries(spec)) {
+      fs.mkdirSync(path.join(root, name), { recursive: true });
+      if (hasFindings) fs.writeFileSync(path.join(root, name, 'findings.json'), '[]');
+    }
+    return root;
+  };
+
+  test('a directory that was never replayed is an absence, not an error', () => {
+    const root = tree({});
+    assert.deepEqual(listRunDirs(path.join(root, 'never-replayed')), []);
+  });
+
+  test('a subdir without findings.json is not a run — a crashed replay leaves debris, not a zero score', () => {
+    const root = tree({ 'run1': true, 'run2-crashed': false, 'logs': false });
+    assert.deepEqual(listRunDirs(root), [path.join(root, 'run1')]);
+  });
+
+  test('an out dir whose every subdir crashed counts as no runs at all', () => {
+    const root = tree({ 'run1-crashed': false, 'run2-crashed': false });
+    assert.deepEqual(listRunDirs(root), []);
+  });
+
+  test('run dirs come back sorted, so a scorecard lists them deterministically', () => {
+    const root = tree({ 'c-run': true, 'a-run': true, 'b-run': true });
+    assert.deepEqual(listRunDirs(root), ['a-run', 'b-run', 'c-run'].map(d => path.join(root, d)));
+  });
+
+  test('a file sitting beside the run dirs is not mistaken for one', () => {
+    const root = tree({ 'run1': true });
+    fs.writeFileSync(path.join(root, 'scorecard-summary.json'), '{}');
+    assert.deepEqual(listRunDirs(root), [path.join(root, 'run1')]);
+  });
+});
+
+// This PR's core change is WHERE the judge is called and WHICH model answers — JUDGE_BASE_URL moved to
+// Anthropic's host and JUDGE_MODEL to a pinned Haiku — and every fake above ignores its `_url` argument
+// and never reads `opts.body.model`. They exercise response handling only, so a fat-fingered base URL (a
+// dropped `/v1/messages`, a stray path segment) or a `model` that never reaches the wire would pass this
+// entire file and surface only as a live HTTP failure, mid-suite, after real spend. The request is half
+// the contract; this asserts that half. [LAW:verifiable-goals]
+test('callJudge posts to the pinned Anthropic messages endpoint with the model it was given', async () => {
+  const tmp = require('path').join(require('os').tmpdir(), `judge-request-${process.pid}-${Date.now()}.json`);
+  const seen = [];
+  const fakeFetch = async (url, opts) => {
+    seen.push({ url, body: JSON.parse(opts.body), auth: opts.headers.Authorization });
+    return { ok: true, json: async () => ({ content: [{ type: 'text', text: '{"i":1,"match":true,"reason":"ok"}' }] }) };
+  };
+  const judge = makeLlmJudge({ apiKey: 'k', model: JUDGE_MODEL, cacheFile: tmp, fetchImpl: fakeFetch });
+  await judge([{ key: '0:0', expectedBody: 'E', producedBody: 'P' }]);
+
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].url, 'https://api.anthropic.com/v1/messages');
+  assert.equal(seen[0].body.model, JUDGE_MODEL);
+  // The credential travels as a bearer token on this endpoint, and the judge is deliberately NOT the
+  // engine's credential — routing it anywhere else is the failure this line pins.
+  assert.equal(seen[0].auth, 'Bearer k');
   require('fs').rmSync(tmp, { force: true });
 });

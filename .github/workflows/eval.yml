@@ -48,10 +48,24 @@ jobs:
        contains(github.event.pull_request.labels.*.name, 'eval') &&
        (github.event.action != 'labeled' || github.event.label.name == 'eval'))
     runs-on: ubuntu-latest
-    # A suite is N full reviews per case, serial per case: ~1 hour observed at N=5. Triple headroom
-    # so API congestion (observed stretching single reviews 3-5×) times out loudly here rather than
-    # at GitHub's 6-hour default.
-    timeout-minutes: 180
+    # Set at the platform ceiling, and that is STILL not enough for the worst case — read this before
+    # trusting a green gate.
+    #
+    # compare.js replays every case serially and every repeat serially within a case: N=5 × 4 cases is
+    # 20 sequential reviews on ONE credential. The pinned engine (claude-subscription/claude-sonnet-5)
+    # runs 13–27 min per replay — measured over the 20 replays of the 2026-09-06 baseline freeze, see
+    # eval/README.md — so a full gate run is 260–540 min. The old 180 was calibrated on the retired
+    # deepseek engine at "~1 hour observed at N=5" with triple headroom; that engine is gone and the
+    # headroom went with it.
+    #
+    # A GitHub-hosted job cannot exceed 6 hours, so 350 (leaving setup headroom under that cap) is the
+    # most this job can be given. The upper half of the observed range does not fit in it. A run that
+    # exceeds this is killed mid-suite: real quota spent, no verdict written, and the job reads as
+    # infrastructure failure rather than as a gate that could not finish — which is exactly the shape
+    # [LAW:no-silent-failure] forbids. The structural fix is a resumable multi-lane run
+    # (eval/freeze-suite.js's model) rather than one serial job; until then, a timed-out gate must be
+    # read as "not measured", never as "not degraded".
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -71,15 +85,21 @@ jobs:
 
       - name: Gate the candidate against the frozen baseline
         env:
-          # Every credential a golden case's pinned provider can use (deepseek/zai/openai — the set
-          # run-case.js's buildProviderInputs wires; CLAUDE_CODE_OAUTH_TOKEN is deliberately not
-          # among them) is forwarded; each case's pin selects which one is actually read, so
-          # re-freezing the baseline onto another of these providers is a data change in eval/ —
-          # this workflow needs no edit. DEEPSEEK_API_KEY also serves the default llm matcher's
-          # judge (score.js reads it unconditionally for that).
+          # Every credential a golden case's pinned provider can use — the set src/provider.js
+          # declares, which the runner now reads through resolveProviderConfig rather than a private
+          # copy. Each case's pin selects which one is actually read, so re-freezing the baseline onto
+          # another of these providers is a data change in eval/ and this workflow needs no edit.
+          # CLAUDE_CODE_OAUTH_TOKEN used to be omitted here on the grounds that the runner could not
+          # reach it; that was true, and it was the bug — it is the credential PROVIDER=auto resolves
+          # to, so its absence made the gate unable to measure the engine production runs.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # The judge's own credential, required unconditionally for the default llm matcher whatever
+          # the cases pin (score.js). Separate from the engine's on purpose: a subscription OAuth token
+          # authenticates the review CLI, not the raw Messages call the judge makes.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         # A fixed --out (not compare.js's timestamped default) so the summary and artifact steps
         # below address the same path without plumbing an output between steps; the runner's
         # workspace is fresh per job, so compare.js's stale-artifact refusal can never fire on it.
