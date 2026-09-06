@@ -199,6 +199,26 @@ function runDirName(timestamp, i) {
   return `${timestamp}-run${i}`;
 }
 
+// The engine tree a replay drives is this checkout's src/, so its identity is this checkout's git state.
+// Read here — the producer's side — and recorded into every run's meta.json; compare.js reads the same
+// function for the tree it gates, so a run and a gate can only agree or disagree about ONE fact.
+// [LAW:one-source-of-truth] Two independent reads, two independent failures: a `status` failure
+// (submodule/ownership issue) must never discard a SHA `rev-parse` already obtained, and an unreadable
+// status is `dirty: null` — unknown — never reported as clean. [LAW:no-silent-failure]
+function workingTree(cwd = __dirname) {
+  let sha = null;
+  try { sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd }).toString().trim(); } catch { /* no git / not a repo */ }
+  let dirty = null;
+  try { dirty = execFileSync('git', ['status', '--porcelain'], { cwd }).toString().trim().length > 0; } catch { /* unknown */ }
+  return { sha, dirty };
+}
+
+// [LAW:types-are-the-program] A tree's identity is its commit, and only a CLEAN commit has one: a dirty or
+// unknown-state tree names no reproducible src/, so nothing can be proven to be a replay of it. Pure.
+function treeIdentity({ sha, dirty }) {
+  return dirty === false && sha !== null ? sha : null;
+}
+
 // The effectful helpers below lazily require their src deps, so importing this module never loads the
 // engine stack — only main() (or a helper it calls) does, after the run boundary is established.
 
@@ -321,6 +341,7 @@ async function main() {
     if (excluded.paths.length > 0) process.stderr.write(`Excluded ${excluded.paths.length} file(s) matching the case's EXCLUDE_PATTERNS: ${excluded.paths.join(', ')}\n`);
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const candidate = workingTree();
     const caseOutRoot = path.join(path.resolve(opts.out), manifest.name);
     fs.mkdirSync(caseOutRoot, { recursive: true });
 
@@ -349,10 +370,13 @@ async function main() {
       fs.writeFileSync(path.join(runDir, 'findings.json'), JSON.stringify(review.findings, null, 2) + '\n');
       fs.writeFileSync(path.join(runDir, 'summary.txt'), (review.summary || '') + '\n');
       fs.writeFileSync(path.join(runDir, 'usage.json'), JSON.stringify(review.usage, null, 2) + '\n');
-      // Provenance the scorer/baseline read instead of re-deriving from the dir name. [LAW:one-source-of-truth]
+      // Provenance the scorer/baseline/gate read instead of re-deriving from the dir name or the clock:
+      // `candidate` is the tree that produced this run, which is what lets compare.js tell its own partial
+      // suite from a foreign one. [LAW:one-source-of-truth]
       fs.writeFileSync(path.join(runDir, 'meta.json'), JSON.stringify({
         case: manifest.name, timestamp, run: i, repeats: opts.repeats, workers: opts.workers,
         config: { name: config.name, engine: config.engine, model: config.model, reasoning: config.reasoning ?? null },
+        candidate,
         findingCount: review.findings.length,
       }, null, 2) + '\n');
       const transcripts = drainTranscripts(TRANSCRIPT_DIR, path.join(runDir, 'transcripts'));
@@ -379,4 +403,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, parseCaseManifest, resolvePinnedConfig, assertConfigMatchesPin, runDirName, buildCaseMaterial };
+module.exports = { parseArgs, parseCaseManifest, resolvePinnedConfig, assertConfigMatchesPin, runDirName, buildCaseMaterial, workingTree, treeIdentity };

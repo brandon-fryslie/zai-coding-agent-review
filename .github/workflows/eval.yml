@@ -83,6 +83,22 @@ jobs:
 
       - run: npm ci
 
+      - name: Restore this commit's partial suite from an earlier gate run
+        # A gate that walls (a lane's account at its daily or weekly limit) or times out leaves completed
+        # replays that were real quota spent; with a fresh workspace per job they were spent for nothing,
+        # and the next dispatch started from zero into the same wall. The candidate root is carried across
+        # runs instead, keyed by the commit under gate: compare.js accepts the runs under it that carry
+        # THIS commit's identity (each run's meta.json records the clean commit that produced it) and
+        # refuses any that do not, and freeze-suite.js's census then replays only the deficit. A different
+        # commit — a push to the PR, a merge to main — matches nothing and starts fresh, which is what a
+        # different candidate should do. The key ends in the run id so every run saves its own entry and
+        # the prefix restore picks the newest, i.e. the most complete. [LAW:one-source-of-truth]
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: eval/out/candidate-ci
+          key: eval-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: eval-candidate-${{ github.sha }}-
+
       - name: Gate the candidate against the frozen baseline
         env:
           # THE LANES. One subscription account per lane; freeze-suite.js (which compare.js replays
@@ -100,13 +116,22 @@ jobs:
           # the cases pin (score.js). Separate from the engine's on purpose: a subscription OAuth token
           # authenticates the review CLI, not the raw Messages call the judge makes.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        # A fixed --out (not compare.js's timestamped default) so the summary and artifact steps
-        # below address the same path without plumbing an output between steps; the runner's
-        # workspace is fresh per job, so compare.js's stale-artifact refusal can never fire on it.
+        # A fixed --out (not compare.js's timestamped default) so the restore above, the save below, and
+        # the summary and artifact steps all address one path without plumbing an output between steps.
         # --credentials names the lane env vars above, in the roster's order.
         run: >-
           node eval/compare.js --out eval/out/candidate-ci
           --credentials CLAUDE_CODE_OAUTH_TOKEN_SSSSSMOKEY,CLAUDE_CODE_OAUTH_TOKEN_SIGNUP,CLAUDE_CODE_OAUTH_TOKEN_BRANDROID
+
+      - name: Save this commit's suite for the next gate run
+        # always(): the partial suite of a walled or timed-out run is exactly what the next dispatch must
+        # inherit. A run that aborted before its first replay has no root to save; the action reports
+        # that as a warning, which is the honest reading — nothing was spent, nothing is kept.
+        if: always()
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: eval/out/candidate-ci
+          key: eval-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Publish the verdict to the Step Summary
         # always(): a DEGRADED gate exits 1 but has already written verdict.md — the red run's

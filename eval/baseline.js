@@ -20,8 +20,8 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
 const { parseJsonObject } = require('./score');
+const { workingTree } = require('./run-case');
 
 // The schema id the freezer stamps and the loader demands — one name, written once, so a writer that
 // stamped a version the reader rejects is not expressible. Superseded schemas (the v1 baseline kept under
@@ -499,7 +499,8 @@ function main() {
   // Provenance: the exact main SHA + a date stamp. SHA defaults to git HEAD (the commit this characterizes);
   // date defaults to today (UTC). [LAW:effects-at-boundaries] The git read is the only ambient input, done
   // here at the boundary, never inside buildBaseline.
-  const sha = opts.sha || execFileSync('git', ['rev-parse', 'HEAD'], { cwd: __dirname }).toString().trim();
+  const sha = opts.sha || workingTree().sha;
+  if (sha === null) throw new Error('No git HEAD to record as this baseline\'s provenance (not a git checkout?); pass --sha.');
   const date = opts.date || new Date().toISOString().slice(0, 10);
 
   const baseline = buildBaseline({ cases, provenance: { sha, date } });

@@ -230,7 +230,21 @@ function parseMeta(raw, label) {
   if (json.case !== path.basename(json.case) || json.case === '.' || json.case === '..') {
     throw new Error(`${label} 'case' must be a plain directory component, got ${JSON.stringify(json.case)}.`);
   }
-  return { case: json.case, config: json.config ?? null };
+  return { case: json.case, config: json.config ?? null, candidate: parseCandidate(json.candidate, label) };
+}
+
+// The tree that produced a run, as run-case.js's workingTree() recorded it: `{sha, dirty}` with sha a
+// commit or null and dirty true/false/null (unknown). Absent on runs replayed before provenance was kept —
+// a typed absence (null), which compare.js reads as "cannot be proven anyone's". Anything else is a
+// malformed record, refused. [LAW:parse-dont-validate]
+function parseCandidate(raw, label) {
+  if (raw === undefined) return null;
+  const isSha = v => v === null || (typeof v === 'string' && v.trim() !== '');
+  const isDirty = v => v === null || typeof v === 'boolean';
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw) || !isSha(raw.sha) || !isDirty(raw.dirty)) {
+    throw new Error(`${label} 'candidate' must be {sha: <commit|null>, dirty: <true|false|null>}, got ${JSON.stringify(raw)}.`);
+  }
+  return { sha: raw.sha, dirty: raw.dirty };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────

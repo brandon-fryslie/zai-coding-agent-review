@@ -279,3 +279,31 @@ describe('resolvePinnedConfig carries a pinned reasoning through the rows that d
     });
   }
 });
+
+// ── tree identity: what a run records, what the gate compares ─────────────────────────────────────────
+const { execFileSync } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const { workingTree, treeIdentity } = require('../eval/run-case');
+
+test('workingTree reads this checkout: HEAD as git reports it, dirtiness as a known boolean', () => {
+  const tree = workingTree();
+  assert.equal(tree.sha, execFileSync('git', ['rev-parse', 'HEAD'], { cwd: path.join(__dirname, '..') }).toString().trim());
+  assert.equal(typeof tree.dirty, 'boolean');
+});
+
+test('workingTree outside any git repo has no commit and an UNKNOWN state — never a clean one', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'no-repo-'));
+  try {
+    assert.deepEqual(workingTree(dir), { sha: null, dirty: null });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('treeIdentity: only a clean commit is an identity', () => {
+  assert.equal(treeIdentity({ sha: 'abc123', dirty: false }), 'abc123');
+  assert.equal(treeIdentity({ sha: 'abc123', dirty: true }), null);
+  assert.equal(treeIdentity({ sha: 'abc123', dirty: null }), null);
+  assert.equal(treeIdentity({ sha: null, dirty: false }), null);
+});

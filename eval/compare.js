@@ -30,7 +30,8 @@ const { spawnSync, execFileSync } = require('child_process');
 const {
   parseCaseSummary, parseCaseEngine, buildBaseline, parseBaseline, sameEngine, evaluateGate,
 } = require('./baseline');
-const { matcherLabel, parseExpected, requireLlmJudgeCredential } = require('./score');
+const { matcherLabel, parseExpected, parseMeta, listRunDirs, requireLlmJudgeCredential } = require('./score');
+const { workingTree, treeIdentity } = require('./run-case');
 
 const USAGE = `Gate a candidate (the current working tree) against a frozen eval baseline: replay the golden
 suite N times, score it, and print a DEGRADED / OK / IMPROVED verdict. Non-zero exit on DEGRADED.
@@ -49,9 +50,12 @@ Usage: ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js [option
                          that mode; the reused summaries' own recorded matcher is what's checked instead).
   --out <dir>            Candidate artifact root (default: eval/out/candidate-<ts>, git-ignored). Kept
                          isolated from the baseline's own run artifacts under eval/out/<case>/. Mutually
-                         exclusive with --reuse-candidate (refused if both are passed). If it names an
-                         existing root with prior run artifacts for a baseline case, refused rather than
-                         silently blending old and new runs into one summary.
+                         exclusive with --reuse-candidate (refused if both are passed). An existing root
+                         RESUMES: runs already under it that carry this candidate's identity (the same
+                         clean commit, recorded in each run's meta.json) count toward N and only the
+                         deficit is replayed — how a gate survives a quota wall across invocations. Any
+                         run under it that is not provably this candidate's (another commit, a dirty
+                         tree, no identity recorded) is refused by name rather than silently blended.
   --credentials <A,B,…>  Names of env vars holding one engine credential each, forwarded to
                          freeze-suite.js: one replay LANE per name, run concurrently. Default: a single
                          lane on the pinned provider's own credential input. N lanes cut the suite's
@@ -270,7 +274,7 @@ function renderVerdictMarkdown(verdict, meta = {}) {
   const lines = [
     `## Eval verdict — ${badge}`,
     '',
-    `Candidate${meta.candidateSha ? ` (working tree \`${meta.candidateSha}\`${meta.dirty ? ', dirty' : ''})` : ''} vs baseline` +
+    `Candidate${meta.candidateSha ? ` (working tree \`${meta.candidateSha}\`${{ true: ', dirty', false: '', null: ', state unknown' }[meta.dirty]})` : ''} vs baseline` +
       `${meta.baselineSha ? ` \`${meta.baselineSha.slice(0, 7)}\`` : ''}` +
       `${eng ? ` · engine \`${eng.provider}\`/\`${eng.model}\`${eng.reasoning ? `/reasoning=${eng.reasoning}` : ''}` : ''}` +
       ` · N=${verdict.repeats}${verdict.matcher ? ` · matcher \`${verdict.matcher}\`` : ''}.`,
@@ -416,16 +420,34 @@ function runCli(scriptPath, args, label) {
   if (res.status !== 0) throw new Error(`${label} exited ${res.status === null ? `on signal ${res.signal}` : `with code ${res.status}`}.`);
 }
 
-// Two independent facts, two independent failures: a `status` failure (submodule/ownership issue, the
-// process being killed) must never discard a SHA `rev-parse` already obtained — that SHA feeds both the
-// rendered verdict and the candidate's `buildBaseline` provenance, so losing it downgrades a real, known
-// commit to the generic 'working-tree' label with no indication anything went wrong. [LAW:no-silent-failure]
-function gitShaAndDirty() {
-  let sha = null;
-  try { sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: __dirname }).toString().trim(); } catch { /* no git / not a repo */ }
-  let dirty = false;
-  try { dirty = execFileSync('git', ['status', '--porcelain'], { cwd: __dirname }).toString().trim().length > 0; } catch { /* unknown — reported as clean, not fatal */ }
-  return { sha, dirty };
+// A tree as a phrase, for the refusal below: the reader must see BOTH sides to know which to fix.
+function describeTree(candidate) {
+  if (candidate === null) return 'no recorded identity (replayed before provenance was kept)';
+  const at = candidate.sha === null ? 'no git commit' : `commit ${candidate.sha.slice(0, 7)}`;
+  if (candidate.dirty === true) return `a dirty tree at ${at}`;
+  if (candidate.dirty === null) return `a tree of unknown state at ${at}`;
+  return at;
+}
+
+// [LAW:effects-at-boundaries] Pure: which prior runs under --out cannot be this candidate's. A run is the
+// candidate's own only when both carry the SAME identity — one clean commit (treeIdentity); a dirty or
+// unknown tree on either side has none, so nothing can be proven and everything is foreign. Every
+// foreign run is named with both trees, so the operator knows whether to move the runs or commit the tree.
+function foreignRuns(current, runs) {
+  const identity = treeIdentity(current);
+  return runs
+    .filter(({ candidate }) => identity === null || candidate === null || treeIdentity(candidate) !== identity)
+    .map(({ dir, candidate }) => ({ dir, reason: `was replayed on ${describeTree(candidate)}; the tree under gate is ${describeTree(current)}` }));
+}
+
+// Every completed run already under the candidate root for the gated cases, with the tree that produced
+// it. "Completed" is score.js's own predicate (listRunDirs) — the same census freeze-suite.js will take,
+// so what this accepts is exactly what the replay will count. [LAW:one-source-of-truth]
+function readPriorRuns(candidateRoot, caseNames) {
+  return caseNames.flatMap(name => listRunDirs(path.join(candidateRoot, name)).map(dir => {
+    const metaPath = path.join(dir, 'meta.json');
+    return { case: name, dir, candidate: parseMeta(fs.readFileSync(metaPath, 'utf8'), metaPath).candidate };
+  }));
 }
 
 function main() {
@@ -448,6 +470,10 @@ function main() {
   const casesDir = path.resolve(opts.casesDir);
   const freezeSuiteScript = path.join(__dirname, 'freeze-suite.js');
   const scoreScript = path.join(__dirname, 'score.js');
+  const caseNames = baseline.cases.map(({ case: name }) => name);
+  // The tree under gate, read once: it decides which prior runs are this candidate's (5), and it is the
+  // provenance the verdict names (8). One read, one fact. [LAW:one-source-of-truth]
+  const candidate = workingTree();
 
   // The pre-spend guards below (3-3c) all share one shape: refuse BEFORE any replay when the thing they
   // check is knowable without running the candidate engine at all. None of them apply under
@@ -522,20 +548,27 @@ function main() {
     // refusal above — except here there's a principled winner (the reused data), just not the flag's value.
     process.stderr.write(`\nReusing candidate artifacts under ${candidateRoot} (no replay, no spend). --matcher is ignored in this mode — the reused summaries' own recorded matcher is what's checked.\n`);
   } else {
-    // 5. Refuse a non-fresh --out: run-case.js is append-only (never cleans <out>/<case>/) and score.js's
-    //    findRunDirs pools EVERY run dir under a case's output root — stale, fresh, whichever — into one
-    //    scorecard-summary.json. Reusing an --out that already has a case's run artifacts would silently
-    //    blend runs from two different working-tree states into a single candidate summary, with no error
-    //    (and possibly no N mismatch either, if the counts happen to add up). The default --out is always a
-    //    fresh timestamped path, so this only fires when --out is passed explicitly at an existing location.
-    for (const { case: name } of baseline.cases) {
-      const caseOutDir = path.join(candidateRoot, name);
-      const hasRunDirs = fs.existsSync(caseOutDir) && fs.readdirSync(caseOutDir, { withFileTypes: true })
-        .some(e => e.isDirectory() && fs.existsSync(path.join(caseOutDir, e.name, 'findings.json')));
-      if (hasRunDirs) {
-        throw new Error(`--out ${candidateRoot} already has run artifacts for case '${name}' at ${caseOutDir} — run-case.js is append-only and would blend them with fresh runs into one summary. Pick a fresh --out, or remove ${caseOutDir} first.`);
-      }
+    // 5. An --out that already holds runs is either this candidate's own partial suite — an earlier gate
+    //    invocation on the same clean commit that walled or timed out, which freeze-suite.js's census then
+    //    tops up to N (the whole reason a hosted gate can outlive a quota wall: eval.yml carries the root
+    //    across dispatches) — or someone else's. run-case.js is append-only and score.js pools EVERY run
+    //    dir under a case into one summary, so one foreign run would blend two trees into a single
+    //    candidate with no error and possibly no N mismatch. Every prior run must therefore carry the
+    //    identity of the tree under gate, and any that cannot is refused by name, before any spend.
+    //    [LAW:no-silent-failure] [LAW:parse-dont-validate]
+    const prior = readPriorRuns(candidateRoot, caseNames);
+    const foreign = foreignRuns(candidate, prior);
+    if (foreign.length > 0) {
+      throw new Error(`--out ${candidateRoot} holds ${foreign.length} run(s) that are not this candidate's:\n${foreign.map(f => `  ${f.dir} ${f.reason}`).join('\n')}\nPick a fresh --out, or remove them first.`);
     }
+    for (const name of caseNames) {
+      process.stderr.write(`  ${name}: ${prior.filter(r => r.case === name).length}/${repeats} run(s) of this candidate already under --out; the replay fills the rest\n`);
+    }
+    // A verdict is the product of ONE invocation over the WHOLE suite. One left under this root by an
+    // earlier invocation would be read as this run's if this run aborted before writing its own (eval.yml
+    // publishes verdict.md from the root, whatever exit it sees). Gone before any spend, unconditionally —
+    // a fresh root has nothing to remove and the same operation runs. [LAW:dataflow-not-control-flow]
+    for (const file of ['verdict.md', 'verdict.json']) fs.rmSync(path.join(candidateRoot, file), { force: true });
 
     // 6. COST GUARDRAIL — print the estimate up front, before spending. [LAW:verifiable-goals]
     const estUsd = estimateCandidateCostUsd(rawBaselineSuite, repeats);
@@ -548,7 +581,6 @@ function main() {
     //    same set, so nothing here re-checks case.json existence or the engine pin. freeze-suite.js exits
     //    non-zero when any case is still short of N, and runCli turns that into an abort here: a partial
     //    candidate is never scored. [LAW:no-silent-failure]
-    const caseNames = baseline.cases.map(({ case: name }) => name);
     process.stderr.write(`\n─── replaying ${caseNames.length} case(s) × N=${repeats} ───\n`);
     runCli(freezeSuiteScript, replayArgs({ repeats, candidateRoot, casesDir, caseNames, credentials: opts.credentials }), 'freeze-suite');
     // 7b. Score each case. The judge is one credential and cheap; it needs no lanes.
@@ -561,7 +593,7 @@ function main() {
   // 8. Reduce the candidate's scored summaries into a suite with the SAME buildBaseline the frozen baseline
   //    used — producer and comparator can't drift. Read each case's summary + its pinned engine, exactly as
   //    baseline.js's main() does.
-  const { sha: candidateSha, dirty } = gitShaAndDirty();
+  const { sha: candidateSha, dirty } = candidate;
   const candidateCases = baseline.cases.map(({ case: name }) => {
     const summaryPath = path.join(candidateRoot, name, 'scorecard-summary.json');
     if (!fs.existsSync(summaryPath)) throw new Error(`No candidate summary for case '${name}' at ${summaryPath}. ${opts.reuseCandidate ? 'The reused root is incomplete.' : 'The replay/score step did not produce it.'}`);
@@ -610,4 +642,5 @@ if (require.main === module) {
 module.exports = {
   parseArgs, replayArgs, expectedMatcherLabel, estimateCandidateCostUsd,
   compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath, computeExpectedOpportunities,
+  foreignRuns, readPriorRuns,
 };

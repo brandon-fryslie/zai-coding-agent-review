@@ -562,6 +562,19 @@ spend — and a run competes with PR reviews on those same accounts while it las
   run the gate: GitHub withholds secrets from fork `pull_request` events, so the job skips them up
   front rather than failing mid-run on empty credentials.
 
+**A walled or timed-out run is not lost.** The workflow carries the candidate root across runs in
+the Actions cache, keyed by the commit under gate. On the next dispatch of the *same* commit,
+`compare.js` finds the earlier replays under `--out`, checks that each carries this commit's identity
+(every run's `meta.json` records the clean commit that produced it — `run-case.js`'s `workingTree`,
+the one function both sides read), and `freeze-suite.js`'s census replays only the deficit. A run
+that carries a different identity — another commit, a dirty tree, or none recorded — is refused by
+name, never blended: `score.js` pools every run dir under a case into one summary, so a foreign run
+would corrupt the candidate silently. A different commit (a push to the PR, a merge to `main`)
+matches nothing and starts fresh, as a different candidate should. So when the daily quota walls a
+run, re-dispatching on the same commit once the accounts reset finishes the suite instead of
+re-spending it; the 2026-09-06 acceptance run walled at 11/20 replays, which is the case this
+exists for.
+
 The workflow checks out with `fetch-depth: 0` because the no-`--baseline` newest-pick ranks
 committed baselines by commit-graph order, which a shallow clone collapses to a refused tie. It
 forwards the three lane secrets (`CLAUDE_CODE_OAUTH_TOKEN_SSSSSMOKEY`, `_SIGNUP`, `_BRANDROID`); each

@@ -112,6 +112,15 @@ test('parseMeta reads the case name and rejects a path-shaped one', () => {
   assert.equal(parseMeta(JSON.stringify({ case: 'demo', config: { model: 'm' } }), 'm').case, 'demo');
   assert.throws(() => parseMeta('{}', 'm'), /no 'case' name/);
   assert.throws(() => parseMeta(JSON.stringify({ case: '../evil' }), 'm'), /plain directory component/);
+});
+
+test('parseMeta keeps the candidate identity a run recorded, reads its absence as null, and refuses a malformed one', () => {
+  assert.equal(parseMeta(JSON.stringify({ case: 'demo' }), 'm').candidate, null);
+  assert.deepEqual(parseMeta(JSON.stringify({ case: 'demo', candidate: { sha: 'abc', dirty: false } }), 'm').candidate, { sha: 'abc', dirty: false });
+  assert.deepEqual(parseMeta(JSON.stringify({ case: 'demo', candidate: { sha: null, dirty: null } }), 'm').candidate, { sha: null, dirty: null });
+  for (const bad of [null, 'abc', [], { sha: 'abc' }, { sha: '', dirty: false }, { sha: 'abc', dirty: 'yes' }]) {
+    assert.throws(() => parseMeta(JSON.stringify({ case: 'demo', candidate: bad }), 'm'), /'candidate' must be/);
+  }
   // `null` is valid JSON but not an object — rejected at the boundary, not a `null.case` crash.
   assert.throws(() => parseMeta('null', 'm'), /not a JSON object/);
 });
