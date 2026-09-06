@@ -501,7 +501,9 @@ gate predicate — it:
 
 1. replays every baseline case **N times** (N and the engine come *from the baseline*, and are
    asserted — a candidate run at a different N or engine measures something else) by spawning
-   `run-case.js`, then scores each with `score.js`, into an isolated candidate root;
+   `freeze-suite.js` over the baseline's case set — the freeze's own scheduler, driving
+   `run-case.js` once per replay across the `--credentials` lanes — then scores each case with
+   `score.js`, into an isolated candidate root;
 2. reduces the candidate's scored summaries into a suite with the **same `buildBaseline`** the
    frozen baseline was built with — so the producer and the comparator can never drift
    (`[LAW:one-source-of-truth]`); and

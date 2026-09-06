@@ -140,13 +140,13 @@ describe('renderReport', () => {
     assert.match(md, /SUITE SHORT of N=5.*at least 3 run\(s\).*deepest freezable suite today is N=3/s);
   });
 
-  test('a met target reports complete, and points at the next step', () => {
+  // The closing line states what this command guarantees and where. It names no next step: the freeze
+  // workflow's next commands are documented once in eval/README.md, and compare.js — the other caller —
+  // scores and gates the root itself, so a "then run baseline.js" hint would be wrong there.
+  test('a met target reports complete, naming the root this run actually used', () => {
     const md = renderReport({ jobs, census: [{ name: 'alpha', completed: 5 }, { name: 'beta', completed: 5 }], repeats: 5, elapsedMs: 1000, outDir: 'eval/out/freeze-abc1234' });
-    assert.match(md, /SUITE COMPLETE at N=5/);
-    // The hint is a command the operator pastes. baseline.js's --out-dir defaults to plain eval/out, so
-    // a hint that omits it scores a DIFFERENT directory than the suite just wrote — silently, if stale
-    // runs happen to sit under the default. It must name the root this run actually used.
-    assert.match(md, /node eval\/baseline\.js --out-dir eval\/out\/freeze-abc1234/);
+    assert.match(md, /SUITE COMPLETE at N=5 in eval\/out\/freeze-abc1234/);
+    assert.doesNotMatch(md, /baseline\.js/);
   });
 });
 

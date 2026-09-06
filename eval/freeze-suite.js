@@ -138,7 +138,8 @@ function resolveLanes(names, env) {
 // census order, so the level-filling plan below is the same plan whichever way the operator spelled the
 // list. A name no case carries is the operator's typo (or a case the golden set no longer holds), and a
 // suite that silently replays the others has spent hours proving less than it was asked to; refused
-// here, before any spend. [LAW:no-silent-failure]
+// here, before any spend. [LAW:no-silent-failure] The comma split is exact because a case name cannot
+// carry one — run-case.js's parseCaseManifest refuses it, the one place a name is parsed.
 function selectCases(cases, names) {
   const wanted = names.map(raw => raw.trim());
   for (const name of wanted) {
@@ -219,7 +220,7 @@ function renderReport({ jobs, census, repeats, elapsedMs, outDir }) {
   lines.push('');
   lines.push(
     usableN >= repeats
-      ? `SUITE COMPLETE at N=${repeats}. Next: score each case, then node eval/baseline.js --out-dir ${outDir}.`
+      ? `SUITE COMPLETE at N=${repeats} in ${outDir}: every case has ${repeats} scorable run(s).`
       : `SUITE SHORT of N=${repeats}. Every case has at least ${usableN} run(s), so the deepest freezable suite today is N=${usableN}. Re-run this command to fill the rest.`,
   );
   return lines.join('\n') + '\n';

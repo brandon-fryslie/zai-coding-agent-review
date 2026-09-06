@@ -78,6 +78,8 @@ test('parseCaseManifest fails loudly on malformed input', () => {
   assert.throws(() => parseCaseManifest(JSON.stringify({ name: '../evil', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm' } }), '/c'), /plain directory component/);
   assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'a/b', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm' } }), '/c'), /plain directory component/);
   assert.throws(() => parseCaseManifest(JSON.stringify({ name: '..', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm' } }), '/c'), /plain directory component/);
+  // A name carrying a comma cannot travel on freeze-suite.js's comma-separated --cases.
+  assert.throws(() => parseCaseManifest(JSON.stringify({ name: 'a,b', diff: 'd', tree: 't', engine: { provider: 'p', model: 'm' } }), '/c'), /plain directory component.*commas/);
 });
 
 // THE regression this file exists to hold. The harness used to hand-build the provider input bag from a

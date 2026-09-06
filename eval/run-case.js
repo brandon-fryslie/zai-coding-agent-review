@@ -113,9 +113,11 @@ function parseCaseManifest(raw, caseDir) {
   // [LAW:parse-dont-validate] name is used as a single path COMPONENT (path.join(caseOutRoot, name) and
   // meta.json provenance), so parse it as one: a name with a separator or `..` would write output
   // outside eval/out/ or nest it unexpectedly while meta.json still records the raw name. Reject any
-  // non-plain-component name here so it can never reach path.join. [LAW:no-silent-failure]
-  if (name !== path.basename(name) || name === '.' || name === '..') {
-    throw new Error(`case.json (${caseDir}) 'name' must be a plain directory component (no path separators or '..'), got ${JSON.stringify(name)}.`);
+  // non-plain-component name here so it can never reach path.join. A comma is refused for the same
+  // reason one layer up: names travel comma-separated on freeze-suite.js's --cases, and a name the list
+  // cannot carry would be split into names that do not exist. [LAW:no-silent-failure]
+  if (name !== path.basename(name) || name === '.' || name === '..' || name.includes(',')) {
+    throw new Error(`case.json (${caseDir}) 'name' must be a plain directory component (no path separators, '..', or commas), got ${JSON.stringify(name)}.`);
   }
   const diff = req(json.diff, 'diff');
   const tree = req(json.tree, 'tree');
