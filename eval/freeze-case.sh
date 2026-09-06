@@ -71,18 +71,25 @@ fi
 # node's own stderr is deliberately NOT silenced: if provider.js cannot load, that stack trace is the
 # only thing that says why, and the generic message below would replace a located cause with a guess.
 # [LAW:no-silent-failure]
+# All three segments of the provenance string come from the table, none from a literal here. The engine
+# type is NOT the same for every row — PROVIDERS.codex.engine is 'codex', not 'claude-code' — so a
+# hardcoded middle segment is correct only for whichever provider PROVIDER_ALIASES.auto happens to name
+# today, and would quietly mislabel every case frozen after a retarget. That is the exact drift this
+# function exists to prevent for the provider and model. [LAW:one-source-of-truth]
 default_engine() {
   node -e '
     const { PROVIDERS, PROVIDER_ALIASES } = require("./src/provider");
     const name = PROVIDER_ALIASES.auto;
-    process.stdout.write(`${name}\t${PROVIDERS[name].defaultModel}`);
+    const row = PROVIDERS[name];
+    process.stdout.write(`${name}\t${row.engine}\t${row.defaultModel}`);
   '
 }
 ENGINE_TSV="$(cd "$SCRIPT_DIR/.." && default_engine)" \
   || { echo "FREEZE ERROR: could not resolve the action's default engine from src/provider.js" >&2; exit 1; }
-PROVIDER="${ENGINE_TSV%%$'\t'*}"
-MODEL="${ENGINE_TSV##*$'\t'}"
-[ -n "$PROVIDER" ] && [ -n "$MODEL" ] && [ "$PROVIDER" != "$ENGINE_TSV" ] \
+IFS=$'\t' read -r PROVIDER ENGINE MODEL <<< "$ENGINE_TSV"
+# Every segment must be present: a provenance string with an empty field is a case that cannot say what
+# produced it, and writing one is worse than refusing to freeze. [LAW:no-silent-failure]
+[ -n "$PROVIDER" ] && [ -n "$ENGINE" ] && [ -n "$MODEL" ] \
   || { echo "FREEZE ERROR: default engine resolved to an unusable value: '$ENGINE_TSV'" >&2; exit 1; }
 
 # Provenance of the GOLDEN REVIEW — a fact about the historical review this case was
@@ -91,7 +98,7 @@ MODEL="${ENGINE_TSV##*$'\t'}"
 # because of it; they are separate facts and a case frozen from an older review must be
 # able to say so. Defaults to the current default engine, which is what a review run
 # today was produced by. [FRAMING:representation]
-PRODUCED_BY="${6:-auto→$PROVIDER / claude-code / $MODEL}"
+PRODUCED_BY="${6:-auto→$PROVIDER / $ENGINE / $MODEL}"
 
 CASE_DIR="eval/cases/$NAME"
 WORK="$(mktemp -d)"
