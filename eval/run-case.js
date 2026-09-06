@@ -210,13 +210,29 @@ function runDirName(timestamp, i) {
 // [LAW:no-silent-failure]
 function workingTree(cwd = __dirname) {
   const git = args => execFileSync('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
-  return { sha: git(['rev-parse', 'HEAD']), dirty: git(['status', '--porcelain', '--untracked-files=no']).length > 0 };
+  // --no-optional-locks: status refreshes the index under its lock by default, and N suite lanes read this
+  // at once against one checkout; the switch is git's own for a read that must never take that lock.
+  return { sha: git(['rev-parse', 'HEAD']), dirty: git(['--no-optional-locks', 'status', '--porcelain', '--untracked-files=no']).length > 0 };
 }
 
 // [LAW:types-are-the-program] A tree's identity is its commit, and only a CLEAN commit has one: a dirty tree
 // names no reproducible content, so nothing can be proven to be a replay of it. Pure.
 function treeIdentity({ sha, dirty }) {
   return dirty ? null : sha;
+}
+
+// One run's record on disk. findings.json is what makes a run dir COMPLETE to every reader (score.js's
+// listRunDirs, the suite census, the gate's resume), so it lands last and atomically — written beside,
+// then renamed — after every file those readers go on to open. A replay killed or failing at any instant
+// leaves a dir that is either complete or ignored, never one that is counted and then unreadable.
+// [LAW:no-ambient-temporal-coupling]
+function writeRunRecord(runDir, { meta, summary, usage, findings }) {
+  fs.writeFileSync(path.join(runDir, 'meta.json'), JSON.stringify(meta, null, 2) + '\n');
+  fs.writeFileSync(path.join(runDir, 'summary.txt'), summary + '\n');
+  fs.writeFileSync(path.join(runDir, 'usage.json'), JSON.stringify(usage, null, 2) + '\n');
+  const findingsPath = path.join(runDir, 'findings.json');
+  fs.writeFileSync(`${findingsPath}.partial`, JSON.stringify(findings, null, 2) + '\n');
+  fs.renameSync(`${findingsPath}.partial`, findingsPath);
 }
 
 // The effectful helpers below lazily require their src deps, so importing this module never loads the
@@ -364,27 +380,22 @@ async function main() {
         log: msg => process.stderr.write(`[run ${i}] ${msg}\n`),
       });
 
-      // Provenance the scorer/baseline/gate read instead of re-deriving from the dir name or the clock:
-      // `candidate` is the tree that produced this run, which is what lets compare.js tell its own partial
-      // suite from a foreign one. [LAW:one-source-of-truth]
-      fs.writeFileSync(path.join(runDir, 'meta.json'), JSON.stringify({
-        case: manifest.name, timestamp, run: i, repeats: opts.repeats, workers: opts.workers,
-        config: { name: config.name, engine: config.engine, model: config.model, reasoning: config.reasoning ?? null },
-        candidate,
-        findingCount: review.findings.length,
-      }, null, 2) + '\n');
-      fs.writeFileSync(path.join(runDir, 'summary.txt'), (review.summary || '') + '\n');
-      fs.writeFileSync(path.join(runDir, 'usage.json'), JSON.stringify(review.usage, null, 2) + '\n');
-      // The raw merged findings from runMultiScope — path/line/body/severity, PRE anchor-partition (the
-      // PR sink's partitionFindings is deliberately NOT applied here; the scorer matches against the
-      // frozen diff itself). [LAW:one-source-of-truth]
-      // findings.json is what makes a run dir COMPLETE to every reader (score.js's listRunDirs, the suite
-      // census, the gate's resume), so it lands last and atomically — written beside, then renamed — after
-      // every file those readers go on to open. A replay killed at any instant leaves a dir that is either
-      // complete or ignored, never one that is counted and then unreadable. [LAW:no-ambient-temporal-coupling]
-      const findingsPath = path.join(runDir, 'findings.json');
-      fs.writeFileSync(`${findingsPath}.partial`, JSON.stringify(review.findings, null, 2) + '\n');
-      fs.renameSync(`${findingsPath}.partial`, findingsPath);
+      // meta.json is provenance the scorer/baseline/gate read instead of re-deriving from the dir name or
+      // the clock; `candidate` is the tree that produced this run, which is what lets compare.js tell its
+      // own partial suite from a foreign one. findings are the raw merged output of runMultiScope —
+      // path/line/body/severity, PRE anchor-partition (the PR sink's partitionFindings is deliberately NOT
+      // applied here; the scorer matches against the frozen diff itself). [LAW:one-source-of-truth]
+      writeRunRecord(runDir, {
+        meta: {
+          case: manifest.name, timestamp, run: i, repeats: opts.repeats, workers: opts.workers,
+          config: { name: config.name, engine: config.engine, model: config.model, reasoning: config.reasoning ?? null },
+          candidate,
+          findingCount: review.findings.length,
+        },
+        summary: review.summary || '',
+        usage: review.usage,
+        findings: review.findings,
+      });
       const transcripts = drainTranscripts(TRANSCRIPT_DIR, path.join(runDir, 'transcripts'));
 
       process.stderr.write(`[run ${i}/${opts.repeats}] ${review.findings.length} finding(s), ${transcripts.length} transcript(s) → ${runDir}\n`);
@@ -409,4 +420,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, parseCaseManifest, resolvePinnedConfig, assertConfigMatchesPin, runDirName, buildCaseMaterial, workingTree, treeIdentity };
+module.exports = { parseArgs, parseCaseManifest, resolvePinnedConfig, assertConfigMatchesPin, runDirName, buildCaseMaterial, workingTree, treeIdentity, writeRunRecord };

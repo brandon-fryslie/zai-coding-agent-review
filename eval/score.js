@@ -222,8 +222,9 @@ function parseUsage(raw, label) {
   };
 }
 
-// meta.json carries provenance the scorer reads instead of parsing the run-dir name: the case name (which
-// resolves expected.json) and the resolved engine config (echoed into the scorecard). [LAW:one-source-of-truth]
+// meta.json carries provenance read instead of parsing the run-dir name: the case name (which resolves
+// expected.json), the resolved engine config (echoed into the scorecard), and the tree that produced the run
+// (`candidate`, which compare.js reads to tell its own partial suite from a foreign one). [LAW:one-source-of-truth]
 function parseMeta(raw, label) {
   const json = parseJsonObject(raw, label);
   if (typeof json.case !== 'string' || json.case.trim() === '') throw new Error(`${label} has no 'case' name.`);

@@ -412,7 +412,7 @@ test('resolveBaselineJsonPath does NOT refuse a shallow clone with an uncommitte
 });
 
 // ── resume or refuse: prior runs under --out against the tree under gate ──────────────────────────────
-const { foreignRuns, readPriorRuns, deficitReplays } = require('../eval/compare');
+const { foreignRuns, readPriorRuns, deficitReplays, excessRuns, driftedRuns } = require('../eval/compare');
 
 test('foreignRuns keeps the runs replayed on this exact clean commit and names every other by both trees', () => {
   const here = { sha: 'aaaaaaa1', dirty: false };
@@ -438,9 +438,30 @@ test('foreignRuns under a dirty tree refuses EVERY prior run — nothing can be 
 });
 
 test('deficitReplays is the census arithmetic: per case, the shortfall to N over the accepted prior runs', () => {
-  const prior = [{ case: 'a' }, { case: 'a' }, { case: 'a' }, { case: 'b' }, { case: 'c' }, { case: 'c' }, { case: 'c' }, { case: 'c' }, { case: 'c' }, { case: 'c' }];
+  const prior = [{ case: 'a' }, { case: 'a' }, { case: 'a' }, { case: 'b' }, { case: 'c' }, { case: 'c' }, { case: 'c' }, { case: 'c' }, { case: 'c' }];
   assert.equal(deficitReplays(['a', 'b', 'c', 'd'], prior, 5), 2 + 4 + 0 + 5);
   assert.equal(deficitReplays(['a', 'b'], [], 5), 10);
+});
+
+test('excessRuns names every case holding more runs than N — the population the gate cannot measure', () => {
+  const prior = [{ case: 'a' }, { case: 'a' }, { case: 'a' }, { case: 'c' }, { case: 'c' }];
+  assert.deepEqual(excessRuns(['a', 'b', 'c'], prior, 2), [{ case: 'a', completed: 3 }]);
+  assert.deepEqual(excessRuns(['a', 'b', 'c'], prior, 3), []);
+});
+
+test('driftedRuns compares the recorded tree to the snapshot by equality — a dirty tree\'s own fresh runs are NOT drift', () => {
+  const dirty = { sha: 'aaaaaaa1', dirty: true };
+  const clean = { sha: 'aaaaaaa1', dirty: false };
+  assert.deepEqual(driftedRuns(dirty, [{ dir: 'r1', candidate: { sha: 'aaaaaaa1', dirty: true } }]), []);
+  assert.deepEqual(driftedRuns(clean, [{ dir: 'r1', candidate: { sha: 'aaaaaaa1', dirty: false } }]), []);
+  const moved = driftedRuns(clean, [
+    { dir: 'r1', candidate: { sha: 'aaaaaaa1', dirty: false } },
+    { dir: 'r2', candidate: { sha: 'aaaaaaa1', dirty: true } },   // edited mid-run
+    { dir: 'r3', candidate: { sha: 'bbbbbbb2', dirty: false } },  // committed mid-run
+    { dir: 'r4', candidate: null },
+  ]);
+  assert.deepEqual(moved.map(m => m.dir), ['r2', 'r3', 'r4']);
+  assert.match(moved[0].reason, /recorded a dirty tree at commit aaaaaaa; the tree snapshotted before the replay was commit aaaaaaa/);
 });
 
 test('readPriorRuns reads the census the replay will take — completed runs only, each with its recorded tree', () => {
@@ -458,6 +479,12 @@ test('readPriorRuns reads the census the replay will take — completed runs onl
     mk('case-a', '2026-01-01T00-00-02-000Z-run1', { candidate: { sha: 'abc', dirty: false } }, false); // crashed: no findings.json
     mk('case-c', '2026-01-01T00-00-03-000Z-run1', { candidate: { sha: 'abc', dirty: false } });       // not a gated case
     const prior = readPriorRuns(root, ['case-a', 'case-b']);
+    const misplaced = path.join(root, 'case-b', '2026-01-01T00-00-04-000Z-run1');
+    fs.mkdirSync(misplaced, { recursive: true });
+    fs.writeFileSync(path.join(misplaced, 'findings.json'), '[]\n');
+    fs.writeFileSync(path.join(misplaced, 'meta.json'), JSON.stringify({ case: 'case-a', candidate: { sha: 'abc', dirty: false } }) + '\n');
+    assert.throws(() => readPriorRuns(root, ['case-a', 'case-b']), /names case 'case-a' but lives under 'case-b'/);
+    fs.rmSync(misplaced, { recursive: true, force: true });
     assert.deepEqual(prior, [
       { case: 'case-a', dir: a1, candidate: { sha: 'abc', dirty: false } },
       { case: 'case-a', dir: a2, candidate: null },

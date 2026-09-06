@@ -284,7 +284,7 @@ describe('resolvePinnedConfig carries a pinned reasoning through the rows that d
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
-const { workingTree, treeIdentity } = require('../eval/run-case');
+const { workingTree, treeIdentity, writeRunRecord } = require('../eval/run-case');
 
 test('workingTree reads this checkout: HEAD as git reports it, dirtiness as a known boolean', () => {
   const tree = workingTree();
@@ -323,4 +323,24 @@ test('workingTree counts tracked modifications as dirty and untracked files as n
 test('treeIdentity: only a clean commit is an identity', () => {
   assert.equal(treeIdentity({ sha: 'abc123', dirty: false }), 'abc123');
   assert.equal(treeIdentity({ sha: 'abc123', dirty: true }), null);
+});
+
+test('writeRunRecord: a counted run dir is a complete one — findings.json lands last, and a record that cannot finish is never counted', () => {
+  const { listRunDirs } = require('../eval/score');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'run-record-'));
+  try {
+    const ok = path.join(root, 'case', 'r1');
+    fs.mkdirSync(ok, { recursive: true });
+    writeRunRecord(ok, { meta: { case: 'case' }, summary: 's', usage: { u: 1 }, findings: [{ path: 'a', line: 1 }] });
+    assert.deepEqual(fs.readdirSync(ok).sort(), ['findings.json', 'meta.json', 'summary.txt', 'usage.json']);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(ok, 'findings.json'), 'utf8')), [{ path: 'a', line: 1 }]);
+
+    const broken = path.join(root, 'case', 'r2');
+    fs.mkdirSync(broken, { recursive: true });
+    assert.throws(() => writeRunRecord(broken, { meta: { case: 'case' }, summary: 's', usage: {}, findings: [1n] }), TypeError);
+    assert.deepEqual(fs.readdirSync(broken).sort(), ['meta.json', 'summary.txt', 'usage.json']);
+    assert.deepEqual(listRunDirs(path.join(root, 'case')), [ok]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

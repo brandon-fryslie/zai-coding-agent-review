@@ -14,9 +14,9 @@
 //   node eval/baseline.js [--out-dir eval/out] [--cases-dir eval/cases] [--dest eval/baseline]
 //                         [--sha <git-sha>] [--date <YYYY-MM-DD>]
 //
-// [LAW:effects-at-boundaries] Module load is PURE: only stdlib + the pure JSON-object boundary imported
-// from score.js. Every world-effect (fs, git) lives inside main(), so importing this file for the
-// pure-core tests performs no IO.
+// [LAW:effects-at-boundaries] Module load is PURE: only stdlib, the pure JSON-object boundary imported
+// from score.js, and workingTree from run-case.js (a function; nothing runs at require). Every
+// world-effect (fs, git) lives inside main(), so importing this file for the pure-core tests performs no IO.
 
 const fs = require('fs');
 const path = require('path');
