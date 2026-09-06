@@ -487,7 +487,8 @@ ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js
 #            --reuse-candidate, where the reused summaries' own recorded matcher is checked instead),
 #          --out <dir> (default eval/out/candidate-<ts>, git-ignored; mutually exclusive with
 #            --reuse-candidate; an existing root resumes — runs under it recorded on this same clean
-#            commit count toward N — and any run that is not provably this candidate's is refused by name),
+#            commit count toward N — and any run that is not provably this candidate's, or a case holding
+#            more runs than the baseline's N, is refused by name),
 #          --credentials <A,B,…> (env var names, one replay lane each, forwarded to freeze-suite.js;
 #            default: one lane on the pinned provider's own input), --cases-dir <dir>, --cache <file>,
 #          --reuse-candidate <dir> (gate an already-produced candidate root; no replay, no spend;
@@ -578,7 +579,11 @@ would corrupt the candidate silently. A different commit (a push to the PR, a me
 matches nothing and starts fresh, as a different candidate should. So when the daily quota walls a
 run, re-dispatching on the same commit once the accounts reset finishes the suite instead of
 re-spending it; the 2026-09-06 acceptance run walled at 11/20 replays, which is the case this
-exists for.
+exists for. Two more refusals guard the same population: a case already holding more runs than the
+baseline's N is refused before any spend (a suite scored over unequal N is not comparable), and after
+the replay every run under `--out` is checked once more against the tree snapshotted before it — a
+working tree that moved mid-invocation is refused by name and no verdict is written, since the
+verdict would name a tree that produced none of those runs.
 
 The workflow checks out with `fetch-depth: 0` because the no-`--baseline` newest-pick ranks
 committed baselines by commit-graph order, which a shallow clone collapses to a refused tie. It

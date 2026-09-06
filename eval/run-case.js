@@ -339,6 +339,10 @@ async function main() {
     // immediately. The src requires inside are lazy (not at module load) so importing this file for the
     // pure-helper tests loads no engine stack; RUNNER_TEMP is already set above, so debug's TRANSCRIPT_DIR
     // is correct.
+    // The tree under test is read BEFORE the engine is loaded: require() caches src/ at first load, so
+    // this names the code every repeat below runs. What the engine reads from disk per spawn (the
+    // instructions file) is not pinned by it — a moving local tree is the operator's; CI's checkout is immutable.
+    const candidate = workingTree();
     const config = resolvePinnedConfig(manifest.engine, process.env);
     const { TRANSCRIPT_DIR } = require('../src/debug');
     const { runMultiScope } = require('../src/multiscope');
@@ -357,7 +361,6 @@ async function main() {
     if (excluded.paths.length > 0) process.stderr.write(`Excluded ${excluded.paths.length} file(s) matching the case's EXCLUDE_PATTERNS: ${excluded.paths.join(', ')}\n`);
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const candidate = workingTree();
     const caseOutRoot = path.join(path.resolve(opts.out), manifest.name);
     fs.mkdirSync(caseOutRoot, { recursive: true });
 

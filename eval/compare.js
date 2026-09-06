@@ -588,6 +588,12 @@ function main() {
     //    candidate with no error and possibly no N mismatch. Every prior run must therefore carry the
     //    identity of the tree under gate, and any that cannot is refused by name, before any spend.
     //    [LAW:no-silent-failure] [LAW:parse-dont-validate]
+    // A verdict is the product of ONE invocation over the WHOLE suite. One left under this root by an
+    // earlier invocation would be read as this run's if this run stopped before writing its own — at a
+    // refusal below or an abort later (eval.yml publishes verdict.md from the root, whatever exit it
+    // sees). Gone first, unconditionally — a fresh root has nothing to remove and the same operation
+    // runs. [LAW:dataflow-not-control-flow]
+    for (const file of ['verdict.md', 'verdict.json']) fs.rmSync(path.join(candidateRoot, file), { force: true });
     const prior = readPriorRuns(candidateRoot, caseNames);
     const foreign = foreignRuns(candidate, prior);
     if (foreign.length > 0) {
@@ -601,11 +607,6 @@ function main() {
       process.stderr.write(`  ${name}: ${prior.filter(r => r.case === name).length}/${repeats} run(s) of this candidate already under --out; the replay fills the rest\n`);
     }
     const owed = deficitReplays(caseNames, prior, repeats);
-    // A verdict is the product of ONE invocation over the WHOLE suite. One left under this root by an
-    // earlier invocation would be read as this run's if this run aborted before writing its own (eval.yml
-    // publishes verdict.md from the root, whatever exit it sees). Gone before any spend, unconditionally —
-    // a fresh root has nothing to remove and the same operation runs. [LAW:dataflow-not-control-flow]
-    for (const file of ['verdict.md', 'verdict.json']) fs.rmSync(path.join(candidateRoot, file), { force: true });
 
     // 6. COST GUARDRAIL — print the estimate of THIS invocation's spend up front, before it happens: the
     //    replays still owed, not the suite's size. [LAW:verifiable-goals]
