@@ -474,7 +474,9 @@ change degrade finding quality?"** answered as a measured verdict, not a guess. 
 is simply the code as checked out; no build or publish) against a frozen baseline.
 
 ```bash
-ANTHROPIC_API_KEY=… CLAUDE_CODE_OAUTH_TOKEN=… node eval/compare.js
+# The engine credential is the pinned provider's own input var (CLAUDE_CODE_OAUTH_TOKEN for the
+# current pins), or one env var per --credentials lane as .github/workflows/eval.yml runs it.
+ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js
 # options: --baseline <dir|baseline.json> (default: newest under eval/baseline/ by COMMIT-GRAPH order,
 #            not directory-name order — an uncommitted baseline.json always outranks a committed one;
 #            refused if the newest can't be determined unambiguously, e.g. a shallow git clone with

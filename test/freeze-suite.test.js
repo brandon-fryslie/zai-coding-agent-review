@@ -554,3 +554,45 @@ describe('selectCaseDirs — the replayed set is exactly the named set, in disco
     assert.throws(() => selectCaseDirs(dirs, ['a', 'b', 'a']), /--cases names 'a' more than once/);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// main()'s composition, through the real CLI: discover → select → census. Each piece is tested above in
+// isolation; this pins their ORDER, which is what two review rounds on #144 found wrong — a sibling case
+// with a broken manifest aborted a suite that never asked for it, because the census parsed everything
+// before the selection ran. The selected case already holds a completed run, so the census plans zero
+// replays and the command exits before it needs a credential: no engine, no spend.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+describe('the CLI selects case directories before any manifest is parsed', () => {
+  const { spawnSync } = require('node:child_process');
+  const cli = path.join(__dirname, '..', 'eval', 'freeze-suite.js');
+  const tree = () => {
+    const root = tmpTree();
+    const casesDir = path.join(root, 'cases');
+    const outRoot = path.join(root, 'out');
+    writeCase(casesDir, 'good', 'good');
+    writeRun(outRoot, 'good', 'run-1', true);
+    fs.mkdirSync(path.join(casesDir, 'wip'), { recursive: true });
+    fs.writeFileSync(path.join(casesDir, 'wip', 'case.json'), '{ not json');
+    return { root, casesDir, outRoot };
+  };
+  const run = (args) => {
+    const r = spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    return { status: r.status, out: `${r.stdout}${r.stderr}` };
+  };
+
+  test('a scoped run never parses the broken sibling', () => {
+    const { root, casesDir, outRoot } = tree();
+    const r = run(['--cases-dir', casesDir, '--cases', 'good', '-n', '1', '--out', outRoot]);
+    assert.equal(r.status, 0, r.out);
+    assert.match(r.out, /0 replay\(s\) to run/);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  test('an unscoped run still refuses the broken sibling loudly', () => {
+    const { root, casesDir, outRoot } = tree();
+    const r = run(['--cases-dir', casesDir, '-n', '1', '--out', outRoot]);
+    assert.notEqual(r.status, 0);
+    assert.match(r.out, /wip.*not valid JSON/);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+});
