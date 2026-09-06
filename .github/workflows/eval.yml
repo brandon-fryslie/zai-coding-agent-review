@@ -88,8 +88,9 @@ jobs:
         # replays that were real quota spent; with a fresh workspace per job they were spent for nothing,
         # and the next dispatch started from zero into the same wall. The candidate root is carried across
         # runs instead, keyed by the commit under gate: compare.js accepts the runs under it that carry
-        # THIS commit's identity (each run's meta.json records the clean commit that produced it) and
-        # refuses any that do not, and freeze-suite.js's census then replays only the deficit. A different
+        # THIS commit's identity (each run's meta.json records the tree that produced it — commit plus
+        # dirty flag — and only a clean tree's identity can match) and refuses any that do not, and
+        # freeze-suite.js's census then replays only the deficit. A different
         # commit — a push to the PR, a merge to main — matches nothing and starts fresh, which is what a
         # different candidate should do. The key ends in the run id so every run saves its own entry and
         # the prefix restore picks the newest, i.e. the most complete. [LAW:one-source-of-truth]

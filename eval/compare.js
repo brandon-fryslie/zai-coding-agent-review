@@ -57,7 +57,8 @@ Usage: ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js [option
                          recorded in each run's meta.json) count toward N and only the
                          deficit is replayed — how a gate survives a quota wall across invocations. Any
                          run under it that is not provably this candidate's (another commit, a dirty
-                         tree, no identity recorded) is refused by name rather than silently blended.
+                         tree, no identity recorded), or a case already holding more runs than the
+                         baseline's N, is refused by name before any spend rather than silently blended.
   --credentials <A,B,…>  Names of env vars holding one engine credential each, forwarded to
                          freeze-suite.js: one replay LANE per name, run concurrently. Default: a single
                          lane on the pinned provider's own credential input. N lanes cut the suite's
@@ -507,13 +508,26 @@ function main() {
   // provenance the verdict names (8). One read, one fact. [LAW:one-source-of-truth]
   const candidate = workingTree();
 
-  // The pre-spend guards below (3-3c) all share one shape: refuse BEFORE any replay when the thing they
+  // 3. Candidate artifact root — isolated from the baseline's own eval/out/<case> runs so score.js never
+  //    pools baseline + candidate run dirs together. Under eval/out/ (git-ignored) by default. Resolved
+  //    BEFORE any refusal below, because the first thing done under it must be undoing the last thing an
+  //    earlier invocation left there: a verdict is the product of ONE invocation over the WHOLE suite, and
+  //    one left under this root would be read as this run's if this run stopped before writing its own —
+  //    at a refusal below or an abort later (eval.yml publishes verdict.md from the root, whatever exit
+  //    it sees). Gone first, unconditionally, in both modes — a fresh root has nothing to remove and the
+  //    same operation runs. [LAW:dataflow-not-control-flow] [LAW:no-silent-failure]
+  const candidateRoot = opts.reuseCandidate
+    ? path.resolve(opts.reuseCandidate)
+    : path.resolve(opts.out || path.join('eval', 'out', `candidate-${new Date().toISOString().replace(/[:.]/g, '-')}`));
+  for (const file of ['verdict.md', 'verdict.json']) fs.rmSync(path.join(candidateRoot, file), { force: true });
+
+  // The pre-spend guards below (4-4c) all share one shape: refuse BEFORE any replay when the thing they
   // check is knowable without running the candidate engine at all. None of them apply under
   // --reuse-candidate, which replays nothing — compareVerdict's own checks (matcher, engine, pooled
   // opportunities), reading the reused summaries' ACTUAL recorded values, are the universal backstop for
   // that path. [LAW:no-silent-failure]
   if (!opts.reuseCandidate) {
-    // 3. Fail BEFORE spending an hour on a matcher that can't be compared: the candidate is scored with
+    // 4. Fail BEFORE spending an hour on a matcher that can't be compared: the candidate is scored with
     //    opts.matcher, which must yield the baseline's exact matcher label.
     if (baseline.matcher) {
       const wouldBe = expectedMatcherLabel(opts.matcher);
@@ -522,13 +536,13 @@ function main() {
       }
     }
 
-    // 3a. Fail BEFORE spending if the 'llm' matcher's credential is missing — score.js's makeLlmJudge
+    // 4a. Fail BEFORE spending if the 'llm' matcher's credential is missing — score.js's makeLlmJudge
     //     would otherwise throw only once a case's replay is already complete and its OWN score.js
     //     invocation runs, wasting that case's real spend on a run this file was never going to be able
     //     to score.
     if (opts.matcher === 'llm') requireLlmJudgeCredential();
 
-    // 3b. Fail BEFORE spending on a denominator that's already known to mismatch: each case's pooled
+    // 4b. Fail BEFORE spending on a denominator that's already known to mismatch: each case's pooled
     //     inventory opportunity count is a PURE function of its current expected.json (findings annotated
     //     must-find, any round) — it does not depend on what the candidate engine produces, so it costs
     //     nothing to check here.
@@ -544,7 +558,7 @@ function main() {
       throw new Error(`Incomparable: the golden suite's current pooled inventory opportunities (${currentOpportunities}) differ from the baseline's (${baseline.pooledInventoryMustFind.opportunities}) — expected.json changed since the baseline was frozen. Re-freeze the baseline before gating against this expected.json.`);
     }
 
-    // 3c. Fail BEFORE spending on engine drift — a FULL pass over every case, not a check folded into the
+    // 4c. Fail BEFORE spending on engine drift — a FULL pass over every case, not a check folded into the
     //     replay loop below: if only a LATER case's engine pin had drifted, folding it into that loop would
     //     let every EARLIER case fully replay and score (real spend) before the mismatch is even reached.
     //     run-case.js's own assertConfigMatchesPin only verifies the resolved config against THIS
@@ -562,12 +576,6 @@ function main() {
       }
     }
   }
-
-  // 4. Candidate artifact root — isolated from the baseline's own eval/out/<case> runs so score.js never
-  //    pools baseline + candidate run dirs together. Under eval/out/ (git-ignored) by default.
-  const candidateRoot = opts.reuseCandidate
-    ? path.resolve(opts.reuseCandidate)
-    : path.resolve(opts.out || path.join('eval', 'out', `candidate-${new Date().toISOString().replace(/[:.]/g, '-')}`));
 
   process.stderr.write(`\nBaseline: ${baselineJsonPath}\n`);
   process.stderr.write(`  ${baseline.mainSha.slice(0, 7)} · engine ${baseline.engine ? `${baseline.engine.provider}/${baseline.engine.model}` : '(unpinned)'} · N=${repeats} · matcher ${baseline.matcher || '(none)'}\n`);
@@ -588,12 +596,6 @@ function main() {
     //    candidate with no error and possibly no N mismatch. Every prior run must therefore carry the
     //    identity of the tree under gate, and any that cannot is refused by name, before any spend.
     //    [LAW:no-silent-failure] [LAW:parse-dont-validate]
-    // A verdict is the product of ONE invocation over the WHOLE suite. One left under this root by an
-    // earlier invocation would be read as this run's if this run stopped before writing its own — at a
-    // refusal below or an abort later (eval.yml publishes verdict.md from the root, whatever exit it
-    // sees). Gone first, unconditionally — a fresh root has nothing to remove and the same operation
-    // runs. [LAW:dataflow-not-control-flow]
-    for (const file of ['verdict.md', 'verdict.json']) fs.rmSync(path.join(candidateRoot, file), { force: true });
     const prior = readPriorRuns(candidateRoot, caseNames);
     const foreign = foreignRuns(candidate, prior);
     if (foreign.length > 0) {
