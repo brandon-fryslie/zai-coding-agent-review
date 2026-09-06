@@ -99,7 +99,7 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 
 | Input | Default | Description |
 |---|---|---|
-| `PROVIDER` | `auto` | Engine: `auto`, `deepseek`, `zai`, `codex`, or `claude-subscription`. Ignored when a `CONFIG_FILE` exists. |
+| `PROVIDER` | `auto` | Engine: `auto`, `deepseek`, `zai`, `codex`, `claude-subscription`, or `local`. Ignored when a `CONFIG_FILE` exists. |
 | `DEEPSEEK_API_KEY` | — | Required for `deepseek`. |
 | `DEEPSEEK_MODEL` | `deepseek-v4-pro` | Model for the `deepseek` provider. |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/anthropic` | Anthropic-compatible endpoint for `deepseek`. |
