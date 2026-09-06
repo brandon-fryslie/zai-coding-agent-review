@@ -333,7 +333,7 @@ const inFlight = new Set();
 // an honest replay destroys an hour of real work, while one that fires late only idles a lane.
 //
 // `detached` makes the replay its own process-group leader so the deadline can take down the WHOLE tree.
-// The engine spawns four claude-code workers per pass; signalling only the direct child would orphan them
+// The engine spawns one claude-code worker per scope; signalling only the direct child would orphan them
 // to keep burning quota against a parent that is already gone.
 // [LAW:decomposition] Supervising a child under a deadline and DECIDING WHAT TO REPLAY are two jobs, and
 // they were one function. Fused, the supervision could only ever be exercised by really replaying a

@@ -184,7 +184,7 @@ is attributable to the code change under test, never to a replay that drifted.
 
 ```bash
 CLAUDE_CODE_OAUTH_TOKEN=… node eval/run-case.js eval/cases/<case-name> -n 3
-# options: -n/--repeats <N> (default 1), --out <dir> (default eval/out), --workers <N> (default 4)
+# options: -n/--repeats <N> (default 1), --out <dir> (default eval/out)
 ```
 
 It extracts `repo.tar.gz` to a temp dir (that becomes `REVIEWED_REPO_ROOT`), feeds

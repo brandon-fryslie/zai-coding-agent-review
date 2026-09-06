@@ -9,13 +9,11 @@ test('parseArgs takes the required positional and applies defaults', () => {
   assert.equal(o.caseDir, 'eval/cases/foo');
   assert.equal(o.repeats, 1);
   assert.equal(o.out, 'eval/out');
-  assert.equal(o.workers, 4);
 });
 
 test('parseArgs supports -n alias, --flag=value, and --help', () => {
-  const o = parseArgs(['eval/cases/foo', '-n', '3', '--workers=2', '--out', 'tmp/out']);
+  const o = parseArgs(['eval/cases/foo', '-n', '3', '--out=tmp/out']);
   assert.equal(o.repeats, 3);
-  assert.equal(o.workers, 2);
   assert.equal(o.out, 'tmp/out');
   assert.equal(parseArgs(['--help']).help, true);
   assert.equal(parseArgs(['-h']).help, true);
@@ -28,17 +26,16 @@ test('parseArgs rejects bad input loudly', () => {
   assert.throws(() => parseArgs(['foo', '--repeats']), /requires a value/);
   assert.throws(() => parseArgs(['foo', '-n', '0']), /positive integer/);
   assert.throws(() => parseArgs(['foo', '-n', 'x']), /positive integer/);
-  assert.throws(() => parseArgs(['foo', '--workers', '-1']), /positive integer/);
   // Non-integers are rejected, never silently truncated (parseInt('2.5') would have accepted 2).
   assert.throws(() => parseArgs(['foo', '-n', '2.5']), /positive integer/);
-  assert.throws(() => parseArgs(['foo', '--workers', '3.7']), /positive integer/);
+  assert.throws(() => parseArgs(['foo', '-n', '3.7']), /positive integer/);
   assert.throws(() => parseArgs(['foo', '-n', '2abc']), /positive integer/);
   // A valid positive integer still parses to a number.
   assert.equal(parseArgs(['foo', '-n', '3']).repeats, 3);
   // A `--`-prefixed value is a swallowed flag, not a path — rejected rather than silently consumed.
-  assert.throws(() => parseArgs(['foo', '--out', '--workers=2']), /looks like another flag/);
+  assert.throws(() => parseArgs(['foo', '--out', '--repeats=2']), /looks like another flag/);
   // A single-dash value (a negative number) still routes to its own validator, not the flag guard.
-  assert.throws(() => parseArgs(['foo', '--workers', '-1']), /positive integer/);
+  assert.throws(() => parseArgs(['foo', '-n', '-1']), /positive integer/);
 });
 
 const VALID_CASE = JSON.stringify({
