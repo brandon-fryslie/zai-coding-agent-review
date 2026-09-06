@@ -256,13 +256,14 @@ test('renderVerdictMarkdown surfaces the gate, the per-case table, cost, and a f
   ]);
   const v = compareVerdict(baseline, candidate);
   const md = renderVerdictMarkdown(v, {
-    candidateSha: 'cafe123', dirty: true, baselineSha: 'basesha0deadbeef',
+    candidate: { sha: 'cafe1234', dirty: true }, baselineSha: 'basesha0deadbeef',
     cost: { baselinePerRun: 0.7, candidatePerRun: 0.5, delta: -0.2 },
   });
   assert.match(md, /## Eval verdict — 🔴 DEGRADED/);
   assert.match(md, /PRIMARY GATE — pooled inventory must-find recall/);
-  assert.match(md, /working tree `cafe123`, dirty/);
-  assert.match(renderVerdictMarkdown(v, { candidateSha: 'cafe123', dirty: false, baselineSha: 'basesha0deadbeef', cost: null }), /working tree `cafe123`\)/);
+  assert.match(md, /Candidate \(a dirty tree at commit cafe123\) vs baseline/);
+  assert.match(renderVerdictMarkdown(v, { candidate: { sha: 'cafe1234', dirty: false }, baselineSha: 'basesha0deadbeef', cost: null }), /Candidate \(commit cafe123\) vs baseline/);
+  assert.match(renderVerdictMarkdown(v, { candidate: null, baselineSha: 'basesha0deadbeef', cost: null }), /Candidate \(no recorded identity/);
   assert.match(md, /\| `case-a` \|/);
   assert.match(md, /⚠️ yes/);
   assert.match(md, /\*\*Cost:\*\*/);
@@ -412,7 +413,7 @@ test('resolveBaselineJsonPath does NOT refuse a shallow clone with an uncommitte
 });
 
 // ── resume or refuse: prior runs under --out against the tree under gate ──────────────────────────────
-const { foreignRuns, readPriorRuns, deficitReplays, excessRuns, driftedRuns } = require('../eval/compare');
+const { foreignRuns, readPriorRuns, deficitReplays, excessRuns, driftedRuns, producedTree } = require('../eval/compare');
 
 test('foreignRuns keeps the runs replayed on this exact clean commit and names every other by both trees', () => {
   const here = { sha: 'aaaaaaa1', dirty: false };
@@ -462,6 +463,20 @@ test('driftedRuns compares the recorded tree to the snapshot by equality — a d
   ]);
   assert.deepEqual(moved.map(m => m.dir), ['r2', 'r3', 'r4']);
   assert.match(moved[0].reason, /recorded a dirty tree at commit aaaaaaa; the tree snapshotted before the replay was commit aaaaaaa/);
+});
+
+test('producedTree names the one tree every run records — the verdict\'s provenance comes from the runs, not the checkout', () => {
+  const clean = { sha: 'aaaaaaa1', dirty: false };
+  assert.deepEqual(producedTree([{ dir: 'r1', candidate: clean }, { dir: 'r2', candidate: { sha: 'aaaaaaa1', dirty: false } }]), clean);
+  assert.deepEqual(producedTree([{ dir: 'r1', candidate: { sha: 'aaaaaaa1', dirty: true } }]), { sha: 'aaaaaaa1', dirty: true });
+  // Pre-provenance runs agree with each other on having no identity, and the verdict says so.
+  assert.equal(producedTree([{ dir: 'r1', candidate: null }, { dir: 'r2', candidate: null }]), null);
+  assert.throws(() => producedTree([]), /No completed runs/);
+  assert.throws(() => producedTree([
+    { dir: 'r1', candidate: clean },
+    { dir: 'r2', candidate: { sha: 'bbbbbbb2', dirty: false } },
+    { dir: 'r3', candidate: null },
+  ]), /not produced by one tree:\n {2}r2 recorded commit bbbbbbb; r1 recorded commit aaaaaaa\n {2}r3 recorded no recorded identity/);
 });
 
 test('readPriorRuns reads the census the replay will take — completed runs only, each with its recorded tree', () => {

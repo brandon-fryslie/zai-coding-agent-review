@@ -68,8 +68,10 @@ Usage: ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js [option
   --cache <file>         Judge-decision cache, forwarded to score.js (default: eval/out/.judge-cache.json).
   --reuse-candidate <d>  Skip the replay+score entirely and gate an ALREADY-produced candidate root <d>
                          (one <case>/scorecard-summary.json per baseline case). For re-rendering a verdict
-                         or validating the gate without re-spending. Mutually exclusive with --out and
-                         with --credentials (nothing is replayed, so there is nothing for either to shape).
+                         or validating the gate without re-spending. The verdict names the tree the reused
+                         runs record (each run's meta.json), not the checked-out tree; runs recording
+                         different trees are refused by name. Mutually exclusive with --out and with
+                         --credentials (nothing is replayed, so there is nothing for either to shape).
   --help                 Show this help.
 
 The candidate always runs at the baseline's N and pinned engine (a replay at a different N/engine would
@@ -175,15 +177,34 @@ function excessRuns(caseNames, prior, repeats) {
     .filter(c => c.completed > repeats);
 }
 
+// [LAW:effects-at-boundaries] Pure: equality of two recorded trees (commit and dirty flag; an unrecorded
+// tree equals only another unrecorded one), not identity: a dirty tree has no identity, yet a replay on
+// it is legitimate and its own runs record the same dirty snapshot; what a dirty tree cannot reveal is
+// movement within its own dirtiness, and the verdict already says 'dirty'.
+function sameTree(a, b) {
+  return a === null || b === null ? a === b : a.sha === b.sha && a.dirty === b.dirty;
+}
+
 // [LAW:effects-at-boundaries] Pure: which runs record a tree OTHER than the one snapshotted before the
-// replay — the tree moved while the suite ran. This is equality of the recorded tree (commit and dirty
-// flag), not identity: a dirty tree has no identity, yet a replay on it is legitimate and its own runs
-// record the same dirty snapshot; what a dirty tree cannot reveal is movement within its own dirtiness,
-// and the verdict already says 'dirty'.
+// replay — the tree moved while the suite ran.
 function driftedRuns(snapshot, runs) {
   return runs
-    .filter(({ candidate }) => candidate === null || candidate.sha !== snapshot.sha || candidate.dirty !== snapshot.dirty)
+    .filter(({ candidate }) => !sameTree(candidate, snapshot))
     .map(({ dir, candidate }) => ({ dir, reason: `recorded ${describeTree(candidate)}; the tree snapshotted before the replay was ${describeTree(snapshot)}` }));
+}
+
+// [LAW:effects-at-boundaries] Pure: the one tree every run records — the tree a verdict over these runs
+// names, read from the runs themselves so a root produced elsewhere is named by its producer, never by the
+// tree that happens to be checked out. Runs recording two trees are not one candidate: refused by name.
+// [LAW:one-source-of-truth] [LAW:no-silent-failure]
+function producedTree(runs) {
+  if (runs.length === 0) throw new Error('No completed runs under the candidate root — nothing to name a verdict after.');
+  const tree = runs[0].candidate;
+  const odd = runs.filter(({ candidate }) => !sameTree(candidate, tree));
+  if (odd.length > 0) {
+    throw new Error(`The runs under the candidate root were not produced by one tree:\n${odd.map(r => `  ${r.dir} recorded ${describeTree(r.candidate)}; ${runs[0].dir} recorded ${describeTree(tree)}`).join('\n')}\nA verdict names one candidate; remove the runs that are not its.`);
+  }
+  return tree;
 }
 
 // The total pooled inventory must-find opportunities a candidate suite would report, given each baseline
@@ -306,7 +327,7 @@ function renderVerdictMarkdown(verdict, meta = {}) {
   const lines = [
     `## Eval verdict — ${badge}`,
     '',
-    `Candidate${meta.candidateSha ? ` (working tree \`${meta.candidateSha}\`${meta.dirty ? ', dirty' : ''})` : ''} vs baseline` +
+    `Candidate${meta.candidate === undefined ? '' : ` (${describeTree(meta.candidate)})`} vs baseline` +
       `${meta.baselineSha ? ` \`${meta.baselineSha.slice(0, 7)}\`` : ''}` +
       `${eng ? ` · engine \`${eng.provider}\`/\`${eng.model}\`${eng.reasoning ? `/reasoning=${eng.reasoning}` : ''}` : ''}` +
       ` · N=${verdict.repeats}${verdict.matcher ? ` · matcher \`${verdict.matcher}\`` : ''}.`,
@@ -504,9 +525,6 @@ function main() {
   const freezeSuiteScript = path.join(__dirname, 'freeze-suite.js');
   const scoreScript = path.join(__dirname, 'score.js');
   const caseNames = baseline.cases.map(({ case: name }) => name);
-  // The tree under gate, read once: it decides which prior runs are this candidate's (5), and it is the
-  // provenance the verdict names (8). One read, one fact. [LAW:one-source-of-truth]
-  const candidate = workingTree();
 
   // 3. Candidate artifact root — isolated from the baseline's own eval/out/<case> runs so score.js never
   //    pools baseline + candidate run dirs together. Under eval/out/ (git-ignored) by default. Resolved
@@ -596,6 +614,9 @@ function main() {
     //    candidate with no error and possibly no N mismatch. Every prior run must therefore carry the
     //    identity of the tree under gate, and any that cannot is refused by name, before any spend.
     //    [LAW:no-silent-failure] [LAW:parse-dont-validate]
+    // The tree under gate, snapshotted once before any replay: the census here and the drift check (7a)
+    // both compare against it. [LAW:one-source-of-truth]
+    const candidate = workingTree();
     const prior = readPriorRuns(candidateRoot, caseNames);
     const foreign = foreignRuns(candidate, prior);
     if (foreign.length > 0) {
@@ -640,10 +661,12 @@ function main() {
     }
   }
 
-  // 8. Reduce the candidate's scored summaries into a suite with the SAME buildBaseline the frozen baseline
-  //    used — producer and comparator can't drift. Read each case's summary + its pinned engine, exactly as
-  //    baseline.js's main() does.
-  const { sha: candidateSha, dirty } = candidate;
+  // 8. The tree the verdict names is the one the runs under the root record — in both modes, so a reused
+  //    root is named by the tree that produced it (7a already proved a replayed root's runs equal the
+  //    snapshot). Then reduce the candidate's scored summaries into a suite with the SAME buildBaseline the
+  //    frozen baseline used — producer and comparator can't drift. Read each case's summary + its pinned
+  //    engine, exactly as baseline.js's main() does.
+  const produced = producedTree(readPriorRuns(candidateRoot, caseNames));
   const candidateCases = baseline.cases.map(({ case: name }) => {
     const summaryPath = path.join(candidateRoot, name, 'scorecard-summary.json');
     if (!fs.existsSync(summaryPath)) throw new Error(`No candidate summary for case '${name}' at ${summaryPath}. ${opts.reuseCandidate ? 'The reused root is incomplete.' : 'The replay/score step did not produce it.'}`);
@@ -652,7 +675,7 @@ function main() {
     const engine = parseCaseEngine(fs.readFileSync(path.join(casesDir, name, 'case.json'), 'utf8'), path.join(casesDir, name, 'case.json'));
     return { summary, engine };
   });
-  const candidateSuite = buildBaseline({ cases: candidateCases, provenance: { sha: candidateSha, date: new Date().toISOString().slice(0, 10) } });
+  const candidateSuite = buildBaseline({ cases: candidateCases, provenance: { sha: produced === null ? null : produced.sha, date: new Date().toISOString().slice(0, 10) } });
 
   // 9. THE VERDICT.
   const verdict = compareVerdict(baseline, candidateSuite);
@@ -662,7 +685,7 @@ function main() {
     delta: null,
   };
   if (typeof cost.baselinePerRun === 'number' && typeof cost.candidatePerRun === 'number') cost.delta = cost.candidatePerRun - cost.baselinePerRun;
-  const md = renderVerdictMarkdown(verdict, { candidateSha: candidateSha.slice(0, 7), dirty, baselineSha: baseline.mainSha, cost });
+  const md = renderVerdictMarkdown(verdict, { candidate: produced, baselineSha: baseline.mainSha, cost });
 
   // Write the verdict alongside the candidate artifacts (2fk.6 reads verdict.md into a Step Summary), and
   // print it to stdout so it's pasteable straight into a PR body.
@@ -692,5 +715,5 @@ if (require.main === module) {
 module.exports = {
   parseArgs, replayArgs, expectedMatcherLabel, estimateCandidateCostUsd,
   compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath, computeExpectedOpportunities,
-  foreignRuns, readPriorRuns, deficitReplays, excessRuns, driftedRuns,
+  foreignRuns, readPriorRuns, deficitReplays, excessRuns, driftedRuns, producedTree,
 };

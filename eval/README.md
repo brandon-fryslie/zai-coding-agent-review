@@ -491,8 +491,9 @@ ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js
 #            more runs than the baseline's N, is refused by name),
 #          --credentials <A,B,…> (env var names, one replay lane each, forwarded to freeze-suite.js;
 #            default: one lane on the pinned provider's own input), --cases-dir <dir>, --cache <file>,
-#          --reuse-candidate <dir> (gate an already-produced candidate root; no replay, no spend;
-#            mutually exclusive with --out)
+#          --reuse-candidate <dir> (gate an already-produced candidate root; no replay, no spend; the
+#            verdict names the tree the reused runs record, not the checked-out tree; mutually
+#            exclusive with --out)
 ```
 
 ANTHROPIC_API_KEY is required **unconditionally** for the default `--matcher llm` (the judge's own
