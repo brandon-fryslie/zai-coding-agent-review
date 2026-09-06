@@ -43,13 +43,19 @@ Usage: node eval/freeze-suite.js [options]
   --help                   Show this help.
 
 Every case must pin the same engine — the rule eval/baseline.js enforces on the resulting suite, applied
-here before any spend. A lane stops at its first failed replay (a walled credential fails every job it is
-handed); the other lanes carry on, and the command exits non-zero naming what is still missing.
+here before any spend. A failed replay goes back on the queue and its lane moves on, attempting each job
+at most once, so a walled credential costs one fast pass and a dead case costs one attempt; the command
+exits non-zero naming what is still missing.
 `;
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
 // pure
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+const MS_PER_MINUTE = 60 * 1000;
+// Node stores a timer delay in a signed 32-bit int; anything larger is not clamped to the maximum but
+// wrapped to ~1ms. The bound this imposes on --job-timeout is enforced in parseArgs.
+const MAX_TIMER_MS = 2147483647;
 
 // [LAW:effects-at-boundaries] Pure arg parse: flags map to a plain options value; no IO. Mirrors
 // run-case.js's parser, including its `--flag looks-like-another-flag` refusal. [LAW:one-source-of-truth]
@@ -63,15 +69,29 @@ function parseArgs(argv) {
     if (!arg.startsWith('-')) throw new Error(`Unexpected positional argument: ${arg} (this command takes options only).`);
     const eq = arg.indexOf('=');
     const rawName = arg.startsWith('--') ? arg.slice(2, eq === -1 ? undefined : eq) : arg.slice(1, eq === -1 ? undefined : eq);
-    const name = keyFor[aliases[rawName] || rawName] || keyFor[rawName];
+    // Resolved before it is used for anything, so the lookup and both error messages name the same
+    // spelling. Reported as the alias, `-n` renders "Option --n requires a value." — a flag that does
+    // not exist, sending the reader to find it. run-case.js's parser resolves first for this reason.
+    const canonical = aliases[rawName] || rawName;
+    const name = keyFor[canonical];
     if (!name) throw new Error(`Unknown option: ${arg.slice(0, eq === -1 ? undefined : eq)}`);
     const value = eq === -1 ? argv[++i] : arg.slice(eq + 1);
-    if (value === undefined) throw new Error(`Option --${rawName} requires a value.`);
-    if (eq === -1 && value.startsWith('--')) throw new Error(`Option --${rawName} requires a value, but got what looks like another flag: ${JSON.stringify(value)}.`);
+    if (value === undefined) throw new Error(`Option --${canonical} requires a value.`);
+    if (eq === -1 && value.startsWith('--')) throw new Error(`Option --${canonical} requires a value, but got what looks like another flag: ${JSON.stringify(value)}.`);
     opts[name] = value;
   }
   opts.repeats = parsePositiveInt(opts.repeats, '-n/--repeats');
   opts.jobTimeout = parsePositiveInt(opts.jobTimeout, '--job-timeout');
+  // A delay past Node's 32-bit ceiling does not wait longer — setTimeout fires it on the next tick. So
+  // `--job-timeout 100000`, reaching for "no meaningful limit", would kill every replay within ~1ms and
+  // report each one TIMED OUT: the operator's intent inverted, in a report that blames the replays.
+  // Refused here, while the value is still an option and not yet a timer. [LAW:no-silent-failure]
+  if (opts.jobTimeout * MS_PER_MINUTE > MAX_TIMER_MS) {
+    throw new Error(
+      `--job-timeout must be at most ${Math.floor(MAX_TIMER_MS / MS_PER_MINUTE)} minutes ` +
+      `(a longer delay overflows setTimeout and fires immediately); got ${opts.jobTimeout}.`,
+    );
+  }
   return opts;
 }
 
@@ -154,7 +174,12 @@ function formatDuration(ms) {
 // [LAW:effects-at-boundaries] Pure: the finished job records and the closing census render the report the
 // caller prints. Every job appears — a suite that spent four hours must be able to say where every hour
 // went, and which log holds the failure. [LAW:no-silent-failure]
-function renderReport({ jobs, census, repeats, elapsedMs }) {
+//
+// `outDir` is threaded in rather than left implicit because the closing hint names a command the operator
+// is meant to paste: baseline.js's --out-dir defaults to plain `eval/out`, so a hint printed without it
+// sends a suite run under --out to score a different directory. Derived from the path this run used, it
+// cannot disagree with it. [LAW:one-source-of-truth]
+function renderReport({ jobs, census, repeats, elapsedMs, outDir }) {
   const lines = [];
   lines.push('', `Suite: ${jobs.length} replay(s) attempted in ${formatDuration(elapsedMs)}`, '');
   lines.push('| level | case | lane | result | time | log |');
@@ -168,7 +193,7 @@ function renderReport({ jobs, census, repeats, elapsedMs }) {
   lines.push('');
   lines.push(
     usableN >= repeats
-      ? `SUITE COMPLETE at N=${repeats}. Next: score each case, then node eval/baseline.js.`
+      ? `SUITE COMPLETE at N=${repeats}. Next: score each case, then node eval/baseline.js --out-dir ${outDir}.`
       : `SUITE SHORT of N=${repeats}. Every case has at least ${usableN} run(s), so the deepest freezable suite today is N=${usableN}. Re-run this command to fill the rest.`,
   );
   return lines.join('\n') + '\n';
@@ -247,46 +272,71 @@ function runReplay({ job, lane, credentialInput, outRoot, logPath, timeoutMinute
     // ignores it. Signalling the negative pid is the process GROUP. A group that has already exited
     // raises ESRCH — that is the race resolving in our favour, not an error to report.
     const signalGroup = sig => { try { process.kill(-child.pid, sig); } catch { /* already gone */ } };
+    // Both timers are cleared by whichever handler ends this replay. The escalation timer especially:
+    // a tree that honours SIGTERM exits at once, and an uncancelled SIGKILL still fires 20s later —
+    // long enough for the OS to have reissued that pid to a process this suite never spawned. The
+    // suite is normally still replaying, so `.unref()` does not save us; the process is alive and the
+    // timer runs. A signal's blast radius belongs to the spawn that armed it.
+    // [LAW:no-ambient-temporal-coupling]
+    let escalation = null;
+    const clearTimers = () => { clearTimeout(deadline); clearTimeout(escalation); };
     const deadline = setTimeout(() => {
       timedOut = true;
       logStream.write(`\nfreeze-suite: replay exceeded its ${timeoutMinutes}m deadline — killing the process group.\n`);
       signalGroup('SIGTERM');
-      setTimeout(() => signalGroup('SIGKILL'), 20000).unref();
-    }, timeoutMinutes * 60 * 1000);
+      escalation = setTimeout(() => signalGroup('SIGKILL'), 20000);
+      escalation.unref();
+    }, timeoutMinutes * MS_PER_MINUTE);
 
     child.on('error', err => {
-      clearTimeout(deadline);
+      clearTimers();
       logStream.end(`\nfreeze-suite: could not spawn the replay: ${err.message}\n`);
       resolve({ exitCode: -1, signal: null, timedOut, durationMs: Date.now() - started });
     });
     child.on('close', (exitCode, signal) => {
-      clearTimeout(deadline);
+      clearTimers();
       logStream.end();
       resolve({ exitCode, signal, timedOut, durationMs: Date.now() - started });
     });
   });
 }
 
-// A lane replays its jobs one at a time and STOPS at its first failure, returning the failed job to the
-// BACK of the queue. A credential that has hit its usage wall fails every job it is handed, instantly, so
-// a lane that carries on would burn the whole queue in minutes and report twenty identical failures; a
-// lane that swallowed the job would lose it while healthy lanes idled. Requeued at the back, the job is
-// retried by whichever lane is still working once the other work is done — and a job that is failing for
-// its own sake (a dead case, not a walled token) costs at most one attempt per lane, then the queue drains
-// and every failure is in the report with its log. [LAW:no-silent-failure]
-async function runLane({ lane, queue, credentialInput, outRoot, logDir, done, log, timeoutMinutes }) {
-  while (queue.length > 0) {
-    const job = queue.shift();
+// A lane replays one job at a time and takes the first queued job it has NOT already failed, requeueing
+// a failure to the BACK. That single rule gives both behaviours the suite needs, with no branch on how
+// many lanes are running:
+//
+//   - A credential at its usage wall fails every job instantly, so the lane crosses the queue once in
+//     seconds — not hours — requeues everything, finds nothing left it hasn't attempted, and exits.
+//     Healthy lanes keep draining the work it put back.
+//   - A job failing for its own sake (a dead case, one corrupt repo.tar.gz, the stochastic
+//     `Prompt is too long` on links-317) costs one attempt and the rest of the suite still runs.
+//
+// Stopping the lane outright on any failure gave the first behaviour and lost the second: under the
+// documented single-lane invocation it ended the only lane, so one transient failure abandoned every
+// other case, and a reproducible one re-aborted every future run at the same job — the suite could never
+// complete. `attempted` holds the job objects themselves, which planJobs creates once and the queue
+// requeues by reference, so a lane's memory of what it tried cannot drift from what it took.
+// [LAW:one-source-of-truth] [LAW:no-silent-failure]
+// `replay` is a parameter, not a direct call to runReplay: the rule above — which job a lane takes next,
+// and what a failure costs the rest of the queue — is the whole reason this function exists, and it can
+// only be checked by a test that decides which replays fail. Spawning is the one effect here; taking it
+// as an argument leaves the scheduling pure enough to assert on. [LAW:effects-at-boundaries]
+async function runLane({ lane, queue, credentialInput, outRoot, logDir, done, log, timeoutMinutes, replay }) {
+  const attempted = new Set();
+  for (;;) {
+    const next = queue.findIndex(job => !attempted.has(job));
+    if (next === -1) return;
+    const [job] = queue.splice(next, 1);
     const logPath = path.join(logDir, `${job.name}-level${job.level}-${lane.name}.log`);
     log(`[${lane.name}] ${job.name} level ${job.level} — replaying…`);
-    const result = await runReplay({ job, lane, credentialInput, outRoot, logPath, timeoutMinutes });
+    const result = await replay({ job, lane, credentialInput, outRoot, logPath, timeoutMinutes });
     const outcome = outcomeLabel({ ...result, timeoutMinutes });
     const ok = outcome === 'ok';
     done.push({ ...job, lane: lane.name, ok, outcome, durationMs: result.durationMs, log: path.relative(process.cwd(), logPath) });
     log(`[${lane.name}] ${job.name} level ${job.level} — ${ok ? 'ok' : `${outcome}, see ${logPath}`} in ${formatDuration(result.durationMs)}`);
     if (!ok) {
+      attempted.add(job);
       queue.push(job);
-      return;
     }
   }
 }
@@ -302,28 +352,38 @@ async function main() {
   const cases = censusCases(discoverCaseDirs(path.resolve(opts.casesDir)), outRoot);
   const pin = suitePin(cases);
   const credentialInput = credentialInputFor(pin.provider);
-  const laneNames = (opts.credentials ?? credentialInput).split(',');
-  const lanes = resolveLanes(laneNames, process.env);
 
   const jobs = planJobs({ cases, repeats: opts.repeats });
+  // Lane names are derived from the planned work, so a suite already at target N resolves none and needs
+  // no credential. Re-invocation is this command's only resume and its only status check — demanding a
+  // credential it would never spend turned reading the census into a spend-shaped precondition. The
+  // resolution itself is unconditional; what varies is the list flowing into it, which is empty when
+  // there is nothing to run. [LAW:dataflow-not-control-flow]
+  const laneNames = jobs.length > 0 ? (opts.credentials ?? credentialInput).split(',') : [];
+  const lanes = resolveLanes(laneNames, process.env);
   const log = msg => process.stderr.write(`${msg}\n`);
   log(`Suite: ${cases.length} case(s) on ${pin.provider}/${pin.model}, target N=${opts.repeats}, ${lanes.length} lane(s) [${lanes.map(l => l.name).join(', ')}], ${opts.jobTimeout}m per replay`);
   cases.forEach(c => log(`  ${c.name}: ${c.completed}/${opts.repeats} completed`));
   log(`${jobs.length} replay(s) to run → ${outRoot}`);
 
-  const logDir = path.join(outRoot, 'logs');
+  // A SIBLING of the out root, never a child: every child of the out root is a case run dir, which is
+  // what lets `<out>/*/` name exactly the things score.js can score. A logs/ dir inside it broke that —
+  // the documented scoring loop handed logs/ to score.js and got "No run dirs" on every freeze.
+  // [LAW:decomposition]
+  const logDir = `${outRoot}-logs`;
   fs.mkdirSync(logDir, { recursive: true });
 
   const queue = jobs.slice();
   const done = [];
   const started = Date.now();
-  await Promise.all(lanes.map(lane => runLane({ lane, queue, credentialInput, outRoot, logDir, done, log, timeoutMinutes: opts.jobTimeout })));
+  await Promise.all(lanes.map(lane => runLane({ lane, queue, credentialInput, outRoot, logDir, done, log, timeoutMinutes: opts.jobTimeout, replay: runReplay })));
 
   // The closing census is re-read from disk, never inferred from the job results: what the scorer will
   // find is the only fact that matters, and a job that exited 0 without leaving a run dir must show up
   // as a case still short. [FRAMING:representation]
   const census = censusCases(cases.map(c => c.dir), outRoot);
-  process.stdout.write(renderReport({ jobs: done, census, repeats: opts.repeats, elapsedMs: Date.now() - started }));
+  const outDir = path.relative(process.cwd(), outRoot) || '.';
+  process.stdout.write(renderReport({ jobs: done, census, repeats: opts.repeats, elapsedMs: Date.now() - started, outDir }));
   if (census.some(c => c.completed < opts.repeats)) process.exitCode = 1;
 }
 
@@ -334,4 +394,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, parsePositiveInt, resolveLanes, suitePin, planJobs, renderReport, formatDuration, outcomeLabel };
+module.exports = { parseArgs, parsePositiveInt, resolveLanes, suitePin, planJobs, runLane, renderReport, formatDuration, outcomeLabel };

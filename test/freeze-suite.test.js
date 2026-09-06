@@ -1,7 +1,7 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { parseArgs, resolveLanes, suitePin, planJobs, renderReport, formatDuration, outcomeLabel } = require('../eval/freeze-suite');
+const { parseArgs, resolveLanes, suitePin, planJobs, runLane, renderReport, formatDuration, outcomeLabel } = require('../eval/freeze-suite');
 
 // The contract these tests hold is the SCHEDULE: how many replays are still owed, in what order, on
 // which credential, and what the operator is told afterwards. The replay itself belongs to run-case.js
@@ -139,9 +139,12 @@ describe('renderReport', () => {
   });
 
   test('a met target reports complete, and points at the next step', () => {
-    const md = renderReport({ jobs, census: [{ name: 'alpha', completed: 5 }, { name: 'beta', completed: 5 }], repeats: 5, elapsedMs: 1000 });
+    const md = renderReport({ jobs, census: [{ name: 'alpha', completed: 5 }, { name: 'beta', completed: 5 }], repeats: 5, elapsedMs: 1000, outDir: 'eval/out/freeze-abc1234' });
     assert.match(md, /SUITE COMPLETE at N=5/);
-    assert.match(md, /eval\/baseline\.js/);
+    // The hint is a command the operator pastes. baseline.js's --out-dir defaults to plain eval/out, so
+    // a hint that omits it scores a DIFFERENT directory than the suite just wrote — silently, if stale
+    // runs happen to sit under the default. It must name the root this run actually used.
+    assert.match(md, /node eval\/baseline\.js --out-dir eval\/out\/freeze-abc1234/);
   });
 });
 
@@ -167,4 +170,79 @@ test('formatDuration reads as wall clock at both scales', () => {
   assert.equal(formatDuration(4200), '4s');
   assert.equal(formatDuration(65000), '1m05s');
   assert.equal(formatDuration(3600000), '60m00s');
+});
+
+// An error naming a flag that does not exist sends the reader looking for it. `-n`'s canonical spelling
+// is `--repeats`; reporting the raw alias produced "Option --n requires a value."
+describe('parseArgs — errors name the flag the reader can actually type', () => {
+  test('a value-less alias is reported under its canonical name', () => {
+    assert.throws(() => parseArgs(['-n']), { message: /Option --repeats requires a value\./ });
+    assert.throws(() => parseArgs(['-n', '--out']), { message: /Option --repeats requires a value, but got what looks like another flag/ });
+  });
+
+  test('a value-less long flag keeps its own name', () => {
+    assert.throws(() => parseArgs(['--job-timeout']), { message: /Option --job-timeout requires a value\./ });
+  });
+});
+
+// Node wraps a setTimeout delay past 2^31-1 ms to ~1ms rather than clamping it, so an operator reaching
+// for "no meaningful limit" would have every replay killed instantly and reported TIMED OUT — the intent
+// inverted, in a report that blames the replays. [LAW:no-silent-failure]
+describe('parseArgs — --job-timeout cannot overflow into an instant deadline', () => {
+  test('a timeout whose milliseconds exceed the timer ceiling is refused', () => {
+    assert.throws(() => parseArgs(['--job-timeout', '100000']), { message: /must be at most 35791 minutes/ });
+    assert.throws(() => parseArgs(['--job-timeout', '35792']), { message: /must be at most 35791 minutes/ });
+  });
+
+  test('the largest safe timeout is accepted, as is the default', () => {
+    assert.equal(parseArgs(['--job-timeout', '35791']).jobTimeout, 35791);
+    assert.equal(parseArgs([]).jobTimeout, 120);
+  });
+});
+
+// THE lane contract: one attempt per job per lane, and a failure never costs the queue.
+//
+// Stopping the lane on any failure was right for a walled credential and wrong for everything else —
+// under the documented single-lane invocation it ended the only lane, so one transient failure abandoned
+// every remaining case, and a reproducible one re-aborted every future run at the same job.
+// [LAW:behavior-not-structure]: asserted through the injected replay, which decides what fails.
+describe('runLane', () => {
+  const laneArgs = { lane: { name: 'TOKEN_A', value: 'x' }, credentialInput: 'TOKEN_A', outRoot: '/out', logDir: '/logs', log: () => {} };
+  const job = (name, level) => ({ name, dir: `/cases/${name}`, level });
+  const ok = { exitCode: 0, signal: null, timedOut: false, durationMs: 1 };
+  const bad = { exitCode: 1, signal: null, timedOut: false, durationMs: 1 };
+
+  test('one failing job does not abandon the rest of the queue', async () => {
+    const queue = [job('alpha', 1), job('doomed', 1), job('beta', 1)];
+    const done = [];
+    const replay = async ({ job: j }) => (j.name === 'doomed' ? bad : ok);
+
+    await runLane({ ...laneArgs, queue, done, timeoutMinutes: 60, replay });
+
+    assert.deepEqual(done.map(d => d.name), ['alpha', 'doomed', 'beta']);
+    assert.deepEqual(done.filter(d => d.ok).map(d => d.name), ['alpha', 'beta']);
+    // The failure is requeued for another lane, not swallowed — and not retried by this one.
+    assert.deepEqual(queue.map(j => j.name), ['doomed']);
+  });
+
+  test('a lane attempts each job at most once, so a walled credential costs one pass', async () => {
+    const queue = [job('alpha', 1), job('beta', 1), job('gamma', 1)];
+    const done = [];
+    const replay = async () => bad;
+
+    await runLane({ ...laneArgs, queue, done, timeoutMinutes: 60, replay });
+
+    assert.equal(done.length, 3, 'every job attempted exactly once, never twice');
+    assert.deepEqual(queue.map(j => j.name).sort(), ['alpha', 'beta', 'gamma'], 'all requeued for a healthy lane');
+  });
+
+  test('a clean run drains the queue empty', async () => {
+    const queue = [job('alpha', 1), job('beta', 2)];
+    const done = [];
+
+    await runLane({ ...laneArgs, queue, done, timeoutMinutes: 60, replay: async () => ok });
+
+    assert.equal(queue.length, 0);
+    assert.deepEqual(done.map(d => d.ok), [true, true]);
+  });
 });
