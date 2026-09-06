@@ -18,7 +18,10 @@
 // 5/5/5/0 that freezes nothing. Re-running the command resumes by re-taking the census — there is no
 // resume flag because there is no resume mode. [LAW:dataflow-not-control-flow]
 //
-//   node eval/freeze-suite.js -n 5 --out eval/out/freeze-<sha> [--credentials VAR1,VAR2,…]
+//   node eval/freeze-suite.js -n 5 --out eval/out/freeze-<sha> [--cases a,b,…] [--credentials VAR1,VAR2,…]
+//
+// It is also the gate's replay step: eval/compare.js spawns this command over the baseline's case set
+// (--cases) so a gate run and a freeze are one scheduler, not a serial loop beside a parallel one.
 //
 // [LAW:effects-at-boundaries] Module load is PURE: only stdlib. Every world-effect (fs, spawn, env reads)
 // lives inside main() or a helper it calls, so importing this file for the planner tests touches nothing.
@@ -34,6 +37,8 @@ Usage: node eval/freeze-suite.js [options]
   -n, --repeats <N>        Target completed runs per case (default: 5 — the standing baseline depth).
   --out <dir>              Output root shared by every case (default: eval/out). Re-runs resume into it.
   --cases-dir <dir>        Golden case root (default: eval/cases).
+  --cases <a,b,…>          Names of the golden cases to replay (default: every case under --cases-dir).
+                           A name no case carries is refused before any spend.
   --job-timeout <minutes>  Deadline for ONE replay (default: 120). A replay past it is killed, process
                            group and all, and recorded as a failure. Set it wide: a deadline that kills
                            an honest replay destroys work, while a late one only wastes a lane.
@@ -60,8 +65,8 @@ const MAX_TIMER_MS = 2147483647;
 // [LAW:effects-at-boundaries] Pure arg parse: flags map to a plain options value; no IO. Mirrors
 // run-case.js's parser, including its `--flag looks-like-another-flag` refusal. [LAW:one-source-of-truth]
 function parseArgs(argv) {
-  const opts = { repeats: 5, out: 'eval/out', casesDir: 'eval/cases', credentials: null, jobTimeout: 120 };
-  const keyFor = { repeats: 'repeats', out: 'out', 'cases-dir': 'casesDir', credentials: 'credentials', 'job-timeout': 'jobTimeout' };
+  const opts = { repeats: 5, out: 'eval/out', casesDir: 'eval/cases', cases: null, credentials: null, jobTimeout: 120 };
+  const keyFor = { repeats: 'repeats', out: 'out', 'cases-dir': 'casesDir', cases: 'cases', credentials: 'credentials', 'job-timeout': 'jobTimeout' };
   const aliases = { n: 'repeats' };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -127,6 +132,29 @@ function resolveLanes(names, env) {
     seen.add(lane.name);
   }
   return lanes;
+}
+
+// [LAW:parse-dont-validate] A comma list of case NAMES in, the case DIRECTORIES that carry them out — in
+// discovery order, so the level-filling plan below is the same plan whichever way the operator spelled
+// the list. A case's name is its directory's name, the identity compare.js already resolves a case by
+// (path.join(casesDir, name)), and selecting on it means the census parses only the selected manifests:
+// a half-written case elsewhere under the golden root cannot abort a suite that was never asked to
+// replay it. A name no directory carries is the operator's typo (or a case the golden set no longer
+// holds), and a suite that silently replays the others has spent hours proving less than it was asked
+// to; refused here, before any spend — as is a repeated name, which would otherwise collapse into a
+// smaller set than the operator wrote. [LAW:no-silent-failure] (A directory whose name holds a comma is
+// unnameable on this list; parseCaseManifest refuses such a name, so no replayable case is unnameable.)
+function selectCaseDirs(caseDirs, names) {
+  const wanted = names.map(raw => raw.trim());
+  const have = caseDirs.map(dir => path.basename(dir));
+  const seen = new Set();
+  for (const name of wanted) {
+    if (name === '') throw new Error(`--cases contains an empty name: ${JSON.stringify(names.join(','))}.`);
+    if (!have.includes(name)) throw new Error(`--cases names '${name}', but no golden case carries that name (have: ${have.join(', ')}).`);
+    if (seen.has(name)) throw new Error(`--cases names '${name}' more than once.`);
+    seen.add(name);
+  }
+  return caseDirs.filter(dir => wanted.includes(path.basename(dir)));
 }
 
 // [LAW:parse-dont-validate] The suite's engine pin: one engine out, or a loud refusal. This is the SAME
@@ -198,7 +226,7 @@ function renderReport({ jobs, census, repeats, elapsedMs, outDir }) {
   lines.push('');
   lines.push(
     usableN >= repeats
-      ? `SUITE COMPLETE at N=${repeats}. Next: score each case, then node eval/baseline.js --out-dir ${outDir}.`
+      ? `SUITE COMPLETE at N=${repeats} in ${outDir}: every case has ${repeats} scorable run(s).`
       : `SUITE SHORT of N=${repeats}. Every case has at least ${usableN} run(s), so the deepest freezable suite today is N=${usableN}. Re-run this command to fill the rest.`,
   );
   return lines.join('\n') + '\n';
@@ -487,7 +515,9 @@ async function main() {
   }
 
   const outRoot = path.resolve(opts.out);
-  const cases = censusCases(discoverCaseDirs(path.resolve(opts.casesDir)), outRoot);
+  const golden = discoverCaseDirs(path.resolve(opts.casesDir));
+  // --cases absent means the whole golden set; that is the option's own enum, so the one branch is on it.
+  const cases = censusCases(opts.cases === null ? golden : selectCaseDirs(golden, opts.cases.split(',')), outRoot);
   const pin = suitePin(cases);
   const credentialInput = credentialInputFor(pin.provider);
 
@@ -555,4 +585,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, parsePositiveInt, resolveLanes, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, superviseSpawn, censusCases, credentialInputFor, renderReport, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };
+module.exports = { parseArgs, parsePositiveInt, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, superviseSpawn, censusCases, credentialInputFor, renderReport, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };

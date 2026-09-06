@@ -1,7 +1,7 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { parseArgs, resolveLanes, suitePin, planJobs, runLane, makeLaneGroup, renderReport, formatDuration, outcomeLabel } = require('../eval/freeze-suite');
+const { parseArgs, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, renderReport, formatDuration, outcomeLabel } = require('../eval/freeze-suite');
 
 // The contract these tests hold is the SCHEDULE: how many replays are still owed, in what order, on
 // which credential, and what the operator is told afterwards. The replay itself belongs to run-case.js
@@ -12,12 +12,14 @@ test('parseArgs defaults to the standing baseline depth and the repo layout', ()
   assert.equal(o.repeats, 5);
   assert.equal(o.out, 'eval/out');
   assert.equal(o.casesDir, 'eval/cases');
+  assert.equal(o.cases, null);
   assert.equal(o.credentials, null);
   assert.equal(o.jobTimeout, 120);
 });
 
 test('parseArgs supports -n, --flag=value, and --help', () => {
-  const o = parseArgs(['-n', '3', '--out=tmp/freeze', '--cases-dir', 'tmp/cases', '--credentials', 'A,B']);
+  const o = parseArgs(['-n', '3', '--out=tmp/freeze', '--cases-dir', 'tmp/cases', '--cases=x,y', '--credentials', 'A,B']);
+  assert.equal(o.cases, 'x,y');
   assert.equal(o.repeats, 3);
   assert.equal(o.out, 'tmp/freeze');
   assert.equal(o.casesDir, 'tmp/cases');
@@ -138,13 +140,13 @@ describe('renderReport', () => {
     assert.match(md, /SUITE SHORT of N=5.*at least 3 run\(s\).*deepest freezable suite today is N=3/s);
   });
 
-  test('a met target reports complete, and points at the next step', () => {
+  // The closing line states what this command guarantees and where. It names no next step: the freeze
+  // workflow's next commands are documented once in eval/README.md, and compare.js — the other caller —
+  // scores and gates the root itself, so a "then run baseline.js" hint would be wrong there.
+  test('a met target reports complete, naming the root this run actually used', () => {
     const md = renderReport({ jobs, census: [{ name: 'alpha', completed: 5 }, { name: 'beta', completed: 5 }], repeats: 5, elapsedMs: 1000, outDir: 'eval/out/freeze-abc1234' });
-    assert.match(md, /SUITE COMPLETE at N=5/);
-    // The hint is a command the operator pastes. baseline.js's --out-dir defaults to plain eval/out, so
-    // a hint that omits it scores a DIFFERENT directory than the suite just wrote — silently, if stale
-    // runs happen to sit under the default. It must name the root this run actually used.
-    assert.match(md, /node eval\/baseline\.js --out-dir eval\/out\/freeze-abc1234/);
+    assert.match(md, /SUITE COMPLETE at N=5 in eval\/out\/freeze-abc1234/);
+    assert.doesNotMatch(md, /baseline\.js/);
   });
 });
 
@@ -321,16 +323,16 @@ const writeRun = (outRoot, caseName, runName, findings) => {
 };
 
 describe('censusCases counts what the scorer will actually find', () => {
-  test('the count keys off the manifest name, not the case directory name', () => {
+  // A case has one identity, its directory's name; a manifest that says otherwise is refused at the census
+  // rather than counted under either name. Two readers (the selector, on directories; the scorer, on
+  // manifest names) would otherwise silently disagree about which runs belong to it.
+  test('a manifest whose name is not its directory name is refused, not counted', () => {
     const root = tmpTree();
     const casesDir = path.join(root, 'cases');
     const outRoot = path.join(root, 'out');
-    // The dir and the manifest name deliberately DISAGREE: joined on the dir's basename this returns 0
-    // for a case with two completed runs, and the suite replays work it already has.
     const dir = writeCase(casesDir, 'dir-name-differs', 'alpha');
     writeRun(outRoot, 'alpha', 'run-1', true);
-    writeRun(outRoot, 'alpha', 'run-2', true);
-    assert.deepEqual(censusCases([dir], outRoot).map(c => [c.name, c.completed]), [['alpha', 2]]);
+    assert.throws(() => censusCases([dir], outRoot), /"alpha" but its directory is "dir-name-differs"/);
     fs.rmSync(root, { recursive: true, force: true });
   });
 
@@ -520,5 +522,77 @@ describe('replaySpawnSpec puts the lane credential in the pinned provider slot',
     for (const s of Object.values(PROVIDERS).filter(s => s.credentialInput !== 'CLAUDE_CODE_OAUTH_TOKEN')) {
       assert.equal(env[s.credentialInput], process.env[s.credentialInput], `${s.credentialInput} was rewritten`);
     }
+  });
+});
+
+// ── selectCaseDirs (the --cases filter the gate replays through) ────────────────────────────────────────
+// compare.js names the BASELINE's case set here so a golden case added since the freeze is not spent on.
+// The contract is on directories, before any manifest is parsed — which is what keeps a half-written
+// case elsewhere under the golden root from aborting a suite that never asked for it.
+
+describe('selectCaseDirs — the replayed set is exactly the named set, in discovery order', () => {
+  const dirs = ['/g/a', '/g/b', '/g/c'];
+
+  test('keeps only the named cases and the discovery order, whatever order the operator wrote', () => {
+    assert.deepEqual(selectCaseDirs(dirs, ['c', 'a']), ['/g/a', '/g/c']);
+    assert.deepEqual(selectCaseDirs(dirs, ['a', 'b', 'c']), dirs);
+  });
+
+  test('tolerates the whitespace a shell-joined list carries', () => {
+    assert.deepEqual(selectCaseDirs(dirs, [' b', 'c ']), ['/g/b', '/g/c']);
+  });
+
+  test('refuses a name no golden case carries, naming what exists', () => {
+    assert.throws(() => selectCaseDirs(dirs, ['a', 'zed']), /--cases names 'zed'.*have: a, b, c/);
+  });
+
+  test('refuses an empty name rather than silently replaying nothing for it', () => {
+    assert.throws(() => selectCaseDirs(dirs, ['a', '']), /--cases contains an empty name/);
+  });
+
+  test('refuses a repeated name rather than silently replaying a smaller set', () => {
+    assert.throws(() => selectCaseDirs(dirs, ['a', 'b', 'a']), /--cases names 'a' more than once/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// main()'s composition, through the real CLI: discover → select → census. Each piece is tested above in
+// isolation; this pins their ORDER, which is what two review rounds on #144 found wrong — a sibling case
+// with a broken manifest aborted a suite that never asked for it, because the census parsed everything
+// before the selection ran. The selected case already holds a completed run, so the census plans zero
+// replays and the command exits before it needs a credential: no engine, no spend.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+describe('the CLI selects case directories before any manifest is parsed', () => {
+  const { spawnSync } = require('node:child_process');
+  const cli = path.join(__dirname, '..', 'eval', 'freeze-suite.js');
+  const tree = () => {
+    const root = tmpTree();
+    const casesDir = path.join(root, 'cases');
+    const outRoot = path.join(root, 'out');
+    writeCase(casesDir, 'good', 'good');
+    writeRun(outRoot, 'good', 'run-1', true);
+    fs.mkdirSync(path.join(casesDir, 'wip'), { recursive: true });
+    fs.writeFileSync(path.join(casesDir, 'wip', 'case.json'), '{ not json');
+    return { root, casesDir, outRoot };
+  };
+  const run = (args) => {
+    const r = spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    return { status: r.status, out: `${r.stdout}${r.stderr}` };
+  };
+
+  test('a scoped run never parses the broken sibling', () => {
+    const { root, casesDir, outRoot } = tree();
+    const r = run(['--cases-dir', casesDir, '--cases', 'good', '-n', '1', '--out', outRoot]);
+    assert.equal(r.status, 0, r.out);
+    assert.match(r.out, /0 replay\(s\) to run/);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  test('an unscoped run still refuses the broken sibling loudly', () => {
+    const { root, casesDir, outRoot } = tree();
+    const r = run(['--cases-dir', casesDir, '-n', '1', '--out', outRoot]);
+    assert.notEqual(r.status, 0);
+    assert.match(r.out, /wip.*not valid JSON/);
+    fs.rmSync(root, { recursive: true, force: true });
   });
 });
