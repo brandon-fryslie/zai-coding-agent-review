@@ -354,7 +354,7 @@ function buildBaseline({ cases, provenance }) {
 // re-read from baseline.md, never re-rendered from a loaded value.
 function parseBaseline(raw, label) {
   const json = parseJsonObject(raw, label);
-  if (json.schema !== BASELINE_SCHEMA) throw new Error(`${label} is not a v2 baseline (schema=${JSON.stringify(json.schema)}). Re-freeze it with eval/baseline.js.`);
+  if (json.schema !== BASELINE_SCHEMA) throw new Error(`${label} is not schema ${BASELINE_SCHEMA} (schema=${JSON.stringify(json.schema)}). Re-freeze it with eval/baseline.js.`);
   if (typeof json.mainSha !== 'string' || json.mainSha.trim() === '') throw new Error(`${label} has no 'mainSha'.`);
   if (!Number.isInteger(json.repeats) || json.repeats < 1) throw new Error(`${label} 'repeats' must be a positive integer.`);
   if (typeof json.suite !== 'object' || json.suite === null) throw new Error(`${label} has no 'suite'.`);
