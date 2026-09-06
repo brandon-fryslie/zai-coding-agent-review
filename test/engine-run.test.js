@@ -2,7 +2,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const core = require('@actions/core');
-const { runEngine, appendBounded } = require('../src/engine/run.js');
+const { runEngine, promptOnStdin, appendBounded } = require('../src/engine/run.js');
 
 // A small retention window for the runEngine integration tests below. The cap is a VALUE the
 // adapter supplies (src defaults to 8 MiB in production), so these tests exercise the identical
@@ -65,6 +65,7 @@ function makeAdapter({ emitTerminal }) {
       env: { PATH: process.env.PATH },
     }),
     // Mirror the real adapters: completion is judged by the presence of the terminal event.
+    session: promptOnStdin,
     assertSucceeded: stdout => {
       const completed = stdout.split('\n').some(line => {
         try { return JSON.parse(line).type === 'turn.completed'; } catch { return false; }
@@ -81,7 +82,7 @@ describe('runEngine with an oversized engine stream', () => {
   test('a stream larger than the retained cap that ends in a terminal success COMPLETES (not killed on size), and the truncation is announced loudly', async () => {
     let stdout;
     const warnings = await captureWarnings(async () => {
-      ({ stdout } = await runEngine(makeAdapter({ emitTerminal: true }), {}, 'prompt', '/tmp', {}, process.cwd()));
+      ({ output: stdout } = await runEngine(makeAdapter({ emitTerminal: true }), {}, 'prompt', '/tmp', {}, process.cwd()));
     });
     assert.ok(stdout.length <= RETAIN_CAP, `retained ${stdout.length} exceeds cap ${RETAIN_CAP}`);
     assert.ok(stdout.includes('turn.completed'), 'the terminal event the caller needs survives in the tail');
@@ -98,6 +99,7 @@ describe('runEngine with an oversized engine stream', () => {
         args: ['-e', `process.stdout.write(JSON.stringify({type:'turn.completed'})+'\\n');`],
         env: { PATH: process.env.PATH },
       }),
+      session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
     };
@@ -131,6 +133,7 @@ describe('runEngine session transcript', () => {
         args: ['-e', `process.stdout.write(JSON.stringify({type:'turn.completed'})+'\\n');`],
         env: { PATH: process.env.PATH },
       }),
+      session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
     };
@@ -161,6 +164,7 @@ describe('runEngine session transcript', () => {
         args: ['-e', `process.stderr.write('BOOM-STDERR'); process.exit(1);`],
         env: { PATH: process.env.PATH },
       }),
+      session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
     };
@@ -190,6 +194,7 @@ describe('runEngine under a wall-clock deadline', () => {
       name: 'fake',
       timeoutMs: 30_000,
       buildCommand: () => { built = true; return { command: process.execPath, args: ['-e', ''], env: { PATH: process.env.PATH } }; },
+      session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
     };
@@ -209,6 +214,7 @@ describe('runEngine under a wall-clock deadline', () => {
         args: ['-e', 'setTimeout(() => {}, 10000);'], // outlives the deadline
         env: { PATH: process.env.PATH },
       }),
+      session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
     };
@@ -227,6 +233,7 @@ describe('runEngine under a wall-clock deadline', () => {
         args: ['-e', 'setTimeout(() => {}, 10000);'],
         env: { PATH: process.env.PATH },
       }),
+      session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
     };
@@ -260,6 +267,7 @@ describe('runEngine kill semantics', () => {
       name: 'fake',
       timeoutMs: 30_000,
       buildCommand: () => ({ command: process.execPath, args: ['-e', script], env: { PATH: process.env.PATH } }),
+      session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
     };
@@ -295,6 +303,7 @@ describe('runEngine kill semantics', () => {
         args: ['-e', 'process.on("SIGTERM", () => {}); setTimeout(() => {}, 30000);'],
         env: { PATH: process.env.PATH },
       }),
+      session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
     };
@@ -352,6 +361,7 @@ describe('runEngine orphan reaping', () => {
       timeoutMs: 30_000,
       killGraceMs: 10_000, // the escalation timer alone would fire far too late to explain a dead straggler
       buildCommand: () => ({ command: process.execPath, args: ['-e', script], env: { PATH: process.env.PATH } }),
+      session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
     };
@@ -373,6 +383,7 @@ describe('runEngine orphan reaping', () => {
         args: ['-e', 'setTimeout(() => {}, 30000);'],
         env: { PATH: process.env.PATH },
       }),
+      session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
     };
@@ -397,6 +408,7 @@ describe('runEngine spawn duration', () => {
       name: 'fake',
       timeoutMs: 30_000,
       buildCommand: () => ({ command: process.execPath, args: ['-e', script], env: { PATH: process.env.PATH } }),
+      session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
       ...extra,
@@ -445,5 +457,66 @@ describe('runEngine spawn duration', () => {
       runEngine(sleeperAdapter(''), {}, 'p', '/tmp', {}, process.cwd(), Date.now() - 1),
       err => err instanceof DeadlineExceededError && err.span === undefined,
     );
+  });
+});
+
+// [LAW:one-type-per-behavior] The session seam: the spec's session decides how the engine is talked to
+// and what value its output is. promptOnStdin (every test above) yields the retained stdout; a
+// protocol session yields whatever it learned. runEngine settles on that value on a clean exit and
+// on the session's rejection when the conversation failed, even though the process exited 0.
+describe('runEngine session seam', () => {
+  const echoChild = () => ({
+    command: process.execPath,
+    // Echo stdin lines back with a prefix, then exit when stdin ends — a stand-in for a server.
+    args: ['-e', `process.stdin.on('data', d => process.stdout.write('echo:' + d)); process.stdin.on('end', () => process.exit(0));`],
+    env: { PATH: process.env.PATH },
+  });
+
+  test("a protocol session's output value — not the raw stdout — is what assertSucceeded and the resolution receive", async () => {
+    const seen = [];
+    const spec = {
+      name: 'fake-server',
+      timeoutMs: 30_000,
+      buildCommand: echoChild,
+      session: async (io, prompt) => {
+        const reply = new Promise(resolve => io.lines.once('line', resolve));
+        io.write(prompt + '\n');
+        const line = await reply;
+        io.end();
+        return { line };
+      },
+      assertSucceeded: output => { seen.push(output); },
+      classifyError: err => err,
+    };
+    const { output } = await runEngine(spec, {}, 'hello', '/tmp', {}, process.cwd());
+    assert.deepEqual(output, { line: 'echo:hello' });
+    assert.deepEqual(seen, [{ line: 'echo:hello' }]);
+  });
+
+  test('a session that rejects mid-conversation fails the spawn loudly on a clean exit', async () => {
+    const spec = {
+      name: 'fake-server',
+      timeoutMs: 30_000,
+      buildCommand: echoChild,
+      session: async () => { throw new Error('thread/start failed: no such model'); },
+      assertSucceeded: () => {},
+      classifyError: err => err,
+    };
+    await assert.rejects(runEngine(spec, {}, 'hello', '/tmp', {}, process.cwd()), /thread\/start failed: no such model/);
+  });
+
+  test("a session still awaiting the engine settles when the engine exits first — `closed` is every session's floor", async () => {
+    const spec = {
+      name: 'fake-server',
+      timeoutMs: 30_000,
+      buildCommand: () => ({ command: process.execPath, args: ['-e', 'process.exit(0)'], env: { PATH: process.env.PATH } }),
+      session: async io => {
+        const never = new Promise(() => {});
+        return Promise.race([never, io.closed.then(() => { throw new Error('engine exited before completing'); })]);
+      },
+      assertSucceeded: () => {},
+      classifyError: err => err,
+    };
+    await assert.rejects(runEngine(spec, {}, 'hello', '/tmp', {}, process.cwd()), /exited before completing/);
   });
 });

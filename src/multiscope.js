@@ -82,8 +82,14 @@ function sumUsage(usages) {
   if (present.length === 0) return null;
   const tokens = present.map(u => u.tokens).filter(Boolean);
   const costs = present.map(u => u.cost).filter(Boolean);
+  const requests = present.map(u => u.requests).filter(Boolean);
   return {
     tokens: tokens.length > 0 ? tokens.reduce(addTokens, emptyTokens()) : null,
+    // The per-request breakdown an engine that observes each model request records (codex, via its
+    // app-server session) is carried whole — the pass's requests are its spawns' requests, in spawn
+    // order — and absent when no spawn recorded one, exactly as tokens are. It is the primary fact
+    // behind a context-tiered cost, so the fold keeps it beside the sum it derives from.
+    requests: requests.length > 0 ? requests.flat() : null,
     // The pass's SPAN is the envelope of its spawns' spans — earliest start, latest end — which is
     // the honest answer for a scheduler that runs workers in waves: the pass occupied that window,
     // and a restatement that needs to know which price epoch applies can see whether the window sits

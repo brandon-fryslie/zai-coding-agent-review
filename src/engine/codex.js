@@ -2,17 +2,28 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const core = require('@actions/core');
 const { TransientError, classifyTransient } = require('../failover');
-const { priceFromTable, spawnFromTokens } = require('../usage');
+const { priceFromTable, spawnFromRequest, sumCost, emptyTokens, addTokens } = require('../usage');
 const { makeCliAdapter } = require('./cli');
+const { createJsonRpcClient } = require('./jsonrpc');
 const { resolveReasoningTier } = require('../effort');
+const { version: ACTION_VERSION } = require('../../package.json');
 
 // [LAW:no-ambient-temporal-coupling] Pin off '@latest' — the same trap claude-code hit: an unowned,
 // time-varying input that lets an upstream npm release break a run with nothing here changing. Pinned
-// to a known-good release; CODEX_VERSION overrides it without cutting a release. [LAW:one-source-of-truth]
-const CODEX_VERSION = process.env.CODEX_VERSION || '0.141.0';
+// to the release the app-server conversation below was verified against (2026-09-06); CODEX_VERSION
+// overrides it without cutting a release. [LAW:one-source-of-truth]
+const CODEX_VERSION = process.env.CODEX_VERSION || '0.142.3';
 const CODEX_PACKAGE = `@openai/codex@${CODEX_VERSION}`;
 const CODEX_TIMEOUT_MS = 3_000_000;
+
+// What this client calls itself in the app-server handshake; codex echoes it into its user agent.
+const CLIENT_INFO = { name: 'copirate-code-review-agent', version: ACTION_VERSION };
+
+// [LAW:one-source-of-truth] The collector's name in codex's MCP registry, declared once: it heads the
+// config.toml section below and is the server whose tool-call approvals the session grants.
+const COLLECTOR_SERVER_NAME = 'review_collector';
 
 // [LAW:one-source-of-truth] The engine's reasoning-effort range, declared once (low→high) and
 // referenced by BOTH the capability declaration (config validation) and buildConfigToml (resolving an
@@ -42,9 +53,9 @@ const TOOL_NAMES = {
 // form is sent verbatim to the API and 400s as model_not_found); REVIEW_COLLECTOR_RECORDS in
 // the mcp_servers env sub-table. The credential is NOT carried by a provider env_key — Codex
 // authenticates the Responses transport from auth.json (written in materializeHome).
-// --dangerously-bypass-approvals-and-sandbox is required in the spawn invocation because
-// approval_policy = "never" only covers shell commands; MCP tool calls have a separate
-// approval gate that requires this flag in non-interactive (--json) mode.
+// approval_policy = "never" covers shell commands only; MCP tool calls have their own approval
+// gate, which the app-server surfaces as an elicitation request the session answers (see
+// appServerSession) — so the sandbox stays read-only instead of being bypassed wholesale.
 function buildConfigToml(config, collectorSpawn) {
   const { command, args, env: collectorEnv } = collectorSpawn;
 
@@ -85,11 +96,11 @@ function buildConfigToml(config, collectorSpawn) {
     // auth.json credential, rather than relying on implicit fallback. [LAW:types-are-the-program]
     `requires_openai_auth = true`,
     '',
-    '[mcp_servers.review_collector]',
+    `[mcp_servers.${COLLECTOR_SERVER_NAME}]`,
     `command = ${q(command)}`,
     `args = ${arr(args)}`,
     '',
-    '[mcp_servers.review_collector.env]',
+    `[mcp_servers.${COLLECTOR_SERVER_NAME}.env]`,
     `REVIEW_COLLECTOR_RECORDS = ${q(collectorEnv.REVIEW_COLLECTOR_RECORDS)}`,
   );
 
@@ -125,10 +136,11 @@ function materializeHome({ config, instructionsPath, collector }) {
 // [LAW:effects-at-boundaries] Pure: returns a full spawn spec from the validated ReviewConfig.
 // The credential is not passed via env — it lives in CODEX_HOME/auth.json (materializeHome),
 // the one channel Codex reads for the Responses transport. [LAW:single-enforcer]
-// --dangerously-bypass-approvals-and-sandbox is intentional for CI: GitHub Actions is an
-// externally sandboxed environment (per Codex docs: "Intended solely for running in
-// environments that are externally sandboxed"). MCP tool calls do not auto-execute in
-// --json mode without this flag regardless of approval_policy in config.toml.
+// The engine is codex's app-server over stdio: a JSON-RPC conversation (appServerSession) rather
+// than `exec --json`, because only the app-server reports usage PER MODEL REQUEST — the fact a
+// context-tiered price needs (see extractUsage). The thread it opens inherits the process cwd (the
+// isolated scratch dir cli.js owns; verified live, and it need not be a git repo) and config.toml's
+// read-only sandbox and never-approve policy — no bypass flag, so the sandbox stays in force.
 //
 // Env is an explicit allowlist — never process.env spread. Codex is an AI agent that can
 // read env vars via shell expressions; spreading process.env would expose GITHUB_TOKEN and
@@ -138,11 +150,7 @@ function materializeHome({ config, instructionsPath, collector }) {
 function buildCommand({ home }) {
   return {
     command: 'npx',
-    // --skip-git-repo-check: the engine's cwd is an isolated scratch dir (an instruction-injection
-    // guard owned in cli.js), which is NOT a git repo. Without this flag `codex exec` refuses to run
-    // outside a git repo and hangs waiting on stdin. The repo itself is read by absolute path; the
-    // sandbox bypass already permits reads anywhere. [LAW:no-silent-failure]
-    args: ['-y', CODEX_PACKAGE, 'exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check'],
+    args: ['-y', CODEX_PACKAGE, 'app-server'],
     env: {
       PATH: process.env.PATH,
       HOME: process.env.HOME,
@@ -151,85 +159,114 @@ function buildCommand({ home }) {
   };
 }
 
-// Parse the JSONL event stream from codex exec --json. Non-JSON lines (stderr noise) are skipped.
-// [LAW:no-silent-failure] Both failure modes are surfaced:
-//   turn.failed  — explicit engine error (throw immediately)
-//   no turn.completed — Codex exited 0 but the turn never finished (interrupted mid-turn,
-//     internal timeout, buffering error). Without this check a clean-exit incomplete turn
-//     silently passes as success with no findings collected.
-function assertSucceeded(stdout) {
-  let completed = false;
-  for (const line of stdout.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let event;
-    try { event = JSON.parse(trimmed); } catch { continue; }
-    if (event.type === 'turn.failed') {
-      throw new Error(`Codex review failed: ${event.error?.message ?? 'unknown error'}`);
+// [LAW:effects-at-boundaries] The one conversation this engine holds, over the io runEngine owns:
+//
+//   initialize -> initialized -> thread/start -> turn/start -> ...notifications... -> turn/completed -> EOF
+//
+// Verified live against codex-cli 0.142.3 (2026-09-06). Every model request the turn makes emits one
+// thread/tokenUsage/updated whose `last` is THAT request's usage — six requests of ~16-17K context
+// each summed exactly to `total` — which is the per-request context `exec --json` collapsed into one
+// turn total. The collector's tool calls arrive as mcpServer/elicitation/request approvals even under
+// approval_policy "never" (the gate `exec` needed --dangerously-bypass-approvals-and-sandbox for);
+// they are granted here for the collector alone, so the read-only sandbox stays in force. The server
+// exits on stdin EOF, which is how the session ends it.
+//
+// [LAW:no-silent-failure] Any other server request is REFUSED with a JSON-RPC error and announced —
+// a command approval under a never-approve policy, a file-change approval in a read-only sandbox —
+// never granted by default, and never left unanswered, which would stall the turn until the timeout.
+// The session resolves with THE SESSION RECORD, { turn, requests }: the completed turn as codex
+// reported it (status + error) and one usage breakdown per model request, in order. A stream that
+// closes before the turn completes rejects, so an engine that dies mid-review is the loud cause.
+async function appServerSession(io, prompt) {
+  const requests = [];
+  let settleTurn;
+  const completed = new Promise(resolve => { settleTurn = resolve; });
+  const rpc = createJsonRpcClient(io, msg => {
+    if (msg.id !== undefined) {
+      const approval = msg.params?._meta?.codex_approval_kind === 'mcp_tool_call' && msg.params.serverName === COLLECTOR_SERVER_NAME;
+      if (msg.method === 'mcpServer/elicitation/request' && approval) {
+        rpc.respond(msg.id, { action: 'accept' });
+      } else {
+        core.warning(`codex asked for ${msg.method}, which the review engine does not grant; refused.`);
+        rpc.refuse(msg.id, `${msg.method} is not granted to a review engine`);
+      }
+      return;
     }
-    if (event.type === 'turn.completed') completed = true;
-  }
-  if (!completed) {
-    throw new Error('Codex review did not complete: turn.completed event was not emitted.');
-  }
+    if (msg.method === 'thread/tokenUsage/updated') requests.push(msg.params.tokenUsage.last);
+    if (msg.method === 'turn/completed') settleTurn(msg.params.turn);
+  });
+  await rpc.request('initialize', { clientInfo: CLIENT_INFO });
+  rpc.notify('initialized');
+  const { thread } = await rpc.request('thread/start', {});
+  await rpc.request('turn/start', { threadId: thread.id, input: [{ type: 'text', text: prompt }] });
+  const turn = await Promise.race([
+    completed,
+    io.closed.then(() => { throw new Error('Codex review did not complete: the app-server exited before turn/completed.'); }),
+  ]);
+  io.end();
+  return { turn, requests };
 }
 
-// [LAW:effects-at-boundaries] Pure: reads usage from the engine's own JSONL output and returns
-// a Usage value, or null when no usage was reported. Codex emits NO USD — 'actual USD' is
+// [LAW:no-silent-failure] The turn's own status is the verdict: 'completed' is the one success, and
+// 'failed' / 'interrupted' surface codex's error, with its typed class (codexErrorInfo) in the text
+// so classifyError can read a quota wall or an overloaded server off it.
+function assertSucceeded({ turn }) {
+  if (turn.status === 'completed') return;
+  const detail = turn.error
+    ? `${turn.error.message}${turn.error.codexErrorInfo ? ` (${JSON.stringify(turn.error.codexErrorInfo)})` : ''}`
+    : 'no error reported';
+  throw new Error(`Codex review ${turn.status}: ${detail}`);
+}
+
+// [LAW:parse-dont-validate] OpenAI reports an input total that INCLUDES its cached subset, so this is
+// the one place that overlap is resolved into THE TOKEN RECORD's disjoint classes (src/usage.js). The
+// clamp belongs here, at the vendor boundary, and nowhere downstream: a foreign payload reporting more
+// cached than total tokens is the only way that state can arise, so absorbing it where the foreign
+// shape is read is what lets every consumer take the classes at face value. reasoningOutputTokens is
+// a subset of outputTokens (verified: totalTokens = inputTokens + outputTokens) and bills as output.
+function tokensOfRequest(u) {
+  const inputCacheHit = Math.min(u.cachedInputTokens, u.inputTokens);
+  return { inputCacheMiss: u.inputTokens - inputCacheHit, inputCacheHit, output: u.outputTokens };
+}
+
+// [LAW:effects-at-boundaries] Pure: reads usage from the session record and returns a Usage value, or
+// null when the turn made no model request that reported usage. Codex emits NO USD — 'actual USD' is
 // tokens x the centralized price table (priceFromTable), which reports its own reason when it cannot
 // price a spawn and never a fabricated zero. [LAW:no-silent-failure]
-// The cumulative turn usage rides on the final turn.completed event; later events overwrite
-// earlier ones so the last wins. An absent/empty usage object (no token fields) is reported as
-// no usage (null), not as a $0.00 run. [LAW:dataflow-not-control-flow]
 //
-// input_tokens is a SUM ACROSS THE TURN'S MODEL REQUESTS, not the size of any one prompt — measured
-// 2026-08-27 against a live codex run, where one turn making three requests of ~26K context each
-// reported 78,338 with cached_input_tokens 52,352 (the two later requests re-reading the same prefix).
-// That is why a context-tiered model prices from an interval rather than from this number; see
-// THE SPAWN FACTS in src/usage.js. usage appears on turn.completed and on no other event, so a
-// per-request context length cannot be recovered from this stream at all.
-function extractUsage(stdout, config, startedAt) {
-  let usage = null;
-  for (const line of stdout.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let event;
-    try { event = JSON.parse(trimmed); } catch { continue; }
-    if (event.type === 'turn.completed' && event.usage) usage = event.usage;
-  }
-  if (!usage || (usage.input_tokens == null && usage.output_tokens == null)) return null;
-  // [LAW:parse-dont-validate] OpenAI reports an input total that INCLUDES its cached subset, so this
-  // is the one place that overlap is resolved into THE TOKEN RECORD's disjoint classes (src/usage.js).
-  // The clamp belongs here, at the vendor boundary, and nowhere downstream: a foreign payload
-  // reporting more cached than total tokens is the only way that state can arise, so absorbing it
-  // where the foreign shape is read is what lets every consumer take the classes at face value.
-  const inputTokens = usage.input_tokens ?? 0;
-  const inputCacheHit = Math.min(usage.cached_input_tokens ?? 0, inputTokens);
-  const tokens = {
-    inputCacheMiss: inputTokens - inputCacheHit,
-    inputCacheHit,
-    output: usage.output_tokens ?? 0,
-  };
-  // `startedAt` is the spawn's start instant, supplied by makeCliAdapter — the price table is a
-  // schedule, so the rate is selected by WHEN this spawn ran, not by a clock read in here.
-  // [LAW:types-are-the-program] cost is a discriminated value, and priceFromTable returns it whole —
-  // dollars, or unpriced carrying the reason it discovered. This adapter never manufactures that
-  // reason: codex can reach two of them (the model is absent from the table, or its schedule covers
-  // no card for this spawn) and telling them apart is the price table's job, not the adapter's.
-  // The basis is never 'subscription': codex declares credentialKinds ['api-key'], so no codex run can
-  // ever be billed to a subscription and this adapter has no notional arm to reach.
-  const cost = priceFromTable(spawnFromTokens(startedAt, tokens), config.model);
-  return { tokens, cost };
+// Each request is priced ON ITS OWN, at the card its own context length selects, and the spawn's
+// cost is the sum (sumCost — one unpriced request makes the whole spawn unpriced, carrying its
+// reason). That is what makes a context-tiered model (gpt-5.6-*, ≤272K / >272K per request) price
+// exactly: a review turn totals well over 272K across its requests while no single request need be,
+// and pricing the total at either card would be the confident misprice zai-cost-truth-p5o exists to
+// end. spawnFromRequest is the narrow claim each request supports — its context is exactly its own
+// input count. The usage record keeps the per-request breakdown beside the summed tokens, so the
+// figure can be re-derived request by request later. [FRAMING:representation]
+//
+// `startedAt` is the spawn's start instant, supplied by makeCliAdapter — the price table is a
+// schedule, so the rate is selected by WHEN this spawn ran, not by a clock read in here.
+// [LAW:types-are-the-program] cost is a discriminated value, and priceFromTable returns it whole —
+// dollars, or unpriced carrying the reason it discovered. This adapter never manufactures that
+// reason: codex can reach two of them (the model is absent from the table, or its schedule covers
+// no card for a request) and telling them apart is the price table's job, not the adapter's.
+// The basis is never 'subscription': codex declares credentialKinds ['api-key'], so no codex run can
+// ever be billed to a subscription and this adapter has no notional arm to reach.
+function extractUsage({ requests }, config, startedAt) {
+  if (requests.length === 0) return null;
+  const perRequest = requests.map(tokensOfRequest);
+  const costs = perRequest.map(tokens => priceFromTable(spawnFromRequest(startedAt, tokens), config.model));
+  return { tokens: perRequest.reduce(addTokens, emptyTokens()), cost: sumCost(costs), requests: perRequest };
 }
 
 // [LAW:single-enforcer] The shared transient vocabulary (429/529/network drop) is classified once in
 // src/failover.js (classifyTransient); codex consumes it and adds only its genuinely OpenAI-specific
-// class — insufficient_quota, a billing limit that also clears with time or a new quota window. codex
-// doesn't surface Retry-After in a parseable form, so it omits the extractor and rate-limits fall to
-// exponential backoff. [LAW:one-source-of-truth] No local copy of the 429/529/network patterns to drift.
+// class — a billing limit (insufficient_quota on the wire, usageLimitExceeded as the app-server's typed
+// class) that also clears with time or a new quota window. codex doesn't surface Retry-After in a
+// parseable form, so it omits the extractor and rate-limits fall to exponential backoff.
+// [LAW:one-source-of-truth] No local copy of the 429/529/network patterns to drift.
 function classifyError(err, text) {
   return classifyTransient(err, text)
-    ?? (/insufficient.quota|quota.exceeded/i.test(text) ? new TransientError(`quota exceeded: ${err.message}`) : err);
+    ?? (/insufficient.quota|quota.exceeded|usageLimitExceeded/i.test(text) ? new TransientError(`quota exceeded: ${err.message}`) : err);
 }
 
 // [LAW:one-type-per-behavior] The CLI lifecycle is identical across engines, so the adapter is built
@@ -250,6 +287,7 @@ const codexAdapter = makeCliAdapter({
   toolNames: TOOL_NAMES,
   materializeHome,
   buildCommand,
+  session: appServerSession,
   assertSucceeded,
   classifyError,
   extractUsage,
@@ -263,6 +301,7 @@ module.exports = {
   buildConfigToml,
   materializeHome,
   buildCommand,
+  appServerSession,
   assertSucceeded,
   classifyError,
   extractUsage,

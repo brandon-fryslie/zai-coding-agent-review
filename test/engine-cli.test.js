@@ -6,6 +6,7 @@ const os = require('os');
 const path = require('path');
 
 const { makeCliAdapter } = require('../src/engine/cli');
+const { promptOnStdin } = require('../src/engine/run');
 
 // The shared CLI lifecycle, exercised through a spec that spawns a REAL child (a one-line node
 // process that writes the collector's finish record and exits). What is under test here is the
@@ -23,6 +24,7 @@ function specThatRecords(onExtract) {
       args: ['-e', 'require("fs").writeFileSync(process.env.RECORDS, JSON.stringify({type:"finish",summary:"done"})+"\\n")'],
       env: { RECORDS: collector.recordsPath },
     }),
+    session: promptOnStdin,
     assertSucceeded: () => {},
     classifyError: err => err,
     extractUsage: (output, config, startedAt) => onExtract(startedAt),

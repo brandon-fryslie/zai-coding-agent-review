@@ -32680,9 +32680,10 @@ const PRICE_SOURCES = [
     // OpenAI also publishes a FOURTH class, "cache writes" ($5.00 for sol against $4.00 input). THE
     // TOKEN RECORD folds cache creation into the cache-MISS class, which is exact for DeepSeek and
     // Anthropic (both bill it at the full input rate) and approximate here. It costs nothing today
-    // because codex reports no cache-write count to price — its usage payload carries input_tokens,
-    // cached_input_tokens and output_tokens only — so there is no number being multiplied by the wrong
-    // rate, and inventing one to fill the class would be a guess wearing a number.
+    // because codex reports no cache-write count to price — its per-request usage carries inputTokens,
+    // cachedInputTokens and outputTokens (plus reasoning, a subset of output) only — so there is no
+    // number being multiplied by the wrong rate, and inventing one to fill the class would be a guess
+    // wearing a number.
     models: {
       'gpt-5.6-sol': {
         tiers: [
@@ -32957,10 +32958,23 @@ function ratesAt(entry, facts) {
 // proves. [LAW:one-source-of-truth] What the sum proves is an upper bound — no single request's
 // context exceeded the total — so the interval is [0, total]: a spawn totalling under 272K is PROVABLY
 // short and prices correctly, while a larger one proves neither card and is reported unpriced rather
-// than guessed. An adapter that can one day observe a per-request context builds a narrower interval
-// and the long card becomes reachable with no change to any of this. [FRAMING:representation]
+// than guessed. An adapter that observes a per-request context builds a narrower interval through
+// spawnFromRequest below, and the long card becomes reachable with no change to the matcher.
+// [FRAMING:representation]
 function spawnFromTokens(at, tokens) {
   return { at, tokens, context: { min: 0, max: totalInputTokens(tokens) } };
+}
+
+// spawnFromRequest is the narrower claim an adapter that OBSERVES each model request can make: these
+// tokens were ONE request, so its context is exactly its own input count — a point interval, which
+// every context tier decides exactly (half-open ranges put 272,000 on the short card and 272,001 on
+// the long one). codex's app-server session builds one per request it saw and sums the priced
+// results (sumCost), so a turn that straddles 272K prices each request at its own card and never
+// the whole turn at one. The two constructors differ in what their facts PROVE, which is why they
+// are two functions and not one with a flag. [LAW:one-type-per-behavior]
+function spawnFromRequest(at, tokens) {
+  const context = totalInputTokens(tokens);
+  return { at, tokens, context: { min: context, max: context } };
 }
 
 // The coordinates a constraint is matched against, parsed from the spawn once per price lookup. The
@@ -33666,8 +33680,8 @@ const UNPRICED_REMEDY = {
     + 'Add the model to PRICE_SOURCES in src/usage.js, under the vendor page that prices it.',
   'schedule-gap': (tag) => `${tag} is in the price table, but no rate card in its schedule covers this `
     + 'spawn, so the review footer shows cost as "unknown". Either the vendor publishes no rate for '
-    + 'this spawn (OpenAI prices gpt-5.5 and gpt-5.4 only up to 272K context), or the spawn is too '
-    + "large for its per-request context length to be proven from the run's token totals. Nothing is "
+    + 'this spawn (OpenAI prices gpt-5.5 and gpt-5.4 only up to 272K context), or the engine reports '
+    + 'usage only as a turn total too large for its per-request context length to be proven. Nothing is '
     + 'wrong with the table: a rate that cannot be shown to apply is reported unknown rather than guessed.',
   'not-reported': (tag, config) => `${config.engine} reported no cost (no USD in its output) for ${tag}; `
     + 'the review footer shows cost as "unknown".',
@@ -33690,6 +33704,7 @@ module.exports = {
   // and deserves to be driven directly, including its loud arm. [LAW:behavior-not-structure]
   ratesAt,
   spawnFromTokens,
+  spawnFromRequest,
   totalInputTokens,
   emptyTokens,
   addTokens,

@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { parseRetryAfterMs, classifyTransient } = require('../failover');
-const { parseJsonEnvelope, formatOutputTail } = require('./run');
+const { parseJsonEnvelope, formatOutputTail, promptOnStdin } = require('./run');
 const { makeCliAdapter } = require('./cli');
 const { isAnthropicEndpoint, isSubscription, priceFromTable, spawnFromTokens } = require('../usage');
 const { resolveReasoningTier } = require('../effort');
@@ -309,6 +309,7 @@ const claudeCodeAdapter = makeCliAdapter({
   toolNames: TOOL_NAMES,
   materializeHome,
   buildCommand,
+  session: promptOnStdin,
   assertSucceeded,
   classifyError,
   extractUsage,

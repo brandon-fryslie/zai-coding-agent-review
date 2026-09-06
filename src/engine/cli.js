@@ -24,8 +24,8 @@ function removeQuietly(dir, label) {
 
 // [LAW:one-type-per-behavior] claude-code and codex are ONE behavior — a CLI agent spawned as a
 // subprocess that returns findings out-of-band through the MCP collector. They differ only in
-// their spawn primitives (the spec: materializeHome/buildCommand/assertSucceeded/extractUsage/...),
-// never in the lifecycle that drives them. This factory holds that single produceReview
+// their spawn primitives (the spec: materializeHome/buildCommand/session/assertSucceeded/
+// extractUsage/...), never in the lifecycle that drives them. This factory holds that single produceReview
 // implementation; each engine module supplies its spec.
 //
 // [FRAMING:parts-and-seams] The adapter contract is lifted to the judgment-vs-transport seam:
@@ -87,7 +87,7 @@ function makeCliAdapter(spec) {
             // say which one lied. Time is a pricing input (DeepSeek's peak/off-peak windows), so
             // this spawn is priced at the tier it actually ran in; extractUsage stays a pure
             // function of the engine's output and the instant it was given. [LAW:effects-at-boundaries]
-            const { stdout: output, span } = await runEngine(spec, config, prompt, home, collector, cwd, deadline);
+            const { output, span } = await runEngine(spec, config, prompt, home, collector, cwd, deadline);
             // [LAW:no-silent-failure] From here the spawn HAS run and its span is known, so any
             // failure past this point — a throwing extractUsage, a ProtocolError from an engine
             // that never called finish_review — still burned real wall clock and provider cost.
