@@ -285,7 +285,7 @@ the version.
 (`copirate-eval-harness-2fk.5`) measures a candidate engine change against. It is an
 instrument, not a third scorer: it never re-runs the engine and never re-scores. It only
 *collects* the per-case `scorecard-summary.json` bands `score.js` already wrote, tags them
-with the exact `main` SHA + pinned engine that produced them, derives the suite's pooled gate
+with the exact commit whose engine tree produced them + the pinned engine, derives the suite's pooled gate
 floor + each case's diagnostic floor and the suite cost, and writes the result under
 `eval/baseline/<date>-<short-sha>/`.
 
@@ -293,6 +293,8 @@ Full-suite workflow (run → score → freeze):
 
 ```bash
 # 1. Replay every golden case N times (N=5 for the current baseline; rationale below).
+#    Per-replay logs land in the SIBLING eval/out/freeze-<sha>-logs/, so every child of the out
+#    root below is a case run dir and the glob in step 2 needs no exclusions.
 CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/freeze-<sha>
 # 2. Score each case (writes scorecard-summary.json per case).
 for c in eval/out/freeze-<sha>/*/; do ANTHROPIC_API_KEY=… node eval/score.js "$c"; done
@@ -527,8 +529,13 @@ reviewers look: the verdict table lands in the run's **Step Summary**, `DEGRADED
 is uploaded as the `eval-candidate` artifact even on a red or aborted run.
 
 Two triggers, both deliberate spends. `compare.js` prints the authoritative cost estimate (the
-baseline's recorded $/full-run × N) before spending; as orientation, the current N=5 × 4-case
-baseline puts a run at a few dollars and around an hour.
+baseline's recorded $/full-run × N) before spending. For the current N=5 × 4-case baseline that
+estimate is **no dollar figure at all** — the pinned engine bills against subscription quota, so the
+baseline records `costPerFullRunUsd: null`. The spend is quota and wall clock: `compare.js` replays
+all 20 runs serially on one credential at 13–27 min each, so a full gate run is **4–9 hours**. That
+does not fit in a GitHub-hosted job (6-hour ceiling), so a CI gate run can be killed before it
+reaches a verdict — see the `timeout-minutes` comment in `.github/workflows/eval.yml`. Read a
+timed-out gate as *not measured*, never as *not degraded*.
 
 - **On demand**: `gh workflow run eval.yml` (optionally `--ref <branch>`) — pressing the button is
   the spend approval. The candidate is that ref's checkout.
