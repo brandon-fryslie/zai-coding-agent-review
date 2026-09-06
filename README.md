@@ -61,6 +61,7 @@ That's it. Open a PR and the action reviews it. The checkout is optional context
 | `zai` | Claude Code → Z.ai | `ZAI_API_KEY` | per token | `glm-5.1` |
 | `codex` | Codex → OpenAI | `OPENAI_API_KEY` | per token | `gpt-5.4-mini` |
 | `claude-subscription` | Claude Code → Anthropic | `CLAUDE_CODE_OAUTH_TOKEN` | your Claude Pro/Max plan | `claude-sonnet-5` |
+| `local` | OpenCode → a local OpenAI-compatible server | *(optional)* `LOCAL_API_KEY` | free — the model runs on your machine | `openai/local-model` |
 
 `auto` resolves to whichever provider the action currently points at — **`claude-subscription` since 1.42.0**, DeepSeek before that. Pinning `auto` lets the maintainer retarget every consumer with a release, without anyone editing their workflow; supply the credential for whatever `auto` currently resolves to, or supply several and let the retarget be free. A repo missing the current target's credential **fails at startup naming the input to set** — loudly, before any spend — never by silently falling back to another provider whose key happens to be present.
 
@@ -112,6 +113,9 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | `OPENAI_MODEL` | `gpt-5.4-mini` | Model for the `codex` provider. |
 | `OPENAI_REASONING_EFFORT` | — | `minimal`, `low`, `medium`, `high`, or `xhigh`. |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-Responses-compatible endpoint (e.g. Azure or a gateway). |
+| `LOCAL_API_KEY` | — | API key for `local`. Optional — most local servers require none, and `local` is the one provider a missing credential does not fail. |
+| `LOCAL_MODEL` | `openai/local-model` | Model for `local`, in OpenCode's `<provider>/<model>` form (e.g. `openai/mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit`). |
+| `LOCAL_BASE_URL` | `http://127.0.0.1:1234/v1` | OpenAI-**chat**-compatible endpoint for `local` (LM Studio's default; Ollama is `http://127.0.0.1:11434/v1`, mlx_lm.server `http://127.0.0.1:8080/v1`). The default is loopback on purpose: an unset endpoint fails against your own machine, never against a vendor. |
 | `MODE` | `pr` | `pr` (review a PR diff, post an inline review) or `repo` ([whole-repo review](#whole-repo-review)). |
 | `SCOPE` | — | Free-text focus for `MODE: repo` (e.g. `the auth layer`). Ignored when `MODE: pr`. |
 | `CONFIG_FILE` | `.github/review-agents.yml` | [Multi-engine config file](#multi-engine-configuration). When present it owns engine selection and the `PROVIDER`/key inputs are ignored. |

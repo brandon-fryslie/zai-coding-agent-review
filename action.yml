@@ -24,7 +24,7 @@ inputs:
     description: "Named config to select from the config file."
     required: false
   PROVIDER:
-    description: "auto|deepseek|codex|zai|claude-subscription (default: auto, which resolves to claude-subscription)"
+    description: "auto|deepseek|codex|zai|claude-subscription|local (default: auto, which resolves to claude-subscription)"
     required: false
     default: "auto"
   # No `default:` on the provider MODEL / BASE_URL inputs below: per the rule at the top of `inputs:`,
@@ -69,6 +69,20 @@ inputs:
     required: false
   CLAUDE_MODEL:
     description: "Model for the claude-subscription provider."
+    required: false
+  # The local provider runs a local OpenAI-compatible server (mlx_lm.server, LM Studio, Ollama) on the
+  # opencode engine. Its credential is optional — most such servers authenticate nothing — so unlike
+  # every other provider it is the one row a missing key does not fail. LOCAL_BASE_URL is the input
+  # that matters: unset, the run goes to the preset's loopback default and fails there rather than
+  # anywhere off this machine.
+  LOCAL_API_KEY:
+    description: "API key for the local provider. Optional — most local servers require none."
+    required: false
+  LOCAL_MODEL:
+    description: "Model for the local provider, in opencode's '<provider>/<model>' form."
+    required: false
+  LOCAL_BASE_URL:
+    description: "OpenAI-chat-compatible endpoint for the local provider (e.g. http://127.0.0.1:8080/v1)."
     required: false
   ZAI_REVIEWER_NAME:
     description: "Name shown in the review comment header (default: CoPirate Code Review). A blank value resolves to that default — an empty string is not a name."

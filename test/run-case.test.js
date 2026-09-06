@@ -99,14 +99,36 @@ describe('resolvePinnedConfig reaches every provider in the table', () => {
 
     // The credential must come from the row's OWN env var: a case pinned to one provider must never
     // resolve by picking up whatever other credential happens to be in the environment.
-    test(`'${name}': refuses to resolve from another provider's credential`, () => {
+    test(`'${name}': never resolves from another provider's credential`, () => {
       const foreign = Object.values(PROVIDERS)
         .filter(s => s.credentialInput !== spec.credentialInput)
         .reduce((env, s) => ({ ...env, [s.credentialInput]: 'wrong-credential' }), {});
-      assert.throws(
-        () => resolvePinnedConfig({ provider: name, model: spec.defaultModel, reasoning: null }, foreign),
-        new RegExp(spec.credentialInput),
-      );
+      // Reduced to a value so both outcomes are asserted the same way, rather than one of them being
+      // an early return out of the test. [LAW:dataflow-not-control-flow]
+      const outcome = (() => {
+        try {
+          return { credential: resolvePinnedConfig({ provider: name, model: spec.defaultModel, reasoning: null }, foreign).endpoint.credential.value };
+        } catch (err) {
+          return { error: err.message };
+        }
+      })();
+
+      // The invariant itself, identical for every row: a credential the row did not name never reaches
+      // the config.
+      assert.notStrictEqual(outcome.credential, 'wrong-credential');
+
+      // How a row can UPHOLD it differs, and `credentialOptional` — table data, never a hardcoded
+      // provider name — says which shape to expect. A row that needs a credential has only refusal
+      // available, and the refusal must name the input to set. A row whose credential is optional has
+      // nothing to demand, so it upholds the same invariant by resolving carrying none; asserting the
+      // refusal alone would read that compliant shape as a violation and push the row out of this
+      // sweep, which is the one place the invariant is checked over the whole table.
+      // Either way the value is stringified before matching, so an outcome of the wrong SHAPE — an
+      // absent key — matches neither pattern and fails here rather than passing vacuously.
+      const expected = spec.credentialOptional
+        ? { key: 'credential', matches: /^$/ }
+        : { key: 'error', matches: new RegExp(spec.credentialInput) };
+      assert.match(String(outcome[expected.key]), expected.matches);
     });
   }
 });

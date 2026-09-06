@@ -87,6 +87,9 @@ function buildConfigChain(selection) {
     // provider row takes no base-URL input and there is nothing here to read. [LAW:types-are-the-program]
     claudeCodeOauthToken: core.getInput('CLAUDE_CODE_OAUTH_TOKEN'),
     claudeModel: core.getInput('CLAUDE_MODEL'),
+    localApiKey: core.getInput('LOCAL_API_KEY'),
+    localModel: core.getInput('LOCAL_MODEL'),
+    localBaseUrl: core.getInput('LOCAL_BASE_URL'),
   });
   core.setSecret(config.endpoint.credential.value);
   core.info(
