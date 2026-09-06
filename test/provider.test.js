@@ -2,7 +2,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert');
 
-const { synthesizeProviderConfig, PROVIDER_NAMES } = require('../src/provider');
+const { synthesizeProviderConfig, PROVIDER_NAMES, PROVIDERS, PRESETS, assertProvidersSafe } = require('../src/provider');
 
 // [LAW:verifiable-goals] AC: in simple mode the PROVIDER value alone selects the engine;
 // credential presence never steers it; the selected provider's missing key fails loud;
@@ -337,4 +337,43 @@ describe('PROVIDERS rows agree with the real adapter capabilities', () => {
       }
     });
   }
+});
+
+// assertProvidersSafe carries a security-critical routing invariant: `inputKeys.credential` names the
+// input bag key a row's credential is read out of, so a row without one routes a request to a pinned
+// host with a credential nothing can supply. Until this block the throw had no test — test/config.test.js
+// exercises only the sibling unknown-preset arm — which left the guard's own failure path unexecuted.
+//
+// Asserted against the contract (refused at load, with a message naming the offending row), not against
+// how the check is spelled. [LAW:behavior-not-structure] [LAW:verifiable-goals]
+describe('assertProvidersSafe — a row must name the input its credential arrives under', () => {
+  const rowsMissingCredential = {
+    'inputKeys absent entirely': { preset: 'claude-subscription' },
+    'inputKeys present but credential absent': { preset: 'claude-subscription', inputKeys: {} },
+    'credential set to the empty string': { preset: 'claude-subscription', inputKeys: { credential: '' } },
+    'credential set to a non-string': { preset: 'claude-subscription', inputKeys: { credential: 42 } },
+  };
+
+  for (const [shape, spec] of Object.entries(rowsMissingCredential)) {
+    test(`refused at load: ${shape}`, () => {
+      assert.throws(
+        () => assertProvidersSafe({ unroutable: spec }, PRESETS),
+        { message: /Provider 'unroutable': 'inputKeys\.credential' must name the action input/ },
+      );
+    });
+  }
+
+  test('a row that names its credential input passes, and is frozen on the way out', () => {
+    const table = { fine: { preset: 'claude-subscription', inputKeys: { credential: 'SOME_TOKEN' } } };
+    const frozen = assertProvidersSafe(table, PRESETS);
+    assert.ok(Object.isFrozen(frozen) && Object.isFrozen(frozen.fine) && Object.isFrozen(frozen.fine.inputKeys));
+  });
+
+  // The shipped table is the one that actually routes credentials, so it is the one that must hold.
+  test('every shipped provider row names its credential input', () => {
+    for (const [name, spec] of Object.entries(PROVIDERS)) {
+      assert.equal(typeof spec.inputKeys.credential, 'string', `provider row '${name}'`);
+      assert.notEqual(spec.inputKeys.credential, '', `provider row '${name}'`);
+    }
+  });
 });
