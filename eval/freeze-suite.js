@@ -78,6 +78,11 @@ function parseArgs(argv) {
     const value = eq === -1 ? argv[++i] : arg.slice(eq + 1);
     if (value === undefined) throw new Error(`Option --${canonical} requires a value.`);
     if (eq === -1 && value.startsWith('--')) throw new Error(`Option --${canonical} requires a value, but got what looks like another flag: ${JSON.stringify(value)}.`);
+    // [LAW:parse-dont-validate] Every option value crosses here, so the empty string is refused once
+    // rather than per-option. `--out=` is the one that bites: path.resolve('') is the CWD, so the suite
+    // reports every case at 0 completed (nothing lives under <cwd>/<case-name>), replays the whole
+    // suite it already has, and writes case-named dirs into whatever directory it was invoked from.
+    if (value === '') throw new Error(`Option --${canonical} requires a non-empty value.`);
     opts[name] = value;
   }
   opts.repeats = parsePositiveInt(opts.repeats, '-n/--repeats');
@@ -254,6 +259,32 @@ const signalGroup = (pid, sig) => { try { process.kill(-pid, sig); } catch { /* 
 // runReplay takes it as a parameter so the escalation can be asserted in a test without waiting it out.
 const KILL_GRACE_MS = 20000;
 
+// How often the interrupt path re-checks whether the trees it signalled have gone. Short enough that an
+// obedient tree costs the operator no perceptible wait, long enough not to spin.
+const DRAIN_POLL_MS = 50;
+
+// [LAW:one-source-of-truth] An interrupt escalates exactly as a deadline does — SIGTERM, then SIGKILL to
+// whatever is still alive KILL_GRACE_MS later. "A tree that ignores SIGTERM" is a case this file already
+// treats as real, with its own escalation in superviseSpawn and a test that exercises it; a fire-and-
+// forget SIGTERM here would leave running precisely the worker that ignores signals, which is the one
+// this path exists to catch. Leaves as soon as the registry drains, so the obedient case waits on nothing.
+// [LAW:effects-at-boundaries] signal/exit/killGraceMs are parameters so the escalation is assertable
+// without sending real signals to real process groups.
+function shutdownInFlight({ groups, signal, killGraceMs, exit }) {
+  for (const pid of groups) signal(pid, 'SIGTERM');
+  const escalate = setTimeout(() => {
+    clearInterval(drained);
+    for (const pid of groups) signal(pid, 'SIGKILL');
+    exit();
+  }, killGraceMs);
+  const drained = setInterval(() => {
+    if (groups.size > 0) return;
+    clearTimeout(escalate);
+    clearInterval(drained);
+    exit();
+  }, DRAIN_POLL_MS);
+}
+
 // [LAW:no-shared-mutable-globals] The set of replays running right now is one fact with exactly one
 // writer — runReplay, across its own spawn/close lifecycle — and one other reader, the interrupt handler
 // main() installs. It has to exist somewhere both can see: `detached` (below) puts every replay outside
@@ -296,6 +327,12 @@ function superviseSpawn({ command, args, cwd, env, logPath, timeoutMinutes, sign
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: true,
     });
+    // [LAW:no-silent-failure] A Writable's unhandled 'error' is an uncaught exception, so a full disk or
+    // a logDir yanked mid-run would take down the whole suite — every other lane's in-flight replay with
+    // it — over one job's log. Reported where the operator will see it, and left to the child's own exit
+    // to decide the job's outcome: a replay that succeeds is not a failure because its log could not be
+    // written, and one that fails already reports itself.
+    logStream.on('error', err => process.stderr.write(`freeze-suite: could not write ${logPath}: ${err.message}\n`));
     child.stdout.pipe(logStream, { end: false });
     child.stderr.pipe(logStream, { end: false });
     inFlight.add(child.pid);
@@ -360,27 +397,70 @@ function runReplay({ job, lane, credentialInput, outRoot, logPath, timeoutMinute
 // complete. `attempted` holds the job objects themselves, which planJobs creates once and the queue
 // requeues by reference, so a lane's memory of what it tried cannot drift from what it took.
 // [LAW:one-source-of-truth] [LAW:no-silent-failure]
+// [LAW:no-ambient-temporal-coupling] A lane may only leave when the queue holds nothing it has not
+// attempted AND no peer is mid-replay — because a peer mid-replay is the only thing that can still put a
+// job back. Leaving on the queue alone made the suite's work depend on completion ORDER: two lanes, two
+// jobs, lane A succeeds while B is still running, A sees the queue empty and goes; B's job then fails,
+// requeues to a lane that has already attempted it, and the job ends the run with one attempt across a
+// two-lane suite. Nothing was lost — the census reports the case short and the runner exits non-zero —
+// but "healthy lanes keep draining" was true only when the timing happened to allow it, and a guarantee
+// that holds by luck is not one. The rendezvous makes it hold by construction.
+//
+// It cannot deadlock: a waiter is only created while a peer is running, and every replay resolves (its
+// deadline guarantees that), and the lane that decrements the count to zero wakes everyone still waiting.
+function makeLaneGroup() {
+  let running = 0;
+  let waiters = [];
+  return {
+    // Held from the moment a lane takes a job until it has finished putting a failure BACK — not merely
+    // for the replay. Waking peers at the end of the replay instead would wake them into the window
+    // between "this job failed" and "this job is back in the queue", where the queue looks final and is not.
+    async holding(fn) {
+      running++;
+      try {
+        return await fn();
+      } finally {
+        running--;
+        const woken = waiters;
+        waiters = [];
+        woken.forEach(wake => wake());
+      }
+    },
+    // true: a peer finished, so the queue may have grown — look again. false: nobody else is running,
+    // so the queue is final and this lane is genuinely done.
+    peerStillRunning() {
+      if (running === 0) return Promise.resolve(false);
+      return new Promise(resolve => waiters.push(() => resolve(true)));
+    },
+  };
+}
+
 // `replay` is a parameter, not a direct call to runReplay: the rule above — which job a lane takes next,
 // and what a failure costs the rest of the queue — is the whole reason this function exists, and it can
 // only be checked by a test that decides which replays fail. Spawning is the one effect here; taking it
 // as an argument leaves the scheduling pure enough to assert on. [LAW:effects-at-boundaries]
-async function runLane({ lane, queue, credentialInput, outRoot, logDir, done, log, timeoutMinutes, replay }) {
+async function runLane({ lane, queue, credentialInput, outRoot, logDir, done, log, timeoutMinutes, replay, group }) {
   const attempted = new Set();
   for (;;) {
     const next = queue.findIndex(job => !attempted.has(job));
-    if (next === -1) return;
-    const [job] = queue.splice(next, 1);
-    const logPath = path.join(logDir, `${job.name}-level${job.level}-${lane.name}.log`);
-    log(`[${lane.name}] ${job.name} level ${job.level} — replaying…`);
-    const result = await replay({ job, lane, credentialInput, outRoot, logPath, timeoutMinutes });
-    const outcome = outcomeLabel({ ...result, timeoutMinutes });
-    const ok = outcome === 'ok';
-    done.push({ ...job, lane: lane.name, ok, outcome, durationMs: result.durationMs, log: path.relative(process.cwd(), logPath) });
-    log(`[${lane.name}] ${job.name} level ${job.level} — ${ok ? 'ok' : `${outcome}, see ${logPath}`} in ${formatDuration(result.durationMs)}`);
-    if (!ok) {
-      attempted.add(job);
-      queue.push(job);
+    if (next === -1) {
+      if (await group.peerStillRunning()) continue;
+      return;
     }
+    const [job] = queue.splice(next, 1);
+    await group.holding(async () => {
+      const logPath = path.join(logDir, `${job.name}-level${job.level}-${lane.name}.log`);
+      log(`[${lane.name}] ${job.name} level ${job.level} — replaying…`);
+      const result = await replay({ job, lane, credentialInput, outRoot, logPath, timeoutMinutes });
+      const outcome = outcomeLabel({ ...result, timeoutMinutes });
+      const ok = outcome === 'ok';
+      done.push({ ...job, lane: lane.name, ok, outcome, durationMs: result.durationMs, log: path.relative(process.cwd(), logPath) });
+      log(`[${lane.name}] ${job.name} level ${job.level} — ${ok ? 'ok' : `${outcome}, see ${logPath}`} in ${formatDuration(result.durationMs)}`);
+      if (!ok) {
+        attempted.add(job);
+        queue.push(job);
+      }
+    });
   }
 }
 
@@ -426,15 +506,20 @@ async function main() {
   for (const sig of Object.keys(SIGNUM)) {
     process.on(sig, () => {
       log(`freeze-suite: ${sig} — signalling ${inFlight.size} in-flight replay(s) before exiting.`);
-      for (const pid of inFlight) signalGroup(pid, 'SIGTERM');
-      process.exit(128 + SIGNUM[sig]);
+      shutdownInFlight({
+        groups: inFlight,
+        signal: signalGroup,
+        killGraceMs: KILL_GRACE_MS,
+        exit: () => process.exit(128 + SIGNUM[sig]),
+      });
     });
   }
 
   const queue = jobs.slice();
   const done = [];
   const started = Date.now();
-  await Promise.all(lanes.map(lane => runLane({ lane, queue, credentialInput, outRoot, logDir, done, log, timeoutMinutes: opts.jobTimeout, replay: runReplay })));
+  const group = makeLaneGroup();
+  await Promise.all(lanes.map(lane => runLane({ lane, queue, credentialInput, outRoot, logDir, done, log, timeoutMinutes: opts.jobTimeout, replay: runReplay, group })));
 
   // The closing census is re-read from disk, never inferred from the job results: what the scorer will
   // find is the only fact that matters, and a job that exited 0 without leaving a run dir must show up
@@ -452,4 +537,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, parsePositiveInt, resolveLanes, suitePin, planJobs, runLane, runReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };
+module.exports = { parseArgs, parsePositiveInt, resolveLanes, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };

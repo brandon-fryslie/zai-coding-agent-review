@@ -171,6 +171,14 @@ function assertProvidersSafe(providers, presets) {
     if (typeof spec.inputKeys?.credential !== 'string' || spec.inputKeys.credential === '') {
       throw new Error(`Provider '${name}': 'inputKeys.credential' must name the action input its credential arrives under.`);
     }
+    // The other half of the same routing fact, and the half that actually reaches the environment:
+    // `inputKeys.credential` names the BAG key, `credentialInput` names the ENV VAR the credential is
+    // read out of (`env[spec.credentialInput]` in resolveProviderConfig). Validating one and not the
+    // other left a row whose credential can never be found failing later as an `env['']` miss reported
+    // as "credential not set" — the true cause, a malformed row, nowhere in the message.
+    if (typeof spec.credentialInput !== 'string' || spec.credentialInput === '') {
+      throw new Error(`Provider '${name}': 'credentialInput' must name the environment variable its credential is read from.`);
+    }
     // `engine` and `defaultModel` are as load-bearing as `preset`: engine picks which CLI runs, and
     // defaultModel is the model a row contributes when no override is given. Nothing downstream can
     // tell a missing one from a present one, because both reach consumers through interpolation —

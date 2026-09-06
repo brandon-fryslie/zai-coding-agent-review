@@ -11,7 +11,7 @@
 # reconverges it on every run and overwrites local edits silently, so editing
 # here appears to work and is undone the next time anyone installs.
 # [LAW:one-source-of-truth]
-name: AI Code Review
+name: CoPirate Code Review
 
 # pull_request (unprivileged), NOT pull_request_target: this job checks out the
 # PR head. Under pull_request_target that checkout runs privileged, with secrets

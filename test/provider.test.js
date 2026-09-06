@@ -370,12 +370,12 @@ describe('assertProvidersSafe — a row must name its credential input, its engi
   // the engine that produced it. Refusing the row here is what makes that string unrepresentable, so
   // no consumer has to check for the word "undefined". [LAW:parse-dont-validate]
   const rowsMissingProvenance = {
-    'engine absent': { preset: 'claude-subscription', inputKeys: { credential: 'T' }, defaultModel: 'm' },
-    'engine empty': { preset: 'claude-subscription', inputKeys: { credential: 'T' }, engine: '', defaultModel: 'm' },
-    'engine non-string': { preset: 'claude-subscription', inputKeys: { credential: 'T' }, engine: 7, defaultModel: 'm' },
-    'defaultModel absent': { preset: 'claude-subscription', inputKeys: { credential: 'T' }, engine: 'claude-code' },
-    'defaultModel empty': { preset: 'claude-subscription', inputKeys: { credential: 'T' }, engine: 'claude-code', defaultModel: '' },
-    'defaultModel non-string': { preset: 'claude-subscription', inputKeys: { credential: 'T' }, engine: 'claude-code', defaultModel: 7 },
+    'engine absent': { preset: 'claude-subscription', credentialInput: 'SOME_TOKEN', inputKeys: { credential: 'T' }, defaultModel: 'm' },
+    'engine empty': { preset: 'claude-subscription', credentialInput: 'SOME_TOKEN', inputKeys: { credential: 'T' }, engine: '', defaultModel: 'm' },
+    'engine non-string': { preset: 'claude-subscription', credentialInput: 'SOME_TOKEN', inputKeys: { credential: 'T' }, engine: 7, defaultModel: 'm' },
+    'defaultModel absent': { preset: 'claude-subscription', credentialInput: 'SOME_TOKEN', inputKeys: { credential: 'T' }, engine: 'claude-code' },
+    'defaultModel empty': { preset: 'claude-subscription', credentialInput: 'SOME_TOKEN', inputKeys: { credential: 'T' }, engine: 'claude-code', defaultModel: '' },
+    'defaultModel non-string': { preset: 'claude-subscription', credentialInput: 'SOME_TOKEN', inputKeys: { credential: 'T' }, engine: 'claude-code', defaultModel: 7 },
   };
   for (const [shape, spec] of Object.entries(rowsMissingProvenance)) {
     test(`refused at load: ${shape}`, () => {
@@ -386,8 +386,26 @@ describe('assertProvidersSafe — a row must name its credential input, its engi
     });
   }
 
+  // `inputKeys.credential` names the input-bag KEY; `credentialInput` names the ENV VAR the credential is
+  // actually read from (`env[spec.credentialInput]`). Validating the first and not the second left a row
+  // whose credential can never be found failing later as an empty-key env miss, reported as "credential
+  // not set" with the real cause — a malformed row — named nowhere. [LAW:no-silent-failure]
+  const rowsMissingCredentialInput = {
+    'credentialInput absent': { preset: 'claude-subscription', engine: 'claude-code', defaultModel: 'm', inputKeys: { credential: 'T' } },
+    'credentialInput empty': { preset: 'claude-subscription', engine: 'claude-code', defaultModel: 'm', credentialInput: '', inputKeys: { credential: 'T' } },
+    'credentialInput non-string': { preset: 'claude-subscription', engine: 'claude-code', defaultModel: 'm', credentialInput: 7, inputKeys: { credential: 'T' } },
+  };
+  for (const [shape, spec] of Object.entries(rowsMissingCredentialInput)) {
+    test(`refused at load: ${shape}`, () => {
+      assert.throws(
+        () => assertProvidersSafe({ unreadable: spec }, PRESETS),
+        { message: /Provider 'unreadable': 'credentialInput' must name the environment variable/ },
+      );
+    });
+  }
+
   test('a complete row passes, and is frozen on the way out', () => {
-    const table = { fine: { preset: 'claude-subscription', engine: 'claude-code', defaultModel: 'm', inputKeys: { credential: 'SOME_TOKEN' } } };
+    const table = { fine: { preset: 'claude-subscription', engine: 'claude-code', defaultModel: 'm', credentialInput: 'SOME_TOKEN', inputKeys: { credential: 'someToken' } } };
     const frozen = assertProvidersSafe(table, PRESETS);
     assert.ok(Object.isFrozen(frozen) && Object.isFrozen(frozen.fine) && Object.isFrozen(frozen.fine.inputKeys));
   });
@@ -397,7 +415,7 @@ describe('assertProvidersSafe — a row must name its credential input, its engi
     for (const [name, spec] of Object.entries(PROVIDERS)) {
       assert.equal(typeof spec.inputKeys.credential, 'string', `provider row '${name}'`);
       assert.notEqual(spec.inputKeys.credential, '', `provider row '${name}'`);
-      for (const field of ['engine', 'defaultModel']) {
+      for (const field of ['engine', 'defaultModel', 'credentialInput']) {
         assert.equal(typeof spec[field], 'string', `provider row '${name}'.${field}`);
         assert.notEqual(spec[field], '', `provider row '${name}'.${field}`);
       }
@@ -450,4 +468,24 @@ describe('resolveProviderConfig threads exactly the fields a provider row declar
       });
     }
   }
+});
+
+// The NO_PROVIDER fallback is reachable from two real non-Action callers — a typo'd `provider` in a
+// case.json through eval/run-case.js, and a `--provider` typo through scripts/local-review.js — and it
+// exists so an unknown name reaches synthesizeProviderConfig's own "Unknown PROVIDER" error instead of
+// crashing on `Object.entries(undefined)`. That is a contract about which error the operator sees, and
+// nothing exercised it. [LAW:verifiable-goals]
+describe('resolveProviderConfig hands an unknown provider to the one enforcer that rejects it', () => {
+  const { resolveProviderConfig } = require('../src/provider');
+
+  test('a typo resolves to the Unknown PROVIDER error, naming every valid value', () => {
+    assert.throws(
+      () => resolveProviderConfig({ provider: 'claude-subscripton', env: {} }),
+      err => /Unknown PROVIDER "claude-subscripton"/.test(err.message) && PROVIDER_NAMES.every(n => err.message.includes(n)),
+    );
+  });
+
+  test('an absent provider fails the same way rather than throwing on an undefined row', () => {
+    assert.throws(() => resolveProviderConfig({ env: {} }), /Unknown PROVIDER/);
+  });
 });

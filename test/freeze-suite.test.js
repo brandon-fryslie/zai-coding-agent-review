@@ -1,7 +1,7 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { parseArgs, resolveLanes, suitePin, planJobs, runLane, renderReport, formatDuration, outcomeLabel } = require('../eval/freeze-suite');
+const { parseArgs, resolveLanes, suitePin, planJobs, runLane, makeLaneGroup, renderReport, formatDuration, outcomeLabel } = require('../eval/freeze-suite');
 
 // The contract these tests hold is the SCHEDULE: how many replays are still owed, in what order, on
 // which credential, and what the operator is told afterwards. The replay itself belongs to run-case.js
@@ -217,7 +217,7 @@ describe('runLane', () => {
     const done = [];
     const replay = async ({ job: j }) => (j.name === 'doomed' ? bad : ok);
 
-    await runLane({ ...laneArgs, queue, done, timeoutMinutes: 60, replay });
+    await runLane({ ...laneArgs, queue, done, timeoutMinutes: 60, replay, group: makeLaneGroup() });
 
     assert.deepEqual(done.map(d => d.name), ['alpha', 'doomed', 'beta']);
     assert.deepEqual(done.filter(d => d.ok).map(d => d.name), ['alpha', 'beta']);
@@ -230,7 +230,7 @@ describe('runLane', () => {
     const done = [];
     const replay = async () => bad;
 
-    await runLane({ ...laneArgs, queue, done, timeoutMinutes: 60, replay });
+    await runLane({ ...laneArgs, queue, done, timeoutMinutes: 60, replay, group: makeLaneGroup() });
 
     assert.equal(done.length, 3, 'every job attempted exactly once, never twice');
     assert.deepEqual(queue.map(j => j.name).sort(), ['alpha', 'beta', 'gamma'], 'all requeued for a healthy lane');
@@ -240,10 +240,40 @@ describe('runLane', () => {
     const queue = [job('alpha', 1), job('beta', 2)];
     const done = [];
 
-    await runLane({ ...laneArgs, queue, done, timeoutMinutes: 60, replay: async () => ok });
+    await runLane({ ...laneArgs, queue, done, timeoutMinutes: 60, replay: async () => ok, group: makeLaneGroup() });
 
     assert.equal(queue.length, 0);
     assert.deepEqual(done.map(d => d.ok), [true, true]);
+  });
+
+  // The multi-lane guarantee, which used to hold only when the timing happened to allow it: a lane that
+  // finishes early must not leave while a peer is still running, because a peer still running is the only
+  // thing that can put a job back. The replays here resolve in a fixed, deliberately hostile order —
+  // the healthy lane finishes FIRST, which is precisely when the old rule let it go.
+  test('a healthy lane waits for a peer still replaying, so a requeued failure is retried', async () => {
+    const queue = [job('alpha', 1), job('doomed', 1)];
+    const done = [];
+    const group = makeLaneGroup();
+    const laneA = { name: 'TOKEN_A', value: 'a' };
+    const laneB = { name: 'TOKEN_B', value: 'b' };
+    // 'doomed' is the SLOW replay and 'alpha' the fast one, so lane A provably finishes and finds an
+    // empty queue while lane B is still mid-replay — the exact window the old rule let it leave through.
+    const replay = async ({ job: j, lane }) => {
+      if (j.name !== 'doomed') return ok;
+      await new Promise(r => setTimeout(r, 30));
+      // Fails on lane B's walled credential, succeeds for whichever lane picks it up next.
+      return lane.name === 'TOKEN_B' ? bad : ok;
+    };
+
+    await Promise.all([
+      runLane({ ...laneArgs, lane: laneA, queue, done, timeoutMinutes: 60, replay, group }),
+      runLane({ ...laneArgs, lane: laneB, queue, done, timeoutMinutes: 60, replay, group }),
+    ]);
+
+    // Without the rendezvous lane A exits on the empty queue while B is still on 'doomed', and 'doomed'
+    // ends the run with a single attempt across a two-lane suite.
+    assert.deepEqual(done.filter(d => d.name === 'doomed').map(d => d.lane), ['TOKEN_B', 'TOKEN_A']);
+    assert.equal(queue.length, 0, 'the requeued job was picked up, not left behind');
   });
 });
 
@@ -369,4 +399,45 @@ describe('superviseSpawn holds a child to its deadline', () => {
     assert.deepEqual(sent, ['SIGTERM', 'SIGKILL']);
     assert.equal(inFlight.size, 0);
   });
+});
+
+// The interrupt path escalates exactly as a deadline does, and for the same reason: the worker that
+// ignores SIGTERM is the one worth catching. A fire-and-forget SIGTERM would leave it running against a
+// subscription with the parent already gone — the unwatched spend this whole file exists to prevent.
+describe('shutdownInFlight escalates an interrupt the way a deadline does', () => {
+  const { shutdownInFlight } = require('../eval/freeze-suite');
+  const run = (groups, { drainAfterMs }) => new Promise(resolve => {
+    const sent = [];
+    if (drainAfterMs !== null) setTimeout(() => groups.clear(), drainAfterMs);
+    shutdownInFlight({
+      groups,
+      signal: (pid, sig) => sent.push(`${pid}:${sig}`),
+      killGraceMs: 300,
+      exit: () => resolve(sent),
+    });
+  });
+
+  test('a tree that goes on SIGTERM is never SIGKILLed, and the operator waits no longer than it takes', async () => {
+    const started = Date.now();
+    const sent = await run(new Set([111, 222]), { drainAfterMs: 20 });
+    assert.deepEqual(sent, ['111:SIGTERM', '222:SIGTERM']);
+    assert.ok(Date.now() - started < 300, 'left as soon as the registry drained, not at the grace deadline');
+  });
+
+  test('a tree still alive at the grace deadline is SIGKILLed before the process leaves', async () => {
+    const sent = await run(new Set([333]), { drainAfterMs: null });
+    assert.deepEqual(sent, ['333:SIGTERM', '333:SIGKILL']);
+  });
+
+  test('an interrupt with nothing in flight leaves immediately, signalling nothing', async () => {
+    assert.deepEqual(await run(new Set(), { drainAfterMs: null }), []);
+  });
+});
+
+// `--out=` is the one that bites: path.resolve('') is the CWD, so the suite reports every case at 0
+// completed and writes case-named run dirs into whatever directory it was invoked from.
+test('parseArgs refuses an empty value for any option rather than resolving it to the CWD', () => {
+  for (const argv of [['--out='], ['--out', ''], ['--cases-dir='], ['--credentials='], ['-n', '']]) {
+    assert.throws(() => parseArgs(argv), /requires a non-empty value|must be a positive integer/, `argv: ${JSON.stringify(argv)}`);
+  }
 });
