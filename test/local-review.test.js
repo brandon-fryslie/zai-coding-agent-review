@@ -282,3 +282,39 @@ test('resolveConfigChain without --config synthesizes a single-entry preset chai
     if (prev === undefined) delete process.env.ZAI_API_KEY; else process.env.ZAI_API_KEY = prev;
   }
 });
+
+// `resolveConfigChain` is the ONLY call site in the repo that passes `baseUrl` through
+// `resolveProviderConfig` — eval/run-case.js's `resolvePinnedConfig` never does, because a replay is
+// forbidden from overriding its pinned host. So the generic
+// `values.baseUrl → spec.inputKeys.baseUrl → inputs[key] → endpoint.baseUrl` path had exactly one user
+// and no test: the existing coverage only checks that `parseArgs` stores the string. A field-name
+// mismatch in that loop would silently break the gateway override with nothing going red, and the only
+// provider that would notice is one nobody replays. [LAW:no-silent-failure]
+test('resolveConfigChain lands --base-url on the endpoint for a provider whose row declares one', () => {
+  const before = process.env.ZAI_API_KEY;
+  process.env.ZAI_API_KEY = 'test-credential';
+  try {
+    const chain = resolveConfigChain({ provider: 'zai', baseUrl: 'http://gw.example' });
+    assert.equal(chain.length, 1);
+    assert.equal(chain[0].endpoint.baseUrl, 'http://gw.example');
+    // Omitting it leaves the preset's own default standing, rather than an empty host.
+    assert.equal(resolveConfigChain({ provider: 'zai' })[0].endpoint.baseUrl, PRESETS.zai.defaultBaseUrl);
+  } finally {
+    if (before === undefined) delete process.env.ZAI_API_KEY; else process.env.ZAI_API_KEY = before;
+  }
+});
+
+// The mirror of the above, on the row that must NOT be overridable: claude-subscription declares no
+// baseUrl key, so its preset's pinned host stands whatever the caller passes. That is the guarantee the
+// whole pinned-preset design exists for, asserted through the same seam a real local run crosses.
+// [LAW:single-enforcer]
+test('resolveConfigChain cannot move the subscription off its pinned host', () => {
+  const before = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  process.env.CLAUDE_CODE_OAUTH_TOKEN = 'test-credential';
+  try {
+    const chain = resolveConfigChain({ provider: 'claude-subscription', baseUrl: 'http://gw.example' });
+    assert.equal(chain[0].endpoint.baseUrl, PRESETS['claude-subscription'].baseUrl);
+  } finally {
+    if (before === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN; else process.env.CLAUDE_CODE_OAUTH_TOKEN = before;
+  }
+});

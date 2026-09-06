@@ -346,7 +346,7 @@ describe('PROVIDERS rows agree with the real adapter capabilities', () => {
 //
 // Asserted against the contract (refused at load, with a message naming the offending row), not against
 // how the check is spelled. [LAW:behavior-not-structure] [LAW:verifiable-goals]
-describe('assertProvidersSafe — a row must name the input its credential arrives under', () => {
+describe('assertProvidersSafe — a row must name its credential input, its engine, and its default model', () => {
   const rowsMissingCredential = {
     'inputKeys absent entirely': { preset: 'claude-subscription' },
     'inputKeys present but credential absent': { preset: 'claude-subscription', inputKeys: {} },
@@ -363,17 +363,91 @@ describe('assertProvidersSafe — a row must name the input its credential arriv
     });
   }
 
-  test('a row that names its credential input passes, and is frozen on the way out', () => {
-    const table = { fine: { preset: 'claude-subscription', inputKeys: { credential: 'SOME_TOKEN' } } };
+  // `engine` and `defaultModel` are checked at the same border and for the same reason. Both reach
+  // consumers through interpolation — eval/freeze-case.sh stamps `${row.engine}` into the provenance
+  // string of every case it freezes — where a missing field arrives as the literal text "undefined",
+  // passes every non-empty check downstream, and is written into a committed case.json as the name of
+  // the engine that produced it. Refusing the row here is what makes that string unrepresentable, so
+  // no consumer has to check for the word "undefined". [LAW:parse-dont-validate]
+  const rowsMissingProvenance = {
+    'engine absent': { preset: 'claude-subscription', inputKeys: { credential: 'T' }, defaultModel: 'm' },
+    'engine empty': { preset: 'claude-subscription', inputKeys: { credential: 'T' }, engine: '', defaultModel: 'm' },
+    'engine non-string': { preset: 'claude-subscription', inputKeys: { credential: 'T' }, engine: 7, defaultModel: 'm' },
+    'defaultModel absent': { preset: 'claude-subscription', inputKeys: { credential: 'T' }, engine: 'claude-code' },
+    'defaultModel empty': { preset: 'claude-subscription', inputKeys: { credential: 'T' }, engine: 'claude-code', defaultModel: '' },
+    'defaultModel non-string': { preset: 'claude-subscription', inputKeys: { credential: 'T' }, engine: 'claude-code', defaultModel: 7 },
+  };
+  for (const [shape, spec] of Object.entries(rowsMissingProvenance)) {
+    test(`refused at load: ${shape}`, () => {
+      assert.throws(
+        () => assertProvidersSafe({ unstampable: spec }, PRESETS),
+        { message: /Provider 'unstampable': '(engine|defaultModel)' must be a non-empty string/ },
+      );
+    });
+  }
+
+  test('a complete row passes, and is frozen on the way out', () => {
+    const table = { fine: { preset: 'claude-subscription', engine: 'claude-code', defaultModel: 'm', inputKeys: { credential: 'SOME_TOKEN' } } };
     const frozen = assertProvidersSafe(table, PRESETS);
     assert.ok(Object.isFrozen(frozen) && Object.isFrozen(frozen.fine) && Object.isFrozen(frozen.fine.inputKeys));
   });
 
   // The shipped table is the one that actually routes credentials, so it is the one that must hold.
-  test('every shipped provider row names its credential input', () => {
+  test('every shipped provider row names its credential input, its engine, and its default model', () => {
     for (const [name, spec] of Object.entries(PROVIDERS)) {
       assert.equal(typeof spec.inputKeys.credential, 'string', `provider row '${name}'`);
       assert.notEqual(spec.inputKeys.credential, '', `provider row '${name}'`);
+      for (const field of ['engine', 'defaultModel']) {
+        assert.equal(typeof spec[field], 'string', `provider row '${name}'.${field}`);
+        assert.notEqual(spec[field], '', `provider row '${name}'.${field}`);
+      }
     }
   });
+});
+
+// [LAW:verifiable-goals] Every field a row DECLARES must arrive at its destination, and every field it
+// does NOT declare must arrive nowhere. Until now only `credential` and `model` were ever carried
+// end-to-end, and only across claude-subscription's two-field row — so a scrambled
+// `Object.entries(spec.inputKeys)` mapping was caught for the first two fields of one provider and for
+// nothing else. The table drives both halves, so the row added tomorrow is covered the day it lands
+// rather than the day someone notices its third field never arrived.
+describe('resolveProviderConfig threads exactly the fields a provider row declares', () => {
+  const { resolveProviderConfig } = require('../src/provider');
+  const registry = require('../src/engine/registry');
+  // Where each optional field lands, and a value legal for it. `reasoning` is validated against the
+  // engine's own capability list, so its value is read from there rather than guessed per provider.
+  const FIELD = {
+    reasoning: {
+      value: spec => registry.get(spec.engine).capabilities.reasoningEfforts[0],
+      lands: config => config.reasoning,
+    },
+    systemPrompt: { value: () => 'pinned-system-prompt', lands: config => config.systemPrompt },
+    baseUrl: { value: () => 'http://gateway.example/v1', lands: config => config.endpoint.baseUrl },
+  };
+
+  for (const [name, spec] of Object.entries(PROVIDERS)) {
+    const declared = Object.keys(spec.inputKeys).filter(f => f in FIELD);
+
+    for (const field of declared) {
+      test(`'${name}' declares '${field}', so a pinned '${field}' reaches the config`, () => {
+        const value = FIELD[field].value(spec);
+        const config = resolveProviderConfig({
+          provider: name, [field]: value, env: { [spec.credentialInput]: 'test-credential' },
+        });
+        assert.strictEqual(FIELD[field].lands(config), value);
+      });
+    }
+
+    for (const field of Object.keys(FIELD).filter(f => !declared.includes(f))) {
+      test(`'${name}' declares no '${field}' key, so a supplied '${field}' reaches nothing`, () => {
+        // The other half of the enumeration. claude-subscription's pinned host is the case that matters:
+        // a baseUrl it never declared must not become the endpoint a credential is sent to, whatever the
+        // caller passes. [LAW:single-enforcer]
+        const config = resolveProviderConfig({
+          provider: name, [field]: FIELD[field].value(spec), env: { [spec.credentialInput]: 'test-credential' },
+        });
+        assert.notStrictEqual(FIELD[field].lands(config), FIELD[field].value(spec));
+      });
+    }
+  }
 });

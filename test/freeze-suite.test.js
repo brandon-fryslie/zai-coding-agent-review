@@ -246,3 +246,127 @@ describe('runLane', () => {
     assert.deepEqual(done.map(d => d.ok), [true, true]);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// The census join, and the supervision the schedule is built on.
+//
+// Everything above hands planJobs a hand-built `{name, dir, completed}`, which is the one shape nothing
+// verifies against a real tree: `censusCases` is where a case manifest meets the scorer's run count, and
+// a wrong join there mis-plans every deficit while every planner test stays green.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { censusCases, superviseSpawn, inFlight } = require('../eval/freeze-suite');
+
+const tmpTree = () => fs.mkdtempSync(path.join(os.tmpdir(), 'freeze-suite-test-'));
+const writeCase = (casesDir, dirName, manifestName) => {
+  const dir = path.join(casesDir, dirName);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'case.json'), JSON.stringify({
+    name: manifestName, diff: 'd.diff', tree: 't.tar.gz', engine: { provider: 'deepseek', model: 'm' },
+  }));
+  return dir;
+};
+const writeRun = (outRoot, caseName, runName, findings) => {
+  const dir = path.join(outRoot, caseName, runName);
+  fs.mkdirSync(dir, { recursive: true });
+  if (findings) fs.writeFileSync(path.join(dir, 'findings.json'), '[]');
+};
+
+describe('censusCases counts what the scorer will actually find', () => {
+  test('the count keys off the manifest name, not the case directory name', () => {
+    const root = tmpTree();
+    const casesDir = path.join(root, 'cases');
+    const outRoot = path.join(root, 'out');
+    // The dir and the manifest name deliberately DISAGREE: joined on the dir's basename this returns 0
+    // for a case with two completed runs, and the suite replays work it already has.
+    const dir = writeCase(casesDir, 'dir-name-differs', 'alpha');
+    writeRun(outRoot, 'alpha', 'run-1', true);
+    writeRun(outRoot, 'alpha', 'run-2', true);
+    assert.deepEqual(censusCases([dir], outRoot).map(c => [c.name, c.completed]), [['alpha', 2]]);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  test('a case that was never replayed counts zero rather than throwing', () => {
+    const root = tmpTree();
+    const dir = writeCase(path.join(root, 'cases'), 'beta', 'beta');
+    // No out subdir at all — the first-ever run of a new case, which must plan a full deficit.
+    assert.deepEqual(censusCases([dir], path.join(root, 'out')).map(c => c.completed), [0]);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  test('a run dir without findings.json is not a completed run', () => {
+    const root = tmpTree();
+    const dir = writeCase(path.join(root, 'cases'), 'gamma', 'gamma');
+    const outRoot = path.join(root, 'out');
+    writeRun(outRoot, 'gamma', 'run-1', true);
+    // The crashed-freeze shape: a run dir the runner created and never finished writing. Counting it
+    // would freeze a suite one run shallower than it claims. [LAW:one-source-of-truth]
+    writeRun(outRoot, 'gamma', 'run-2', false);
+    assert.deepEqual(censusCases([dir], outRoot).map(c => c.completed), [1]);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+});
+
+// The regression these hold: an escalation timer that outlives the child it was armed for. A tree that
+// honours SIGTERM exits at once, and an uncancelled SIGKILL still fires killGraceMs later — long enough
+// for the OS to have reissued that pid to a process this suite never spawned. The signaller is injected
+// so the negative ("no SIGKILL was sent") is asserted directly instead of waited out.
+describe('superviseSpawn holds a child to its deadline', () => {
+  // Records every signal AND delivers it: a fake that only recorded would leave the child alive and the
+  // promise unresolved, so the test would prove nothing by hanging.
+  const recorder = () => {
+    const sent = [];
+    return {
+      sent,
+      signal: (pid, sig) => { sent.push(sig); try { process.kill(-pid, sig); } catch { /* already gone */ } },
+    };
+  };
+  const runNode = (source, { timeoutMinutes, killGraceMs }) => {
+    const logPath = path.join(tmpTree(), 'replay.log');
+    const rec = recorder();
+    return superviseSpawn({
+      command: process.execPath,
+      args: ['-e', source],
+      cwd: process.cwd(),
+      env: process.env,
+      logPath,
+      timeoutMinutes,
+      signal: rec.signal,
+      killGraceMs,
+    }).then(result => ({ result, sent: rec.sent, log: fs.readFileSync(logPath, 'utf8') }));
+  };
+
+  test('a child that finishes inside its deadline is never signalled', async () => {
+    const { result, sent } = await runNode('', { timeoutMinutes: 1, killGraceMs: 50 });
+    assert.equal(result.timedOut, false);
+    assert.equal(result.exitCode, 0);
+    assert.deepEqual(sent, []);
+    assert.equal(inFlight.size, 0);
+  });
+
+  test('a child that outruns its deadline is killed, reported timedOut, and told why in its log', async () => {
+    const { result, sent, log } = await runNode('setInterval(() => {}, 1000);', { timeoutMinutes: 0.005, killGraceMs: 50 });
+    assert.equal(result.timedOut, true);
+    assert.equal(result.signal, 'SIGTERM');
+    assert.deepEqual(sent, ['SIGTERM']);
+    assert.match(log, /exceeded its 0\.005m deadline/);
+    // THE regression: the child died on SIGTERM, so the escalation must have been cancelled. Waiting
+    // well past the grace period is what makes a stray SIGKILL observable rather than merely unlikely.
+    await new Promise(r => setTimeout(r, 250));
+    assert.deepEqual(sent, ['SIGTERM']);
+    assert.equal(inFlight.size, 0);
+  });
+
+  test('a child that ignores SIGTERM is escalated to SIGKILL after the grace period', async () => {
+    const { result, sent } = await runNode(
+      "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);",
+      { timeoutMinutes: 0.005, killGraceMs: 50 },
+    );
+    assert.equal(result.timedOut, true);
+    assert.equal(result.signal, 'SIGKILL');
+    assert.deepEqual(sent, ['SIGTERM', 'SIGKILL']);
+    assert.equal(inFlight.size, 0);
+  });
+});

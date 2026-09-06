@@ -7,7 +7,7 @@ const {
   normalizeBody, pairCandidates, computeMetrics, scoreRun, aggregateRuns, renderTable,
   makeLexicalJudge, jaccard, wordSet,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, loadCache,
-  requireLlmJudgeCredential, listRunDirs,
+  requireLlmJudgeCredential, listRunDirs, JUDGE_MODEL,
 } = require('../eval/score');
 
 // [LAW:verifiable-goals] AC: the scorer reduces a run's findings.json + a case's expected.json to
@@ -507,4 +507,29 @@ describe('listRunDirs — what counts as a completed run', () => {
     fs.writeFileSync(path.join(root, 'scorecard-summary.json'), '{}');
     assert.deepEqual(listRunDirs(root), [path.join(root, 'run1')]);
   });
+});
+
+// This PR's core change is WHERE the judge is called and WHICH model answers — JUDGE_BASE_URL moved to
+// Anthropic's host and JUDGE_MODEL to a pinned Haiku — and every fake above ignores its `_url` argument
+// and never reads `opts.body.model`. They exercise response handling only, so a fat-fingered base URL (a
+// dropped `/v1/messages`, a stray path segment) or a `model` that never reaches the wire would pass this
+// entire file and surface only as a live HTTP failure, mid-suite, after real spend. The request is half
+// the contract; this asserts that half. [LAW:verifiable-goals]
+test('callJudge posts to the pinned Anthropic messages endpoint with the model it was given', async () => {
+  const tmp = require('path').join(require('os').tmpdir(), `judge-request-${process.pid}-${Date.now()}.json`);
+  const seen = [];
+  const fakeFetch = async (url, opts) => {
+    seen.push({ url, body: JSON.parse(opts.body), auth: opts.headers.Authorization });
+    return { ok: true, json: async () => ({ content: [{ type: 'text', text: '{"i":1,"match":true,"reason":"ok"}' }] }) };
+  };
+  const judge = makeLlmJudge({ apiKey: 'k', model: JUDGE_MODEL, cacheFile: tmp, fetchImpl: fakeFetch });
+  await judge([{ key: '0:0', expectedBody: 'E', producedBody: 'P' }]);
+
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].url, 'https://api.anthropic.com/v1/messages');
+  assert.equal(seen[0].body.model, JUDGE_MODEL);
+  // The credential travels as a bearer token on this endpoint, and the judge is deliberately NOT the
+  // engine's credential — routing it anywhere else is the failure this line pins.
+  assert.equal(seen[0].auth, 'Bearer k');
+  require('fs').rmSync(tmp, { force: true });
 });

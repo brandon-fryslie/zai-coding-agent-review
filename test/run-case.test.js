@@ -219,3 +219,37 @@ test('buildCaseMaterial refuses a case whose patterns exclude everything, rather
     /All 2 changed file\(s\) were excluded/,
   );
 });
+
+// The `reasoning` coverage above proves only that the field is correctly ABSENT: it goes through
+// claude-subscription, whose row declares no `reasoning` key, so no reasoning value is ever threaded
+// through the assembly loop at all. `credential` and `model` on that two-field row were the only fields
+// any test carried end-to-end — a scrambled `Object.entries(spec.inputKeys)` mapping would go unseen on
+// the third and fourth field every other row declares. Parameterized over the table for the same reason
+// the block above is: a row that grows a field tomorrow is covered the day it lands. [LAW:no-silent-failure]
+describe('resolvePinnedConfig carries a pinned reasoning through the rows that declare one', () => {
+  const { PROVIDERS } = require('../src/provider');
+  const registry = require('../src/engine/registry');
+
+  for (const [name, spec] of Object.entries(PROVIDERS).filter(([, s]) => 'reasoning' in s.inputKeys)) {
+    for (const effort of registry.get(spec.engine).capabilities.reasoningEfforts) {
+      test(`'${name}' pinned to reasoning '${effort}' resolves to a config carrying it`, () => {
+        const config = resolvePinnedConfig(
+          { provider: name, model: spec.defaultModel, reasoning: effort },
+          { [spec.credentialInput]: 'test-credential' },
+        );
+        assert.equal(config.reasoning, effort);
+        assert.equal(config.model, spec.defaultModel);
+      });
+    }
+
+    test(`'${name}' rejects a reasoning its engine does not offer, naming what is allowed`, () => {
+      assert.throws(
+        () => resolvePinnedConfig(
+          { provider: name, model: spec.defaultModel, reasoning: 'ludicrous' },
+          { [spec.credentialInput]: 'test-credential' },
+        ),
+        /reasoning 'ludicrous' is not valid for engine/,
+      );
+    });
+  }
+});
