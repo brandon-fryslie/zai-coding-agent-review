@@ -469,9 +469,10 @@ test('producedTree names the one tree every run records — the verdict\'s prove
   const clean = { sha: 'aaaaaaa1', dirty: false };
   assert.deepEqual(producedTree([{ dir: 'r1', candidate: clean }, { dir: 'r2', candidate: { sha: 'aaaaaaa1', dirty: false } }]), clean);
   assert.deepEqual(producedTree([{ dir: 'r1', candidate: { sha: 'aaaaaaa1', dirty: true } }]), { sha: 'aaaaaaa1', dirty: true });
-  // Pre-provenance runs agree with each other on having no identity, and the verdict says so.
+  // Pre-provenance runs agree with each other on having no identity, and the verdict says so; a reused
+  // root of summaries alone (no run dirs) has none to name either.
   assert.equal(producedTree([{ dir: 'r1', candidate: null }, { dir: 'r2', candidate: null }]), null);
-  assert.throws(() => producedTree([]), /No completed runs/);
+  assert.equal(producedTree([]), null);
   assert.throws(() => producedTree([
     { dir: 'r1', candidate: clean },
     { dir: 'r2', candidate: { sha: 'bbbbbbb2', dirty: false } },

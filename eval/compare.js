@@ -195,11 +195,11 @@ function driftedRuns(snapshot, runs) {
 
 // [LAW:effects-at-boundaries] Pure: the one tree every run records — the tree a verdict over these runs
 // names, read from the runs themselves so a root produced elsewhere is named by its producer, never by the
-// tree that happens to be checked out. Runs recording two trees are not one candidate: refused by name.
-// [LAW:one-source-of-truth] [LAW:no-silent-failure]
+// tree that happens to be checked out. No runs (a reused root of summaries alone) is no recorded identity,
+// the same null a pre-provenance run records. Runs recording two trees are not one candidate: refused by
+// name. [LAW:one-source-of-truth] [LAW:no-silent-failure]
 function producedTree(runs) {
-  if (runs.length === 0) throw new Error('No completed runs under the candidate root — nothing to name a verdict after.');
-  const tree = runs[0].candidate;
+  const tree = runs[0]?.candidate ?? null;
   const odd = runs.filter(({ candidate }) => !sameTree(candidate, tree));
   if (odd.length > 0) {
     throw new Error(`The runs under the candidate root were not produced by one tree:\n${odd.map(r => `  ${r.dir} recorded ${describeTree(r.candidate)}; ${runs[0].dir} recorded ${describeTree(tree)}`).join('\n')}\nA verdict names one candidate; remove the runs that are not its.`);
@@ -475,7 +475,7 @@ function runCli(scriptPath, args, label) {
 
 // A tree as a phrase, for the refusal below: the reader must see BOTH sides to know which to fix.
 function describeTree(candidate) {
-  if (candidate === null) return 'no recorded identity (replayed before provenance was kept)';
+  if (candidate === null) return 'no recorded identity';
   return `${candidate.dirty ? 'a dirty tree at ' : ''}commit ${candidate.sha.slice(0, 7)}`;
 }
 
