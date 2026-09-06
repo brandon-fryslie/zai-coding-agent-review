@@ -39,20 +39,30 @@ if [ "$#" -lt 4 ]; then
 fi
 NAME="$1"; REPO="$2"; PR="$3"; REVIEW_ID="$4"
 
-# The default exclude set has ONE source of truth: action.yml's EXCLUDE_PATTERNS
-# default. Read it from there rather than hardcoding a copy that would silently drift
-# from what the action actually does. [LAW:one-source-of-truth] Resolve the path from
-# the script's own location so cwd doesn't matter.
+# What an action input DEFAULTS to has ONE source of truth: action.yml. Read it from there rather than
+# hardcoding a copy that would silently drift from what the action actually does.
+# [LAW:one-source-of-truth] Resolve the path from the script's own location so cwd doesn't matter.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ACTION_YML="$SCRIPT_DIR/../action.yml"
-default_exclude() {
+# Reading one input's default is a single behavior with two callers — the exclude set, and the provider
+# pin below — so it takes the input's name rather than existing once per input. [LAW:one-type-per-behavior]
+# The `default:` match is ANCHORED to its own line, and that anchor is load-bearing rather than tidiness:
+# PROVIDER's description reads "...(default: auto, which resolves to claude-subscription)", so the
+# unanchored /default:/ this used while EXCLUDE_PATTERNS was its only caller matches the description and
+# returns prose where a value belongs. The next `^  KEY:` ends the block, so an input with no default
+# yields empty rather than silently inheriting the next input's. [LAW:no-silent-failure]
+action_input_default() {
   [ -f "$ACTION_YML" ] || { echo "action.yml not found at $ACTION_YML" >&2; return 1; }
-  awk '/^  EXCLUDE_PATTERNS:/{f=1} f&&/default:/{sub(/.*default:[ ]*/,""); gsub(/^"|"$/,""); print; exit}' "$ACTION_YML"
+  awk -v n="$1" '
+    index($0, "  " n ":") == 1 { f = 1; next }
+    f && /^    default:/ { sub(/^    default:[ ]*/, ""); gsub(/^"|"$/, ""); print; exit }
+    f && /^  [A-Za-z_]+:/ { exit }
+  ' "$ACTION_YML"
 }
 # The explicit 5th arg overrides (for a source workflow that sets its own patterns).
 EXCLUDE="${5:-}"
 if [ -z "$EXCLUDE" ]; then
-  EXCLUDE="$(default_exclude)" || { echo "FREEZE ERROR: could not read EXCLUDE_PATTERNS default from action.yml" >&2; exit 1; }
+  EXCLUDE="$(action_input_default EXCLUDE_PATTERNS)" || { echo "FREEZE ERROR: could not read EXCLUDE_PATTERNS default from action.yml" >&2; exit 1; }
   [ -n "$EXCLUDE" ] || { echo "FREEZE ERROR: EXCLUDE_PATTERNS default in action.yml is empty" >&2; exit 1; }
 fi
 
@@ -71,25 +81,39 @@ fi
 # node's own stderr is deliberately NOT silenced: if provider.js cannot load, that stack trace is the
 # only thing that says why, and the generic message below would replace a located cause with a guess.
 # [LAW:no-silent-failure]
-# All three segments of the provenance string come from the table, none from a literal here. The engine
-# type is NOT the same for every row — PROVIDERS.codex.engine is 'codex', not 'claude-code' — so a
-# hardcoded middle segment is correct only for whichever provider PROVIDER_ALIASES.auto happens to name
-# today, and would quietly mislabel every case frozen after a retarget. That is the exact drift this
-# function exists to prevent for the provider and model. [LAW:one-source-of-truth]
+# Every segment of the provenance string comes from the table, none from a literal here. The engine type
+# is NOT the same for every row — PROVIDERS.codex.engine is 'codex', not 'claude-code' — so a hardcoded
+# middle segment is correct only for whichever provider the action currently defaults to, and would
+# quietly mislabel every case frozen after a retarget. [LAW:one-source-of-truth]
+#
+# WHICH provider name to resolve is action.yml's fact, read above, not `PROVIDER_ALIASES.auto` — that
+# literal assumed the PROVIDER input still defaults to the alias, which is the same class of assumption
+# 1.42.0 broke when it retargeted what `auto` resolves to. Repointing the input's default at a concrete
+# provider would have left this deriving a pin for an engine the action no longer runs, reopening the
+# drift for the whole chain the derivation exists to close. Now no step of
+# `action.yml default → alias → row` is written down twice.
 default_engine() {
   node -e '
-    const { PROVIDERS, PROVIDER_ALIASES } = require("./src/provider");
-    const name = PROVIDER_ALIASES.auto;
-    const row = PROVIDERS[name];
-    process.stdout.write(`${name}\t${row.engine}\t${row.defaultModel}`);
-  '
+    const { resolveProviderName, providerSpec } = require("./src/provider");
+    const requested = process.argv[1];
+    const name = resolveProviderName(requested);
+    const row = providerSpec(requested);
+    if (!row) throw new Error(`action.yml PROVIDER default ${JSON.stringify(requested)} names no provider src/provider.js defines.`);
+    // The 4th field is how the resolution is written for a human, in the same arrow form provider.js
+    // uses for an alias, so a case frozen under PROVIDER=auto still records that auto is what was asked for.
+    process.stdout.write(`${name}\t${row.engine}\t${row.defaultModel}\t${requested === name ? name : `${requested}\u2192${name}`}`);
+  ' "$1"
 }
-ENGINE_TSV="$(cd "$SCRIPT_DIR/.." && default_engine)" \
+PROVIDER_DEFAULT="$(action_input_default PROVIDER)" \
+  || { echo "FREEZE ERROR: could not read the PROVIDER default from action.yml" >&2; exit 1; }
+[ -n "$PROVIDER_DEFAULT" ] \
+  || { echo "FREEZE ERROR: PROVIDER default in action.yml is empty — the replay pin has nothing to resolve" >&2; exit 1; }
+ENGINE_TSV="$(cd "$SCRIPT_DIR/.." && default_engine "$PROVIDER_DEFAULT")" \
   || { echo "FREEZE ERROR: could not resolve the action's default engine from src/provider.js" >&2; exit 1; }
-IFS=$'\t' read -r PROVIDER ENGINE MODEL <<< "$ENGINE_TSV"
+IFS=$'\t' read -r PROVIDER ENGINE MODEL RESOLUTION <<< "$ENGINE_TSV"
 # Every segment must be present: a provenance string with an empty field is a case that cannot say what
 # produced it, and writing one is worse than refusing to freeze. [LAW:no-silent-failure]
-[ -n "$PROVIDER" ] && [ -n "$ENGINE" ] && [ -n "$MODEL" ] \
+[ -n "$PROVIDER" ] && [ -n "$ENGINE" ] && [ -n "$MODEL" ] && [ -n "$RESOLUTION" ] \
   || { echo "FREEZE ERROR: default engine resolved to an unusable value: '$ENGINE_TSV'" >&2; exit 1; }
 
 # Provenance of the GOLDEN REVIEW — a fact about the historical review this case was
@@ -98,7 +122,7 @@ IFS=$'\t' read -r PROVIDER ENGINE MODEL <<< "$ENGINE_TSV"
 # because of it; they are separate facts and a case frozen from an older review must be
 # able to say so. Defaults to the current default engine, which is what a review run
 # today was produced by. [FRAMING:representation]
-PRODUCED_BY="${6:-auto→$PROVIDER / $ENGINE / $MODEL}"
+PRODUCED_BY="${6:-$RESOLUTION / $ENGINE / $MODEL}"
 
 CASE_DIR="eval/cases/$NAME"
 WORK="$(mktemp -d)"
