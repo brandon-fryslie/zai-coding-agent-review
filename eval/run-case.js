@@ -127,8 +127,8 @@ function parseCaseManifest(raw, caseDir) {
   // the pin check compares one representation of "no reasoning", never undefined-vs-null. [LAW:one-source-of-truth]
   const reasoning = engine.reasoning ?? null;
   // [LAW:parse-dont-validate] reasoning is null OR a non-empty tier string. An empty string is neither —
-  // left unrejected it slips past a bare typeof check, then buildProviderInputs coerces it to undefined
-  // and the pin check reports a confusing "Reasoning-pin mismatch" instead of the real problem. Reject it
+  // left unrejected it slips past a bare typeof check, then the provider resolution coerces it to
+  // undefined and the pin check reports a confusing "Reasoning-pin mismatch" instead. Reject it
   // here, at the boundary, exactly as `req` rejects an empty provider/model. [LAW:no-silent-failure]
   if (reasoning !== null && (typeof reasoning !== 'string' || reasoning.trim() === '')) {
     throw new Error(`case.json (${caseDir}) 'engine.reasoning' must be null or a non-empty string.`);

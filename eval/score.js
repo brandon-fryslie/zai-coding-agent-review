@@ -495,8 +495,8 @@ function buildJudgePrompt(batch) {
   return header.join('\n') + '\n' + body.join('\n');
 }
 
-// The DeepSeek Anthropic-compatible endpoint leads its content with a `thinking` block, so the answer is
-// the LAST `text` block — never content[0]. [LAW:no-silent-failure] A missing text block is a loud failure.
+// Content blocks may precede the answer, so the answer is the LAST `text` block — never content[0].
+// [LAW:no-silent-failure] A missing text block is a loud failure.
 function extractText(envelope) {
   const blocks = Array.isArray(envelope.content) ? envelope.content : [];
   const texts = blocks.filter(b => b && b.type === 'text' && typeof b.text === 'string');
@@ -631,10 +631,10 @@ async function callJudge(doFetch, apiKey, model, batch) {
     body: JSON.stringify({
       model,
       max_tokens: 2048,
-      // Disable the model's own chain-of-thought: the judge must emit ONLY the JSON array. Left on, the
-      // reasoning-heavy flash model spends the whole token budget thinking and returns no text block at
-      // all (extractText then aborts loudly). The prompt already carries the discrimination rules, so the
-      // reasoning that matters is in the instruction, not a hidden scratchpad. [LAW:no-silent-failure]
+      // The judge must emit ONLY the JSON array. A model left free to think can spend the whole token
+      // budget on it and return no text block at all (extractText then aborts loudly); the discrimination
+      // rules live in the prompt, so the reasoning that matters is the instruction, not a hidden
+      // scratchpad. [LAW:no-silent-failure]
       thinking: { type: 'disabled' },
       messages: [{ role: 'user', content: buildJudgePrompt(batch) }],
     }),
