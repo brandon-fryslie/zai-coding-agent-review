@@ -496,12 +496,15 @@ describe('replaySpawnSpec puts the lane credential in the pinned provider slot',
     lane: { name: 'TOKEN_B', value: 'lane-b-credential' },
     credentialInput: 'CLAUDE_CODE_OAUTH_TOKEN',
     outRoot: '/out/freeze-abc',
+    memoryBudget: 8 * 2 ** 30,
   });
 
-  test('one replay of one case at N=1, into the suite out root', () => {
+  test("one replay of one case at N=1, into the suite out root, planning against the lane's memory share", () => {
     const s = spec();
     assert.equal(s.command, process.execPath);
-    assert.deepEqual(s.args, [path.join(__dirname, '..', 'eval', 'run-case.js'), '/cases/alpha', '-n', '1', '--out', '/out/freeze-abc']);
+    // The share arrives as bytes on the child's own flag: L children each defaulting to the whole host
+    // would multiply the per-lane memory guardrail by L.
+    assert.deepEqual(s.args, [path.join(__dirname, '..', 'eval', 'run-case.js'), '/cases/alpha', '-n', '1', '--out', '/out/freeze-abc', '--memory-budget', String(8 * 2 ** 30)]);
     // Resolved from the module, not the caller's cwd: run-case.js reads repo-relative paths.
     assert.equal(s.cwd, path.join(__dirname, '..'));
   });

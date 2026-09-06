@@ -9,6 +9,17 @@ test('parseArgs takes the required positional and applies defaults', () => {
   assert.equal(o.caseDir, 'eval/cases/foo');
   assert.equal(o.repeats, 1);
   assert.equal(o.out, 'eval/out');
+  // No budget given: the recorded absence, resolved to the whole host where the host is read.
+  assert.equal(o.memoryBudget, null);
+});
+
+test('parseArgs takes --memory-budget as a positive integer of bytes, in both flag forms', () => {
+  assert.equal(parseArgs(['foo', '--memory-budget', '8589934592']).memoryBudget, 8589934592);
+  assert.equal(parseArgs(['foo', '--memory-budget=1024']).memoryBudget, 1024);
+  assert.throws(() => parseArgs(['foo', '--memory-budget', '0']), /--memory-budget must be a positive integer/);
+  assert.throws(() => parseArgs(['foo', '--memory-budget', '1.5']), /--memory-budget must be a positive integer/);
+  assert.throws(() => parseArgs(['foo', '--memory-budget', 'lots']), /--memory-budget must be a positive integer/);
+  assert.throws(() => parseArgs(['foo', '--memory-budget']), /--memory-budget requires a value/);
 });
 
 test('parseArgs supports -n alias, --flag=value, and --help', () => {
