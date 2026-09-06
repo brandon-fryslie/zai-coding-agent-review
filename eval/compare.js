@@ -104,6 +104,16 @@ function parseArgs(argv) {
     opts[keyFor[rawName]] = value;
   }
   if (opts.matcher !== 'llm' && opts.matcher !== 'lexical') throw new Error(`--matcher must be 'llm' or 'lexical' (got ${JSON.stringify(opts.matcher)}).`);
+  // --reuse-candidate replays nothing, so a flag that only shapes the replay is a contradiction, not a
+  // no-op: --out named a root that verdict.{md,json} would then never appear under, and --credentials
+  // named lanes that would never run. Refused rather than silently outranked. (--matcher is different:
+  // it always has a value, so main() reports it ignored instead.) [LAW:no-silent-failure]
+  if (opts.out && opts.reuseCandidate) {
+    throw new Error(`--out and --reuse-candidate are mutually exclusive: --reuse-candidate names an existing root to read from and gate; there is nothing fresh for --out to name. Pass one or the other.`);
+  }
+  if (opts.credentials && opts.reuseCandidate) {
+    throw new Error(`--credentials and --reuse-candidate are mutually exclusive: --reuse-candidate replays nothing, so there are no lanes for --credentials to name.`);
+  }
   return opts;
 }
 
@@ -424,13 +434,7 @@ function main() {
     return 0;
   }
 
-  // 1. --out names where FRESH artifacts land; --reuse-candidate names an EXISTING root to read from.
-  //    Passing both silently discarded --out in favor of the reused root — a candidateRoot a user asked
-  //    for by name that verdict.{md,json} then never appear under. Refuse the combination outright rather
-  //    than pick a silent winner. [LAW:no-silent-failure]
-  if (opts.out && opts.reuseCandidate) {
-    throw new Error(`--out and --reuse-candidate are mutually exclusive: --reuse-candidate names an existing root to read from and gate; there is nothing fresh for --out to name. Pass one or the other.`);
-  }
+  // 1. Flag combinations that contradict each other were refused in parseArgs, before any IO.
 
   // 2. Load the frozen baseline. Parse the raw object once for the cost preview (parseBaseline is a lossy
   //    GATE SUBSET that deliberately drops cost — do not widen it), and parseBaseline for the gate contract.

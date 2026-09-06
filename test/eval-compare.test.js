@@ -67,14 +67,14 @@ test('parseArgs applies defaults and honors flags', () => {
   assert.equal(d.casesDir, 'eval/cases');
   assert.equal(d.cache, 'eval/out/.judge-cache.json');
   assert.equal(d.reuseCandidate, null);
-  const o = parseArgs(['--baseline', 'b', '--matcher=lexical', '--out', 'o', '--credentials=A,B', '--cases-dir', 'c', '--cache=k', '--reuse-candidate', 'r']);
+  const o = parseArgs(['--baseline', 'b', '--matcher=lexical', '--out', 'o', '--credentials=A,B', '--cases-dir', 'c', '--cache=k']);
   assert.equal(o.baseline, 'b');
   assert.equal(o.matcher, 'lexical');
   assert.equal(o.out, 'o');
   assert.equal(o.credentials, 'A,B');
   assert.equal(o.casesDir, 'c');
   assert.equal(o.cache, 'k');
-  assert.equal(o.reuseCandidate, 'r');
+  assert.equal(parseArgs(['--reuse-candidate', 'r']).reuseCandidate, 'r');
   assert.equal(parseArgs(['--help']).help, true);
   assert.equal(parseArgs(['-h']).help, true);
 });
@@ -88,6 +88,9 @@ test('parseArgs rejects bad input loudly', () => {
   assert.throws(() => parseArgs(['--matcher', 'fuzzy']), /--matcher must be 'llm' or 'lexical'/);
   assert.throws(() => parseArgs(['--credentials=']), /requires a non-empty value/);
   assert.throws(() => parseArgs(['--workers', '2']), /Unknown option: --workers/);
+  // A flag that only shapes the replay contradicts --reuse-candidate, which replays nothing.
+  assert.throws(() => parseArgs(['--out', 'o', '--reuse-candidate', 'r']), /--out and --reuse-candidate are mutually exclusive/);
+  assert.throws(() => parseArgs(['--credentials', 'A,B', '--reuse-candidate', 'r']), /--credentials and --reuse-candidate are mutually exclusive/);
 });
 
 // ── replayArgs (what the replay step hands freeze-suite.js) ────────────────────────────────────────────
