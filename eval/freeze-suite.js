@@ -368,17 +368,24 @@ function superviseSpawn({ command, args, cwd, env, logPath, timeoutMinutes, sign
   });
 }
 
-// [LAW:decomposition] One job: name the command a replay is. Everything about surviving it — the
-// deadline, the process group, the log — belongs to superviseSpawn above.
-function runReplay({ job, lane, credentialInput, outRoot, logPath, timeoutMinutes }) {
-  return superviseSpawn({
+// [LAW:decomposition] [LAW:effects-at-boundaries] Pure: the argv, working directory and environment that
+// ONE replay is. Separated from the spawn because putting THIS lane's credential in the slot the pinned
+// provider reads is the security-relevant half of this file, and it inherited process.env — so a wrong
+// key does not fail, it silently replays on whatever credential the parent happened to be holding. A
+// mapping only a real spawn can observe is a mapping nothing asserts.
+function replaySpawnSpec({ job, lane, credentialInput, outRoot }) {
+  return {
     command: process.execPath,
     args: [path.join(__dirname, 'run-case.js'), job.dir, '-n', '1', '--out', outRoot],
     cwd: path.join(__dirname, '..'),
     env: { ...process.env, [credentialInput]: lane.value },
-    logPath,
-    timeoutMinutes,
-  });
+  };
+}
+
+// [LAW:decomposition] One job: hand the supervision the command a replay is. Everything about surviving
+// it — the deadline, the process group, the log — belongs to superviseSpawn above.
+function runReplay({ job, lane, credentialInput, outRoot, logPath, timeoutMinutes }) {
+  return superviseSpawn({ ...replaySpawnSpec({ job, lane, credentialInput, outRoot }), logPath, timeoutMinutes });
 }
 
 // A lane replays one job at a time and takes the first queued job it has NOT already failed, requeueing
@@ -410,7 +417,9 @@ function runReplay({ job, lane, credentialInput, outRoot, logPath, timeoutMinute
 // deadline guarantees that), and the lane that decrements the count to zero wakes everyone still waiting.
 function makeLaneGroup() {
   let running = 0;
+  let stopped = false;
   let waiters = [];
+  const wakeAll = () => { const woken = waiters; waiters = []; woken.forEach(wake => wake()); };
   return {
     // Held from the moment a lane takes a job until it has finished putting a failure BACK — not merely
     // for the replay. Waking peers at the end of the replay instead would wake them into the window
@@ -421,15 +430,21 @@ function makeLaneGroup() {
         return await fn();
       } finally {
         running--;
-        const woken = waiters;
-        waiters = [];
-        woken.forEach(wake => wake());
+        wakeAll();
       }
     },
+    // [LAW:dataflow-not-control-flow] An interrupt is a fact about the whole group, not about any one
+    // lane, and signalling the groups already in flight was only half of acting on it: the lanes went on
+    // taking jobs and spawning FRESH replays for the entire escalation window, each one a new charge
+    // against a real credential, started after the operator asked to stop and killed before it could
+    // finish. Once stopped, the queue looks empty and no peer looks live — the two values runLane already
+    // decides on — so every lane leaves through the path it already had and the stop adds no branch.
+    stop() { stopped = true; wakeAll(); },
+    get stopped() { return stopped; },
     // true: a peer finished, so the queue may have grown — look again. false: nobody else is running,
     // so the queue is final and this lane is genuinely done.
     peerStillRunning() {
-      if (running === 0) return Promise.resolve(false);
+      if (stopped || running === 0) return Promise.resolve(false);
       return new Promise(resolve => waiters.push(() => resolve(true)));
     },
   };
@@ -442,7 +457,7 @@ function makeLaneGroup() {
 async function runLane({ lane, queue, credentialInput, outRoot, logDir, done, log, timeoutMinutes, replay, group }) {
   const attempted = new Set();
   for (;;) {
-    const next = queue.findIndex(job => !attempted.has(job));
+    const next = group.stopped ? -1 : queue.findIndex(job => !attempted.has(job));
     if (next === -1) {
       if (await group.peerStillRunning()) continue;
       return;
@@ -503,9 +518,13 @@ async function main() {
   // failure this tool was written to make impossible. 128+signum is the shell's own convention for
   // "killed by this signal", so a wrapping script reads the interrupt as an interrupt.
   const SIGNUM = { SIGINT: 2, SIGTERM: 15 };
+  const group = makeLaneGroup();
   for (const sig of Object.keys(SIGNUM)) {
     process.on(sig, () => {
       log(`freeze-suite: ${sig} — signalling ${inFlight.size} in-flight replay(s) before exiting.`);
+      // Before the signalling, not after: a lane that takes one more job in between starts a replay this
+      // handler has already walked past, and nothing will ever signal it.
+      group.stop();
       shutdownInFlight({
         groups: inFlight,
         signal: signalGroup,
@@ -518,7 +537,6 @@ async function main() {
   const queue = jobs.slice();
   const done = [];
   const started = Date.now();
-  const group = makeLaneGroup();
   await Promise.all(lanes.map(lane => runLane({ lane, queue, credentialInput, outRoot, logDir, done, log, timeoutMinutes: opts.jobTimeout, replay: runReplay, group })));
 
   // The closing census is re-read from disk, never inferred from the job results: what the scorer will
@@ -537,4 +555,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, parsePositiveInt, resolveLanes, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };
+module.exports = { parseArgs, parsePositiveInt, resolveLanes, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, superviseSpawn, censusCases, credentialInputFor, renderReport, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };

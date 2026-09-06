@@ -275,6 +275,22 @@ describe('runLane', () => {
     assert.deepEqual(done.filter(d => d.name === 'doomed').map(d => d.lane), ['TOKEN_B', 'TOKEN_A']);
     assert.equal(queue.length, 0, 'the requeued job was picked up, not left behind');
   });
+
+  // Signalling the groups already in flight was only half of acting on an interrupt: the lane loop went
+  // on taking jobs and spawning fresh replays for the whole escalation window, each a new charge against
+  // a real credential, begun after the operator asked to stop and killed before it could finish.
+  test('a stopped group takes no further job, whatever is left in the queue', async () => {
+    const queue = [job('alpha', 1), job('beta', 1), job('gamma', 1)];
+    const done = [];
+    const group = makeLaneGroup();
+    // The interrupt lands while the first replay is in flight, which is the only moment it can.
+    const replay = async () => { group.stop(); return ok; };
+
+    await runLane({ ...laneArgs, queue, done, timeoutMinutes: 60, replay, group });
+
+    assert.deepEqual(done.map(d => d.name), ['alpha'], 'the in-flight replay finished; no new one began');
+    assert.deepEqual(queue.map(j => j.name), ['beta', 'gamma'], 'untaken work is left for a later run');
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -287,7 +303,7 @@ describe('runLane', () => {
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { censusCases, superviseSpawn, inFlight } = require('../eval/freeze-suite');
+const { censusCases, superviseSpawn, inFlight, credentialInputFor, replaySpawnSpec } = require('../eval/freeze-suite');
 
 const tmpTree = () => fs.mkdtempSync(path.join(os.tmpdir(), 'freeze-suite-test-'));
 const writeCase = (casesDir, dirName, manifestName) => {
@@ -440,4 +456,69 @@ test('parseArgs refuses an empty value for any option rather than resolving it t
   for (const argv of [['--out='], ['--out', ''], ['--cases-dir='], ['--credentials='], ['-n', '']]) {
     assert.throws(() => parseArgs(argv), /requires a non-empty value|must be a positive integer/, `argv: ${JSON.stringify(argv)}`);
   }
+});
+
+// The alias-blind lookup this function used to have threw "src/provider.js does not define 'auto'" on a
+// pin that replays fine — on a status-only re-invocation that spends nothing. Its siblings from that same
+// round got regression tests; this one, the function the bug was actually in, did not.
+describe('credentialInputFor names the env var a pin travels under', () => {
+  const { PROVIDERS, PROVIDER_ALIASES } = require('../src/provider');
+
+  test("the alias every case is frozen under resolves rather than throwing", () => {
+    assert.equal(credentialInputFor('auto'), PROVIDERS[PROVIDER_ALIASES.auto].credentialInput);
+  });
+
+  // Parameterized so a provider row added tomorrow is covered the day it lands, not the day someone
+  // notices the suite cannot replay a case pinned to it.
+  for (const [name, spec] of Object.entries(PROVIDERS)) {
+    test(`'${name}' resolves to its own credential env var`, () => {
+      assert.equal(credentialInputFor(name), spec.credentialInput);
+    });
+  }
+
+  test('a provider no row defines still fails loudly, naming the ones that exist', () => {
+    assert.throws(
+      () => credentialInputFor('claude-subscripton'),
+      err => /does not define/.test(err.message) && Object.keys(PROVIDERS).every(n => err.message.includes(n)),
+    );
+  });
+});
+
+// runReplay's only job is this mapping, and it inherits process.env — so a wrong credential key does not
+// fail, it silently replays on whatever credential the parent happened to be holding, which is the one
+// failure this file's provider-table dependency exists to prevent. Asserted directly rather than through
+// a spawn, where it is invisible.
+describe('replaySpawnSpec puts the lane credential in the pinned provider slot', () => {
+  const spec = () => replaySpawnSpec({
+    job: { name: 'alpha', dir: '/cases/alpha', level: 1 },
+    lane: { name: 'TOKEN_B', value: 'lane-b-credential' },
+    credentialInput: 'CLAUDE_CODE_OAUTH_TOKEN',
+    outRoot: '/out/freeze-abc',
+  });
+
+  test('one replay of one case at N=1, into the suite out root', () => {
+    const s = spec();
+    assert.equal(s.command, process.execPath);
+    assert.deepEqual(s.args, [path.join(__dirname, '..', 'eval', 'run-case.js'), '/cases/alpha', '-n', '1', '--out', '/out/freeze-abc']);
+    // Resolved from the module, not the caller's cwd: run-case.js reads repo-relative paths.
+    assert.equal(s.cwd, path.join(__dirname, '..'));
+  });
+
+  test("the lane's value lands in the named slot and overrides an inherited one", () => {
+    const before = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'the-parent-credential';
+    try {
+      assert.equal(spec().env.CLAUDE_CODE_OAUTH_TOKEN, 'lane-b-credential');
+    } finally {
+      if (before === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN; else process.env.CLAUDE_CODE_OAUTH_TOKEN = before;
+    }
+  });
+
+  test('no other provider slot is written, so a lane cannot replay on a foreign credential', () => {
+    const { PROVIDERS } = require('../src/provider');
+    const env = spec().env;
+    for (const s of Object.values(PROVIDERS).filter(s => s.credentialInput !== 'CLAUDE_CODE_OAUTH_TOKEN')) {
+      assert.equal(env[s.credentialInput], process.env[s.credentialInput], `${s.credentialInput} was rewritten`);
+    }
+  });
 });
