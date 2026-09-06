@@ -81,7 +81,7 @@ Usage: node eval/baseline.js [options]
                      silently completed). A scored dir under <out-dir> with no matching golden case is not
                      part of the suite and is ignored.
   --dest <dir>       Baseline output root (default: eval/baseline). Writes <dest>/<date>-<shortsha>/.
-  --sha <git-sha>    The main commit this baseline characterizes (default: git rev-parse HEAD).
+  --sha <git-sha>    The commit whose engine tree produced these runs (default: git rev-parse HEAD).
   --date <date>      YYYY-MM-DD stamp for the baseline dir (default: today, UTC).
   --help             Show this help.
 `;
@@ -416,7 +416,10 @@ function renderBaselineMarkdown(baseline) {
   const lines = [
     `# Eval baseline — ${baseline.mainSha.slice(0, 7)} (${baseline.generatedAt})`,
     '',
-    `Frozen distribution of must-find recall for the golden case suite on \`main\` at commit \`${baseline.mainSha}\`.`,
+    // [FRAMING:representation] The freezer knows which TREE produced the runs, never which branch that
+    // commit sits on. This repo squash-merges, so a branch-tip freeze is never reachable from main — a
+    // doc asserting `main` would be false for exactly the freezes that matter most. State the commit.
+    `Frozen distribution of must-find recall for the golden case suite at commit \`${baseline.mainSha}\` — the engine tree that produced these runs.`,
     `This is the reference the compare gate (\`copirate-eval-harness-2fk.5\`) measures a candidate engine change against.`,
     '',
     `- **Engine (pinned):** \`${eng.provider}\` / \`${eng.model}\`${eng.reasoning ? ` / reasoning=${eng.reasoning}` : ''}`,
