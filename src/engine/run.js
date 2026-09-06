@@ -326,11 +326,11 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
       // the spawn would hang until the timeout found a dead tree. The check is deterministic, not a
       // grace period: `closed` resolved synchronously above, so every reaction to it runs as a
       // microtask before the setImmediate macrotask fires.
-      const settled = Promise.race([
+      const sessionOutcome = Promise.race([
         session,
         new Promise((_, reject) => setImmediate(() => reject(new Error(`${adapter.name} session did not settle when the engine exited.`)))),
       ]);
-      settled.then(
+      sessionOutcome.then(
         output => finish(() => {
           try {
             adapter.assertSucceeded(output);
