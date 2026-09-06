@@ -55,10 +55,12 @@ jobs:
     # kills a replay that stalls (a throttled CLI sits in silent retry) at its 120-minute deadline and
     # hands the job to another lane. A lane that dies outright (its account at the daily wall, which PR
     # reviews on the same accounts can bring on) fails every job instantly and the survivors split its
-    # share, so the busiest survivor carries ~9; one stall there is 8 × 27 + 120 ≈ 336 min, plus setup
-    # and a few minutes of judge calls. 350 covers that and is the most a hosted job can carry under its
-    # 6-hour ceiling. A second dead lane, or a second stall on one lane, does not fit and is read as
-    # below. The serial single-lane shape this replaced needed 260–540 min before any stall.
+    # share: 10 each if it was dead from the start. 350 is the most a hosted job can carry under its
+    # 6-hour ceiling, and by this model it fits three healthy lanes with one stall (6 × 27 + 120 ≈ 282)
+    # or one dead lane with no stall (10 × 27 = 270), each plus setup and a few minutes of judge calls.
+    # A dead lane AND a stall (9 × 27 + 120 ≈ 363), two dead lanes, or two stalls on one lane do not
+    # fit and are read as below. The serial single-lane shape this replaced needed 260–540 min before
+    # any stall.
     #
     # A run that exceeds this is killed mid-suite: real quota spent, no verdict written, and the job
     # reads as infrastructure failure rather than as a gate that could not finish. A timed-out gate must

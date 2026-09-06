@@ -61,7 +61,8 @@ Usage: ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js [option
   --cache <file>         Judge-decision cache, forwarded to score.js (default: eval/out/.judge-cache.json).
   --reuse-candidate <d>  Skip the replay+score entirely and gate an ALREADY-produced candidate root <d>
                          (one <case>/scorecard-summary.json per baseline case). For re-rendering a verdict
-                         or validating the gate without re-spending. Mutually exclusive with --out.
+                         or validating the gate without re-spending. Mutually exclusive with --out and
+                         with --credentials (nothing is replayed, so there is nothing for either to shape).
   --help                 Show this help.
 
 The candidate always runs at the baseline's N and pinned engine (a replay at a different N/engine would
