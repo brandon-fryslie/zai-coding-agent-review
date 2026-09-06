@@ -4,14 +4,13 @@
 //
 // [FRAMING:representation] Summed spawn time and elapsed wall time are different numbers, and their
 // ratio is the diagnosis: an operator who sees only a total cannot tell a slow model (fix: faster
-// engine) from too many waves (fix: raise concurrency) from too many sweeps (fix: lower sweepCap) —
-// three causes with opposite remedies. The schedule value recorded by runMultiScopePass carries the
-// facts; this module derives everything derivable from them, so the record can never contradict
-// itself — wave count is never STORED anywhere, it always falls out of scope count and concurrency.
-// [LAW:one-source-of-truth]
+// engine) from a machine too small for the plan (laneCount below scopeCount: a capacity cap, not a
+// review setting) from too many sweeps (fix: lower sweepCap) — three causes with opposite remedies.
+// The schedule value recorded by runMultiScopePass carries the facts; this module derives everything
+// derivable from them, so the record can never contradict itself. [LAW:one-source-of-truth]
 //
 // The recorded schedule value:
-//   { scopeConcurrency, sweepCap, scopeCount, spawns: SpawnRecord[] }
+//   { laneCount, sweepCap, scopeCount, spawns: SpawnRecord[] }
 // where each SpawnRecord is a discriminated value, one per engine spawn ATTEMPT:
 //   { phase: 'scout',                     outcome, usage }
 //   { phase: 'worker', scope, pass,      outcome, usage }
@@ -46,12 +45,13 @@ function spawnRecord(tag, outcome, usage) {
 
 // [LAW:one-source-of-truth] The OUTER shape gets the same owner the inner one has: the pass builds
 // its schedule envelope through this mint, so a renamed or dropped field fails loudly here instead
-// of surfacing as describeSchedule deriving NaN waves from an undefined count. The domains mirror
-// the pass's own entry gates (positive concurrency, non-negative sweep cap); the gates exist to
-// fail BEFORE spawns are spent, this mint to stamp the record — same predicate, different instant.
-function scheduleRecord({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
-  if (!Number.isInteger(scopeConcurrency) || scopeConcurrency < 1) {
-    throw new Error(`scheduleRecord: scopeConcurrency must be a positive integer (got ${JSON.stringify(scopeConcurrency)})`);
+// of surfacing as a footer rendering 'undefined lane(s)'. The domains mirror the pass's own entry
+// gates (positive lane ceiling, non-negative sweep cap); the gates exist to fail BEFORE spawns are
+// spent, this mint to stamp the record — same predicate, different instant. laneCount is the count
+// AS USED: the plan's scope count under the machine's ceiling, so it never exceeds scopeCount.
+function scheduleRecord({ laneCount, sweepCap, scopeCount, spawns }) {
+  if (!Number.isInteger(laneCount) || laneCount < 1) {
+    throw new Error(`scheduleRecord: laneCount must be a positive integer (got ${JSON.stringify(laneCount)})`);
   }
   if (!Number.isInteger(sweepCap) || sweepCap < 0) {
     throw new Error(`scheduleRecord: sweepCap must be a non-negative integer (got ${JSON.stringify(sweepCap)})`);
@@ -62,7 +62,10 @@ function scheduleRecord({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
   if (!Array.isArray(spawns)) {
     throw new Error('scheduleRecord: spawns must be an array of spawn records');
   }
-  return { scopeConcurrency, sweepCap, scopeCount, spawns };
+  if (laneCount > scopeCount) {
+    throw new Error(`scheduleRecord: laneCount (${laneCount}) cannot exceed scopeCount (${scopeCount}) — a lane is only ever occupied by a scope`);
+  }
+  return { laneCount, sweepCap, scopeCount, spawns };
 }
 
 // [LAW:effects-at-boundaries] Pure: a span's duration in milliseconds. Absent span → null — a
@@ -103,18 +106,16 @@ function sumMs(values) {
 //     { outcome, ms }   // so the summed figure and the per-attempt rows cannot disagree
 //   ],
 //   passes: [          // worker spawns grouped by pass index, ascending; order within a pass is
-//     { pass, spawns: [{ scope, outcome, ms }], waves }   // settle order, as recorded
+//     { pass, spawns: [{ scope, outcome, ms }] }   // settle order, as recorded
 //   ],
-//   scopeCount, scopeConcurrency, sweepCap,        // the scheduling facts, echoed as recorded
-//   waveCount,          // sum of each pass's waves — DERIVED, so it cannot contradict the records
+//   scopeCount, laneCount, sweepCap,        // the scheduling facts, echoed as recorded
 // }
-// [LAW:one-source-of-truth] A pass's `waves` derives from the DISTINCT scopes that actually spawned
-// in it — ceil(distinctScopes / scopeConcurrency) — never from the planned scopeCount: a pass the
-// time budget cut short mid-wave ran fewer waves than the plan implies, and a retried attempt is a
-// second record for the SAME scope, not a second slot in a wave. So waveCount reflects work that
-// actually ran — a fully-refused pass contributes no group, a partially-refused one only the waves
-// its spawned scopes filled — never work that was merely planned.
-function describeSchedule({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
+// A pass index groups spawns that share a depth, not spawns that ran together: every scope runs its
+// own chain (pass 0, then its sweeps) in its own lane, so pass 1 of one scope may overlap pass 0 of
+// another. The grouping answers "how much did each depth cost" — the sweep multiplier — and the
+// passes list is as deep as the deepest chain that actually spawned, never as deep as sweepCap
+// permits. [LAW:one-source-of-truth]
+function describeSchedule({ laneCount, sweepCap, scopeCount, spawns }) {
   const scouts = [];
   const byPass = new Map();
   // [LAW:no-silent-failure] The dispatch is EXHAUSTIVE over the phase vocabulary this module owns:
@@ -130,11 +131,7 @@ function describeSchedule({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
       throw new Error(`describeSchedule: unknown phase ${JSON.stringify(s.phase)} in spawn record`);
     }
   }
-  const passes = [...byPass.keys()].sort((a, b) => a - b).map(pass => {
-    const spawns = byPass.get(pass);
-    const distinctScopes = new Set(spawns.map(s => s.scope)).size;
-    return { pass, spawns, waves: Math.ceil(distinctScopes / scopeConcurrency) };
-  });
+  const passes = [...byPass.keys()].sort((a, b) => a - b).map(pass => ({ pass, spawns: byPass.get(pass) }));
   return {
     // scoutMs stays derived from the scout rows it sits beside, so the summary figure and the
     // per-attempt table can never disagree about the scout. [LAW:one-source-of-truth]
@@ -142,9 +139,8 @@ function describeSchedule({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
     scouts,
     passes,
     scopeCount,
-    scopeConcurrency,
+    laneCount,
     sweepCap,
-    waveCount: passes.reduce((sum, p) => sum + p.waves, 0),
   };
 }
 
@@ -224,8 +220,11 @@ function scopeText(str) {
 // The line answers "why was this slow?" without the run log: total wall clock (the whole run —
 // preflight, diff fetch and host I/O included, which is why it comes from the run's own clock and
 // not from summing spawns); the spawn time inside it (their ratio separates working from waiting);
-// the split by phase; the slowest scope (one pathological scope sets its wave's duration, and
-// every wave waits for it); and the schedule sentence that turns spawn time into wall time.
+// the split by phase; the slowest scope (every scope runs its passes back to back in its own lane,
+// so the clause is that scope's summed chain — the run's wall clock and nothing else); and the
+// schedule sentence that turns spawn time into
+// wall time — lanes below scopes names the one thing that can still queue a ready scope, the
+// machine's capacity.
 //
 // [LAW:parse-dont-validate] totalMs is minted by the run boundary from its one clock; a non-finite
 // or negative figure here is a wiring bug, thrown loudly for the boundary's catch — never rendered
@@ -257,12 +256,16 @@ function renderTimingBreakdown(schedule, totalMs, prTime = '') {
     phaseClause('scout', d.scouts.map(s => s.ms)),
     ...d.passes.map(p => phaseClause(passLabel(p.pass), p.spawns.map(s => s.ms))),
   ].join(' · ');
-  // The slowest CLOCKED worker attempt; ties keep the first recorded. All-unclocked stays an
-  // explicit 'unclocked', never a fabricated winner.
-  const slowest = workerRows.reduce((best, s) => (s.ms != null && (best == null || s.ms > best.ms) ? s : best), null);
+  // The slowest CHAIN, not the slowest attempt: a scope's passes run back to back in its lane, so its
+  // wall clock is the sum of its clocked attempts (a partial clock is the same lower bound the phase
+  // clauses carry). Scopes in first-recorded order, so ties keep the first; a scope with no clocked
+  // attempt sums to null and cannot win; all-unclocked stays an explicit 'unclocked', never a
+  // fabricated winner. [LAW:one-source-of-truth]
+  const chains = [...new Set(workerRows.map(s => s.scope))]
+    .map(scope => ({ scope, ms: sumMs(workerRows.filter(s => s.scope === scope).map(s => s.ms)) }));
+  const slowest = chains.reduce((best, c) => (c.ms != null && (best == null || c.ms > best.ms) ? c : best), null);
   const slowestClause = slowest ? `slowest scope: ${scopeText(slowest.scope)} (${formatMs(slowest.ms)})` : 'slowest scope: unclocked';
-  const scheduleSentence =
-    `${d.scopeCount} scope(s) at concurrency ${d.scopeConcurrency} over ${d.passes.length} pass(es) = ${d.waveCount} wave(s)`;
+  const scheduleSentence = `${d.scopeCount} scope(s) on ${d.laneCount} lane(s), deepest chain ${d.passes.length} pass(es)`;
   const line = `${head} · ${phaseClause('spawns', allDurations)} (${spawnCount} attempt(s))`
     + ` — ${phases} · ${slowestClause} · ${scheduleSentence}_`;
   const rows = [

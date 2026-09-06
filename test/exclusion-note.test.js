@@ -226,7 +226,7 @@ describe('the strip is wired end to end — material → plan boundary → worke
       material,
       registry: { get: () => adapter },
       instructionsPath: 'x',
-      maxConcurrent: 4,
+      laneCeiling: 4,
       sweepCap: 0,
       log: m => logs.push(m),
       sleepFn: async () => {},

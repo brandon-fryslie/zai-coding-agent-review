@@ -114,7 +114,7 @@ test('formatReport surfaces the explore verdict, beyond-diff reads, findings, an
       summary: 'looks fine',
       usage: { tokens: { inputCacheMiss: 1000, inputCacheHit: 0, output: 200 }, cost: { basis: 'dollars', usd: 0.0123 } },
       schedule: {
-        scopeConcurrency: 2, sweepCap: 0, scopeCount: 1,
+        laneCount: 1, sweepCap: 0, scopeCount: 1,
         spawns: [
           { phase: 'scout', outcome: 'completed', usage: { span: { from: '2026-08-23T12:00:00.000Z', to: '2026-08-23T12:01:00.000Z' } } },
           { phase: 'worker', scope: 'the change', pass: 0, outcome: 'completed', usage: { span: { from: '2026-08-23T12:01:00.000Z', to: '2026-08-23T12:02:00.000Z' } } },

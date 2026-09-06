@@ -31999,18 +31999,16 @@ module.exports = {
 
 // [FRAMING:parts-and-seams] EffortProfile is the single value answering "how much effort to spend on
 // THIS review". Today the levers that set a review's cost are scattered and independently owned —
-// scope concurrency was a module constant in multiscope.js, reasoning is a per-config field resolved
-// at each adapter, the round cap and diff budget come from action inputs, model tier from the failover
-// chain. This module is the ONE owner of the effort representation, so the difficulty (propose) and
-// budget (cap) epics constrain a single value here instead of reaching into every knob independently.
-// [LAW:single-enforcer] [LAW:no-mode-explosion]
+// reasoning is a per-config field resolved at each adapter, the round cap and diff budget come from
+// action inputs, model tier from the failover chain. This module is the ONE owner of the effort
+// representation, so the difficulty (propose) and budget (cap) epics constrain a single value here
+// instead of reaching into every knob independently. [LAW:single-enforcer] [LAW:no-mode-explosion]
 //
 // The type carries only the axes it TRULY governs today. [LAW:types-are-the-program] a field that
 // nothing derives from would be a false theorem — a knob the profile claims to own while its real
-// source is still an input or a per-config value elsewhere. So the profile owns `scopeConcurrency`
-// (its consumer, the worker pool, reads it here), `roundCap` (its consumer, the pre-spawn round
-// gate in run.js, reads it here), `sweepCap` (its consumer, the convergence-sweep loop in
-// runMultiScopePass, reads it here), and `reasoningTier` (its consumer is the reasoning fold at the
+// source is still an input or a per-config value elsewhere. So the profile owns `roundCap` (its
+// consumer, the pre-spawn round gate in run.js, reads it here), `sweepCap` (its consumer, the
+// convergence chain in runMultiScopePass, reads it here), and `reasoningTier` (its consumer is the reasoning fold at the
 // runMultiScope seam — the one place the chain and the effort profile meet — which reconciles the
 // profile's proposed tier with each config's own reasoning via `maxTier` before the adapter clamps it
 // to the engine's range). It GROWS a field as each remaining knob's consumer is migrated off its
@@ -32028,22 +32026,21 @@ module.exports = {
 // proposed raise) PER CONFIG. This makes difficulty a monotonic FLOOR (it can lift an under-specified
 // config, never lower an explicit one) and keeps a default-profile run byte-identical.
 //
-// `roundCap` is the profile's first COST-BEARING axis, and that is why it lands first: scopeConcurrency
-// is cost-NEUTRAL (parallelism trades runner load for wall time, not spend), so a cost estimate over
-// the profile had nothing to vary until now (spike zai-budget-qzm.1). Measured cost is cleanly ADDITIVE
-// across rounds, so the cap is a clean linear multiplier — the budget epic's most trustworthy estimate
-// axis. The value's meaning is unchanged from MAX_REVIEW_ROUNDS: 0 = the "unlimited" sentinel.
+// `roundCap` is the profile's first COST-BEARING axis. Measured cost is cleanly ADDITIVE across
+// rounds, so the cap is a clean linear multiplier — the budget epic's most trustworthy estimate axis.
+// The value's meaning is unchanged from MAX_REVIEW_ROUNDS: 0 = the "unlimited" sentinel.
+//
+// Lane count is deliberately NOT an axis. How many scope workers run at once is cost-neutral —
+// parallelism trades runner load for wall time, never spend — so it was never effort; the profile
+// carried it as `scopeConcurrency = 4` for a while and that misfiling is what made every ready scope
+// queue behind a constant (zai-timing-ptp). The count now derives from the plan itself, under a
+// machine-capacity ceiling owned by the pool (laneCeilingFromMemory, src/multiscope.js).
 
-// [LAW:one-source-of-truth] The default scope-worker concurrency. Quality is identical at any
-// concurrency; this only trades runner load for wall time. It lived as DEFAULT_SCOPE_CONCURRENCY in
-// multiscope.js; it is the profile's value now, and the worker pool reads it FROM the profile.
-const DEFAULT_SCOPE_CONCURRENCY = 4;
-
-// [LAW:one-source-of-truth] The default convergence-sweep bound: after the initial worker pass, up to
-// this many further sweep passes re-review the same material hunting only for findings NOT yet
-// recorded, stopping early when a sweep adds nothing new (zai-recall-upr.2). The push-round dribble
-// this replaces converged in ~5-8 rounds WITHOUT showing each round the prior findings; a sweep IS
-// shown them, so convergence is expected in fewer passes — 2 bounds the worst case at 3 worker layers
+// [LAW:one-source-of-truth] The default convergence-sweep bound: after a scope's initial review, up
+// to this many further sweeps re-review that scope hunting only for findings NOT yet recorded,
+// stopping early when a sweep adds nothing new (zai-recall-upr.2). The push-round dribble this
+// replaces converged in ~5-8 rounds WITHOUT showing each round the prior findings; a sweep IS shown
+// them, so convergence is expected in fewer passes — 2 bounds the worst case at 3 spawns per scope
 // per round. 0 = no sweeps, the pre-convergence single-pass behavior. Unlike roundCap there is NO
 // "unlimited" sentinel: termination inside one action run must be guaranteed by the bound, so the cap
 // is always finite. [LAW:types-are-the-program]
@@ -32058,7 +32055,7 @@ const TIER_RANK = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
 
 // The single representation of review effort. Produced at one seam (a default in simple mode,
 // overridable via the config file later) and consumed uniformly by the engine.
-// @typedef {{ scopeConcurrency: number, roundCap: number, sweepCap: number, reasoningTier: (string|null) }} EffortProfile
+// @typedef {{ roundCap: number, sweepCap: number, reasoningTier: (string|null) }} EffortProfile
 
 // [LAW:effects-at-boundaries] Pure. The default profile — its values ARE the engine's default
 // behavior (which, since zai-recall-upr.2, includes convergence sweeps: sweepCap > 0). An OPTIONS
@@ -32077,10 +32074,10 @@ const TIER_RANK = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
 // `sweepCap` is a further cost-bearing axis (zai-recall-upr.2, after roundCap and reasoningTier): its consumer is the
 // convergence-sweep loop in runMultiScopePass, its price the sweep multiplicand in budget.js's
 // estimatedCostUsd — both land together with the axis, per this module's header. It is OWNED here
-// (DEFAULT_SWEEP_CAP), not sourced from an action input: the sweep bound is engine policy, like
-// scope concurrency, not a consumer knob. [LAW:no-mode-explosion]
+// (DEFAULT_SWEEP_CAP), not sourced from an action input: the sweep bound is engine policy, not a
+// consumer knob. [LAW:no-mode-explosion]
 function defaultEffortProfile({ roundCap = 0, sweepCap = DEFAULT_SWEEP_CAP, reasoningTier = null } = {}) {
-  return { scopeConcurrency: DEFAULT_SCOPE_CONCURRENCY, roundCap, sweepCap, reasoningTier };
+  return { roundCap, sweepCap, reasoningTier };
 }
 
 // [LAW:effects-at-boundaries] Pure. The higher of two abstract reasoning tiers by TIER_RANK — the
@@ -32158,7 +32155,6 @@ function resolveReasoningTier(tier, engineEfforts) {
 }
 
 module.exports = {
-  DEFAULT_SCOPE_CONCURRENCY,
   DEFAULT_SWEEP_CAP,
   TIER_RANK,
   defaultEffortProfile,
@@ -34301,6 +34297,7 @@ module.exports = {
 
 "use strict";
 
+const os = __nccwpck_require__(857);
 const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS } = __nccwpck_require__(2887);
 const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = __nccwpck_require__(6757);
 const { defaultEffortProfile, maxTier } = __nccwpck_require__(4652);
@@ -34320,12 +34317,13 @@ const {
 //
 // [FRAMING:parts-and-seams] A review IS one shape regardless of material or sink: a SCOUT plans the
 // review (one survey spawn that emits a list of scopes), then one WORKER per scope judges it (one
-// review spawn each), then the workers' findings + usage AGGREGATE into a single review value. The
-// worker layer additionally re-runs as CONVERGENCE SWEEPS over the same scopes — each shown the
-// findings already recorded, hunting only for what is missing — until a pass adds nothing new or the
-// effort profile's sweepCap is reached (zai-recall-upr.2). PR and repo differ only in two values they
-// already differ on elsewhere — the `material` (what the scout surveys and what each worker reviews)
-// and the `sink` (how findings leave). [LAW:one-type-per-behavior]
+// review spawn each), then the workers' findings + usage AGGREGATE into a single review value. Each
+// worker continues as its scope's CONVERGENCE CHAIN — re-reviewing the same scope, shown the findings
+// recorded so far, hunting only for what is missing — until a sweep adds nothing new or the effort
+// profile's sweepCap is reached (zai-recall-upr.2); one chain per scope, in its own lane, so no scope
+// waits for a sibling. PR and repo differ only in two values they already differ on elsewhere — the
+// `material` (what the scout surveys and what each worker reviews) and the `sink` (how findings
+// leave). [LAW:one-type-per-behavior]
 //
 // Adaptivity is the GROUPING, not a counted threshold: the scout groups the change by concern and
 // follows the import edges it actually crosses, so a one-concern change yields one scope and a
@@ -34393,7 +34391,7 @@ function sumUsage(usages) {
     // behind a context-tiered cost, so the fold keeps it beside the sum it derives from.
     requests: requests.length > 0 ? requests.flat() : null,
     // The pass's SPAN is the envelope of its spawns' spans — earliest start, latest end — which is
-    // the honest answer for a scheduler that runs workers in waves: the pass occupied that window,
+    // the honest answer for a scheduler whose lanes overlap: the pass occupied that window,
     // and a restatement that needs to know which price epoch applies can see whether the window sits
     // inside one or straddles a boundary. Collapsing it to a single instant would hide the straddle.
     // [LAW:no-silent-failure] A spawn that recorded no span contributes none, exactly as a spawn
@@ -34459,51 +34457,140 @@ function composeSummary(scoutSummary, scopes, sweeps = [], budget = { exhausted:
   return lines.join('\n');
 }
 
-// [LAW:dataflow-not-control-flow] A bounded-concurrency worker pool that is FAIL-LOUD: the first error
-// stops new work and is rethrown after in-flight workers settle, preserving its type (a TransientError
+// [LAW:one-source-of-truth] The memory one engine lane reserves. Every lane is a full engine CLI
+// process (claude-code, codex, opencode) holding its own context — observed in the low hundreds of MB
+// each; 512 MiB leaves headroom for the tree it spawns. This is a CAPACITY guardrail, never a review
+// setting: the lane count is derived from the plan (one lane per scope) and this constant only caps
+// the pathology of a plan wider than the machine — a 7 GiB hosted runner holds 14 lanes, which no
+// PR-mode plan approaches, while a repo audit's dozens of scopes queue rather than fork-bomb the box.
+// Quality is identical at any lane count; only wall clock moves. Change it with a measurement of a
+// lane's footprint, not a wish for more parallelism. (zai-timing-ptp)
+const LANE_MEMORY_BYTES = 512 * 1024 * 1024;
+
+// [LAW:effects-at-boundaries] Pure: how many lanes a machine with this much memory holds. At least
+// one — a machine too small for one lane still runs the review, one scope at a time.
+// [LAW:parse-dont-validate] the one checkpoint for the host figure: os.totalmem is a positive number
+// by contract, so anything else here is a caller that lost the value, refused loudly.
+function laneCeilingFromMemory(totalMemBytes) {
+  if (!Number.isFinite(totalMemBytes) || totalMemBytes <= 0) {
+    throw new Error(`laneCeilingFromMemory: total memory must be a positive number of bytes (got ${JSON.stringify(totalMemBytes)})`);
+  }
+  return Math.max(1, Math.floor(totalMemBytes / LANE_MEMORY_BYTES));
+}
+
+// [LAW:no-shared-mutable-globals] The pass's findings accumulator. N concurrent chains read it (a
+// sweep's priorFindings is whatever is recorded the instant it starts) and write it (each completed
+// pass merges in), so it has ONE owner with a two-verb API rather than a `let` every lane reassigns.
+// merge returns how many findings the merge ADDED — the convergence signal — decided by
+// dedupeFindings, the one sameness key (src/review.js). [LAW:no-ambient-temporal-coupling] the
+// read-merge-assign inside merge has no await, so two chains settling back to back each see the
+// other's additions and neither's are lost; that atomicity is Node's single thread, relied on here
+// once, by name.
+function findingsLedger() {
+  let findings = [];
+  return {
+    get findings() { return findings; },
+    merge(more) {
+      const merged = dedupeFindings([...findings, ...more]);
+      const added = merged.length - findings.length;
+      findings = merged;
+      return added;
+    },
+  };
+}
+
+// [LAW:effects-at-boundaries] Pure: fold every chain's sweep records into one record per DEPTH — the
+// per-sweep lines the summary prints and the budget verdict reads. Index i is sweep i+1. A chain that
+// stopped earlier contributes nothing at deeper indexes; a depth is curtailed when ANY chain's sweep at
+// that depth was, and its `added` is what the chains that ran it added between them. The result is as
+// deep as the deepest chain, so a review with no sweeps folds to [] — the value composeSummary renders
+// as nothing. [LAW:dataflow-not-control-flow]
+function sweepsByDepth(chains) {
+  const depth = Math.max(0, ...chains.map(c => c.length));
+  return Array.from({ length: depth }, (_, i) => {
+    const at = chains.filter(c => i < c.length).map(c => c[i]);
+    return { added: at.reduce((sum, s) => sum + s.added, 0), curtailed: at.some(s => s.curtailed) };
+  });
+}
+
+// [LAW:dataflow-not-control-flow] A fixed-width pool of lanes that is FAIL-LOUD: the first error
+// stops new work and is rethrown after in-flight lanes settle, preserving its type (a TransientError
 // stays a TransientError so failover can classify it). [LAW:no-silent-failure] this is the deliberate
 // inverse of swallowing a failed scope into an empty-finding result — an unreviewed scope must never
-// pass as a clean one.
-//
-// [LAW:types-are-the-program] The pool returns one OUTCOME per scope, in scope order — a discriminated
-// value: { status: 'reviewed', result } | { status: 'unreviewed' }. 'unreviewed' is the time budget's
-// planned degradation, reached two ways: shouldStart() said no before the spawn (nothing ran), or the
-// spawn was killed at the deadline mid-flight (DeadlineExceededError). Both are absorbed HERE, scope
-// by scope, so sibling workers' already-earned results survive — the deadline must never take the
-// fail-loud path that discards the whole batch. The killed spawn's burned time is NOT this pool's
-// concern: it is metered at the one spawn seam in runMultiScopePass (zai-timing-31d.5), which records
-// every attempt — including this killed one, via err.span — before the error reaches this absorber.
-// [LAW:single-enforcer] the pool schedules; the spawn seam meters.
-// Every other error still aborts the batch exactly as before; the caller decides what 'unreviewed'
-// means for its layer (a pass-0 coverage gap vs a merely-curtailed sweep).
-async function runScopeWorkers({ scopes, runOne, maxConcurrent, shouldStart = () => true }) {
+// pass as a clean one. The pool knows nothing of budgets: what runOne returns is the scope's outcome,
+// in scope order regardless of settle order, and the budget's planned degradation is a VALUE inside
+// it (runScopeChain), never an error this pool has to recognise. [LAW:single-enforcer] the chain
+// absorbs the deadline; the pool schedules; the spawn seam meters.
+async function runScopeWorkers({ scopes, runOne, laneCount }) {
   const outcomes = new Array(scopes.length);
   let next = 0;
   let firstError = null;
   async function lane() {
     while (next < scopes.length && !firstError) {
       const i = next++;
-      if (!shouldStart()) {
-        outcomes[i] = { status: 'unreviewed' }; // refused before anything spawned
-        continue;
-      }
       try {
-        outcomes[i] = { status: 'reviewed', result: await runOne(scopes[i]) };
+        outcomes[i] = await runOne(scopes[i]);
       } catch (e) {
-        if (e instanceof DeadlineExceededError) {
-          // The kill's burned time was already recorded upstream at the spawn seam (see the pool
-          // header); here the outcome only says WHAT happened to the scope, never what it cost.
-          outcomes[i] = { status: 'unreviewed' };
-          continue;
-        }
         firstError = firstError || e;
       }
     }
   }
-  const laneCount = Math.min(Math.max(1, maxConcurrent), scopes.length);
   await Promise.all(Array.from({ length: laneCount }, lane));
   if (firstError) throw firstError;
   return outcomes;
+}
+
+// One scope's whole convergence chain, in one lane: pass 0 (the judgment of record, seeded with
+// nothing), then up to sweepCap sweeps of the same scope, each seeded with every finding the pass has
+// recorded so far — its own and its siblings' — stopping the moment a sweep adds nothing.
+// [LAW:composability] It returns one OUTCOME per scope:
+//   { passes: [{ added, curtailed }], assessments }
+// where passes[0] is the review of record and passes[k] is sweep k. `curtailed` is the time budget's
+// planned degradation, one fact at every depth: at pass 0 it is the coverage gap the summary and the
+// verdict carry (the scope was not reviewed); at a sweep it merely ends the chain (pass 0's judgment
+// stands). The list is exactly the passes that RAN plus at most one curtailed entry, so a caller reads
+// the chain's depth off its length. [LAW:types-are-the-program]
+//
+// [LAW:single-enforcer] The budget meets a scope in exactly ONE place — attemptPass — identically
+// before every pass: a pass is refused before spawning when nothing remains, and a spawn the deadline
+// kills mid-flight settles the same way (DeadlineExceededError, absorbed here so sibling chains'
+// earned results are never discarded by a fail-loud rethrow). Both are the same fact, "the budget
+// took this pass", and what that means is decided by the pass index the fact lands on — a value, not
+// a branch. Every other error propagates. [LAW:dataflow-not-control-flow] The killed spawn's burned
+// time is not this chain's concern: the spawn seam recorded it (err.span) before the error got here.
+async function runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, deadline, now, runningTotal }) {
+  // Pass 0 is seeded with NOTHING — its prompt stays byte-identical to the pre-sweep engine even when
+  // a sibling chain has already recorded findings, because a scope that waited for a lane must not
+  // be told its material "was already examined" (the sweep block's premise). A sweep is seeded with
+  // the ledger as it stands the instant it starts. The pass index is the domain's own discriminator
+  // (review of record vs sweep), so this is the one branch the chain has. [LAW:dataflow-not-control-flow]
+  const seedFor = (pass) => (pass === 0 ? [] : ledger.findings);
+  const attemptPass = async (pass) => {
+    if (remainingMs(deadline, now()) <= 0) return null;
+    try {
+      return await runScopeWorker({ scope, context, material, spawn, log, priorFindings: seedFor(pass), pass });
+    } catch (e) {
+      if (e instanceof DeadlineExceededError) return null;
+      throw e;
+    }
+  };
+  const passes = [];
+  const assessments = [];
+  for (let pass = 0; pass <= sweepCap; pass++) {
+    const result = await attemptPass(pass);
+    if (result === null) {
+      log(`${sweepLabelPrefix(pass)}scope '${scope.name}' not reviewed — time budget exhausted`);
+      passes.push({ added: 0, curtailed: true });
+      break;
+    }
+    assessments.push(...result.assessments);
+    const added = ledger.merge(result.findings);
+    passes.push({ added, curtailed: false });
+    if (pass > 0) log(`sweep ${pass} scope '${scope.name}': ${added} new finding(s)`);
+    if (added === 0) break;
+  }
+  log(`scope '${scope.name}' finished after ${passes.filter(p => !p.curtailed).length} pass(es) — ${runningTotal()}`);
+  return { passes, assessments };
 }
 
 // One scope worker: a single review spawn on this config, focused on one scope. [LAW:composability]
@@ -34537,7 +34624,7 @@ async function runScopeWorker({ scope, context, material, spawn, log, priorFindi
 }
 
 // [LAW:one-source-of-truth] The one derivation of a pass index's log-label prefix, shared by the
-// worker's spawn label and the pool caller's skip lines: pass 0 (the review of record) is unprefixed,
+// worker's spawn label and the chain's skip lines: pass 0 (the review of record) is unprefixed,
 // so its logs stay byte-identical to the pre-sweep engine.
 function sweepLabelPrefix(pass) {
   return pass === 0 ? '' : `sweep ${pass} `;
@@ -34691,20 +34778,20 @@ function uniquelyNamed(scopes) {
 // log's running totals count from it, so they agree with the footer's total by construction. A
 // caller without one (null) logs 'elapsed unclocked' rather than minting a second start here:
 // timing is diagnostics and never invents a clock. [LAW:one-source-of-truth]
-async function runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, sweepCap, log, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
+async function runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
   // [LAW:no-silent-failure] A missing/malformed sweep bound must not decide anything by accident: an
-  // undefined cap would make the convergence loop's `pass <= sweepCap` false on pass 0 and the review
-  // would "succeed" having run NO workers at all. The bound comes from the effort profile (its one
+  // undefined cap would make every chain's `pass <= sweepCap` false on pass 0 and the review would
+  // "succeed" having run NO workers at all. The bound comes from the effort profile (its one
   // source); a caller that lost it is a bug that fails loud here.
   if (!Number.isInteger(sweepCap) || sweepCap < 0) {
     throw new Error(`runMultiScopePass requires a non-negative integer sweepCap (got ${JSON.stringify(sweepCap)}); it comes from the effort profile.`);
   }
-  // [LAW:single-enforcer] Same checkpoint for the concurrency: the pool would silently clamp a
-  // nonsensical value to 1, but the schedule records scopeConcurrency AS USED and describeSchedule
-  // divides by it — a 0 or negative here would make the recorded schedule disagree with what the
-  // pool actually did (and derive Infinity waves). One loud gate keeps record and behavior one fact.
-  if (!Number.isInteger(maxConcurrent) || maxConcurrent < 1) {
-    throw new Error(`runMultiScopePass requires a positive integer maxConcurrent (got ${JSON.stringify(maxConcurrent)}); it comes from the effort profile.`);
+  // [LAW:single-enforcer] Same checkpoint for the lane ceiling: the pool runs whatever width it is
+  // handed, and the schedule records that width AS USED — a 0 or a fraction here would make the
+  // recorded schedule disagree with what the pool actually did. One loud gate keeps record and
+  // behavior one fact.
+  if (!Number.isInteger(laneCeiling) || laneCeiling < 1) {
+    throw new Error(`runMultiScopePass requires a positive integer laneCeiling (got ${JSON.stringify(laneCeiling)}); it comes from the machine's capacity (laneCeilingFromMemory).`);
   }
   const adapter = registry.get(config.engine);
 
@@ -34789,20 +34876,23 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   }
   const context = scoutResult.summary.trim();
 
-  // Layer 2 — the convergence loop (zai-recall-upr.2): the worker layer (one worker per scope, judging
-  // in parallel under the concurrency cap) runs 1 + up-to-sweepCap times over the SAME scopes. Pass 0
-  // is the review of record; each further pass is a convergence sweep shown the cumulative deduped
-  // findings and hunting only for what is not yet on that list. [LAW:one-type-per-behavior] a sweep is
-  // not a second kind of pass — it is the identical worker layer with a non-empty priorFindings value,
-  // so pass 0's prompt is byte-identical to the pre-sweep engine.
+  // Layer 2 — the convergence chains (zai-recall-upr.2; one chain per scope since zai-timing-ptp).
+  // Every scope runs its own chain in its own lane: pass 0 (the review of record), then up to sweepCap
+  // sweeps of the same scope, each shown the findings recorded so far and hunting only for what is
+  // missing, stopping the moment a sweep adds nothing. A scope waits on nothing but its own previous
+  // pass — the only fact a sweep takes from its siblings is their findings, and it takes whatever is
+  // recorded when it starts — so the pass's wall clock is its slowest chain, not the sum of its layers.
+  // [LAW:one-type-per-behavior] a sweep is not a second kind of pass: it is the identical worker with a
+  // non-empty priorFindings value, so pass 0's prompt is byte-identical to the pre-sweep engine.
   //
   // [LAW:one-source-of-truth] "Added nothing new" is decided by the SAME key that merges findings —
-  // dedupeFindings — never a second sameness definition: a pass converges the round exactly when
-  // merging its findings leaves the deduped cumulative set unchanged. A verbatim re-record therefore
-  // never counts as new; a paraphrase of a known issue can (the dedupe key's documented noise
-  // direction), which is why the loop is BOUNDED by sweepCap rather than trusting convergence alone.
-  // The predicate is uniform across passes: a pass-0 with zero findings converges immediately (a clean
-  // change), since a sweep after it would re-run a byte-identical prompt — a re-roll, not a hunt.
+  // dedupeFindings, applied once at the ledger — never a second sameness definition: a chain converges
+  // exactly when merging its latest pass leaves the deduped cumulative set unchanged. A verbatim
+  // re-record therefore never counts as new; a paraphrase of a known issue can (the dedupe key's
+  // documented noise direction), which is why every chain is BOUNDED by sweepCap rather than trusting
+  // convergence alone. The predicate is uniform across passes: a pass-0 with zero findings converges
+  // immediately (a clean change), since a sweep after it would re-run a byte-identical prompt — a
+  // re-roll, not a hunt.
   // [LAW:one-source-of-truth] The live log's running total derives from the run's ONE mint
   // (startedAt and the deadline spent from it) plus the injected clock — never a second clock read
   // here. The budget's size is (deadline - startedAt) because both came from the same mint; either
@@ -34811,87 +34901,59 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     startedAt == null ? null : now() - startedAt,
     startedAt == null || deadline == null ? null : deadline - startedAt,
   );
-  const allResults = [];
-  const sweeps = [];
-  const unreviewedScopes = [];
-  let budgetExhausted = false;
-  let findings = [];
-  for (let pass = 0; pass <= sweepCap; pass++) {
-    // The sweep gate: a further pass only starts inside the budget. Pass 0 is never gated here —
-    // its coverage is what the run exists to deliver, and its own workers degrade scope-by-scope
-    // through the pool below. [LAW:no-silent-failure] a gate trip is announced, never a quiet
-    // shortfall that reads as convergence.
-    if (pass > 0 && remainingMs(deadline, now()) <= 0) {
-      budgetExhausted = true;
-      log(`convergence sweeps stopped before sweep ${pass} — time budget exhausted`);
-      break;
-    }
-    const priorFindings = findings;
-    const outcomes = await runScopeWorkers({
-      scopes,
-      maxConcurrent,
-      shouldStart: () => remainingMs(deadline, now()) > 0,
-      runOne: (scope) => runScopeWorker({ scope, context, material, spawn, log, priorFindings, pass }),
-    });
-    const results = outcomes.filter(o => o.status === 'reviewed').map(o => o.result);
-    const skipped = scopes.filter((s, i) => outcomes[i].status === 'unreviewed');
-    for (const s of skipped) log(`${sweepLabelPrefix(pass)}scope '${s.name}' not reviewed — time budget exhausted`);
-    if (skipped.length > 0) budgetExhausted = true;
-    // The pass boundary is a real event this loop owns, so the running total lands here LIVE, while
-    // the run is still going (zai-timing-31d.7) — before the pass-0 empty-handed throw below, so
-    // even a run that dies here logged where its wall clock went. Waves are deliberately NOT logged:
-    // the pool is lane-based, waves exist only as describeSchedule's post-hoc derivation, and a
-    // "wave done" line would fake an event no scheduler observed — the per-scope done lines above
-    // are the intra-pass live signal. [LAW:one-source-of-truth]
-    log(`${passLabel(pass)} workers done — ${runningTotal()}`);
-    if (pass === 0) {
-      // An unreviewed scope at pass 0 is a COVERAGE gap, carried as data to the summary and the
-      // verdict; at a sweep it merely curtails convergence — pass 0's judgments of record stand.
-      unreviewedScopes.push(...skipped.map(s => s.name));
-      // [LAW:no-silent-failure] The budget expired before ANY scope completed: there is no review
-      // to deliver, and "delivering" an empty one would approve a change nobody looked at. Fail
-      // fast with the knob named — the diagnosable error the empty-handed workflow cancel never was.
-      if (results.length === 0) {
-        throw new DeadlineExceededError(
-          `The review's time budget expired before any scope completed — no review to deliver. ${BUDGET_REMEDY}`,
-        );
-      }
-    }
-    allResults.push(...results);
-    const merged = dedupeFindings([...findings, ...results.flatMap(r => r.findings)]);
-    const added = merged.length - findings.length;
-    findings = merged;
-    if (pass > 0) {
-      const curtailed = skipped.length > 0;
-      sweeps.push({ added, curtailed });
-      log(`convergence sweep ${pass}: ${added} new finding(s)${curtailed ? ' — cut short (time budget)' : added === 0 ? ' — converged' : pass === sweepCap ? ' — sweep cap reached' : ''}`);
-    }
-    if (added === 0) break;
+  // The lane count IS the plan's width — one lane per scope — under the one thing that can still make
+  // a ready scope wait, the machine's capacity. Logged as both numbers so a footer or log reading
+  // lanes below scopes names a capacity cap, never a setting. [LAW:no-silent-failure]
+  const laneCount = Math.min(scopes.length, laneCeiling);
+  log(`${scopes.length} scope(s) on ${laneCount} lane(s)`);
+  const ledger = findingsLedger();
+  const outcomes = await runScopeWorkers({
+    scopes,
+    laneCount,
+    runOne: (scope) => runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, deadline, now, runningTotal }),
+  });
+  log(`all scopes done — ${runningTotal()}`);
+  // A scope whose pass 0 the budget took is a COVERAGE gap, carried as data to the summary and the
+  // verdict; a curtailed sweep merely bounds convergence — pass 0's judgments of record stand.
+  const unreviewedScopes = scopes.filter((s, i) => outcomes[i].passes[0].curtailed).map(s => s.name);
+  // [LAW:no-silent-failure] The budget expired before ANY scope completed: there is no review to
+  // deliver, and "delivering" an empty one would approve a change nobody looked at. Fail fast with
+  // the knob named — the diagnosable error the empty-handed workflow cancel never was.
+  if (unreviewedScopes.length === scopes.length) {
+    throw new DeadlineExceededError(
+      `The review's time budget expired before any scope completed — no review to deliver. ${BUDGET_REMEDY}`,
+    );
   }
+  const sweeps = sweepsByDepth(outcomes.map(o => o.passes.slice(1)));
+  for (const [i, s] of sweeps.entries()) {
+    const pass = i + 1;
+    log(`convergence sweep ${pass}: ${s.added} new finding(s)${s.curtailed ? ' — cut short (time budget)' : s.added === 0 ? ' — converged' : pass === sweepCap ? ' — sweep cap reached' : ''}`);
+  }
+  const budgetExhausted = unreviewedScopes.length > 0 || sweeps.some(s => s.curtailed);
 
   return {
     summary: composeSummary(context, scopes, sweeps, { exhausted: budgetExhausted, unreviewedScopes }),
-    findings,
+    findings: ledger.findings,
     // [LAW:dataflow-not-control-flow] Dependency assessments aggregate exactly like findings — a flatMap
-    // over the workers plus one dedup — and with the SAME shape: no `|| []` fallback, because every worker
-    // result carries an `assessments` array (readCollectedReview always returns one), exactly as it carries
-    // `findings`. [LAW:one-type-per-behavior] guarding only this record kind would let an out-of-contract
-    // adapter that omits the field degrade the whole section to "unassessed" silently; the bare access makes
-    // that surface as a loud crash instead. [LAW:no-silent-failure] Only the go.mod-owning worker records
-    // any; dedupeAssessments (keyed by module) collapses the multi-go.mod case — and the sweep-pass
-    // re-assessments, which collapse by the same module key. Non-dependency PR → [].
-    assessments: dedupeAssessments(allResults.flatMap(r => r.assessments)),
+    // over the chains plus one dedup — and with the SAME shape: no `|| []` fallback, because every chain
+    // carries an `assessments` array (every worker result does — readCollectedReview always returns one),
+    // exactly as it carries its passes. [LAW:one-type-per-behavior] guarding only this record kind would
+    // let an out-of-contract adapter that omits the field degrade the whole section to "unassessed"
+    // silently; the bare access makes that surface as a loud crash instead. [LAW:no-silent-failure] Only
+    // the go.mod-owning worker records any; dedupeAssessments (keyed by module) collapses the multi-go.mod
+    // case — and the sweep-pass re-assessments, which collapse by the same module key. Non-dependency PR → [].
+    assessments: dedupeAssessments(outcomes.flatMap(o => o.assessments)),
     // [LAW:one-source-of-truth] The pass total folds from the SAME record list the schedule reports,
     // so "what this pass consumed" has one owner: a spawn in the schedule is in the total, and a
     // spawn in the total is in the schedule — including retried attempts and deadline-killed scopes,
     // whose span-only records widen the envelope exactly as a reviewed spawn's does.
     usage: sumUsage(spawnRecords.map(r => r.usage)),
     // The pass's recorded shape (zai-timing-31d.5): the scheduling facts as actually used, plus one
-    // record per spawn attempt. Wave count is deliberately NOT stored — it derives from scopeCount
-    // and scopeConcurrency (describeSchedule, src/schedule.js), so the record cannot contradict
-    // itself. [LAW:one-source-of-truth]
+    // record per spawn attempt. laneCount is the count the pool RAN — the plan's width under the
+    // machine's ceiling — so the record cannot claim a parallelism the pass did not have.
+    // [LAW:one-source-of-truth]
     schedule: scheduleRecord({
-      scopeConcurrency: maxConcurrent,
+      laneCount,
       sweepCap,
       scopeCount: scopes.length,
       spawns: spawnRecords,
@@ -34910,22 +34972,25 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
 // multi-scope pass builds its own prompts per spawn from `material`, so the latter two are unused
 // here — passed null, exactly as repo mode already passes null anchors. [LAW:composability]
 // log is the injected progress effect (core.info in the action, a stderr writer in the dev script).
-// [LAW:single-enforcer] The effort profile is the ONE source of the review's scope concurrency AND the
+// [LAW:single-enforcer] The effort profile is the ONE source of the review's sweep bound AND the
 // reasoning raise, and this is the ONE seam where the chain and the profile meet — so both projections
-// happen here: scopeConcurrency onto the worker pool's plain number, and reasoningTier folded onto each
-// config's own reasoning as a FLOOR (maxTier). Folding into the chain — rather than threading the tier
-// down to each adapter — means the effective config flows through produceReview unchanged, so the
-// engine clamps it per its range (resolveReasoningTier) and `configUsed` (hence the attribution footer)
-// automatically reports the raised tier. [LAW:dataflow-not-control-flow] a null proposed tier folds to
-// each config's own reasoning (byte-identical), so an omitted/default `effort` leaves the chain untouched.
-function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), log = () => {}, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
-  const maxConcurrent = effort.scopeConcurrency;
+// happen here: sweepCap onto the pass's plain number, and reasoningTier folded onto each config's own
+// reasoning as a FLOOR (maxTier). Folding into the chain — rather than threading the tier down to each
+// adapter — means the effective config flows through produceReview unchanged, so the engine clamps it
+// per its range (resolveReasoningTier) and `configUsed` (hence the attribution footer) automatically
+// reports the raised tier. [LAW:dataflow-not-control-flow] a null proposed tier folds to each config's
+// own reasoning (byte-identical), so an omitted/default `effort` leaves the chain untouched.
+// [LAW:effects-at-boundaries] `laneCeiling` is the one machine fact the pass needs, and the host read
+// that produces it (os.totalmem) sits HERE, at the seam's default, never inside the pass: the pass
+// takes a number, so a test hands it one and the production callers hand it nothing. It is not on the
+// effort profile because it is not effort — see LANE_MEMORY_BYTES.
+function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), laneCeiling = laneCeilingFromMemory(os.totalmem()), log = () => {}, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
   const sweepCap = effort.sweepCap;
   const effectiveChain = chain.map(config => ({
     ...config,
     reasoning: maxTier(config.reasoning ?? null, effort.reasoningTier ?? null),
   }));
-  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, sweepCap, log, sleepFn, deadline, now, startedAt });
+  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, sleepFn, deadline, now, startedAt });
   // [LAW:no-ambient-temporal-coupling] ONE sleepFn and ONE clock own the whole pass's retry timing:
   // both are forwarded to produceReview, so the pass-level gates, the spawn-level retry clamp, and
   // config-level failover all measure the budget on the same injected `now` — a fake clock in a test
@@ -35008,7 +35073,12 @@ module.exports = {
   sumUsage,
   composeSummary,
   planScopes,
+  LANE_MEMORY_BYTES,
+  laneCeilingFromMemory,
+  findingsLedger,
+  sweepsByDepth,
   runScopeWorkers,
+  runScopeChain,
   runMultiScopePass,
   runMultiScope,
   buildPrMaterial,
@@ -37496,14 +37566,13 @@ module.exports = { run, runPrReview, buildReviewFooter, credentialsToMask, resol
 //
 // [FRAMING:representation] Summed spawn time and elapsed wall time are different numbers, and their
 // ratio is the diagnosis: an operator who sees only a total cannot tell a slow model (fix: faster
-// engine) from too many waves (fix: raise concurrency) from too many sweeps (fix: lower sweepCap) —
-// three causes with opposite remedies. The schedule value recorded by runMultiScopePass carries the
-// facts; this module derives everything derivable from them, so the record can never contradict
-// itself — wave count is never STORED anywhere, it always falls out of scope count and concurrency.
-// [LAW:one-source-of-truth]
+// engine) from a machine too small for the plan (laneCount below scopeCount: a capacity cap, not a
+// review setting) from too many sweeps (fix: lower sweepCap) — three causes with opposite remedies.
+// The schedule value recorded by runMultiScopePass carries the facts; this module derives everything
+// derivable from them, so the record can never contradict itself. [LAW:one-source-of-truth]
 //
 // The recorded schedule value:
-//   { scopeConcurrency, sweepCap, scopeCount, spawns: SpawnRecord[] }
+//   { laneCount, sweepCap, scopeCount, spawns: SpawnRecord[] }
 // where each SpawnRecord is a discriminated value, one per engine spawn ATTEMPT:
 //   { phase: 'scout',                     outcome, usage }
 //   { phase: 'worker', scope, pass,      outcome, usage }
@@ -37538,12 +37607,13 @@ function spawnRecord(tag, outcome, usage) {
 
 // [LAW:one-source-of-truth] The OUTER shape gets the same owner the inner one has: the pass builds
 // its schedule envelope through this mint, so a renamed or dropped field fails loudly here instead
-// of surfacing as describeSchedule deriving NaN waves from an undefined count. The domains mirror
-// the pass's own entry gates (positive concurrency, non-negative sweep cap); the gates exist to
-// fail BEFORE spawns are spent, this mint to stamp the record — same predicate, different instant.
-function scheduleRecord({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
-  if (!Number.isInteger(scopeConcurrency) || scopeConcurrency < 1) {
-    throw new Error(`scheduleRecord: scopeConcurrency must be a positive integer (got ${JSON.stringify(scopeConcurrency)})`);
+// of surfacing as a footer rendering 'undefined lane(s)'. The domains mirror the pass's own entry
+// gates (positive lane ceiling, non-negative sweep cap); the gates exist to fail BEFORE spawns are
+// spent, this mint to stamp the record — same predicate, different instant. laneCount is the count
+// AS USED: the plan's scope count under the machine's ceiling, so it never exceeds scopeCount.
+function scheduleRecord({ laneCount, sweepCap, scopeCount, spawns }) {
+  if (!Number.isInteger(laneCount) || laneCount < 1) {
+    throw new Error(`scheduleRecord: laneCount must be a positive integer (got ${JSON.stringify(laneCount)})`);
   }
   if (!Number.isInteger(sweepCap) || sweepCap < 0) {
     throw new Error(`scheduleRecord: sweepCap must be a non-negative integer (got ${JSON.stringify(sweepCap)})`);
@@ -37554,7 +37624,10 @@ function scheduleRecord({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
   if (!Array.isArray(spawns)) {
     throw new Error('scheduleRecord: spawns must be an array of spawn records');
   }
-  return { scopeConcurrency, sweepCap, scopeCount, spawns };
+  if (laneCount > scopeCount) {
+    throw new Error(`scheduleRecord: laneCount (${laneCount}) cannot exceed scopeCount (${scopeCount}) — a lane is only ever occupied by a scope`);
+  }
+  return { laneCount, sweepCap, scopeCount, spawns };
 }
 
 // [LAW:effects-at-boundaries] Pure: a span's duration in milliseconds. Absent span → null — a
@@ -37595,18 +37668,16 @@ function sumMs(values) {
 //     { outcome, ms }   // so the summed figure and the per-attempt rows cannot disagree
 //   ],
 //   passes: [          // worker spawns grouped by pass index, ascending; order within a pass is
-//     { pass, spawns: [{ scope, outcome, ms }], waves }   // settle order, as recorded
+//     { pass, spawns: [{ scope, outcome, ms }] }   // settle order, as recorded
 //   ],
-//   scopeCount, scopeConcurrency, sweepCap,        // the scheduling facts, echoed as recorded
-//   waveCount,          // sum of each pass's waves — DERIVED, so it cannot contradict the records
+//   scopeCount, laneCount, sweepCap,        // the scheduling facts, echoed as recorded
 // }
-// [LAW:one-source-of-truth] A pass's `waves` derives from the DISTINCT scopes that actually spawned
-// in it — ceil(distinctScopes / scopeConcurrency) — never from the planned scopeCount: a pass the
-// time budget cut short mid-wave ran fewer waves than the plan implies, and a retried attempt is a
-// second record for the SAME scope, not a second slot in a wave. So waveCount reflects work that
-// actually ran — a fully-refused pass contributes no group, a partially-refused one only the waves
-// its spawned scopes filled — never work that was merely planned.
-function describeSchedule({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
+// A pass index groups spawns that share a depth, not spawns that ran together: every scope runs its
+// own chain (pass 0, then its sweeps) in its own lane, so pass 1 of one scope may overlap pass 0 of
+// another. The grouping answers "how much did each depth cost" — the sweep multiplier — and the
+// passes list is as deep as the deepest chain that actually spawned, never as deep as sweepCap
+// permits. [LAW:one-source-of-truth]
+function describeSchedule({ laneCount, sweepCap, scopeCount, spawns }) {
   const scouts = [];
   const byPass = new Map();
   // [LAW:no-silent-failure] The dispatch is EXHAUSTIVE over the phase vocabulary this module owns:
@@ -37622,11 +37693,7 @@ function describeSchedule({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
       throw new Error(`describeSchedule: unknown phase ${JSON.stringify(s.phase)} in spawn record`);
     }
   }
-  const passes = [...byPass.keys()].sort((a, b) => a - b).map(pass => {
-    const spawns = byPass.get(pass);
-    const distinctScopes = new Set(spawns.map(s => s.scope)).size;
-    return { pass, spawns, waves: Math.ceil(distinctScopes / scopeConcurrency) };
-  });
+  const passes = [...byPass.keys()].sort((a, b) => a - b).map(pass => ({ pass, spawns: byPass.get(pass) }));
   return {
     // scoutMs stays derived from the scout rows it sits beside, so the summary figure and the
     // per-attempt table can never disagree about the scout. [LAW:one-source-of-truth]
@@ -37634,9 +37701,8 @@ function describeSchedule({ scopeConcurrency, sweepCap, scopeCount, spawns }) {
     scouts,
     passes,
     scopeCount,
-    scopeConcurrency,
+    laneCount,
     sweepCap,
-    waveCount: passes.reduce((sum, p) => sum + p.waves, 0),
   };
 }
 
@@ -37716,8 +37782,11 @@ function scopeText(str) {
 // The line answers "why was this slow?" without the run log: total wall clock (the whole run —
 // preflight, diff fetch and host I/O included, which is why it comes from the run's own clock and
 // not from summing spawns); the spawn time inside it (their ratio separates working from waiting);
-// the split by phase; the slowest scope (one pathological scope sets its wave's duration, and
-// every wave waits for it); and the schedule sentence that turns spawn time into wall time.
+// the split by phase; the slowest scope (every scope runs its passes back to back in its own lane,
+// so the clause is that scope's summed chain — the run's wall clock and nothing else); and the
+// schedule sentence that turns spawn time into
+// wall time — lanes below scopes names the one thing that can still queue a ready scope, the
+// machine's capacity.
 //
 // [LAW:parse-dont-validate] totalMs is minted by the run boundary from its one clock; a non-finite
 // or negative figure here is a wiring bug, thrown loudly for the boundary's catch — never rendered
@@ -37749,12 +37818,16 @@ function renderTimingBreakdown(schedule, totalMs, prTime = '') {
     phaseClause('scout', d.scouts.map(s => s.ms)),
     ...d.passes.map(p => phaseClause(passLabel(p.pass), p.spawns.map(s => s.ms))),
   ].join(' · ');
-  // The slowest CLOCKED worker attempt; ties keep the first recorded. All-unclocked stays an
-  // explicit 'unclocked', never a fabricated winner.
-  const slowest = workerRows.reduce((best, s) => (s.ms != null && (best == null || s.ms > best.ms) ? s : best), null);
+  // The slowest CHAIN, not the slowest attempt: a scope's passes run back to back in its lane, so its
+  // wall clock is the sum of its clocked attempts (a partial clock is the same lower bound the phase
+  // clauses carry). Scopes in first-recorded order, so ties keep the first; a scope with no clocked
+  // attempt sums to null and cannot win; all-unclocked stays an explicit 'unclocked', never a
+  // fabricated winner. [LAW:one-source-of-truth]
+  const chains = [...new Set(workerRows.map(s => s.scope))]
+    .map(scope => ({ scope, ms: sumMs(workerRows.filter(s => s.scope === scope).map(s => s.ms)) }));
+  const slowest = chains.reduce((best, c) => (c.ms != null && (best == null || c.ms > best.ms) ? c : best), null);
   const slowestClause = slowest ? `slowest scope: ${scopeText(slowest.scope)} (${formatMs(slowest.ms)})` : 'slowest scope: unclocked';
-  const scheduleSentence =
-    `${d.scopeCount} scope(s) at concurrency ${d.scopeConcurrency} over ${d.passes.length} pass(es) = ${d.waveCount} wave(s)`;
+  const scheduleSentence = `${d.scopeCount} scope(s) on ${d.laneCount} lane(s), deepest chain ${d.passes.length} pass(es)`;
   const line = `${head} · ${phaseClause('spawns', allDurations)} (${spawnCount} attempt(s))`
     + ` — ${phases} · ${slowestClause} · ${scheduleSentence}_`;
   const rows = [
@@ -50975,7 +51048,7 @@ exports.visitAsync = visitAsync;
 /***/ ((module) => {
 
 "use strict";
-module.exports = /*#__PURE__*/JSON.parse('{"name":"copirate-code-review-agent","version":"1.59.0","description":"AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER","license":"MIT","repository":{"type":"git","url":"git+https://github.com/promptctl/copirate-code-review-agent.git"},"author":"Brandon Fryslie","main":"dist/index.js","engines":{"node":">=24"},"scripts":{"build":"ncc build src/index.js -o dist --license licenses.txt && ncc build src/dismiss-index.js -o dismiss-block/dist --license licenses.txt","test":"node --test","review:local":"node scripts/local-review.js","review:case":"node eval/run-case.js","review:suite":"node eval/freeze-suite.js","review:score":"node eval/score.js","review:baseline":"node eval/baseline.js","review:compare":"node eval/compare.js"},"dependencies":{"@actions/core":"^1.10.1","@actions/github":"^6.0.0","yaml":"^2.9.0"},"devDependencies":{"@vercel/ncc":"^0.38.1"}}');
+module.exports = /*#__PURE__*/JSON.parse('{"name":"copirate-code-review-agent","version":"1.60.0","description":"AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER","license":"MIT","repository":{"type":"git","url":"git+https://github.com/promptctl/copirate-code-review-agent.git"},"author":"Brandon Fryslie","main":"dist/index.js","engines":{"node":">=24"},"scripts":{"build":"ncc build src/index.js -o dist --license licenses.txt && ncc build src/dismiss-index.js -o dismiss-block/dist --license licenses.txt","test":"node --test","review:local":"node scripts/local-review.js","review:case":"node eval/run-case.js","review:suite":"node eval/freeze-suite.js","review:score":"node eval/score.js","review:baseline":"node eval/baseline.js","review:compare":"node eval/compare.js"},"dependencies":{"@actions/core":"^1.10.1","@actions/github":"^6.0.0","yaml":"^2.9.0"},"devDependencies":{"@vercel/ncc":"^0.38.1"}}');
 
 /***/ })
 
