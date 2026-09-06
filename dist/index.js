@@ -34183,29 +34183,31 @@ function sumSpan(spans) {
   };
 }
 
-// [LAW:effects-at-boundaries] Pure: the aggregated review summary. It names every scope reviewed and
-// carries each worker's own summary verbatim — never the scout's raw JSON, which stays out of the
-// author-facing text. [LAW:one-source-of-truth]
-// workerResults are the INITIAL pass's — the judgments of record. Each convergence sweep contributes
-// one line stating what it added; its workers' own summaries are mostly "nothing new" narration, so
-// their findings flow to the merged set while the sweep line carries the summary-level story. sweeps
-// is a value: [] (sweepCap 0, or the shape predating sweeps) renders nothing. [LAW:dataflow-not-control-flow]
+// [LAW:effects-at-boundaries] Pure: the aggregated review summary. It leads with the SCOUT's summary —
+// the one whole-change description this run produces — and then names every scope reviewed.
+// [LAW:one-source-of-truth] That summary has one author and two readers: it is the orientation every
+// worker reviews against (handed to them as `context`) and the author-facing summary here, written once
+// for both. Per-scope worker summaries are deliberately NOT rendered. N workers each describing their
+// own slice produced N paragraphs restating one change N times, and no worker can see the change whole
+// enough to summarize it anyway — the scout is the only agent that does. A worker's output is its
+// findings; its summary is not output.
+// Each convergence sweep contributes one line stating what it added; sweeps is a value: [] (sweepCap 0,
+// or the shape predating sweeps) renders nothing. [LAW:dataflow-not-control-flow]
 // budget is the time-budget outcome: the default (not exhausted, nothing unreviewed) renders nothing,
 // so a run without a deadline — and a run that fit its deadline — is byte-identical to before.
-// [LAW:no-silent-failure] When the budget DID bite, the summary leads with the truth: the headline
-// count names only the scopes actually reviewed, the unreviewed ones are listed by name, and a
-// curtailed convergence is called out — a partial review must never read like a clean bill.
-function composeSummary(scopes, workerResults, sweeps = [], budget = { exhausted: false, unreviewedScopes: [] }) {
+// [LAW:no-silent-failure] When the budget DID bite, the coverage line names only the scopes actually
+// reviewed, the unreviewed ones are listed by name, and a curtailed convergence is called out — a
+// partial review must never read like a clean bill. The scout summary standing above it describes the
+// CHANGE and never the review, so it cannot soften that report into one.
+function composeSummary(scoutSummary, scopes, sweeps = [], budget = { exhausted: false, unreviewedScopes: [] }) {
   const unreviewed = new Set(budget.unreviewedScopes);
   const reviewed = scopes.filter(s => !unreviewed.has(s.name));
   // [LAW:parse-dont-validate] Nothing is flattened here. A scope's name comes stamped single-line from
-  // parseScopeValue and a worker's summary from parseReviewValue, so neither can break this
-  // line-structured summary. This sink previously flattened the name and NOT the summary — the exact
-  // shape of bug that call-site discipline produces, and the reason the rule moved to the boundary.
-  const lines = [`Reviewed ${reviewed.length} scope(s): ${reviewed.map(s => s.name).join(', ')}.`, ''];
-  for (const r of workerResults) {
-    lines.push(`**${r.name}** — ${r.summary || '(no summary)'}`);
-  }
+  // parseScopeValue and the scout's summary from parseReviewValue — which also refuses an empty one, so
+  // there is no absent-summary state for this sink to represent. Neither can break this line-structured
+  // summary. This sink previously flattened the name and NOT the summary — the exact shape of bug that
+  // call-site discipline produces, and the reason the rule moved to the boundary.
+  const lines = [scoutSummary, '', `Reviewed ${reviewed.length} scope(s): ${reviewed.map(s => s.name).join(', ')}.`];
   for (const [i, s] of sweeps.entries()) {
     // [FRAMING:representation] A curtailed sweep must never render as convergence: "added nothing
     // because it was killed" and "searched and found nothing" are different facts.
@@ -34575,7 +34577,6 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     startedAt == null ? null : now() - startedAt,
     startedAt == null || deadline == null ? null : deadline - startedAt,
   );
-  const initialResults = [];
   const allResults = [];
   const sweeps = [];
   const unreviewedScopes = [];
@@ -34621,7 +34622,6 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
           `The review's time budget expired before any scope completed — no review to deliver. ${BUDGET_REMEDY}`,
         );
       }
-      initialResults.push(...results);
     }
     allResults.push(...results);
     const merged = dedupeFindings([...findings, ...results.flatMap(r => r.findings)]);
@@ -34636,7 +34636,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   }
 
   return {
-    summary: composeSummary(scopes, initialResults, sweeps, { exhausted: budgetExhausted, unreviewedScopes }),
+    summary: composeSummary(context, scopes, sweeps, { exhausted: budgetExhausted, unreviewedScopes }),
     findings,
     // [LAW:dataflow-not-control-flow] Dependency assessments aggregate exactly like findings — a flatMap
     // over the workers plus one dedup — and with the SAME shape: no `|| []` fallback, because every worker
@@ -35345,16 +35345,31 @@ function scoutOutputContract(toolNames, { assignFiles = false } = {}) {
     ? `\n      - files: the array of changed file paths this scope owns, copied EXACTLY as listed above. `
       + `Every changed file must appear in exactly ONE scope's files — the worker for that scope reads those files in full.`
     : '';
+  // The summary's SUBJECT and its second reader both vary by mode, and nothing else about the
+  // contract does. [LAW:dataflow-not-control-flow] one contract, varied by a value, not two copies.
+  const summaryContract = assignFiles
+    ? `The summary says what this pull request changes and why — the change in the author's own terms, `
+      + `not a file-by-file list. TWO readers get it verbatim: every scope worker, as the orientation it `
+      + `reviews against, and the pull request author, as the ONLY summary this review posts.`
+    : `The summary says what this codebase is and how its main parts relate. Every scope worker gets it `
+      + `verbatim, as the orientation it reviews against.`;
   return `Do NOT call ${toolNames.requestChange}. You are planning the review here, not reviewing code.
 
     Record your plan by calling ${toolNames.addScope} ONCE PER SCOPE, providing:
       - name: a short label (for example "cost", "line-anchoring", or "parser→renderer" for a boundary).
       - focus: one or two sentences naming the exact files and what to examine in them.${filesField}
 
-    Then call ${toolNames.finishReview} exactly once, with a summary of two to four plain sentences
-    describing what this codebase is and how its main parts relate. Do NOT list the scopes in the
-    summary — the scopes ARE your ${toolNames.addScope} calls. These collector tools are your only
-    output channel; never print the plan as text.`;
+    Then call ${toolNames.finishReview} exactly once. ${summaryContract}
+
+    ONE TO FOUR plain sentences, and never more. This bound bites at the end, after you have planned
+    every scope and your head is full of detail that all feels worth saying — a summary that runs past
+    a short paragraph is wrong even when every word of it is true. Do NOT list the scopes; the scopes
+    ARE your ${toolNames.addScope} calls. Do NOT narrate your planning, your reading, or what you
+    checked — "I examined X and confirmed Y" is never a summary. Do NOT state a verdict: whether the
+    change is good, risky, or needs fixing is the HOST's call, derived from what the workers record,
+    and a verdict here would be a second one contradicting it. [LAW:one-source-of-truth]
+
+    These collector tools are your only output channel; never print the plan as text.`;
 }
 
 // [LAW:decomposition] The PR scout MATERIAL: it is handed the list of files this pull request changed
